@@ -21,7 +21,7 @@ impl TestCtx {
 			test_name
 		);
 		let source_hash = std::env::var("RIVET_SOURCE_HASH").unwrap();
-		let pools = rivet_pools::from_env(service_name.clone()).await?;
+		let pools = rivet_pools::from_env().await?;
 		let cache =
 			rivet_cache::CacheInner::new(service_name.clone(), source_hash, pools.redis_cache()?);
 		let client = chirp_client::SharedClient::from_env(pools.clone())
@@ -77,10 +77,6 @@ impl TestCtx {
 
 	pub async fn redis_mm(&self) -> Result<RedisPool, rivet_pools::Error> {
 		self.op_ctx.redis_mm().await
-	}
-
-	pub async fn redis_user_presence(&self) -> Result<RedisPool, rivet_pools::Error> {
-		self.op_ctx.redis_user_presence().await
 	}
 
 	pub async fn clickhouse(&self) -> GlobalResult<ClickHousePool> {

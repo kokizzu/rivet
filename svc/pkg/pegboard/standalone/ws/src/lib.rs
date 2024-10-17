@@ -29,6 +29,12 @@ struct Connection {
 
 type Connections = HashMap<Uuid, Arc<Connection>>;
 
+pub async fn start() -> GlobalResult<()> {
+	let pools = rivet_pools::from_env().await?;
+
+	run_from_env(pools.clone()).await
+}
+
 #[tracing::instrument(skip_all)]
 pub async fn run_from_env(pools: rivet_pools::Pools) -> GlobalResult<()> {
 	let client = chirp_client::SharedClient::from_env(pools.clone())?.wrap_new("pegboard-ws");

@@ -6,7 +6,7 @@ pub mod utils;
 use std::{collections::HashMap, env, fmt::Debug, str::FromStr, sync::Arc, time::Duration};
 
 use rand::prelude::SliceRandom;
-use tokio::task::JoinSet;
+use tokio::{sync::OnceCell, task::JoinSet};
 use tokio_util::sync::CancellationToken;
 
 use crate::pools::{ClickHousePool, CrdbPool, NatsPool, PoolsInner, RedisPool};
@@ -26,34 +26,43 @@ pub mod prelude {
 
 pub use crate::{error::Error, pools::Pools};
 
+static POOLS_ONCE: OnceCell<Pools> = OnceCell::const_new();
+
 // TODO: implement this as a once so we don't do this multiple times
 #[tracing::instrument]
-pub async fn from_env(client_name: impl ToString + Debug) -> Result<Pools, Error> {
-	let client_name = client_name.to_string();
-	let token = CancellationToken::new();
+pub async fn from_env() -> Result<Pools, Error> {
+	let pools = POOLS_ONCE
+		.get_or_try_init(|| async {
+			// TODO: Choose client name for this service
+			let client_name = "rivet".to_string();
+			let token = CancellationToken::new();
 
-	let (nats, crdb, redis) = tokio::try_join!(
-		nats_from_env(client_name.clone()),
-		crdb_from_env(client_name.clone()),
-		redis_from_env(),
-	)?;
-	let clickhouse = clickhouse_from_env()?;
+			let (nats, crdb, redis) = tokio::try_join!(
+				nats_from_env(client_name.clone()),
+				crdb_from_env(client_name.clone()),
+				redis_from_env(),
+			)?;
+			let clickhouse = clickhouse_from_env()?;
 
-	let pool = Arc::new(PoolsInner {
-		_guard: token.clone().drop_guard(),
-		nats,
-		crdb,
-		redis,
-		clickhouse,
-	});
-	pool.clone().start(token);
+			let pool = Arc::new(PoolsInner {
+				_guard: token.clone().drop_guard(),
+				nats,
+				crdb,
+				redis,
+				clickhouse,
+			});
+			pool.clone().start(token);
 
-	tokio::task::Builder::new()
-		.name("rivet_pools::runtime")
-		.spawn(runtime(pool.clone(), client_name.clone()))
-		.map_err(Error::TokioSpawn)?;
+			tokio::task::Builder::new()
+				.name("rivet_pools::runtime")
+				.spawn(runtime(pool.clone(), client_name.clone()))
+				.map_err(Error::TokioSpawn)?;
 
-	Ok(pool)
+			Ok(pool)
+		})
+		.await?
+		.clone();
+	Ok(pools)
 }
 
 #[tracing::instrument]
@@ -127,8 +136,17 @@ async fn nats_from_env(client_name: String) -> Result<Option<NatsPool>, Error> {
 }
 
 #[tracing::instrument]
-async fn crdb_from_env(_client_name: String) -> Result<Option<CrdbPool>, Error> {
+pub fn crdb_url_from_env() -> Result<Option<String>, Error> {
 	if let Some(url) = std::env::var("CRDB_URL").ok() {
+		Ok(Some(url))
+	} else {
+		Ok(None)
+	}
+}
+
+#[tracing::instrument]
+pub async fn crdb_from_env(_client_name: String) -> Result<Option<CrdbPool>, Error> {
+	if let Some(url) = crdb_url_from_env()? {
 		let min_connections = std::env::var("CRDB_MIN_CONNECTIONS")
 			.ok()
 			.and_then(|s| s.parse::<u32>().ok())
@@ -230,8 +248,17 @@ async fn redis_from_env() -> Result<HashMap<String, RedisPool>, Error> {
 }
 
 #[tracing::instrument]
-fn clickhouse_from_env() -> Result<Option<ClickHousePool>, Error> {
+pub fn clickhouse_url_from_env() -> Result<Option<String>, Error> {
 	if let Some(url) = std::env::var("CLICKHOUSE_URL").ok() {
+		Ok(Some(url))
+	} else {
+		Ok(None)
+	}
+}
+
+#[tracing::instrument]
+pub fn clickhouse_from_env() -> Result<Option<ClickHousePool>, Error> {
+	if let Some(url) = clickhouse_url_from_env()? {
 		tracing::info!(%url, "clickhouse connecting");
 
 		// Build HTTP client

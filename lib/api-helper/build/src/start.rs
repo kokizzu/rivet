@@ -10,7 +10,7 @@ use tracing::Instrument;
 use uuid::Uuid;
 
 #[tracing::instrument(skip_all)]
-pub fn start<T: 'static, Fut>(handle: T)
+pub async fn start<T: 'static, Fut>(handle: T)
 where
 	T: Fn(
 			chirp_client::SharedClientHandle,
@@ -24,43 +24,10 @@ where
 		+ Copy,
 	Fut: Future<Output = Result<Response<Body>, http::Error>> + Send,
 {
-	rivet_runtime::run(start_fut(handle)).unwrap()
-}
-
-#[tracing::instrument(skip_all)]
-async fn start_fut<T: 'static, Fut>(handle: T)
-where
-	T: Fn(
-			chirp_client::SharedClientHandle,
-			rivet_pools::Pools,
-			rivet_cache::Cache,
-			Uuid,
-			Request<Body>,
-		) -> Fut
-		+ Send
-		+ Sync
-		+ Copy,
-	Fut: Future<Output = Result<Response<Body>, http::Error>> + Send,
-{
-	let pools = rivet_pools::from_env("api").await.expect("create pool");
+	let pools = rivet_pools::from_env().await.expect("create pool");
 	let shared_client = chirp_client::SharedClient::from_env(pools.clone()).expect("create client");
 
 	let cache = rivet_cache::CacheInner::from_env(pools.clone()).expect("create cache");
-
-	let health_check_config = rivet_health_checks::Config {
-		pools: Some(pools.clone()),
-	};
-	tokio::task::Builder::new()
-		.name("api_helper::run_standalone")
-		.spawn(rivet_health_checks::run_standalone(
-			health_check_config.clone(),
-		))
-		.unwrap();
-
-	tokio::task::Builder::new()
-		.name("rivet_metrics::run_standalone")
-		.spawn(rivet_metrics::run_standalone())
-		.unwrap();
 
 	let port: u16 = std::env::var("PORT")
 		.ok()

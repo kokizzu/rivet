@@ -20,6 +20,18 @@ struct ContainerRow {
 	failed_stop: bool,
 }
 
+pub async fn start() -> GlobalResult<()> {
+	let pools = rivet_pools::from_env().await?;
+
+	let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
+	loop {
+		interval.tick().await;
+
+		let ts = util::timestamp::now();
+		run_from_env(ts, pools.clone()).await?;
+	}
+}
+
 #[tracing::instrument(skip_all)]
 pub async fn run_from_env(ts: i64, pools: rivet_pools::Pools) -> GlobalResult<()> {
 	let client = chirp_client::SharedClient::from_env(pools.clone())?.wrap_new("pegboard-gc");

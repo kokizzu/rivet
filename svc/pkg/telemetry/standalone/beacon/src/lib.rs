@@ -14,9 +14,13 @@ struct NamespaceAnalytics {
 	linked_users: i64,
 }
 
+pub async fn start() -> GlobalResult<()> {
+	run_from_env(util::timestamp::now()).await
+}
+
 #[tracing::instrument]
 pub async fn run_from_env(ts: i64) -> GlobalResult<()> {
-	let pools = rivet_pools::from_env("telemetry-beacon").await?;
+	let pools = rivet_pools::from_env().await?;
 	let client = chirp_client::SharedClient::from_env(pools.clone())?.wrap_new("telemetry-beacon");
 	let cache = rivet_cache::CacheInner::from_env(pools.clone())?;
 	let ctx = OperationContext::new(

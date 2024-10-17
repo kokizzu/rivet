@@ -27,6 +27,19 @@ lazy_static::lazy_static! {
 /// known jobs.
 pub const CHECK_ORPHANED_JOB_THRESHOLD: i64 = util::duration::hours(1);
 
+pub async fn start() -> GlobalResult<()> {
+	// TODO: Handle ctrl-c
+
+	let pools = rivet_pools::from_env().await?;
+
+	let mut interval = tokio::time::interval(std::time::Duration::from_secs(60 * 15));
+	loop {
+		interval.tick().await;
+
+		run_from_env(util::timestamp::now(), pools.clone()).await?;
+	}
+}
+
 #[tracing::instrument(skip_all)]
 pub async fn run_from_env(ts: i64, pools: rivet_pools::Pools) -> GlobalResult<()> {
 	let check_orphaned_ts = ts - CHECK_ORPHANED_JOB_THRESHOLD;
