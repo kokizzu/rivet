@@ -4,7 +4,6 @@ use cluster::types::BuildDeliveryMethod;
 use fdb_util::FormalKey;
 use foundationdb as fdb;
 use sqlx::Acquire;
-use util::serde::AsHashableExt;
 
 use super::{Input, Port};
 use crate::{
@@ -403,6 +402,36 @@ async fn insert_db(ctx: &ActivityCtx, input: &InsertDbInput) -> GlobalResult<i64
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Hash)]
+struct InsertMetaInput {
+	meta: GetMetaOutput,
+	root_user_enabled: bool,
+}
+
+#[activity(InsertMeta)]
+async fn insert_meta(ctx: &ActivityCtx, input: &InsertMetaInput) -> GlobalResult<()> {
+	let pool = ctx.sqlite().await?;
+
+	sql_execute!(
+		[ctx, pool]
+		"
+		UPDATE state
+		SET
+			project_id = ?,
+			build_kind = ?,
+			build_compression = ?,
+			root_user_enabled = ?
+		",
+		input.meta.project_id,
+		input.meta.build_kind as i64,
+		input.meta.build_compression as i64,
+		input.root_user_enabled,
+	)
+	.await?;
+
+	Ok(())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Hash)]
 struct InsertFdbInput {
 	actor_id: Uuid,
 	env_id: Uuid,
@@ -454,9 +483,9 @@ async fn insert_fdb(ctx: &ActivityCtx, input: &InsertFdbInput) -> GlobalResult<(
 }
 
 #[derive(Debug, Serialize, Deserialize, Hash)]
-struct GetMetaInput {
-	env_id: Uuid,
-	image_id: Uuid,
+pub struct GetMetaInput {
+	pub env_id: Uuid,
+	pub image_id: Uuid,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Hash)]
@@ -474,7 +503,7 @@ pub struct GetMetaOutput {
 }
 
 #[activity(GetMeta)]
-async fn get_meta(ctx: &ActivityCtx, input: &GetMetaInput) -> GlobalResult<GetMetaOutput> {
+pub async fn get_meta(ctx: &ActivityCtx, input: &GetMetaInput) -> GlobalResult<GetMetaOutput> {
 	let dc_id = ctx.config().server()?.rivet.edge()?.datacenter_id;
 
 	let (env_res, build_res, dc_res) = tokio::try_join!(
@@ -539,7 +568,7 @@ pub async fn setup(
 ) -> GlobalResult<ActorSetupCtx> {
 	let image_id = match setup {
 		SetupCtx::Init { network_ports } => {
-			let tags = input.tags.as_hashable();
+			let tags = input.tags.clone();
 			let create_ts = ctx
 				.activity(InsertDbInput {
 					actor_id: input.actor_id,
@@ -550,7 +579,7 @@ pub async fn setup(
 					image_id: input.image_id,
 					args: input.args.clone(),
 					network_mode: input.network_mode,
-					environment: input.environment.as_hashable(),
+					environment: input.environment.clone(),
 					network_ports,
 				})
 				.await?;
@@ -572,6 +601,13 @@ pub async fn setup(
 		.activity(GetMetaInput {
 			env_id: input.env_id,
 			image_id,
+		})
+		.await?;
+
+	ctx.v(2)
+		.activity(InsertMetaInput {
+			meta: meta.clone(),
+			root_user_enabled: input.root_user_enabled,
 		})
 		.await?;
 

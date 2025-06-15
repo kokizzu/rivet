@@ -47,13 +47,21 @@ pub(crate) async fn cluster_datacenter(ctx: &mut WorkflowCtx, input: &Input) -> 
 		};
 
 		match ctx.check_version(2).await? {
-			1 => ctx.activity(v1).await?,
+			1 => {
+				// We remove here because the hash doesn't calculate correctly anymore
+				ctx.removed::<Activity<InsertDb>>().await?;
+			}
+			2 => {
+				// We remove here because the hash doesn't calculate correctly anymore
+				ctx.removed::<Activity<InsertDbV2>>().await?;
+			}
 			_latest => {
-				ctx.activity(InsertDbInputV2 {
-					v1,
-					guard_public_hostname: input.guard_public_hostname.clone(),
-				})
-				.await?
+				ctx.v(3)
+					.activity(InsertDbInputV2 {
+						v1,
+						guard_public_hostname: input.guard_public_hostname.clone(),
+					})
+					.await?
 			}
 		}
 	}
@@ -316,26 +324,29 @@ async fn update_db(ctx: &ActivityCtx, input: &UpdateDbInput) -> GlobalResult<()>
 			if let Some(drain_timeout) = pool.drain_timeout {
 				current_pool.drain_timeout = drain_timeout;
 			}
+			if let Some(margin) = pool.margin {
+				current_pool.margin = margin;
+			}
 		} else {
 			tracing::info!(pool_type=?pool.pool_type, "creating new pool");
 
 			if pool.hardware.is_empty() {
-				tracing::warn!("must define hardware when creating new pool");
+				tracing::error!("must define hardware when creating new pool");
 				return Ok(());
 			}
 
 			let Some(min_count) = pool.min_count else {
-				tracing::warn!("must have `min_count` when creating a new pool");
+				tracing::error!("must have `min_count` when creating a new pool");
 				return Ok(());
 			};
 
 			let Some(max_count) = pool.max_count else {
-				tracing::warn!("must have `max_count` when creating a new pool");
+				tracing::error!("must have `max_count` when creating a new pool");
 				return Ok(());
 			};
 
 			let Some(drain_timeout) = pool.drain_timeout else {
-				tracing::warn!("must have `max_count` when creating a new pool");
+				tracing::error!("must have `max_count` when creating a new pool");
 				return Ok(());
 			};
 
@@ -346,6 +357,7 @@ async fn update_db(ctx: &ActivityCtx, input: &UpdateDbInput) -> GlobalResult<()>
 				min_count,
 				max_count,
 				drain_timeout,
+				margin: 0,
 			});
 		};
 	}
@@ -369,8 +381,8 @@ async fn update_db(ctx: &ActivityCtx, input: &UpdateDbInput) -> GlobalResult<()>
 		input.datacenter_id,
 		serde_json::to_string(&pools)?,
 		input.prebakes_enabled,
-		gph_dns_parent,
-		gph_static
+		&gph_dns_parent,
+		&gph_static
 	)
 	.await?;
 

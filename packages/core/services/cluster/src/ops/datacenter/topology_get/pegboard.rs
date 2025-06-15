@@ -37,24 +37,14 @@ pub async fn pegboard_client_usage_get(ctx: &OperationCtx, input: &Input) -> Glo
 			r#"
 			label_replace(
 				sum by (client_id) (
-					last_over_time(
-						rivet_pegboard_client_cpu_allocated{{
-							client_id=~"({client_ids})",
-						}}
-						[15m:15s]
-					)
+					rivet_pegboard_client_cpu_allocated{{client_id=~"({client_ids})"}}
 				),
 				"metric", "cpu", "", ""
 			)
 			OR
 			label_replace(
 				sum by (client_id) (
-					last_over_time(
-						rivet_pegboard_client_memory_allocated{{
-							client_id=~"({client_ids})",
-						}}
-						[15m:15s]
-					)
+					rivet_pegboard_client_memory_allocated{{client_id=~"({client_ids})"}}
 				),
 				"metric", "mem", "", ""
 			)
@@ -86,13 +76,13 @@ pub async fn pegboard_client_usage_get(ctx: &OperationCtx, input: &Input) -> Glo
 		if let Some((_, value)) = row.value {
 			match row.labels.metric {
 				Metric::Cpu => {
-					// MiB
-					server_entry.cpu += value.parse::<f64>()? as u32;
+					// Millicores -> MHz
+					server_entry.cpu +=
+						value.parse::<f64>()? as u32 * server_spec::LINODE_CPU_PER_CORE / 1000;
 				}
 				Metric::Memory => {
-					// MHz
-					server_entry.memory +=
-						value.parse::<f64>()? as u32 * server_spec::LINODE_CPU_PER_CORE / 1000;
+					// MiB
+					server_entry.memory += value.parse::<f64>()? as u32;
 				}
 			}
 		} else {

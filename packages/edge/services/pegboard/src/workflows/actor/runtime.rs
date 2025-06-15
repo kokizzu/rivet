@@ -9,11 +9,11 @@ use foundationdb::{
 };
 use futures_util::{FutureExt, TryStreamExt};
 use sqlx::Acquire;
-use util::serde::AsHashableExt;
 
 use super::{
 	destroy::{self, KillCtx},
 	setup, Destroy, Input, ACTOR_START_THRESHOLD_MS, BASE_RETRY_TIMEOUT_MS,
+	RETRY_RESET_DURATION_MS,
 };
 use crate::{
 	keys, metrics,
@@ -26,11 +26,16 @@ use crate::{
 #[derive(Deserialize, Serialize)]
 pub struct State {
 	pub generation: u32,
+
 	pub client_id: Uuid,
 	pub client_workflow_id: Uuid,
 	pub image_id: Option<Uuid>,
+
 	pub drain_timeout_ts: Option<i64>,
 	pub gc_timeout_ts: Option<i64>,
+
+	#[serde(default)]
+	reschedule_state: RescheduleState,
 }
 
 impl State {
@@ -42,6 +47,7 @@ impl State {
 			image_id: Some(image_id),
 			drain_timeout_ts: None,
 			gc_timeout_ts: Some(util::timestamp::now() + ACTOR_START_THRESHOLD_MS),
+			reschedule_state: RescheduleState::default(),
 		}
 	}
 }
@@ -49,6 +55,12 @@ impl State {
 #[derive(Serialize, Deserialize)]
 pub struct StateRes {
 	pub kill: Option<KillCtx>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Default)]
+struct RescheduleState {
+	last_retry_ts: i64,
+	retry_count: usize,
 }
 
 #[derive(Debug, Serialize, Deserialize, Hash)]
@@ -82,7 +94,7 @@ async fn update_client(ctx: &ActivityCtx, input: &UpdateClientInput) -> GlobalRe
 		",
 		input.client_id,
 		input.client_workflow_id,
-		client_wan_hostname,
+		&client_wan_hostname,
 	)
 	.await?;
 
@@ -224,9 +236,9 @@ struct AllocateActorInputV2 {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct AllocateActorOutputV2 {
-	client_id: Uuid,
-	client_workflow_id: Uuid,
+pub struct AllocateActorOutputV2 {
+	pub client_id: Uuid,
+	pub client_workflow_id: Uuid,
 }
 
 #[activity(AllocateActorV2)]
@@ -611,7 +623,7 @@ pub async fn spawn_actor(
 	input: &Input,
 	actor_setup: &setup::ActorSetupCtx,
 	generation: u32,
-) -> GlobalResult<Option<(Uuid, Uuid)>> {
+) -> GlobalResult<Option<AllocateActorOutputV2>> {
 	let res = match ctx.check_version(2).await? {
 		1 => {
 			ctx.activity(AllocateActorInputV1 {
@@ -671,7 +683,7 @@ pub async fn spawn_actor(
 				},
 			},
 			root_user_enabled: input.root_user_enabled,
-			env: input.environment.as_hashable(),
+			env: input.environment.clone(),
 			ports: ports_res
 				.ports
 				.iter()
@@ -711,7 +723,7 @@ pub async fn spawn_actor(
 			metadata: util::serde::Raw::new(&protocol::ActorMetadata {
 				actor: protocol::ActorMetadataActor {
 					actor_id: input.actor_id,
-					tags: input.tags.as_hashable(),
+					tags: input.tags.clone(),
 					create_ts: ctx.ts(),
 				},
 				network: Some(protocol::ActorMetadataNetwork {
@@ -744,7 +756,7 @@ pub async fn spawn_actor(
 	.send()
 	.await?;
 
-	Ok(Some((res.client_id, res.client_workflow_id)))
+	Ok(Some(res))
 }
 
 pub async fn reschedule_actor(
@@ -769,7 +781,7 @@ pub async fn reschedule_actor(
 
 	// Waits for the actor to be ready (or destroyed) and automatically retries if failed to allocate.
 	let res = ctx
-		.loope(RescheduleState::default(), |ctx, state| {
+		.loope(state.reschedule_state.clone(), |ctx, state| {
 			let input = input.clone();
 			let actor_setup = actor_setup.clone();
 
@@ -778,14 +790,13 @@ pub async fn reschedule_actor(
 				let mut backoff =
 					util::Backoff::new_at(8, None, BASE_RETRY_TIMEOUT_MS, 500, state.retry_count);
 
-				// If the last retry ts is more than 2 * backoff ago, reset retry count to 0
+				// If the last retry ts is more than RETRY_RESET_DURATION_MS, reset retry count to 0
 				let now = util::timestamp::now();
-				state.retry_count =
-					if state.last_retry_ts < now - i64::try_from(2 * backoff.current_duration())? {
-						0
-					} else {
-						state.retry_count + 1
-					};
+				state.retry_count = if state.last_retry_ts < now - RETRY_RESET_DURATION_MS {
+					0
+				} else {
+					state.retry_count + 1
+				};
 				state.last_retry_ts = now;
 
 				// Don't sleep for first retry
@@ -797,14 +808,14 @@ pub async fn reschedule_actor(
 						.listen_with_timeout::<Destroy>(Instant::from(next) - Instant::now())
 						.await?
 					{
-						tracing::debug!("destroying before actor start");
+						tracing::debug!("destroying before actor reschedule");
 
 						return Ok(Loop::Break(Err(sig)));
 					}
 				}
 
 				if let Some(res) = spawn_actor(ctx, &input, &actor_setup, next_generation).await? {
-					Ok(Loop::Break(Ok(res)))
+					Ok(Loop::Break(Ok((state.clone(), res))))
 				} else {
 					tracing::debug!(actor_id=?input.actor_id, "failed to reschedule actor, retrying");
 
@@ -817,10 +828,13 @@ pub async fn reschedule_actor(
 
 	// Update loop state
 	match res {
-		Ok((client_id, client_workflow_id)) => {
+		Ok((reschedule_state, res)) => {
 			state.generation = next_generation;
-			state.client_id = client_id;
-			state.client_workflow_id = client_workflow_id;
+			state.client_id = res.client_id;
+			state.client_workflow_id = res.client_workflow_id;
+
+			// Save reschedule state in global state
+			state.reschedule_state = reschedule_state;
 
 			// Reset gc timeout once allocated
 			state.gc_timeout_ts = Some(util::timestamp::now() + ACTOR_START_THRESHOLD_MS);
@@ -829,12 +843,6 @@ pub async fn reschedule_actor(
 		}
 		Err(sig) => Ok(Some(sig)),
 	}
-}
-
-#[derive(Serialize, Deserialize, Default)]
-struct RescheduleState {
-	last_retry_ts: i64,
-	retry_count: usize,
 }
 
 #[derive(Debug, Serialize, Deserialize, Hash)]

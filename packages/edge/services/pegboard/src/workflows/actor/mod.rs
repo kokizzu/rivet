@@ -1,15 +1,15 @@
-use std::collections::HashMap;
-
+use analytics::InsertClickHouseInput;
 use chirp_workflow::prelude::*;
 use destroy::KillCtx;
 use futures_util::FutureExt;
-use util::serde::AsHashableExt;
+use rivet_util::serde::HashableMap;
 
 use crate::{
 	protocol,
 	types::{ActorLifecycle, ActorResources, EndpointType, NetworkMode, Routing},
 };
 
+mod analytics;
 pub mod destroy;
 mod migrations;
 mod runtime;
@@ -26,20 +26,23 @@ const ACTOR_START_THRESHOLD_MS: i64 = util::duration::seconds(30);
 const ACTOR_STOP_THRESHOLD_MS: i64 = util::duration::seconds(30);
 /// How long to wait after stopped and not receiving an exit state before setting actor as lost.
 const ACTOR_EXIT_THRESHOLD_MS: i64 = util::duration::seconds(5);
+/// How long an actor goes without retries before it's retry count is reset to 0, effectively resetting its
+/// backoff to 0.
+const RETRY_RESET_DURATION_MS: i64 = util::duration::minutes(10);
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, Hash)]
 pub struct Input {
 	pub actor_id: Uuid,
 	pub env_id: Uuid,
-	pub tags: HashMap<String, String>,
+	pub tags: HashableMap<String, String>,
 	pub resources: ActorResources,
 	pub lifecycle: ActorLifecycle,
 	pub image_id: Uuid,
 	pub root_user_enabled: bool,
 	pub args: Vec<String>,
 	pub network_mode: NetworkMode,
-	pub environment: HashMap<String, String>,
-	pub network_ports: HashMap<String, Port>,
+	pub environment: HashableMap<String, String>,
+	pub network_ports: HashableMap<String, Port>,
 	pub endpoint_type: Option<EndpointType>,
 }
 
@@ -57,14 +60,14 @@ pub async fn pegboard_actor(ctx: &mut WorkflowCtx, input: &Input) -> GlobalResul
 	let validation_res = ctx
 		.activity(setup::ValidateInput {
 			env_id: input.env_id,
-			tags: input.tags.as_hashable(),
+			tags: input.tags.clone(),
 			resources: input.resources.clone(),
 			image_id: input.image_id,
 			root_user_enabled: input.root_user_enabled,
 			args: input.args.clone(),
 			network_mode: input.network_mode,
-			environment: input.environment.as_hashable(),
-			network_ports: input.network_ports.as_hashable(),
+			environment: input.environment.clone(),
+			network_ports: input.network_ports.clone(),
 		})
 		.await?;
 
@@ -82,7 +85,7 @@ pub async fn pegboard_actor(ctx: &mut WorkflowCtx, input: &Input) -> GlobalResul
 
 	let network_ports = ctx
 		.activity(setup::DisableTlsPortsInput {
-			network_ports: input.network_ports.as_hashable(),
+			network_ports: input.network_ports.clone(),
 		})
 		.await?;
 
@@ -119,14 +122,18 @@ pub async fn pegboard_actor(ctx: &mut WorkflowCtx, input: &Input) -> GlobalResul
 		}
 	};
 
+	ctx.v(2)
+		.activity(InsertClickHouseInput {
+			actor_id: input.actor_id,
+		})
+		.await?;
+
 	ctx.msg(CreateComplete {})
 		.tag("actor_id", input.actor_id)
 		.send()
 		.await?;
 
-	let Some((client_id, client_workflow_id)) =
-		runtime::spawn_actor(ctx, input, &initial_actor_setup, 0).await?
-	else {
+	let Some(res) = runtime::spawn_actor(ctx, input, &initial_actor_setup, 0).await? else {
 		ctx.msg(Failed {
 			message: "Failed to allocate (no availability).".into(),
 		})
@@ -145,11 +152,20 @@ pub async fn pegboard_actor(ctx: &mut WorkflowCtx, input: &Input) -> GlobalResul
 		return Ok(());
 	};
 
+	ctx.v(2)
+		.msg(Allocated {
+			client_id: res.client_id,
+		})
+		.tag("actor_id", input.actor_id)
+		.send()
+		.await?;
+
 	let state_res = ctx
 		.loope(
-			runtime::State::new(client_id, client_workflow_id, input.image_id),
+			runtime::State::new(res.client_id, res.client_workflow_id, input.image_id),
 			|ctx, state| {
 				let input = input.clone();
+				let meta = initial_actor_setup.meta.clone();
 
 				async move {
 					let sig = if let Some(drain_timeout_ts) = state.drain_timeout_ts {
@@ -229,7 +245,7 @@ pub async fn pegboard_actor(ctx: &mut WorkflowCtx, input: &Input) -> GlobalResul
 
 							ctx.activity(runtime::UpdateFdbInput {
 								actor_id: input.actor_id,
-								client_id,
+								client_id: state.client_id,
 								state: sig.state.clone(),
 							})
 							.await?;
@@ -258,6 +274,12 @@ pub async fn pegboard_actor(ctx: &mut WorkflowCtx, input: &Input) -> GlobalResul
 									let updated = ctx
 										.activity(runtime::SetConnectableInput {
 											connectable: true,
+										})
+										.await?;
+
+									ctx.v(2)
+										.activity(InsertClickHouseInput {
+											actor_id: input.actor_id,
 										})
 										.await?;
 
@@ -434,7 +456,7 @@ pub async fn pegboard_actor(ctx: &mut WorkflowCtx, input: &Input) -> GlobalResul
 
 	ctx.workflow(destroy::Input {
 		actor_id: input.actor_id,
-		build_kind: Some(initial_actor_setup.meta.build_kind),
+		build_kind: Some(initial_actor_setup.meta.build_kind.clone()),
 		kill: state_res.kill,
 	})
 	.output()
@@ -445,6 +467,11 @@ pub async fn pegboard_actor(ctx: &mut WorkflowCtx, input: &Input) -> GlobalResul
 
 #[message("pegboard_actor_create_complete")]
 pub struct CreateComplete {}
+
+#[message("pegboard_actor_allocated")]
+pub struct Allocated {
+	pub client_id: Uuid,
+}
 
 #[message("pegboard_actor_failed")]
 pub struct Failed {
