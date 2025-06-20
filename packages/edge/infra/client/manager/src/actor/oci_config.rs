@@ -11,6 +11,7 @@ pub struct ConfigOpts<'a> {
 	pub env: Vec<String>,
 	pub user: PartialOciConfigUser,
 	pub cwd: String,
+	pub use_resource_constraints: bool,
 	pub cpu: u64,
 	pub memory: u64,
 	pub memory_max: u64,
@@ -25,9 +26,7 @@ pub fn config(opts: ConfigOpts) -> Result<serde_json::Value> {
 	//
 	// Corresponds to cpu.weight in cgroups. Must be [1, 10_000]
 	//
-	// We divide by 8 in order to make sure the CPU shares are within bounds. `cpu` is measured in
-	// millishares, so 1_000 = 1 core. For a range of 32d1 (32_000) to 1d16 (62), we divide by 8
-	// to make the range 3_200 to 6.
+	// We divide by 10 in order to make sure the CPU shares are within bounds.
 	let mut cpu_shares = opts.cpu / 10;
 	if cpu_shares > 10_000 {
 		cpu_shares = 10_000;
@@ -83,24 +82,32 @@ pub fn config(opts: ConfigOpts) -> Result<serde_json::Value> {
 		"linux": {
 			"resources": {
 				"devices": linux_resources_devices(),
-				"cpu": {
-					"shares": cpu_shares,
-					// If `quota` is greater than `period`, it is allowed to use multiple cores.
-					//
-					// Read more: https://access.redhat.com/documentation/en-us/red_hat_enterprise_linux/6/html/resource_management_guide/sec-cpu
-					// "quota": CPU_PERIOD * cpu / 1_000,
-					// "period": CPU_PERIOD,
-					// Use the env var for the CPU since Nomad handles assigning CPUs to each task
-					// "cpus": if cpu >= 1_000 {
-					// 	Some(template_env_var("NOMAD_CPU_CORES"))
-					// } else {
-					// 	None
-					// }
+				"cpu": if opts.use_resource_constraints {
+					Some(json!({
+						"shares": cpu_shares,
+						// If `quota` is greater than `period`, it is allowed to use multiple cores.
+						//
+						// Read more: https://access.redhat.com/documentation/en-us/red_hat_enterprise_linux/6/html/resource_management_guide/sec-cpu
+						// "quota": CPU_PERIOD * cpu / 1_000,
+						// "period": CPU_PERIOD,
+						// Use the env var for the CPU since Nomad handles assigning CPUs to each task
+						// "cpus": if cpu >= 1_000 {
+						// 	Some(template_env_var("NOMAD_CPU_CORES"))
+						// } else {
+						// 	None
+						// }
+					}))
+				} else {
+					None
 				},
 				// Docker: https://github.com/moby/moby/blob/777e9f271095685543f30df0ff7a12397676f938/daemon/daemon_unix.go#L75
-				"memory": {
-					"reservation": opts.memory,
-					"limit": opts.memory_max,
+				"memory": if opts.use_resource_constraints {
+					Some(json!({
+						"reservation": opts.memory,
+						"limit": opts.memory_max,
+					}))
+				} else {
+					None
 				},
 
 				// TODO: network

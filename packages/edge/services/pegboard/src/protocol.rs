@@ -28,8 +28,7 @@ pub enum ToClient {
 	},
 	Commands(Vec<CommandWrapper>),
 	PrewarmImage {
-		image_id: Uuid,
-		image_artifact_url_stub: String,
+		image: Image,
 	},
 }
 
@@ -118,6 +117,8 @@ pub struct Image {
 	pub artifact_url_stub: String,
 	/// Direct S3 url to download the image from without ATS.
 	pub fallback_artifact_url: Option<String>,
+	/// Size in bytes of the artfiact.
+	pub artifact_size_bytes: u64,
 	pub kind: ImageKind,
 	pub compression: ImageCompression,
 }
@@ -128,6 +129,16 @@ pub enum ImageKind {
 	DockerImage,
 	OciBundle,
 	JavaScript,
+}
+
+impl From<build::types::BuildKind> for ImageKind {
+    fn from(kind: build::types::BuildKind) -> Self {
+        match kind {
+            build::types::BuildKind::DockerImage => ImageKind::DockerImage,
+            build::types::BuildKind::OciBundle => ImageKind::OciBundle,
+            build::types::BuildKind::JavaScript => ImageKind::JavaScript,
+        }
+    }
 }
 
 impl ImageKind {
@@ -144,6 +155,15 @@ impl ImageKind {
 pub enum ImageCompression {
 	None,
 	Lz4,
+}
+
+impl From<build::types::BuildCompression> for ImageCompression {
+    fn from(compression: build::types::BuildCompression) -> Self {
+        match compression {
+            build::types::BuildCompression::None => ImageCompression::None,
+            build::types::BuildCompression::Lz4 => ImageCompression::Lz4,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Hash)]

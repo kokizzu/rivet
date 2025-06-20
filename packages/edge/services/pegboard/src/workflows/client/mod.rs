@@ -109,6 +109,7 @@ pub async fn pegboard_client(ctx: &mut WorkflowCtx, input: &Input) -> GlobalResu
 								activity(UpdateMetricsInput {
 									client_id,
 									flavor,
+									draining: state.drain_timeout_ts.is_some(),
 									clear: false,
 								}),
 							))
@@ -125,6 +126,7 @@ pub async fn pegboard_client(ctx: &mut WorkflowCtx, input: &Input) -> GlobalResu
 								activity(UpdateMetricsInput {
 									client_id,
 									flavor,
+									draining: state.drain_timeout_ts.is_some(),
 									clear: false,
 								}),
 							))
@@ -178,13 +180,10 @@ pub async fn pegboard_client(ctx: &mut WorkflowCtx, input: &Input) -> GlobalResu
 					)
 					.await?;
 				}
-				Some(Main::PrewarmImage(sig)) => {
+				Some(Main::PrewarmImage2(sig)) => {
 					ctx.msg(ToWs {
 						client_id,
-						inner: protocol::ToClient::PrewarmImage {
-							image_id: sig.image_id,
-							image_artifact_url_stub: sig.image_artifact_url_stub,
-						},
+						inner: protocol::ToClient::PrewarmImage { image: sig.image },
 					})
 					.send()
 					.await?;
@@ -192,21 +191,37 @@ pub async fn pegboard_client(ctx: &mut WorkflowCtx, input: &Input) -> GlobalResu
 				Some(Main::Drain(sig)) => {
 					state.drain_timeout_ts = Some(sig.drain_timeout_ts);
 
-					ctx.activity(SetDrainInput {
-						client_id,
-						flavor,
-						draining: true,
-					})
+					ctx.join((
+						activity(SetDrainInput {
+							client_id,
+							flavor,
+							draining: true,
+						}),
+						v(2).activity(UpdateMetricsInput {
+							client_id,
+							flavor,
+							draining: true,
+							clear: false,
+						}),
+					))
 					.await?;
 				}
 				Some(Main::Undrain(_)) => {
 					state.drain_timeout_ts = None;
 
-					ctx.activity(SetDrainInput {
-						client_id,
-						flavor,
-						draining: false,
-					})
+					ctx.join((
+						activity(SetDrainInput {
+							client_id,
+							flavor,
+							draining: false,
+						}),
+						v(2).activity(UpdateMetricsInput {
+							client_id,
+							flavor,
+							draining: false,
+							clear: false,
+						}),
+					))
 					.await?;
 
 					let actor_ids = ctx
@@ -254,6 +269,7 @@ pub async fn pegboard_client(ctx: &mut WorkflowCtx, input: &Input) -> GlobalResu
 	ctx.activity(UpdateMetricsInput {
 		client_id: input.client_id,
 		flavor: input.flavor,
+		draining: false,
 		clear: true,
 	})
 	.await?;
@@ -691,6 +707,7 @@ pub async fn handle_commands(
 			activity(UpdateMetricsInput {
 				client_id,
 				flavor,
+				draining: drain_timeout_ts.is_some(),
 				clear: false,
 			}),
 		))
@@ -933,14 +950,75 @@ async fn check_expired(ctx: &ActivityCtx, input: &CheckExpiredInput) -> GlobalRe
 struct UpdateMetricsInput {
 	client_id: Uuid,
 	flavor: ClientFlavor,
+	#[serde(default)]
+	draining: bool,
 	clear: bool,
 }
 
 #[activity(UpdateMetrics)]
 async fn update_metrics(ctx: &ActivityCtx, input: &UpdateMetricsInput) -> GlobalResult<()> {
-	let (memory, cpu) = if input.clear {
-		(0, 0)
-	} else {
+	if input.clear {
+		metrics::CLIENT_MEMORY_TOTAL
+			.with_label_values(&[
+				&input.client_id.to_string(),
+				&input.flavor.to_string(),
+				"active",
+			])
+			.set(0);
+		metrics::CLIENT_CPU_TOTAL
+			.with_label_values(&[
+				&input.client_id.to_string(),
+				&input.flavor.to_string(),
+				"active",
+			])
+			.set(0);
+		metrics::CLIENT_MEMORY_TOTAL
+			.with_label_values(&[
+				&input.client_id.to_string(),
+				&input.flavor.to_string(),
+				"draining",
+			])
+			.set(0);
+		metrics::CLIENT_CPU_TOTAL
+			.with_label_values(&[
+				&input.client_id.to_string(),
+				&input.flavor.to_string(),
+				"draining",
+			])
+			.set(0);
+		metrics::CLIENT_MEMORY_ALLOCATED
+			.with_label_values(&[
+				&input.client_id.to_string(),
+				&input.flavor.to_string(),
+				"active",
+			])
+			.set(0);
+		metrics::CLIENT_CPU_ALLOCATED
+			.with_label_values(&[
+				&input.client_id.to_string(),
+				&input.flavor.to_string(),
+				"active",
+			])
+			.set(0);
+		metrics::CLIENT_MEMORY_ALLOCATED
+			.with_label_values(&[
+				&input.client_id.to_string(),
+				&input.flavor.to_string(),
+				"draining",
+			])
+			.set(0);
+		metrics::CLIENT_CPU_ALLOCATED
+			.with_label_values(&[
+				&input.client_id.to_string(),
+				&input.flavor.to_string(),
+				"draining",
+			])
+			.set(0);
+
+		return Ok(());
+	}
+
+	let (total_mem, remaining_mem, total_cpu, remaining_cpu) =
 		ctx.fdb()
 			.await?
 			.run(|tx, _mc| async move {
@@ -982,22 +1060,79 @@ async fn update_metrics(ctx: &ActivityCtx, input: &UpdateMetricsInput) -> Global
 					)
 					.map_err(|x| fdb::FdbBindingError::CustomError(x.into()))?;
 
-				Ok((
-					total_mem.saturating_sub(remaining_mem),
-					total_cpu.saturating_sub(remaining_cpu),
-				))
+				Ok((total_mem, remaining_mem, total_cpu, remaining_cpu))
 			})
 			.custom_instrument(tracing::info_span!("client_update_metrics_tx"))
-			.await?
-	};
+			.await?;
 
-	metrics::CLIENT_CPU_ALLOCATED
-		.with_label_values(&[&input.client_id.to_string(), &input.flavor.to_string()])
-		.set(cpu.try_into()?);
+	let (state, other_state) = if input.draining {
+		("draining", "active")
+	} else {
+		("active", "draining")
+	};
+	let allocated_mem = total_mem.saturating_sub(remaining_mem);
+	let allocated_cpu = total_cpu.saturating_sub(remaining_cpu);
+
+	metrics::CLIENT_MEMORY_TOTAL
+		.with_label_values(&[
+			&input.client_id.to_string(),
+			&input.flavor.to_string(),
+			state,
+		])
+		.set(total_mem.try_into()?);
+	metrics::CLIENT_CPU_TOTAL
+		.with_label_values(&[
+			&input.client_id.to_string(),
+			&input.flavor.to_string(),
+			state,
+		])
+		.set(total_cpu.try_into()?);
 
 	metrics::CLIENT_MEMORY_ALLOCATED
-		.with_label_values(&[&input.client_id.to_string(), &input.flavor.to_string()])
-		.set(memory.try_into()?);
+		.with_label_values(&[
+			&input.client_id.to_string(),
+			&input.flavor.to_string(),
+			state,
+		])
+		.set(allocated_mem.try_into()?);
+	metrics::CLIENT_CPU_ALLOCATED
+		.with_label_values(&[
+			&input.client_id.to_string(),
+			&input.flavor.to_string(),
+			state,
+		])
+		.set(allocated_cpu.try_into()?);
+
+	// Clear other state
+	metrics::CLIENT_MEMORY_TOTAL
+		.with_label_values(&[
+			&input.client_id.to_string(),
+			&input.flavor.to_string(),
+			other_state,
+		])
+		.set(0);
+	metrics::CLIENT_CPU_TOTAL
+		.with_label_values(&[
+			&input.client_id.to_string(),
+			&input.flavor.to_string(),
+			other_state,
+		])
+		.set(0);
+
+	metrics::CLIENT_MEMORY_ALLOCATED
+		.with_label_values(&[
+			&input.client_id.to_string(),
+			&input.flavor.to_string(),
+			other_state,
+		])
+		.set(0);
+	metrics::CLIENT_CPU_ALLOCATED
+		.with_label_values(&[
+			&input.client_id.to_string(),
+			&input.flavor.to_string(),
+			other_state,
+		])
+		.set(0);
 
 	Ok(())
 }
@@ -1008,10 +1143,9 @@ pub struct ToWs {
 	pub inner: protocol::ToClient,
 }
 
-#[signal("pegboard_prewarm_image")]
-pub struct PrewarmImage {
-	pub image_id: Uuid,
-	pub image_artifact_url_stub: String,
+#[signal("pegboard_prewarm_image2")]
+pub struct PrewarmImage2 {
+	pub image: protocol::Image,
 }
 #[message("pegboard_client_close_ws")]
 pub struct CloseWs {
@@ -1030,7 +1164,7 @@ join_signal!(Main {
 	Command(protocol::Command),
 	// Forwarded from the ws to this workflow
 	Forward(protocol::ToServer),
-	PrewarmImage,
+	PrewarmImage2,
 	Drain,
 	Undrain,
 });

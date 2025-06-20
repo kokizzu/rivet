@@ -157,7 +157,7 @@ impl DatabaseDebug for DatabaseCrdbNats {
 			SET silence_ts = $2
 			WHERE workflow_id = ANY($1)
 			",
-			workflow_ids,
+			&workflow_ids,
 			rivet_util::timestamp::now(),
 		)
 		.await?;
@@ -174,7 +174,7 @@ impl DatabaseDebug for DatabaseCrdbNats {
 			SET wake_immediate = TRUE
 			WHERE workflow_id = ANY($1)
 			",
-			workflow_ids,
+			&workflow_ids,
 		)
 		.await?;
 
@@ -404,7 +404,7 @@ impl DatabaseDebug for DatabaseCrdbNats {
 					8 AS event_type,
 					1 AS version,
 					NULL as create_ts,
-					NULL AS name,
+					event_name AS name,
 					NULL AS auxiliary_id,
 					NULL AS auxiliary_id2,
 					NULL AS input,
@@ -599,7 +599,7 @@ impl DatabaseDebug for DatabaseCrdbNats {
 				)
 			SELECT 1
 			",
-			signal_ids,
+			&signal_ids,
 			rivet_util::timestamp::now(),
 		)
 		.await?;

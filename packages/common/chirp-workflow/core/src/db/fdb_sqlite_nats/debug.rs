@@ -15,11 +15,7 @@ use std::{
 use tracing::Instrument;
 use uuid::Uuid;
 
-use super::{
-	keys,
-	sqlite::{db_name_internal, SqlStub},
-	DatabaseFdbSqliteNats,
-};
+use super::{keys, sqlite::SqlStub, DatabaseFdbSqliteNats};
 use crate::{
 	db::debug::{
 		ActivityError, ActivityEvent, DatabaseDebug, Event, EventData, HistoryData, LoopEvent,
@@ -602,10 +598,10 @@ impl DatabaseDebug for DatabaseFdbSqliteNats {
 
 						for key in sub_workflow_wake_keys {
 							tracing::warn!(
-							"workflow {} is being waited on by sub workflow {}, silencing anyway",
-							key.workflow_id,
-							key.sub_workflow_id
-						);
+								"workflow {} is being waited on by sub workflow {}, silencing anyway",
+								key.workflow_id,
+								key.sub_workflow_id
+							);
 						}
 
 						for key in tag_keys {
@@ -741,7 +737,7 @@ impl DatabaseDebug for DatabaseFdbSqliteNats {
 	) -> Result<Option<HistoryData>> {
 		let pool = &self
 			.pools
-			.sqlite(db_name_internal(workflow_id), true)
+			.sqlite(crate::db::sqlite_db_name_internal(workflow_id), true)
 			.await?;
 
 		let (wf_data, event_rows, error_rows) = tokio::try_join!(

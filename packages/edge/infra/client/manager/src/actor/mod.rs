@@ -1,7 +1,7 @@
 use std::{
 	result::Result::{Err, Ok},
 	sync::Arc,
-	time::Duration,
+	time::{Duration, Instant},
 };
 
 use anyhow::*;
@@ -9,6 +9,7 @@ use indoc::indoc;
 use nix::sys::signal::Signal;
 use pegboard::protocol;
 use pegboard_config::runner_protocol;
+use sqlx::Acquire;
 use tokio::{fs, sync::Mutex};
 use uuid::Uuid;
 
@@ -22,7 +23,7 @@ mod setup;
 /// How often to check for a PID when one is not present and a stop command was received.
 const STOP_PID_INTERVAL: Duration = std::time::Duration::from_millis(250);
 /// How many times to check for a PID when a stop command was received.
-const STOP_PID_RETRIES: usize = 32;
+const STOP_PID_RETRIES: usize = 1024;
 
 pub struct Actor {
 	actor_id: Uuid,
@@ -75,9 +76,10 @@ impl Actor {
 					actor_id,
 					generation,
 					config,
-					start_ts
+					start_ts,
+					image_id
 				)
-				VALUES (?1, ?2, ?3, ?4)
+				VALUES (?1, ?2, ?3, ?4, ?5)
 				ON CONFLICT (actor_id, generation) DO NOTHING
 				",
 			))
@@ -85,6 +87,7 @@ impl Actor {
 			.bind(self.generation as i64)
 			.bind(&config_json)
 			.bind(utils::now())
+			.bind(self.config.image.id)
 			.execute(&mut *ctx.sql().await?)
 			.await
 		})
@@ -128,7 +131,7 @@ impl Actor {
 		self: &Arc<Self>,
 		ctx: &Arc<Ctx>,
 	) -> Result<protocol::HashableMap<String, protocol::ProxiedPort>> {
-		let setup_timer = std::time::Instant::now();
+		let setup_timer = Instant::now();
 		tracing::info!(actor_id=?self.actor_id, generation=?self.generation, "setting up actor");
 
 		let actor_path = ctx.actor_path(self.actor_id, self.generation);
@@ -146,20 +149,13 @@ impl Actor {
 				protocol::ImageKind::DockerImage | protocol::ImageKind::OciBundle
 			) && matches!(self.config.network_mode, protocol::NetworkMode::Bridge);
 
-		// Parallelize two independent jobs:
-		//
-		// - `download_image` takes a long time to download. `download_image` is dependent on
-		//   `make_fs`
-		// - `setup_cni_network` takes a long time. `setup_cni_network` is dependent on
-		//   `bind_ports`.
 		tracing::info!(actor_id=?self.actor_id, generation=?self.generation, "starting parallel setup tasks");
-		let parallel_timer = std::time::Instant::now();
+		let parallel_timer = Instant::now();
 
 		let (_, ports) = tokio::try_join!(
 			async {
-				self.make_fs(&ctx).await?;
 				self.download_image(&ctx).await?;
-				Result::<(), anyhow::Error>::Ok(())
+				self.make_fs(&ctx).await
 			},
 			async {
 				let ports = self.bind_ports(ctx).await?;
@@ -205,7 +201,12 @@ impl Actor {
 		let mut runner_env = vec![
 			(
 				"ROOT_USER_ENABLED",
-				self.config.root_user_enabled.to_string(),
+				if self.config.root_user_enabled {
+					"1"
+				} else {
+					"0"
+				}
+				.to_string(),
 			),
 			("ACTOR_ID", self.actor_id.to_string()),
 		];
@@ -377,16 +378,31 @@ impl Actor {
 
 		// Signal command might be sent before the actor has a runner. This loop waits for the runner to start
 		let runner_guard = loop {
-			let runner_guard = self.runner.lock().await;
-			if runner_guard.is_some() {
-				break Some(runner_guard);
+			{
+				let runner_guard = self.runner.lock().await;
+				if runner_guard.is_some() {
+					break Some(runner_guard);
+				}
 			}
 
-			tracing::warn!(
-				actor_id=?self.actor_id,
-				generation=?self.generation,
-				"waiting for pid to signal actor",
-			);
+			if *self.exited.lock().await {
+				tracing::warn!(
+					actor_id=?self.actor_id,
+					generation=?self.generation,
+					"actor exited before PID was set, ignoring signal",
+				);
+
+				break None;
+			}
+
+			// Progress log
+			if i % 10 == 0 {
+				tracing::warn!(
+					actor_id=?self.actor_id,
+					generation=?self.generation,
+					"waiting for PID to signal actor",
+				);
+			}
 
 			if i > STOP_PID_RETRIES {
 				tracing::error!(
@@ -396,6 +412,7 @@ impl Actor {
 
 				break None;
 			}
+
 			i += 1;
 
 			tokio::time::sleep(STOP_PID_INTERVAL).await;
@@ -427,7 +444,10 @@ impl Actor {
 		// Update stop_ts
 		if matches!(signal, Signal::SIGTERM | Signal::SIGKILL) || !has_runner {
 			let stop_ts_set = utils::sql::query(|| async {
-				sqlx::query_as::<_, (bool,)>(indoc!(
+				let mut conn = ctx.sql().await?;
+				let mut tx = conn.begin().await?;
+
+				let res = sqlx::query_as::<_, (bool,)>(indoc!(
 					"
 					UPDATE actors
 					SET stop_ts = ?3
@@ -441,11 +461,27 @@ impl Actor {
 				.bind(self.actor_id)
 				.bind(self.generation as i64)
 				.bind(utils::now())
-				.fetch_optional(&mut *ctx.sql().await?)
-				.await
+				.fetch_optional(&mut *tx)
+				.await?;
+
+				// Update LRU cache
+				sqlx::query(indoc!(
+					"
+					UPDATE images_cache
+					SET last_used_ts = ?2
+					WHERE image_id = ?1
+					",
+				))
+				.bind(self.config.image.id)
+				.bind(utils::now())
+				.execute(&mut *tx)
+				.await?;
+
+				tx.commit().await?;
+
+				Ok(res.is_some())
 			})
-			.await?
-			.is_some();
+			.await?;
 
 			// Emit event if not stopped before
 			if stop_ts_set {

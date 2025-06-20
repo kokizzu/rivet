@@ -92,9 +92,9 @@ impl DatabaseFdbSqliteNats {
 
 // MARK: Sqlite
 impl DatabaseFdbSqliteNats {
-	/// Executes SQL queries and explicitly handles retry errors.
+	/// Executes queries while explicitly handling txn retry errors.
 	#[tracing::instrument(skip_all)]
-	async fn query<'a, F, Fut, T>(&self, mut cb: F) -> WorkflowResult<T>
+	async fn txn<'a, F, Fut, T>(&self, mut cb: F) -> WorkflowResult<T>
 	where
 		F: FnMut() -> Fut,
 		Fut: std::future::Future<Output = WorkflowResult<T>> + 'a,
@@ -108,14 +108,18 @@ impl DatabaseFdbSqliteNats {
 				Err(WorkflowError::Sqlx(err)) => {
 					i += 1;
 					if i > MAX_QUERY_RETRIES {
-						return Err(WorkflowError::MaxSqlRetries(err));
+						return Err(WorkflowError::Sqlx(sqlx::Error::Io(std::io::Error::new(
+							std::io::ErrorKind::Other,
+							rivet_pools::utils::sql_query_macros::Error::MaxSqlRetries(err),
+						))));
 					}
 
 					use sqlx::Error::*;
 					match &err {
+						// Retry all errors with a backoff
 						Database(_) | Io(_) | Tls(_) | Protocol(_) | PoolTimedOut | PoolClosed
 						| WorkerCrashed => {
-							tracing::warn!(?err, "query retry");
+							tracing::warn!(?err, "txn retry");
 							backoff.tick().await;
 						}
 						// Throw error
@@ -138,7 +142,7 @@ impl DatabaseFdbSqliteNats {
 		self.pools
 			.sqlite_manager()
 			.evict(vec![
-				sqlite::db_name_internal(workflow_id),
+				crate::db::sqlite_db_name_internal(workflow_id),
 				crate::db::sqlite_db_name_data(workflow_id),
 			])
 			.await?;
@@ -1273,7 +1277,10 @@ impl Database for DatabaseFdbSqliteNats {
 				async move {
 					let pool = &self
 						.pools
-						.sqlite(sqlite::db_name_internal(partial.workflow_id), false)
+						.sqlite(
+							crate::db::sqlite_db_name_internal(partial.workflow_id),
+							false,
+						)
 						.await?;
 
 					// Handle error during sqlite init
@@ -1872,7 +1879,7 @@ impl Database for DatabaseFdbSqliteNats {
 	) -> WorkflowResult<Option<SignalData>> {
 		let pool = &self
 			.pools
-			.sqlite(sqlite::db_name_internal(workflow_id), false)
+			.sqlite(crate::db::sqlite_db_name_internal(workflow_id), false)
 			.await?;
 
 		let owned_filter = filter
@@ -1995,49 +2002,44 @@ impl Database for DatabaseFdbSqliteNats {
 
 							// In the event of an FDB txn retry, we have to delete the previously inserted row
 							if is_retrying.load(Ordering::Relaxed) {
-								self.query(|| async {
-									sql_execute!(
-										[self, &pool]
-										"
-										DELETE FROM workflow_signal_events
-										WHERE location = jsonb(?1)
-										",
-										location,
-									)
-									.await
-								})
+								sql_execute!(
+									[self, &pool]
+									"
+									DELETE FROM workflow_signal_events
+									WHERE location = jsonb(?1)
+									",
+									location,
+								)
 								.await
 								.map_err(|x| fdb::FdbBindingError::CustomError(x.into()))?;
 							}
 
 							// Insert history event
-							self.query(|| async {
-								sql_execute!(
-									[self, &pool]
-									"
-									INSERT INTO workflow_signal_events (
-										location,
-										version,
-										signal_id,
-										signal_name,
-										body,
-										create_ts,
-										loop_location
-									)
-									VALUES (jsonb(?1), ?2, ?3, ?4, jsonb(?5), ?6, jsonb(?7))
-									",
+							sql_execute!(
+								[self, &pool]
+								"
+								INSERT INTO workflow_signal_events (
 									location,
-									version as i64,
+									version,
 									signal_id,
-									&signal_name,
-									sqlx::types::Json(&body),
-									rivet_util::timestamp::now(),
-									loop_location,
+									signal_name,
+									body,
+									create_ts,
+									loop_location
 								)
-								.await
-							})
+								VALUES (jsonb(?1), ?2, ?3, ?4, jsonb(?5), ?6, jsonb(?7))
+								",
+								location,
+								version as i64,
+								signal_id,
+								&signal_name,
+								sqlx::types::Json(&body),
+								rivet_util::timestamp::now(),
+								loop_location,
+							)
 							.await
 							.map_err(|x| fdb::FdbBindingError::CustomError(x.into()))?;
+
 							is_retrying.store(true, Ordering::Relaxed);
 
 							Ok(Some(SignalData {
@@ -2324,30 +2326,27 @@ impl Database for DatabaseFdbSqliteNats {
 	) -> WorkflowResult<()> {
 		let pool = &self
 			.pools
-			.sqlite(sqlite::db_name_internal(from_workflow_id), false)
+			.sqlite(crate::db::sqlite_db_name_internal(from_workflow_id), false)
 			.await?;
 
 		// Insert history event
-		self.query(|| async {
-			sql_execute!(
-				[self, pool]
-				"
-				INSERT INTO workflow_signal_send_events (
-					location, version, signal_id, signal_name, body, workflow_id, create_ts, loop_location
-				)
-				VALUES (jsonb(?1), ?2, ?3, ?4, jsonb(?5), ?6, ?7, jsonb(?8))
-				",
-				location,
-				version as i64,
-				signal_id,
-				signal_name,
-				sqlx::types::Json(body),
-				to_workflow_id,
-				rivet_util::timestamp::now(),
-				loop_location,
+		sql_execute!(
+			[self, pool]
+			"
+			INSERT INTO workflow_signal_send_events (
+				location, version, signal_id, signal_name, body, workflow_id, create_ts, loop_location
 			)
-			.await
-		})
+			VALUES (jsonb(?1), ?2, ?3, ?4, jsonb(?5), ?6, ?7, jsonb(?8))
+			",
+			location,
+			version as i64,
+			signal_id,
+			signal_name,
+			sqlx::types::Json(body),
+			to_workflow_id,
+			rivet_util::timestamp::now(),
+			loop_location,
+		)
 		.await?;
 
 		// Block while flushing databases in order ensure listeners have the latest data
@@ -2355,7 +2354,7 @@ impl Database for DatabaseFdbSqliteNats {
 			.sqlite_manager()
 			.flush(
 				vec![
-					sqlite::db_name_internal(from_workflow_id),
+					crate::db::sqlite_db_name_internal(from_workflow_id),
 					crate::db::sqlite_db_name_data(from_workflow_id),
 				],
 				false,
@@ -2367,17 +2366,14 @@ impl Database for DatabaseFdbSqliteNats {
 			.await
 		{
 			// Undo history if FDB failed
-			self.query(|| async {
-				sql_execute!(
-					[self, pool]
-					"
-					DELETE FROM workflow_signal_send_events
-					WHERE location = jsonb(?1)
-					",
-					location,
-				)
-				.await
-			})
+			sql_execute!(
+				[self, pool]
+				"
+				DELETE FROM workflow_signal_send_events
+				WHERE location = jsonb(?1)
+				",
+				location,
+			)
 			.await?;
 
 			self.flush_wf_sqlite(from_workflow_id)?;
@@ -2420,37 +2416,34 @@ impl Database for DatabaseFdbSqliteNats {
 	) -> WorkflowResult<Uuid> {
 		let pool = &self
 			.pools
-			.sqlite(sqlite::db_name_internal(workflow_id), false)
+			.sqlite(crate::db::sqlite_db_name_internal(workflow_id), false)
 			.await?;
 
 		// Insert history event
-		self.query(|| async {
-			sql_execute!(
-				[self, pool]
-				"
-				INSERT INTO workflow_sub_workflow_events (
-					location,
-					version,
-					sub_workflow_id,
-					sub_workflow_name,
-					tags,
-					input,
-					create_ts,
-					loop_location
-				)
-				VALUES (jsonb(?1), ?2, ?3, ?4, jsonb(?5), jsonb(?6), ?7, jsonb(?8))				
-				",
+		sql_execute!(
+			[self, pool]
+			"
+			INSERT INTO workflow_sub_workflow_events (
 				location,
-				version as i64,
+				version,
 				sub_workflow_id,
 				sub_workflow_name,
 				tags,
-				sqlx::types::Json(input),
-				rivet_util::timestamp::now(),
-				loop_location,
+				input,
+				create_ts,
+				loop_location
 			)
-			.await
-		})
+			VALUES (jsonb(?1), ?2, ?3, ?4, jsonb(?5), jsonb(?6), ?7, jsonb(?8))				
+			",
+			location,
+			version as i64,
+			sub_workflow_id,
+			sub_workflow_name,
+			tags,
+			sqlx::types::Json(input),
+			rivet_util::timestamp::now(),
+			loop_location,
+		)
 		.await?;
 
 		// Block while flushing databases in order ensure sub workflow have the latest data
@@ -2458,7 +2451,7 @@ impl Database for DatabaseFdbSqliteNats {
 			.sqlite_manager()
 			.flush(
 				vec![
-					sqlite::db_name_internal(workflow_id),
+					crate::db::sqlite_db_name_internal(workflow_id),
 					crate::db::sqlite_db_name_data(workflow_id),
 				],
 				false,
@@ -2479,17 +2472,14 @@ impl Database for DatabaseFdbSqliteNats {
 			Ok(workflow_id) => Ok(workflow_id),
 			Err(err) => {
 				// Undo history if FDB failed
-				self.query(|| async {
-					sql_execute!(
-						[self, pool]
-						"
-						DELETE FROM workflow_sub_workflow_events
-						WHERE location = jsonb(?1)
-						",
-						location,
-					)
-					.await
-				})
+				sql_execute!(
+					[self, pool]
+					"
+					DELETE FROM workflow_sub_workflow_events
+					WHERE location = jsonb(?1)
+					",
+					location,
+				)
 				.await?;
 
 				self.flush_wf_sqlite(workflow_id)?;
@@ -2609,45 +2599,42 @@ impl Database for DatabaseFdbSqliteNats {
 	) -> WorkflowResult<()> {
 		let pool = &self
 			.pools
-			.sqlite(sqlite::db_name_internal(workflow_id), false)
+			.sqlite(crate::db::sqlite_db_name_internal(workflow_id), false)
 			.await?;
 		let input_hash = event_id.input_hash.to_be_bytes();
 
 		match res {
 			Ok(output) => {
-				self.query(|| async {
-					sql_execute!(
-						[self, pool]
-						"
-						INSERT INTO workflow_activity_events (
-							location,
-							version,
-							activity_name,
-							input_hash,
-							input,
-							output,
-							create_ts,
-							loop_location
-						)
-						VALUES (jsonb(?1), ?2, ?3, ?4, jsonb(?5), jsonb(?6), ?7, jsonb(?8))
-						ON CONFLICT (location) DO UPDATE
-						SET output = EXCLUDED.output
-						",
+				sql_execute!(
+					[self, pool]
+					"
+					INSERT INTO workflow_activity_events (
 						location,
-						version as i64,
-						&event_id.name,
-						input_hash.as_slice(),
-						sqlx::types::Json(input),
-						sqlx::types::Json(output),
+						version,
+						activity_name,
+						input_hash,
+						input,
+						output,
 						create_ts,
-						loop_location,
+						loop_location
 					)
-					.await
-				})
+					VALUES (jsonb(?1), ?2, ?3, ?4, jsonb(?5), jsonb(?6), ?7, jsonb(?8))
+					ON CONFLICT (location) DO UPDATE
+					SET output = EXCLUDED.output
+					",
+					location,
+					version as i64,
+					&event_id.name,
+					input_hash.as_slice(),
+					sqlx::types::Json(input),
+					sqlx::types::Json(output),
+					create_ts,
+					loop_location,
+				)
 				.await?;
 			}
 			Err(err) => {
-				self.query(|| async {
+				self.txn(|| async {
 					let mut conn = pool.conn().await?;
 					let mut tx = conn.begin().await?;
 
@@ -2718,7 +2705,7 @@ impl Database for DatabaseFdbSqliteNats {
 			.sqlite_manager()
 			.flush(
 				vec![
-					sqlite::db_name_internal(from_workflow_id),
+					crate::db::sqlite_db_name_internal(from_workflow_id),
 					crate::db::sqlite_db_name_data(from_workflow_id),
 				],
 				false,
@@ -2727,28 +2714,25 @@ impl Database for DatabaseFdbSqliteNats {
 
 		let pool = &self
 			.pools
-			.sqlite(sqlite::db_name_internal(from_workflow_id), false)
+			.sqlite(crate::db::sqlite_db_name_internal(from_workflow_id), false)
 			.await?;
 
-		self.query(|| async {
-			sql_execute!(
-				[self, pool]
-				"
-				INSERT INTO workflow_message_send_events (
-					location, version, tags, message_name, body, create_ts, loop_location
-				)
-				VALUES (jsonb(?1), ?2, jsonb(?3), ?4, jsonb(?5), ?6, jsonb(?7))
-				",
-				location,
-				version as i64,
-				tags,
-				message_name,
-				sqlx::types::Json(body),
-				rivet_util::timestamp::now(),
-				loop_location,
+		sql_execute!(
+			[self, pool]
+			"
+			INSERT INTO workflow_message_send_events (
+				location, version, tags, message_name, body, create_ts, loop_location
 			)
-			.await
-		})
+			VALUES (jsonb(?1), ?2, jsonb(?3), ?4, jsonb(?5), ?6, jsonb(?7))
+			",
+			location,
+			version as i64,
+			tags,
+			message_name,
+			sqlx::types::Json(body),
+			rivet_util::timestamp::now(),
+			loop_location,
+		)
 		.await?;
 
 		self.flush_wf_sqlite(from_workflow_id)?;
@@ -2770,10 +2754,10 @@ impl Database for DatabaseFdbSqliteNats {
 	) -> WorkflowResult<()> {
 		let pool = &self
 			.pools
-			.sqlite(sqlite::db_name_internal(workflow_id), false)
+			.sqlite(crate::db::sqlite_db_name_internal(workflow_id), false)
 			.await?;
 
-		self.query(|| async {
+		self.txn(|| async {
 			let mut conn = pool.conn().await?;
 			let mut tx = conn.begin().await?;
 
@@ -3059,27 +3043,24 @@ impl Database for DatabaseFdbSqliteNats {
 	) -> WorkflowResult<()> {
 		let pool = &self
 			.pools
-			.sqlite(sqlite::db_name_internal(from_workflow_id), false)
+			.sqlite(crate::db::sqlite_db_name_internal(from_workflow_id), false)
 			.await?;
 
-		self.query(|| async {
-			sql_execute!(
-				[self, pool]
-				"
-				INSERT INTO workflow_sleep_events (
-					location, version, deadline_ts, create_ts, state, loop_location
-				)
-				VALUES (jsonb(?1), ?2, ?3, ?4, ?5, jsonb(?6))
-				",
-				location,
-				version as i64,
-				deadline_ts,
-				rivet_util::timestamp::now(),
-				SleepState::Normal as i64,
-				loop_location,
+		sql_execute!(
+			[self, pool]
+			"
+			INSERT INTO workflow_sleep_events (
+				location, version, deadline_ts, create_ts, state, loop_location
 			)
-			.await
-		})
+			VALUES (jsonb(?1), ?2, ?3, ?4, ?5, jsonb(?6))
+			",
+			location,
+			version as i64,
+			deadline_ts,
+			rivet_util::timestamp::now(),
+			SleepState::Normal as i64,
+			loop_location,
+		)
 		.await?;
 
 		Ok(())
@@ -3094,22 +3075,19 @@ impl Database for DatabaseFdbSqliteNats {
 	) -> WorkflowResult<()> {
 		let pool = &self
 			.pools
-			.sqlite(sqlite::db_name_internal(from_workflow_id), false)
+			.sqlite(crate::db::sqlite_db_name_internal(from_workflow_id), false)
 			.await?;
 
-		self.query(|| async {
-			sql_execute!(
-				[self, pool]
-				"
-				UPDATE workflow_sleep_events
-				SET state = ?1
-				WHERE location = jsonb(?2)
-				",
-				state as i64,
-				location,
-			)
-			.await
-		})
+		sql_execute!(
+			[self, pool]
+			"
+			UPDATE workflow_sleep_events
+			SET state = ?1
+			WHERE location = jsonb(?2)
+			",
+			state as i64,
+			location,
+		)
 		.await?;
 
 		Ok(())
@@ -3125,25 +3103,22 @@ impl Database for DatabaseFdbSqliteNats {
 	) -> WorkflowResult<()> {
 		let pool = &self
 			.pools
-			.sqlite(sqlite::db_name_internal(from_workflow_id), false)
+			.sqlite(crate::db::sqlite_db_name_internal(from_workflow_id), false)
 			.await?;
 
-		self.query(|| async {
-			sql_execute!(
-				[self, pool]
-				"
-				INSERT INTO workflow_branch_events (
-					location, version, create_ts, loop_location
-				)
-				VALUES (jsonb(?1), ?2, ?3, jsonb(?4))
-				",
-				location,
-				version as i64,
-				rivet_util::timestamp::now(),
-				loop_location,
+		sql_execute!(
+			[self, pool]
+			"
+			INSERT INTO workflow_branch_events (
+				location, version, create_ts, loop_location
 			)
-			.await
-		})
+			VALUES (jsonb(?1), ?2, ?3, jsonb(?4))
+			",
+			location,
+			version as i64,
+			rivet_util::timestamp::now(),
+			loop_location,
+		)
 		.await?;
 
 		Ok(())
@@ -3160,26 +3135,23 @@ impl Database for DatabaseFdbSqliteNats {
 	) -> WorkflowResult<()> {
 		let pool = &self
 			.pools
-			.sqlite(sqlite::db_name_internal(from_workflow_id), false)
+			.sqlite(crate::db::sqlite_db_name_internal(from_workflow_id), false)
 			.await?;
 
-		self.query(|| async {
-			sql_execute!(
-				[self, pool]
-				"
-				INSERT INTO workflow_removed_events (
-					location, event_type, event_name, create_ts, loop_location
-				)
-				VALUES (jsonb(?1), ?2, ?3, ?4, jsonb(?5))
-				",
-				location,
-				event_type as i64,
-				event_name,
-				rivet_util::timestamp::now(),
-				loop_location,
+		sql_execute!(
+			[self, pool]
+			"
+			INSERT INTO workflow_removed_events (
+				location, event_type, event_name, create_ts, loop_location
 			)
-			.await
-		})
+			VALUES (jsonb(?1), ?2, ?3, ?4, jsonb(?5))
+			",
+			location,
+			event_type as i64,
+			event_name,
+			rivet_util::timestamp::now(),
+			loop_location,
+		)
 		.await?;
 
 		Ok(())
@@ -3195,25 +3167,22 @@ impl Database for DatabaseFdbSqliteNats {
 	) -> WorkflowResult<()> {
 		let pool = &self
 			.pools
-			.sqlite(sqlite::db_name_internal(from_workflow_id), false)
+			.sqlite(crate::db::sqlite_db_name_internal(from_workflow_id), false)
 			.await?;
 
-		self.query(|| async {
-			sql_execute!(
-				[self, pool]
-				"
-				INSERT INTO workflow_version_check_events (
-					location, version, create_ts, loop_location
-				)
-				VALUES (jsonb(?1), ?2, ?3, jsonb(?4))
-				",
-				location,
-				version as i64,
-				rivet_util::timestamp::now(),
-				loop_location,
+		sql_execute!(
+			[self, pool]
+			"
+			INSERT INTO workflow_version_check_events (
+				location, version, create_ts, loop_location
 			)
-			.await
-		})
+			VALUES (jsonb(?1), ?2, ?3, jsonb(?4))
+			",
+			location,
+			version as i64,
+			rivet_util::timestamp::now(),
+			loop_location,
+		)
 		.await?;
 
 		Ok(())
@@ -3254,7 +3223,7 @@ async fn flush_handler(pools: rivet_pools::Pools, mut flush_rx: mpsc::UnboundedR
 			.sqlite_manager()
 			.flush(
 				vec![
-					sqlite::db_name_internal(workflow_id),
+					crate::db::sqlite_db_name_internal(workflow_id),
 					crate::db::sqlite_db_name_data(workflow_id),
 				],
 				true,

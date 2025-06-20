@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use tokio::signal::unix::signal;
 use tokio::signal::unix::SignalKind;
 use tokio_rustls::TlsAcceptor;
-use tracing::{error, info, Instrument};
+use tracing::Instrument;
 
 // HACK: GlobalError does not conform to StdError required by hyper
 #[derive(Debug)]
@@ -34,6 +34,7 @@ pub async fn run_server(
 	routing_fn: RoutingFn,
 	middleware_fn: MiddlewareFn,
 	cert_resolver_fn: Option<CertResolverFn>,
+	clickhouse_inserter: Option<clickhouse_inserter::ClickHouseInserterHandle>,
 ) -> GlobalResult<()> {
 	// Configure servers for different ports
 	let guard_config = config.guard()?;
@@ -45,41 +46,44 @@ pub async fn run_server(
 		routing_fn.clone(),
 		middleware_fn.clone(),
 		crate::proxy_service::PortType::Http,
+		clickhouse_inserter.clone(),
 	));
 	let http_listener = tokio::net::TcpListener::bind(http_addr).await?;
 
 	// Set up HTTPS server (if configured)
-	let (https_addr, https_factory, https_listener, https_acceptor) =
-		if let Some(https) = &guard_config.https {
-			let https_addr: std::net::SocketAddr = ([0, 0, 0, 0], https.port).into();
-			let https_factory = Arc::new(ProxyServiceFactory::new(
-				config.clone(),
-				routing_fn.clone(),
-				middleware_fn.clone(),
-				crate::proxy_service::PortType::Https,
-			));
-			let listener = tokio::net::TcpListener::bind(https_addr).await?;
+	let (https_addr, https_factory, https_listener, https_acceptor) = if let Some(https) =
+		&guard_config.https
+	{
+		let https_addr: std::net::SocketAddr = ([0, 0, 0, 0], https.port).into();
+		let https_factory = Arc::new(ProxyServiceFactory::new(
+			config.clone(),
+			routing_fn.clone(),
+			middleware_fn.clone(),
+			crate::proxy_service::PortType::Https,
+			clickhouse_inserter.clone(),
+		));
+		let listener = tokio::net::TcpListener::bind(https_addr).await?;
 
-			// Configure TLS if resolver function is provided
-			let acceptor = if let Some(resolver_fn) = cert_resolver_fn {
-				// Create a TLS server config using our certificate resolver
-				let server_config = create_tls_config(resolver_fn);
+		// Configure TLS if resolver function is provided
+		let acceptor = if let Some(resolver_fn) = cert_resolver_fn {
+			// Create a TLS server config using our certificate resolver
+			let server_config = create_tls_config(resolver_fn);
 
-				Some(TlsAcceptor::from(Arc::new(server_config)))
-			} else {
-				info!("No TLS certificate resolver provided, HTTPS will not work properly");
-				None
-			};
-
-			(
-				Some(https_addr),
-				Some(https_factory),
-				Some(listener),
-				acceptor,
-			)
+			Some(TlsAcceptor::from(Arc::new(server_config)))
 		} else {
-			(None, None, None, None)
+			tracing::warn!("No TLS certificate resolver provided, HTTPS will not work properly");
+			None
 		};
+
+		(
+			Some(https_addr),
+			Some(https_factory),
+			Some(listener),
+			acceptor,
+		)
+	} else {
+		(None, None, None, None)
+	};
 
 	// Set up server builder and graceful shutdown
 	let server = hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
@@ -91,9 +95,9 @@ pub async fn run_server(
 	let mut sigint = signal(SignalKind::interrupt())?;
 	let mut sigint = pin!(sigint.recv());
 
-	info!("HTTP server listening on {}", http_addr);
+	tracing::info!("HTTP server listening on {}", http_addr);
 	if let Some(addr) = &https_addr {
-		info!("HTTPS server listening on {}", addr);
+		tracing::info!("HTTPS server listening on {}", addr);
 	}
 
 	// Helper function to process regular connections
@@ -133,9 +137,9 @@ pub async fn run_server(
 		tokio::spawn(
 			async move {
 				if let Err(err) = conn.await {
-					error!("{} connection error: {}", port_type_str, err);
+					tracing::error!("{} connection error: {}", port_type_str, err);
 				}
-				info!("{} connection dropped: {}", port_type_str, remote_addr);
+				tracing::debug!("{} connection dropped: {}", port_type_str, remote_addr);
 
 				let connection_duration = connection_start.elapsed().as_secs_f64();
 				metrics::TCP_CONNECTION_DURATION.observe(connection_duration);
@@ -160,8 +164,8 @@ pub async fn run_server(
 							"HTTP".to_string()
 						);
 					},
-					Err(e) => {
-						error!("Accept error on HTTP port: {}", e);
+					Err(err) => {
+						tracing::debug!(?err, "Accept error on HTTP port");
 						tokio::time::sleep(Duration::from_secs(1)).await;
 					}
 				}
@@ -198,7 +202,7 @@ pub async fn run_server(
 											.await
 										{
 											Ok(tls_stream) => {
-												info!("TLS handshake successful for {}", remote_addr);
+												tracing::debug!("TLS handshake successful for {}", remote_addr);
 
 												// Create service for this connection
 												let io = hyper_util::rt::TokioIo::new(tls_stream);
@@ -218,13 +222,13 @@ pub async fn run_server(
 
 												// Serve the connection (no graceful shutdown in spawned task)
 												if let Err(err) = conn_server.serve_connection_with_upgrades(io, service).await {
-													error!("HTTPS connection error: {}", err);
+													tracing::debug!(?err, "HTTPS connection error");
 												}
 
-												info!("HTTPS connection dropped: {}", remote_addr);
+												tracing::debug!("HTTPS connection dropped: {}", remote_addr);
 											},
-											Err(e) => {
-												error!("TLS handshake failed for {}: {}", remote_addr, e);
+											Err(err) => {
+												tracing::debug!(?err, "TLS handshake failed for {}", remote_addr);
 											}
 										}
 
@@ -235,7 +239,7 @@ pub async fn run_server(
 								} else {
 									// Fallback to non-TLS handling (useful for testing)
 									// In production, this would not secure the connection
-									error!("HTTPS port configured but no TLS acceptor available");
+									tracing::warn!("HTTPS port configured but no TLS acceptor available");
 									process_connection(
 										tcp_stream,
 										remote_addr,
@@ -247,8 +251,8 @@ pub async fn run_server(
 								}
 							}
 						},
-						Err(e) => {
-							error!("Accept error on HTTPS port: {}", e);
+						Err(err) => {
+							tracing::debug!(?err, "Accept error on HTTPS port");
 							tokio::time::sleep(Duration::from_secs(1)).await;
 						}
 					}
@@ -257,28 +261,28 @@ pub async fn run_server(
 			},
 
 			_ = sigterm.as_mut() => {
-				info!("SIGTERM received, starting shutdown");
+				tracing::info!("SIGTERM received, starting shutdown");
 				break;
 			},
 
 			_ = sigint.as_mut() => {
-				info!("SIGINT (Ctrl-C) received, starting shutdown");
+				tracing::info!("SIGINT (Ctrl-C) received, starting shutdown");
 				break;
 			}
 		};
 
-		if let Err(e) = result {
-			error!("Error in server loop: {}", e);
+		if let Err(err) = result {
+			tracing::error!(?err, "Error in server loop");
 		}
 	}
 
 	// Start graceful shutdown with timeout
 	tokio::select! {
 		_ = graceful.shutdown() => {
-			info!("Gracefully shutdown completed");
+			tracing::info!("Gracefully shutdown completed");
 		},
 		_ = tokio::time::sleep(Duration::from_secs(30)) => {
-			error!("Waited 30 seconds for graceful shutdown, aborting...");
+			tracing::error!("Waited 30 seconds for graceful shutdown, aborting...");
 		}
 	}
 

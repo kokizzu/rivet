@@ -44,12 +44,7 @@ impl TryFrom<ServerRow> for ServerRowStructured {
 			runtime: if let Some(nomad_node_id) = value.nomad_node_id {
 				Runtime::Nomad(nomad_node_id)
 			} else if let Some(pegboard_client_id) = value.pegboard_client_id {
-				if let PoolType::Pegboard = pool_type {
-					Runtime::Pegboard(pegboard_client_id)
-				} else {
-					// Pegboard isolate
-					Runtime::None
-				}
+				Runtime::Pegboard(pegboard_client_id)
 			} else {
 				Runtime::None
 			},
@@ -60,7 +55,6 @@ impl TryFrom<ServerRow> for ServerRowStructured {
 #[derive(Debug)]
 enum Runtime {
 	Nomad(String),
-	// Does not include pegboard isolate
 	Pegboard(Uuid),
 	// Other pool types
 	None,
@@ -118,8 +112,7 @@ pub async fn cluster_datacenter_topology_get(
 		FROM db_cluster.servers
 		WHERE
 			datacenter_id = ANY($1) AND
-			cloud_destroy_ts IS NULL AND
-			taint_ts IS NULL
+			cloud_destroy_ts IS NULL
 		",
 		&input.datacenter_ids,
 	)
@@ -198,9 +191,9 @@ pub async fn cluster_datacenter_topology_get(
 					matches!(
 						server.pool_type,
 						PoolType::Gg
-							| PoolType::Ats | PoolType::PegboardIsolate
-							| PoolType::Fdb | PoolType::Worker
-							| PoolType::Nats | PoolType::Guard
+							| PoolType::Ats | PoolType::Fdb
+							| PoolType::Worker | PoolType::Nats
+							| PoolType::Guard
 					)
 				})
 				.collect::<Vec<_>>();

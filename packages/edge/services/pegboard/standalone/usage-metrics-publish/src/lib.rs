@@ -8,7 +8,7 @@ use futures_util::{StreamExt, TryStreamExt};
 use pegboard::{keys, protocol};
 
 struct Usage {
-	// Percent of core.
+	// Millicores.
 	pub cpu: u64,
 	/// MiB.
 	pub memory: u64,
@@ -38,6 +38,17 @@ pub async fn run_from_env(
 		"pegboard-usage-metrics-publish",
 	)
 	.await?;
+
+	let dc_id = ctx.config().server()?.rivet.edge()?.datacenter_id;
+	let dc_res = ctx
+		.op(cluster::ops::datacenter::get::Input {
+			datacenter_ids: vec![dc_id],
+		})
+		.await?;
+	if dc_res.datacenters.is_empty() {
+		tracing::debug!("cluster not initialized");
+		return Ok(());
+	}
 
 	// List all actor ids that are currently running
 	let actor_ids = ctx
@@ -115,7 +126,7 @@ pub async fn run_from_env(
 			.entry((actor.env_id, client_flavor))
 			.or_insert(Usage { cpu: 0, memory: 0 });
 
-		env_usage.cpu += (actor.resources.cpu_millicores / 10) as u64;
+		env_usage.cpu += actor.resources.cpu_millicores as u64;
 		env_usage.memory += actor.resources.memory_mib as u64;
 	}
 
