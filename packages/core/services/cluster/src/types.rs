@@ -1,6 +1,7 @@
 use std::{
 	convert::{TryFrom, TryInto},
 	net::{IpAddr, Ipv4Addr},
+	str::FromStr,
 };
 
 use chirp_workflow::prelude::*;
@@ -49,6 +50,8 @@ pub struct Pool {
 	pub min_count: u32,
 	pub max_count: u32,
 	pub drain_timeout: u64,
+	#[serde(default)]
+	pub margin: u32,
 }
 
 // Backwards compatibility
@@ -69,6 +72,7 @@ impl TryFrom<backend::cluster::Pool> for Pool {
 			min_count: value.min_count,
 			max_count: value.max_count,
 			drain_timeout: value.drain_timeout,
+			margin: 0,
 		})
 	}
 }
@@ -104,6 +108,25 @@ impl std::fmt::Display for PoolType {
 	}
 }
 
+impl FromStr for PoolType {
+	type Err = GlobalError;
+
+	fn from_str(s: &str) -> Result<Self, Self::Err> {
+		match s {
+			"job" => Ok(PoolType::Job),
+			"gg" => Ok(PoolType::Gg),
+			"ats" => Ok(PoolType::Ats),
+			"pegboard" => Ok(PoolType::Pegboard),
+			"pegboard-isolate" => Ok(PoolType::PegboardIsolate),
+			"fdb" => Ok(PoolType::Fdb),
+			"worker" => Ok(PoolType::Worker),
+			"nats" => Ok(PoolType::Nats),
+			"guard" => Ok(PoolType::Guard),
+			_ => bail!("Invalid PoolType string: {}", s),
+		}
+	}
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Hash)]
 pub struct Hardware {
 	pub provider_hardware: String,
@@ -119,6 +142,7 @@ pub struct PoolUpdate {
 	pub min_count: Option<u32>,
 	pub max_count: Option<u32>,
 	pub drain_timeout: Option<u64>,
+	pub margin: Option<u32>,
 }
 
 #[derive(Serialize, Deserialize, Hash, Debug, Clone, Copy, PartialEq, Eq, FromRepr)]
@@ -140,7 +164,7 @@ impl From<rivet_config::config::rivet::BuildDeliveryMethod> for BuildDeliveryMet
 	}
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Server {
 	pub server_id: Uuid,
 	pub datacenter_id: Uuid,
@@ -148,11 +172,15 @@ pub struct Server {
 	pub provider_server_id: Option<String>,
 	pub lan_ip: Option<IpAddr>,
 	pub wan_ip: Option<IpAddr>,
+	pub create_ts: i64,
+	pub install_complete_ts: Option<i64>,
 	pub cloud_destroy_ts: Option<i64>,
 	pub state: ServerState,
 }
 
-#[derive(Serialize, Deserialize, Hash, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, FromRepr)]
+#[derive(
+	Serialize, Deserialize, Hash, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, FromRepr,
+)]
 pub enum ServerState {
 	Provisioning = 0,
 	Installing = 1,

@@ -40,8 +40,13 @@ async fn isolate_lifecycle() {
 
 	// Init project directories
 	let tmp_dir = tempfile::TempDir::new().unwrap();
-	let config = init_client(&gen_tmp_dir_path, tmp_dir.path()).await;
-	tracing::info!(path=%tmp_dir.path().display(), "client dir");
+	let path = tmp_dir.path();
+	// let path = std::path::Path::new(
+	// 	"/home/rivet/rivet-ee/oss/packages/edge/infra/client/manager/tests/foo",
+	// );
+
+	let config = init_client(&gen_tmp_dir_path, &path).await;
+	tracing::info!(path=%path.display(), "client dir");
 
 	start_client(config, ctx_wrapper, close_rx.clone(), port).await;
 }
@@ -99,7 +104,7 @@ async fn handle_connection(
 										// Verify client state
 										let actors = ctx.actors().read().await;
 										assert!(
-											actors.contains_key(&actor_id),
+											actors.contains_key(&(actor_id, 0)),
 											"actor not in client memory"
 										);
 									}
@@ -117,11 +122,11 @@ async fn handle_connection(
 										// Verify client state
 										let actors = ctx.actors().read().await;
 										assert!(
-											actors.contains_key(&actor_id),
+											actors.contains_key(&(actor_id, 0)),
 											"actor not in client memory"
 										);
 
-										tokio::time::sleep(std::time::Duration::from_millis(250))
+										tokio::time::sleep(std::time::Duration::from_millis(1000))
 											.await;
 
 										tracing::info!("sending echo");
@@ -148,9 +153,9 @@ async fn handle_connection(
 											&mut tx,
 											protocol::Command::SignalActor {
 												actor_id,
+												generation: 0,
 												signal: Signal::SIGKILL as i32,
 												persist_storage: false,
-												ignore_future_state: false,
 											},
 										)
 										.await;
@@ -167,7 +172,7 @@ async fn handle_connection(
 										// Verify client state
 										let actors = ctx.actors().read().await;
 										assert!(
-											actors.contains_key(&actor_id),
+											actors.contains_key(&(actor_id, 0)),
 											"actor not in client memory"
 										);
 									}
@@ -180,12 +185,12 @@ async fn handle_connection(
 											);
 										}
 
-										tokio::time::sleep(Duration::from_millis(5)).await;
+										tokio::time::sleep(Duration::from_millis(50)).await;
 
 										// Verify client state
 										let actors = ctx.actors().read().await;
 										assert!(
-											!actors.contains_key(&actor_id),
+											!actors.contains_key(&(actor_id, 0)),
 											"actor still in client memory"
 										);
 
@@ -196,6 +201,7 @@ async fn handle_connection(
 								}
 							}
 						}
+						protocol::ToServer::AckCommands { .. } => {}
 					}
 				}
 				Message::Close(_) => {

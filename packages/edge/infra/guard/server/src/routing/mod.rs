@@ -29,7 +29,7 @@ pub fn create_routing_function(
 					// Extract just the host, stripping the port if present
 					let host = hostname.split(':').next().unwrap_or(hostname);
 
-					tracing::info!("Routing request for hostname: {host}, path: {path}");
+					tracing::debug!("Routing request for hostname: {host}, path: {path}");
 
 					// Get DC information
 					let dc_id = ctx.config().server()?.rivet.edge()?.datacenter_id;
@@ -42,10 +42,10 @@ pub fn create_routing_function(
 					let dc = unwrap!(dc_res.datacenters.first());
 
 					// Try to route using configured routes first
-					tracing::info!("Attempting route-based routing for {host} {path}");
+					tracing::debug!("Attempting route-based routing for {host} {path}");
 					match actor_routes::route_via_route_config(&ctx, host, path, dc_id).await {
 						Ok(Some(RoutingOutput::Route(routing_result))) => {
-							tracing::info!(
+							tracing::debug!(
 								"Successfully routed via route config for {host} {path}"
 							);
 							return Ok(RoutingOutput::Route(routing_result));
@@ -57,8 +57,13 @@ pub fn create_routing_function(
 							// Continue to next routing method
 						}
 						Err(err) => {
-							tracing::error!("Error in route_via_route_config: {err}");
-							// Continue to next routing method
+							tracing::error!(?err, "Error in route_via_route_config");
+
+							return Ok(RoutingOutput::Response(StructuredResponse {
+								status: StatusCode::INTERNAL_SERVER_ERROR,
+								message: Cow::Borrowed("Failed while attempting to route request."),
+								docs: None,
+							}));
 						}
 					}
 
@@ -74,8 +79,13 @@ pub fn create_routing_function(
 							// Continue to next routing method
 						}
 						Err(err) => {
-							tracing::error!("Error in actor_routes::route_actor_request: {err}");
-							// Continue to next routing method
+							tracing::error!(?err, "Error in actor_routes::route_actor_request");
+
+							return Ok(RoutingOutput::Response(StructuredResponse {
+								status: StatusCode::INTERNAL_SERVER_ERROR,
+								message: Cow::Borrowed("Failed while attempting to route request."),
+								docs: None,
+							}));
 						}
 					}
 
@@ -93,13 +103,18 @@ pub fn create_routing_function(
 							// Continue
 						}
 						Err(err) => {
-							tracing::error!("Error in api::route_api_request: {err}");
-							// Continue to next routing method
+							tracing::error!(?err, "Error in api::route_api_request");
+
+							return Ok(RoutingOutput::Response(StructuredResponse {
+								status: StatusCode::INTERNAL_SERVER_ERROR,
+								message: Cow::Borrowed("Failed while attempting to route request."),
+								docs: None,
+							}));
 						}
 					}
 
 					// No matching route found
-					tracing::warn!("No route found for: {host} {path}");
+					tracing::debug!("No route found for: {host} {path}");
 					Ok(RoutingOutput::Response(StructuredResponse {
 						status: StatusCode::NOT_FOUND,
 						message: Cow::Owned(format!(

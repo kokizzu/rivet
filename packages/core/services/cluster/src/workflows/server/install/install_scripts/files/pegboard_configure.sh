@@ -1,3 +1,5 @@
+# SEE ALSO: docker/dev-full/rivet-client/pegboard-configure.sh
+
 PUBLIC_IP=$(ip -4 route get 1.0.0.0 | awk '{print $7; exit}')
 
 # MARK: Pegboard config
@@ -353,6 +355,8 @@ ExecStart=/usr/local/bin/rivet-client -c /etc/rivet-client/config.json
 Restart=always
 RestartSec=2
 
+# High scheduling priority
+Nice=-15
 # Real time service
 CPUSchedulingPolicy=fifo
 # High CPU priority

@@ -87,16 +87,33 @@ pub struct Runner {
 	/// Whether or not to use a mount for actor file systems.
 	pub use_mounts: Option<bool>,
 
+	/// Whether or not to use resource constraints on containers.
+	///
+	/// You should enable this if you see this error in development:
+	///
+	/// ```
+	/// cannot enter cgroupv2 "/sys/fs/cgroup/test" with domain controllers -- it is in an invalid state
+	/// ````
+	pub use_resource_constraints: Option<bool>,
+
 	/// WebSocket Port for runners on this machine to connect to.
 	pub port: Option<u16>,
 
 	pub container_runner_binary_path: Option<PathBuf>,
 	pub isolate_runner_binary_path: Option<PathBuf>,
+	
+	/// Custom host entries to append to /etc/hosts in actor containers.
+	#[serde(default)]
+	pub custom_hosts: Option<Vec<HostEntry>>,
 }
 
 impl Runner {
 	pub fn use_mounts(&self) -> bool {
 		self.use_mounts.unwrap_or(true)
+	}
+
+	pub fn use_resource_constraints(&self) -> bool {
+		self.use_resource_constraints.unwrap_or(true)
 	}
 
 	pub fn port(&self) -> u16 {
@@ -114,12 +131,18 @@ impl Runner {
 			.clone()
 			.unwrap_or_else(|| Path::new("/usr/local/bin/rivet-isolate-v8-runner").into())
 	}
+
+	pub fn custom_hosts(&self) -> &[HostEntry] {
+		self.custom_hosts.as_deref().unwrap_or(&[])
+	}
 }
 
 #[derive(Clone, Deserialize, JsonSchema, Default)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct Images {
 	pub pull_addresses: Option<Addresses>,
+	/// Bytes. Defaults to 64 GiB.
+	pub max_cache_size: Option<u64>,
 }
 
 impl Images {
@@ -128,6 +151,11 @@ impl Images {
 			.as_ref()
 			.map(Cow::Borrowed)
 			.unwrap_or_else(|| Cow::Owned(Addresses::Static(Vec::new())))
+	}
+
+	pub fn max_cache_size(&self) -> u64 {
+		// 64 GiB
+		self.max_cache_size.unwrap_or(1024 * 1024 * 1024 * 64)
 	}
 }
 
@@ -271,4 +299,11 @@ pub enum Addresses {
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct Vector {
 	pub address: String,
+}
+
+#[derive(Clone, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct HostEntry {
+	pub ip: String,
+	pub hostname: String,
 }

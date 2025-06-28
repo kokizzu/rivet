@@ -1,10 +1,17 @@
-use chirp_workflow::prelude::*;
-use cluster::types::{Filter, PoolType};
-use global_error::GlobalResult;
-use rivet_guard_core::proxy_service::{RouteConfig, RouteTarget, RoutingOutput, RoutingTimeout, StructuredResponse};
-use rivet_guard_core::status::StatusCode;
 use std::borrow::Cow;
+
+use chirp_workflow::prelude::*;
+use global_error::GlobalResult;
+use rivet_guard_core::proxy_service::{
+	RouteConfig, RouteTarget, RoutingOutput, RoutingTimeout, StructuredResponse,
+};
+use rivet_guard_core::status::StatusCode;
+use service_discovery::ServiceDiscovery;
+use url::Url;
 use uuid::Uuid;
+
+// TODO: Copied from cluster/src/workflows/server/install/install_scripts/components/rivet/mod.rs
+const TUNNEL_API_EDGE_PORT: u16 = 5010;
 
 /// Route requests to the API service
 #[tracing::instrument(skip_all)]
@@ -37,55 +44,45 @@ pub async fn route_api_request(
 		})));
 	}
 
-	// Get API server from the cluster
-	let servers_res = ctx
-		.op(cluster::ops::server::list::Input {
-			filter: Filter {
-				datacenter_ids: Some(vec![dc_id]),
-				pool_types: Some(vec![PoolType::Worker]),
-				..Default::default()
-			},
-			include_destroyed: false,
-			exclude_draining: true,
-			exclude_no_vlan: true,
-		})
-		.await?;
-	tracing::info!(?servers_res, "servers");
+	// NOTE: We use service discovery instead of server::list or datacenter::server_discovery because cache is not
+	// shared between edge-edge or edge-core. SD requests the core which has a single cache.
+	let url = Url::parse(&format!("http://127.0.0.1:{TUNNEL_API_EDGE_PORT}/provision/datacenters/{dc_id}/servers?pools=worker"))?;
+	let sd = ServiceDiscovery::new(url);
+	let servers = sd.fetch().await?;
 
-	let targets = if !servers_res.servers.is_empty() {
-		let port = ctx.config().server()?.rivet.api_public.port();
-		servers_res
-			.servers
-			.iter()
-			.map(|server| {
-				// For each server, create a target
-				// In a real implementation, use the actual server IP
-				// For demo purposes, use the loopback IP for all servers
-				Ok(RouteTarget {
-					actor_id: None,
-					server_id: Some(server.server_id),
-					host: unwrap!(server.lan_ip).to_string(),
-					port,
-					path: path.to_owned(),
-				})
+	tracing::debug!(?servers, "api servers");
+
+	let port = ctx.config().server()?.rivet.api_public.port();
+	let targets = servers
+		.iter()
+		.map(|server| {
+			// For each server, create a target
+			Ok(RouteTarget {
+				actor_id: None,
+				server_id: Some(server.server_id),
+				host: unwrap_ref!(server.lan_ip).to_string(),
+				port,
+				path: path.to_owned(),
 			})
-			.collect::<GlobalResult<Vec<_>>>()?
-	} else if let Some((host, port)) = ctx.config().server()?.rivet.edge_api_fallback_addr_lan() {
-		vec![RouteTarget {
-			actor_id: None,
-			server_id: None,
-			host,
-			port,
-			path: path.to_owned(),
-		}]
-	} else {
-		// No API servers to route to
-		Vec::new()
-	};
+		})
+		.collect::<GlobalResult<Vec<_>>>()?;
 
-	if targets.is_empty() {
-		return Ok(None);
-	}
+	let targets = if targets.is_empty() {
+		if let Some((host, port)) = ctx.config().server()?.rivet.edge_api_fallback_addr_lan() {
+			vec![RouteTarget {
+				actor_id: None,
+				server_id: None,
+				host,
+				port,
+				path: path.to_owned(),
+			}]
+		} else {
+			// No API servers to route to
+			return Ok(None);
+		}
+	} else {
+		targets
+	};
 
 	return Ok(Some(RoutingOutput::Route(RouteConfig {
 		targets,

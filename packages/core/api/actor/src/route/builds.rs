@@ -520,13 +520,7 @@ pub async fn complete_build(
 					edge_intercom_pegboard_prewarm_image(
 						&config,
 						&build_id.to_string(),
-						models::EdgeIntercomPegboardPrewarmImageRequest {
-							image_artifact_url_stub: pegboard::util::image_artifact_url_stub(
-								ctx.config(),
-								build.upload_id,
-								&build::utils::file_name(build.kind, build.compression),
-							)?,
-						},
+						json!({}),
 					)
 					.await
 					.map_err(Into::<GlobalError>::into)

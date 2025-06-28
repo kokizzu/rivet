@@ -1,9 +1,19 @@
 {
 	"client": {
 		"runner": {
-			"flavor": "isolate",
-			// Enables running in non-privileged Docker containers
-			"use_mounts": false
+			"flavor": "container",
+			// Resource constraints are not supported in Docker
+			// TODO: Needs further investigation in to why nested cgroups v2 resource constraints aren't working
+			"use_resource_constraints": false,
+			"custom_hosts": [
+				// Define host for the API server
+				//
+				// This is a custom IP defined in entrypoint.sh iptables
+				{
+					"ip": "192.168.100.1",
+					"hostname": "rivet-server"
+				}
+			]
 		},
 		"cluster": {
 			// This is safe to hardcode
@@ -15,6 +25,7 @@
 				]
 			}
 		},
+		// TODO: Compare this to network in cluster config
 		"network": {
 			"bind_ip": "127.0.0.1",
 			// Point to DNS name inside Docker container

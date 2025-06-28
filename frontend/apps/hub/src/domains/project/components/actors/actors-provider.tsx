@@ -13,13 +13,15 @@ import {
 	createActorAtom,
 	type Logs,
 	actorsQueryAtom,
+	actorsInternalFilterAtom,
+	type Actor,
 } from "@rivet-gg/components/actors";
 import {
 	InfiniteQueryObserver,
 	QueryObserver,
 	MutationObserver,
 } from "@tanstack/react-query";
-import { createClient } from "actor-core/client";
+//import { createClient } from "actor-core/client";
 import { atom, createStore, Provider, type PrimitiveAtom } from "jotai";
 import equal from "fast-deep-equal";
 import { type ReactNode, useEffect, useState } from "react";
@@ -40,6 +42,7 @@ interface ActorsProviderProps {
 	children?: ReactNode;
 	fixedTags?: Record<string, string>;
 	filter?: (actor: Rivet.actors.Actor) => boolean;
+	isActorInternal?: (actor: Actor) => boolean;
 
 	/// filters
 	tags: FilterValue;
@@ -57,6 +60,7 @@ export function ActorsProvider({
 	children,
 	fixedTags,
 	filter,
+	isActorInternal: internalFilter,
 	// filters
 	tags,
 	region,
@@ -83,6 +87,15 @@ export function ActorsProvider({
 			devMode,
 		});
 	}, [tags, region, createdAt, destroyedAt, status, devMode]);
+
+	// biome-ignore lint/correctness/useExhaustiveDependencies:  store is not a dependency
+	useEffect(() => {
+		if (internalFilter) {
+			store.set(actorsInternalFilterAtom, { fn: internalFilter });
+		} else {
+			store.set(actorsInternalFilterAtom, undefined);
+		}
+	}, [internalFilter]);
 
 	// biome-ignore lint/correctness/useExhaustiveDependencies: store is not a dependency
 	useEffect(() => {
@@ -314,19 +327,19 @@ export function ActorsProvider({
 				region?: string;
 				params?: Record<string, unknown>;
 			}) => {
-				const client = createClient(data.endpoint);
-
-				const build = store
-					.get(actorBuildsAtom)
-					.find((build) => build.id === data.id);
-
-				return client.create(build?.tags.name || "", {
-					params: data.params,
-					create: {
-						tags: data.tags,
-						region: data.region || undefined,
-					},
-				});
+				//const client = createClient(data.endpoint);
+				//
+				//const build = store
+				//	.get(actorBuildsAtom)
+				//	.find((build) => build.id === data.id);
+				//
+				//return client.create(build?.tags.name || "", {
+				//	params: data.params,
+				//	create: {
+				//		tags: data.tags,
+				//		region: data.region || undefined,
+				//	},
+				//});
 			},
 		});
 

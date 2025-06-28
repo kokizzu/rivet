@@ -1,4 +1,5 @@
 import {
+	type Actor as StateActor,
 	ActorFeature,
 	ActorNotFound,
 	ActorsActorDetails,
@@ -59,12 +60,7 @@ function Actor() {
 
 const FIXED_TAGS = {};
 
-//const ACTORS_FILTER = (actor: Rivet.actors.Actor) =>
-//	toRecord(actor.tags).type !== "function" &&
-//	toRecord(actor.tags).framework !== "actor-core";
-
 const ACTORS_FILTER = (actor: Rivet.actors.Actor) =>
-	//toRecord(actor.tags).type !== "function" &&
 	toRecord(actor.tags).framework !== "actor-core";
 
 const ACTORS_VIEW_CONTEXT = {
@@ -107,6 +103,9 @@ const ACTORS_VIEW_CONTEXT = {
 	canCreate: false,
 };
 
+const IS_ACTOR_INTERNAL = (actor: StateActor) =>
+	toRecord(actor?.tags)?.type === "function";
+
 function Content() {
 	const { nameId: projectNameId } = useProject();
 	const { nameId: environmentNameId } = useEnvironment();
@@ -137,6 +136,7 @@ function Content() {
 				actorId={actorId}
 				fixedTags={FIXED_TAGS}
 				filter={ACTORS_FILTER}
+				isActorInternal={IS_ACTOR_INTERNAL}
 				{...filters}
 			>
 				<ActorsListPreview>

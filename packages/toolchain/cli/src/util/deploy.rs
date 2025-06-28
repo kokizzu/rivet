@@ -19,6 +19,9 @@ pub struct DeployOpts<'a> {
 	pub filter_tags: Option<HashMap<String, String>>,
 	pub build_tags: Option<HashMap<String, String>>,
 	pub version: Option<String>,
+	pub skip_route_creation: Option<bool>,
+	pub keep_existing_routes: Option<bool>,
+	pub non_interactive: bool,
 }
 
 pub async fn deploy(opts: DeployOpts<'_>) -> Result<Vec<Uuid>> {
@@ -65,7 +68,16 @@ pub async fn deploy(opts: DeployOpts<'_>) -> Result<Vec<Uuid>> {
 	.await?;
 
 	// Setup function routes
-	setup_function_routes(opts.ctx, environment, &config, &opts.filter_tags).await?;
+	setup_function_routes(
+		opts.ctx,
+		environment,
+		&config,
+		&opts.filter_tags,
+		opts.skip_route_creation,
+		opts.keep_existing_routes,
+		opts.non_interactive,
+	)
+	.await?;
 
 	// Print summary
 	print_summary(opts.ctx, environment);
@@ -78,20 +90,23 @@ async fn setup_function_routes(
 	environment: &toolchain::project::environment::TEMPEnvironment,
 	config: &config::Config,
 	filter_tags: &Option<HashMap<String, String>>,
+	skip_route_creation: Option<bool>,
+	keep_existing_routes: Option<bool>,
+	non_interactive: bool,
 ) -> Result<()> {
-	// Determine default hostname based on project & env
-	let default_hostname = format!(
-		"{}-{}.{}",
-		ctx.project.name_id,
-		environment.slug,
-		ctx.bootstrap
-			.domains
-			.job
-			.as_ref()
-			.context("bootstrap.domains.job")?
-	);
-
 	for (fn_name, function) in &config.functions {
+		// Determine default hostname based on project & env
+		let default_hostname = format!(
+			"{}-{}-{fn_name}.{}",
+			ctx.project.name_id,
+			environment.slug,
+			ctx.bootstrap
+				.domains
+				.job
+				.as_ref()
+				.context("bootstrap.domains.job")?
+		);
+
 		// TODO: Convert this in to a shared fn
 		// Filter out builds that match the tags
 		if let Some(filter) = &filter_tags {
@@ -190,19 +205,40 @@ async fn setup_function_routes(
 			];
 
 			println!();
-			let choice = block_in_place(|| {
-				Select::new(
-					&format!(
-						"Route configuration for '{fn_name}' has changed{}",
-						changes_text
-					),
-					options.to_vec(),
-				)
-				.with_starting_cursor(0)
-				.prompt()
-			})?;
 
-			match choice.index {
+			let choice_index = if non_interactive {
+				// In non-interactive mode, use auto_sync_routes if provided, otherwise sync by default
+				match keep_existing_routes {
+					Some(true) => {
+						println!("Skipping route sync for '{fn_name}' (non-interactive mode)");
+						1 // Keep existing route
+					}
+					Some(false) => {
+						println!("Auto-syncing route configuration for '{fn_name}' (non-interactive mode)");
+						0 // Sync route with config
+					}
+					None => {
+						println!("Auto-syncing route configuration for '{fn_name}' (non-interactive mode)");
+						0 // Default to sync in non-interactive mode
+					}
+				}
+			} else {
+				// Interactive mode - prompt the user
+				let choice = block_in_place(|| {
+					Select::new(
+						&format!(
+							"Route configuration for '{fn_name}' has changed{}",
+							changes_text
+						),
+						options.to_vec(),
+					)
+					.with_starting_cursor(0)
+					.prompt()
+				})?;
+				choice.index
+			};
+
+			match choice_index {
 				0 => {
 					// Update first matching route to match config
 					let mut update_route_body = models::RoutesUpdateRouteBody {
@@ -268,17 +304,42 @@ async fn setup_function_routes(
 			];
 
 			println!();
-			let choice = block_in_place(|| {
-				Select::new(
-					&format!("Set up routing for function '{}':", fn_name),
-					options.to_vec(),
-				)
-				.with_help_message("Routes can be manually created in the Rivet dashboard")
-				.with_starting_cursor(0)
-				.prompt()
-			})?;
 
-			match choice.index {
+			let choice_index = if non_interactive {
+				// In non-interactive mode, use auto_create_routes if provided, otherwise create by default
+				match skip_route_creation {
+					Some(true) => {
+						println!("Skipping route creation for '{fn_name}' (non-interactive mode)");
+						1 // Skip route creation
+					}
+					Some(false) => {
+						println!(
+							"Auto-creating route for function '{fn_name}' (non-interactive mode)"
+						);
+						0 // Create default route
+					}
+					None => {
+						println!(
+							"Auto-creating route for function '{fn_name}' (non-interactive mode)"
+						);
+						0 // Default to create in non-interactive mode
+					}
+				}
+			} else {
+				// Interactive mode - prompt the user
+				let choice = block_in_place(|| {
+					Select::new(
+						&format!("Set up routing for function '{}':", fn_name),
+						options.to_vec(),
+					)
+					.with_help_message("Routes can be manually created in the Rivet dashboard")
+					.with_starting_cursor(0)
+					.prompt()
+				})?;
+				choice.index
+			};
+
+			match choice_index {
 				0 => {
 					// Create route with default settings
 					create_function_route(
@@ -333,55 +394,42 @@ async fn create_function_route(
 	route_tags: &HashMap<String, String>,
 	default_hostname: &str,
 ) -> Result<()> {
-	// Get route_subpaths and strip_prefix from config
 	let default_route_subpaths = function.route_subpaths.unwrap_or(true);
 	let default_strip_prefix = function.strip_prefix.unwrap_or(true);
 
-	// Loop until route creation succeeds
-	let mut route_created = false;
-	while !route_created {
-		let hostname = default_hostname.to_string();
-		let path = function.path();
-		let route_subpaths = default_route_subpaths;
-		let strip_prefix = default_strip_prefix;
+	let hostname = default_hostname.to_string();
+	let path = function.path();
+	let route_subpaths = default_route_subpaths;
+	let strip_prefix = default_strip_prefix;
 
-		// Prepare route body
-		let update_route_body = models::RoutesUpdateRouteBody {
-			hostname,
-			path,
-			route_subpaths,
-			strip_prefix,
-			target: Box::new(models::RoutesRouteTarget {
-				actors: Some(Box::new(models::RoutesRouteTargetActors {
-					selector_tags: route_tags.clone(),
-				})),
-			}),
-		};
+	// Prepare route body
+	let update_route_body = models::RoutesUpdateRouteBody {
+		hostname,
+		path,
+		route_subpaths,
+		strip_prefix,
+		target: Box::new(models::RoutesRouteTarget {
+			actors: Some(Box::new(models::RoutesRouteTargetActors {
+				selector_tags: route_tags.clone(),
+			})),
+		}),
+	};
 
-		// Create/update route
-		let result = apis::routes_api::routes_update(
-			&ctx.openapi_config_cloud,
-			&fn_name,
-			update_route_body.clone(),
-			Some(&ctx.project.name_id.to_string()),
-			Some(&environment.slug),
-		)
-		.await;
+	// Create/update route
+	apis::routes_api::routes_update(
+		&ctx.openapi_config_cloud,
+		&fn_name,
+		update_route_body.clone(),
+		Some(&ctx.project.name_id.to_string()),
+		Some(&environment.slug),
+	)
+	.await?;
 
-		match result {
-			Result::Ok(_) => {
-				println!(
-					"Successfully created route: {}{}",
-					update_route_body.hostname, update_route_body.path
-				);
-				route_created = true;
-			}
-			Err(err) => {
-				eprintln!("Failed to create route: {}", err);
-				break;
-			}
-		}
-	}
+	println!(
+		"Successfully created route: {}{}",
+		update_route_body.hostname, update_route_body.path
+	);
 
 	Ok(())
 }
+

@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use api_helper::{anchor::WatchIndexQuery, ctx::Ctx};
 use futures_util::{FutureExt, StreamExt, TryStreamExt};
+use util::serde::AsHashableExt;
 use rivet_api::models;
 use rivet_convert::{ApiInto, ApiTryInto};
 use rivet_operation::prelude::*;
@@ -150,14 +151,14 @@ pub async fn create(
 
 	tracing::info!(?actor_id, ?tags, "creating actor with tags");
 
-	let create_fut = if network.wait_ready.unwrap_or_default() {
+	let allocated_fut = if network.wait_ready.unwrap_or_default() {
 		std::future::pending().boxed()
 	} else {
-		let mut create_sub = ctx
-			.subscribe::<pegboard::workflows::actor::CreateComplete>(("actor_id", actor_id))
+		let mut allocated_sub = ctx
+			.subscribe::<pegboard::workflows::actor::Allocated>(("actor_id", actor_id))
 			.await?;
 
-		async move { create_sub.next().await }.boxed()
+		async move { allocated_sub.next().await }.boxed()
 	};
 	let mut ready_sub = ctx
 		.subscribe::<pegboard::workflows::actor::Ready>(("actor_id", actor_id))
@@ -185,7 +186,7 @@ pub async fn create(
 		// args: body.runtime.arguments.unwrap_or_default(),
 		args: Vec::new(),
 		network_mode: network.mode.unwrap_or_default().api_into(),
-		environment: body.runtime.and_then(|r| r.environment).unwrap_or_default(),
+		environment: body.runtime.and_then(|r| r.environment).unwrap_or_default().as_hashable(),
 		network_ports: network
 			.ports
 			.unwrap_or_default()
@@ -231,16 +232,16 @@ pub async fn create(
 					}
 				}
 			)))
-			.collect::<GlobalResult<HashMap<_, _>>>()?,
+			.collect::<GlobalResult<HashMap<_, _>>>()?.as_hashable(),
 		endpoint_type,
 	})
 	.tag("actor_id", actor_id)
 	.dispatch()
 	.await?;
 
-	// Wait for create/ready, fail, or destroy
+	// Wait for allocated/ready, fail, or destroy
 	tokio::select! {
-		res = create_fut => { res?; },
+		res = allocated_fut => { res?; },
 		res = ready_sub.next() => { res?; },
 		res = fail_sub.next() => {
 			let msg = res?;
