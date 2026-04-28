@@ -836,6 +836,13 @@ impl VfsContext {
 			Ok(CommitWait::Completed(outcome)) => outcome,
 			Ok(CommitWait::TimedOut) => return Ok(CommitWait::TimedOut),
 			Err(err) => {
+				tracing::error!(
+					actor_id = %self.actor_id,
+					new_db_size_pages = request.new_db_size_pages,
+					dirty_pages = request.dirty_pages.len(),
+					?err,
+					"sqlite flush commit failed"
+				);
 				mark_dead_for_non_fence_commit_error(self, &err);
 				return Err(err);
 			}
@@ -923,6 +930,13 @@ impl VfsContext {
 			Ok(CommitWait::Completed(outcome)) => outcome,
 			Ok(CommitWait::TimedOut) => return Ok(CommitWait::TimedOut),
 			Err(err) => {
+				tracing::error!(
+					actor_id = %self.actor_id,
+					new_db_size_pages = request.new_db_size_pages,
+					dirty_pages = request.dirty_pages.len(),
+					?err,
+					"sqlite atomic commit failed"
+				);
 				mark_dead_for_non_fence_commit_error(self, &err);
 				return Err(err);
 			}
@@ -991,13 +1005,28 @@ fn assert_batch_atomic_probe(db: *mut sqlite3, vfs: &SqliteVfs) -> std::result::
 	";
 
 	if let Err(err) = sqlite_exec(db, probe_sql) {
+		let last_error = vfs.clone_last_error();
+		tracing::error!(
+			%err,
+			last_error = ?last_error,
+			commit_atomic_before,
+			"sqlite batch atomic probe failed"
+		);
 		cleanup_batch_atomic_probe(db);
+		if let Some(last_error) = last_error {
+			return Err(format!(
+				"batch atomic probe failed: {err}; vfs last_error: {last_error}"
+			));
+		}
 		return Err(format!("batch atomic probe failed: {err}"));
 	}
 
 	let commit_atomic_after = vfs.commit_atomic_count();
 	if commit_atomic_after == commit_atomic_before {
 		tracing::error!(
+			commit_atomic_before,
+			commit_atomic_after,
+			last_error = ?vfs.clone_last_error(),
 			"batch atomic writes not active for sqlite, SQLITE_ENABLE_BATCH_ATOMIC_WRITE may be missing"
 		);
 		cleanup_batch_atomic_probe(db);
@@ -1627,6 +1656,12 @@ unsafe extern "C" fn io_sync(p_file: *mut sqlite3_file, _flags: c_int) -> c_int 
 		match ctx.flush_dirty_pages() {
 			Ok(_) => SQLITE_OK,
 			Err(err) => {
+				tracing::error!(
+					actor_id = %ctx.actor_id,
+					last_error = ?ctx.clone_last_error(),
+					?err,
+					"sqlite sync failed"
+				);
 				mark_dead_from_fence_commit_error(ctx, &err);
 				SQLITE_IOERR_FSYNC
 			}
@@ -1698,6 +1733,12 @@ unsafe extern "C" fn io_file_control(
 					SQLITE_OK
 				}
 				Err(err) => {
+					tracing::error!(
+						actor_id = %ctx.actor_id,
+						last_error = ?ctx.clone_last_error(),
+						?err,
+						"sqlite atomic write file control failed"
+					);
 					mark_dead_from_fence_commit_error(ctx, &err);
 					SQLITE_IOERR
 				}
@@ -1952,6 +1993,10 @@ impl SqliteVfs {
 		self.ctx.take_last_error()
 	}
 
+	fn clone_last_error(&self) -> Option<String> {
+		self.ctx.clone_last_error()
+	}
+
 	fn register_with_transport(
 		name: &str,
 		transport: SqliteTransport,
@@ -2126,6 +2171,13 @@ pub fn open_database(
 	};
 	if rc != SQLITE_OK {
 		let message = sqlite_error_message(db);
+		tracing::error!(
+			file_name,
+			rc,
+			%message,
+			last_error = ?vfs.clone_last_error(),
+			"failed to open sqlite database with custom VFS"
+		);
 		if !db.is_null() {
 			unsafe {
 				sqlite3_close(db);
@@ -2143,6 +2195,13 @@ pub fn open_database(
 		"PRAGMA locking_mode = EXCLUSIVE;",
 	] {
 		if let Err(err) = sqlite_exec(db, pragma) {
+			tracing::error!(
+				file_name,
+				pragma,
+				%err,
+				last_error = ?vfs.clone_last_error(),
+				"failed to configure sqlite database"
+			);
 			unsafe {
 				sqlite3_close(db);
 			}
@@ -2156,6 +2215,12 @@ pub fn open_database(
 	let assert_batch_atomic = true;
 	if assert_batch_atomic {
 		if let Err(err) = assert_batch_atomic_probe(db, &vfs) {
+			tracing::error!(
+				file_name,
+				%err,
+				last_error = ?vfs.clone_last_error(),
+				"failed to verify sqlite batch atomic writes"
+			);
 			unsafe {
 				sqlite3_close(db);
 			}
