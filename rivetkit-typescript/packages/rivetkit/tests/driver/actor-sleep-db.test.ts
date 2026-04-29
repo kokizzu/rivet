@@ -1,6 +1,5 @@
 import { describe, expect, test, vi } from "vitest";
 import {
-	ACTIVE_DB_WRITE_COUNT,
 	EXCEEDS_GRACE_HANDLER_DELAY,
 	EXCEEDS_GRACE_SLEEP_TIMEOUT,
 	SLEEP_DB_TIMEOUT,
@@ -12,6 +11,7 @@ import { setupDriverTest, waitFor } from "./shared-utils";
 type LogEntry = { id: number; event: string; created_at: number };
 
 const CONNECTION_READY_TIMEOUT_MS = 10_000;
+const ACTIVE_DB_WRITE_ADVANCES_BEFORE_SLEEP = 3;
 
 async function waitForAction<T>(
 	action: () => Promise<T>,
@@ -108,6 +108,32 @@ async function connectRawWebSocket(handle: {
 	});
 
 	return ws;
+}
+
+async function waitForRawWsMessage<T>(
+	ws: WebSocket,
+	matches: (data: any) => data is T,
+) {
+	return await new Promise<T>((resolve, reject) => {
+		const onMessage = (event: MessageEvent) => {
+			const data = JSON.parse(String(event.data));
+			if (matches(data)) {
+				cleanup();
+				resolve(data);
+			}
+		};
+		const onClose = () => {
+			cleanup();
+			reject(new Error("websocket closed early"));
+		};
+		const cleanup = () => {
+			ws.removeEventListener("message", onMessage);
+			ws.removeEventListener("close", onClose);
+		};
+
+		ws.addEventListener("message", onMessage);
+		ws.addEventListener("close", onClose, { once: true });
+	});
 }
 
 describeDriverMatrix("Actor Sleep Db", (driverTestConfig) => {
@@ -985,9 +1011,8 @@ describeDriverMatrix("Actor Sleep Db", (driverTestConfig) => {
 			{ timeout: 15_000 },
 		);
 
-		// TODO(#4705): Root-cause in-flight DB write interruption during sleep shutdown and re-enable this coverage.
-		test.skip(
-			"active db writes interrupted by sleep produce db error",
+		test(
+			"active-db-writes interrupted by sleep persist exact completed count",
 			async (c) => {
 				const { client } = await setupDriverTest(c, driverTestConfig);
 
@@ -996,62 +1021,53 @@ describeDriverMatrix("Actor Sleep Db", (driverTestConfig) => {
 				]);
 				const ws = await connectRawWebSocket(actor);
 
-				// Start the write loop
-				ws.send("start-writes");
+				const started = waitForRawWsMessage(
+					ws,
+					(data): data is { type: "started" } =>
+						data.type === "started",
+				);
+				ws.send(JSON.stringify({ type: "start-writes" }));
+				await started;
 
-				// Wait for confirmation
-				await new Promise<void>((resolve) => {
-					const onMessage = (event: MessageEvent) => {
-						const data = JSON.parse(String(event.data));
-						if (data.type === "started") {
-							ws.removeEventListener("message", onMessage);
-							resolve();
-						}
-					};
-					ws.addEventListener("message", onMessage);
-				});
+				for (
+					let i = 0;
+					i < ACTIVE_DB_WRITE_ADVANCES_BEFORE_SLEEP;
+					i++
+				) {
+					const writeCompleted = waitForRawWsMessage(
+						ws,
+						(
+							data,
+						): data is {
+							type: "write";
+							index: number;
+							writesCompleted: number;
+						} => data.type === "write" && data.index === i,
+					);
+					ws.send(JSON.stringify({ type: "continue-write" }));
+					const write = await writeCompleted;
+					expect(write.writesCompleted).toBe(i + 1);
+				}
 
 				// Trigger sleep while writes are in progress.
 				await triggerSleepBestEffort(actor);
 
-				// Poll until the woken actor reports the persisted post-sleep status after shutdown completes.
-				await vi.waitFor(
-					async () => {
-						const wokenActor =
-							client.sleepWsActiveDbExceedsGrace.getOrCreate([
-								"ws-active-db-exceeds-grace",
-							]);
-						const status = await wokenActor.getStatus();
-						expect(status.sleepCount).toBeGreaterThanOrEqual(1);
-						expect(status.startCount).toBeGreaterThanOrEqual(2);
-
-						const entries = await wokenActor.getLogEntries();
-						const writeEntries = entries.filter(
-							(e: { event: string }) =>
-								e.event.startsWith("write-"),
-						);
-						expect(writeEntries.length).toBeGreaterThan(0);
-						expect(writeEntries.length).toBeLessThan(
-							ACTIVE_DB_WRITE_COUNT,
-						);
-					},
-					{
-						timeout: 10_000,
-						interval: 50,
-					},
-				);
-
-				// Verify the DB has fewer rows than the full count.
 				const wokenActor =
 					client.sleepWsActiveDbExceedsGrace.getOrCreate([
 						"ws-active-db-exceeds-grace",
 					]);
+				await waitForAction(wokenActor.getStatus, (status) => {
+					expect(status.sleepCount).toBeGreaterThanOrEqual(1);
+					expect(status.startCount).toBeGreaterThanOrEqual(2);
+				});
+
 				const entries = await wokenActor.getLogEntries();
 				const writeEntries = entries.filter((e: { event: string }) =>
 					e.event.startsWith("write-"),
 				);
-				expect(writeEntries.length).toBeGreaterThan(0);
-				expect(writeEntries.length).toBeLessThan(ACTIVE_DB_WRITE_COUNT);
+				expect(writeEntries.length).toBe(
+					ACTIVE_DB_WRITE_ADVANCES_BEFORE_SLEEP,
+				);
 			},
 			{ timeout: 30_000 },
 		);

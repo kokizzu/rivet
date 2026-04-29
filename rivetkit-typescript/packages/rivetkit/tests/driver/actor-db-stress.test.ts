@@ -1,5 +1,5 @@
-import { describeDriverMatrix } from "./shared-matrix";
 import { describe, expect, test, vi } from "vitest";
+import { describeDriverMatrix } from "./shared-matrix";
 import { setupDriverTest } from "./shared-utils";
 
 const STRESS_TEST_TIMEOUT_MS = 60_000;
@@ -74,27 +74,14 @@ describeDriverMatrix("Actor Db Stress", (driverTestConfig) => {
 						`stress-cycle-${i}-${crypto.randomUUID()}`,
 					];
 					const getActor = () => client.dbStressActor.getOrCreate(actorKey);
+					const actor = getActor();
+					await actor.ready;
+					await actor.insertBatch(10);
 
-					// Poll the first insert because the actor can still be starting when the initial DB action is sent.
-					await vi.waitFor(
-						async () => {
-							await getActor().insertBatch(10);
-						},
-						{ timeout: ACTOR_READY_TIMEOUT_MS, interval: 100 },
-					);
-
-					// Reacquire the keyed handle before verifying the write.
-					// The direct target from the insert can already be moving
-					// through sleep teardown under the task model.
-					await vi.waitFor(
-						async () => {
-							const count = await client.dbStressActor
-								.getOrCreate(actorKey)
-								.getCount();
-							expect(count).toBeGreaterThanOrEqual(10);
-						},
-						{ timeout: ACTOR_READY_TIMEOUT_MS, interval: 100 },
-					);
+					const verifyActor = getActor();
+					await verifyActor.ready;
+					const count = await verifyActor.getCount();
+					expect(count).toBeGreaterThanOrEqual(10);
 
 					// Destroy the actor (triggers close_database).
 					await getActor().destroy();

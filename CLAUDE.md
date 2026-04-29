@@ -20,7 +20,7 @@ Design constraints, invariants, and reference commands for the Rivet monorepo. F
 - Add a new versioned schema instead, then migrate `versioned.rs` and related compatibility code to bridge old versions forward.
 - When bumping the protocol version, update `PROTOCOL_MK2_VERSION` in `engine/packages/runner-protocol/src/lib.rs` and `PROTOCOL_VERSION` in `rivetkit-typescript/packages/engine-runner/src/mod.ts` together. Both must match the latest schema version.
 
-**Always use versioned BARE (`vbare`) instead of raw `serde_bare` for any persisted or wire-format encoding unless explicitly told otherwise.** Raw `serde_bare::to_vec` / `from_slice` has no version header, so any future schema change forces hand-rolled `LegacyXxx` fallback structs. `vbare::OwnedVersionedData` plus a versioned `*.bare` schema is the standard pattern. Acceptable raw-bare exceptions: ephemeral in-memory encodings that never cross a process boundary or hit disk, and wire formats whose protocol version is coordinated out-of-band (e.g. an HTTP path like `/v{PROTOCOL_VERSION}/...` or another channel that pins both peers to one schema per call).
+**Always use versioned BARE (`vbare`) for persisted or wire-format encoding. Never use raw `serde_bare::to_vec` / `from_slice` for those formats unless explicitly told otherwise.** Raw `serde_bare` has no version header, so any future schema change forces hand-rolled `LegacyXxx` fallback structs. `vbare::OwnedVersionedData` plus a versioned `*.bare` schema is the standard pattern. Acceptable raw-bare exceptions: ephemeral in-memory encodings that never cross a process boundary or hit disk, and wire formats whose protocol version is coordinated out-of-band (e.g. an HTTP path like `/v{PROTOCOL_VERSION}/...` or another channel that pins both peers to one schema per call).
 
 When talking about "Rivet Actors" make sure to capitalize "Rivet Actor" as a proper noun and lowercase "actor" as a generic noun.
 
@@ -99,13 +99,17 @@ docker-compose up -d
 - Core tests that touch the `_RIVET_TEST_INSPECTOR_TOKEN` env override must share a process-wide lock with startup tests that assert inspector-token initialization side effects; otherwise parallel `cargo test` runs can flip `init_inspector_token(...)` between the env-override no-op path and the KV-backed path.
 - For the fast static/http/bare driver verifier, pass only the files listed under `## Fast Tests` in `.agent/notes/driver-test-progress.md`; `tests/driver/*.test.ts` also pulls in slow-suite files and gives bogus gate failures.
 - When moving Rust inline tests out of `src/`, keep a tiny source-owned `#[cfg(test)] #[path = "..."] mod tests;` shim so the moved file still has private module access without widening runtime visibility. Prefer a dedicated moved-test file per source module; reusing stale shared `tests/modules/*.rs` files can silently rot against private APIs and explode once you wire them back in.
+- Put path-shimmed unit test bodies under `tests/inline/` or another nested path; Cargo compiles direct `tests/*.rs` files as integration tests.
 - Tracing assertions on spawned Rust futures should bind an explicit `tracing::Dispatch` with `.with_subscriber(...)` on the spawned future; thread-local `set_default(...)` can miss the real logs in full async suite runs.
 
 ### SQLite Package
 
 - RivetKit SQLite is native-only: VFS and query execution live in `rivetkit-rust/packages/rivetkit-sqlite/`, core owns lifecycle, and NAPI only marshals JS types.
+- SQLite VFS direct tests should record workflow compaction wakes through `CompactionSignaler`, not call legacy `compact_default_batch`.
+- SQLite VFS `xSync` durability depends on depot's `sqlite_commit` reply waiting for the FDB transaction commit.
+- SQLite VFS process-global registrations must be owned by a Drop guard so panics unwind through `sqlite3_vfs_unregister`.
+- `NativeDatabase::Drop` must bound dirty-page flushes with a short timeout and return after logging if the commit future never resolves.
 - Actor2 workflows and envoy actors always use the SQLite v2 storage format; only old actor v1 workflows and pegboard runners use the v1 storage format. ("v2" here refers to the on-disk storage format, not envoy-protocol v2.)
-- For `sqlite-storage` raw byte prefix scans and clears, build a `universaldb::Subspace` with `tuple::Subspace::from_bytes(prefix)` and use its range.
 - For NAPI bridge wiring (TSF callback layout, cancellation tokens, `#[napi(object)]` rules), see `docs-internal/engine/napi-bridge.md`.
 
 ## Agent Working Directory
@@ -227,7 +231,7 @@ When the user asks to track something in a note, store it in `.agent/notes/` by 
 - Driver tests that wait for actor sleep must not poll actor actions while waiting; each action counts as activity and can reset the sleep deadline.
 - **Never paper over flakes with retry loops or bumped waits.** When a test flakes, (1) root-cause the race, (2) write a deterministic repro using `vi.useFakeTimers()` or event-ordered `Promise` resolution, (3) fix the underlying ordering in core/napi/typescript, (4) delete any flake-workaround note. `vi.waitFor` is acceptable for legitimate "wait for an async event" coordination but never as a retry-until-success masking layer. Every `vi.waitFor` call must have a one-line comment explaining why polling rather than direct awaiting is necessary.
 - In `rivetkit-typescript/packages/rivetkit/tests/`, put the `vi.waitFor(...)` justification on the immediately preceding `//` line. `pnpm run check:wait-for-comments` enforces the adjacent comment.
-- **Rust tests live under `tests/`, not inline `#[cfg(test)] mod tests` in `src/`.** Move every inline test module in Rust crates to the crate's `tests/` directory. Exceptions must be justified (e.g., testing a private internal that can't be reached from an integration test).
+- **Rust test bodies live under `tests/`, not inline `#[cfg(test)] mod tests` in `src/`.** Move inline test modules to the crate's `tests/` directory; source files may keep only tiny `#[cfg(test)] #[path = "..."] mod tests;` shims for private access.
 - For running RivetKit tests, Vitest filter gotchas, the driver-test parity workflow, and Rust test layout rules, see `.claude/reference/testing.md`.
 
 ## Traces Package
@@ -256,6 +260,7 @@ When the user asks to track something in a note, store it in `.agent/notes/` by 
 - Write comments as normal, complete sentences. Avoid fragmented structures with parentheticals and dashes like `// Spawn engine (if configured) - regardless of start kind`. Instead, write `// Spawn the engine if configured`. Especially avoid dashes (hyphens are OK).
 - Do not use em dashes (—). Use periods to separate sentences instead.
 - Documenting deltas is not important or useful. A developer who has never worked on the project will not gain extra information if you add a comment stating that something was removed or changed because they don't know what was there before. The only time you would be adding a comment for something NOT being there is if its unintuitive for why its not there in the first place.
+- Any code that relies on subtle ordering, transactional atomicity, TOCTOU revalidation, or race-condition prevention must include an inline comment explaining the invariant being protected and, when relevant, the operation flow that preserves it.
 
 ### Match statements
 
@@ -286,8 +291,8 @@ Load these only when the task touches the topic.
 - **[Inspector protocol](docs-internal/engine/inspector-protocol.md)** — HTTP↔WebSocket mirroring rules, wire-version negotiation, `inspector.*_dropped` downgrades, workflow inspector inference. Read before touching inspector endpoints.
 - **[NAPI bridge](docs-internal/engine/napi-bridge.md)** — TSF callback slots, `ActorContextShared` cache reset, `#[napi(object)]` payload rules, cancellation token bridging, error prefix encoding. Read before touching `rivetkit-napi`.
 - **[BARE protocol crates](docs-internal/engine/bare-protocol-crates.md)** — vbare schema ordering, identity converters, `build.rs` TS codec generation pattern. Read before adding/changing protocol crates.
-- **[SQLite VFS parity](docs-internal/engine/sqlite-vfs.md)** — native Rust VFS ↔ WASM TypeScript VFS 1:1 parity rule, v2 storage keys, chunk layout, delete/truncate strategy. Read before touching either VFS.
-- **[SQLite storage crash course](docs-internal/engine/sqlite-storage.md)** — META/PIDX/DELTA/SHARD layout, read/write/compaction paths, generation vs `head_txid` fences, in-RAM caches. Read before touching `engine/packages/sqlite-storage/`.
+- **[SQLite VFS](docs-internal/engine/sqlite-vfs.md)** — native-only VFS rules, v2 storage keys, chunk layout, delete/truncate strategy. Read before touching the VFS.
+- **[Depot crash course](docs-internal/engine/depot.md)** — META/PIDX/DELTA/SHARD layout, read/write/compaction paths, generation vs `head_txid` fences, in-RAM caches. Read before touching `engine/packages/depot/`.
 - **[TLS trust roots](docs-internal/engine/tls-trust-roots.md)** — rustls native+webpki union rationale, which clients use which backend.
 - **[Sleep sequence](docs-internal/engine/sleep-sequence.md)** — engine lifecycle authority, `keepAwake` vs `waitUntil` semantics, grace deadline shutdown-token abort, `can_arm_sleep_timer` vs `can_finalize_sleep` predicates. Read before touching sleep/destroy lifecycle.
 

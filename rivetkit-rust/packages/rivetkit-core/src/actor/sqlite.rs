@@ -1,7 +1,10 @@
 use std::collections::HashSet;
 use std::io::Cursor;
 #[cfg(feature = "sqlite")]
-use std::sync::Arc;
+use std::sync::{
+	Arc,
+	atomic::{AtomicBool, Ordering},
+};
 
 use anyhow::{Context, Result};
 #[cfg(feature = "sqlite")]
@@ -84,6 +87,8 @@ pub struct SqliteDb {
 	// Forced-sync: native SQLite handles are used inside spawn_blocking and
 	// synchronous diagnostic accessors.
 	db: Arc<Mutex<Option<NativeDatabaseHandle>>>,
+	#[cfg(feature = "sqlite")]
+	cleaned_up: Arc<AtomicBool>,
 }
 
 impl SqliteDb {
@@ -98,6 +103,8 @@ impl SqliteDb {
 			enabled,
 			#[cfg(feature = "sqlite")]
 			db: Default::default(),
+			#[cfg(feature = "sqlite")]
+			cleaned_up: Default::default(),
 		}
 	}
 
@@ -122,13 +129,23 @@ impl SqliteDb {
 	pub async fn open(&self) -> Result<()> {
 		#[cfg(feature = "sqlite")]
 		{
+			self.ensure_not_cleaned_up()?;
+
 			let config = self.runtime_config()?;
 			let db = self.db.clone();
+			let cleaned_up = self.cleaned_up.clone();
 			let rt_handle = tokio::runtime::Handle::try_current()
 				.context("open sqlite database requires a tokio runtime")?;
 
 			tokio::task::spawn_blocking(move || {
+				if cleaned_up.load(Ordering::Acquire) {
+					return Err(SqliteRuntimeError::Closed.build());
+				}
+
 				let mut guard = db.lock();
+				if cleaned_up.load(Ordering::Acquire) {
+					return Err(SqliteRuntimeError::Closed.build());
+				}
 				if guard.is_some() {
 					return Ok(());
 				}
@@ -251,6 +268,9 @@ impl SqliteDb {
 	}
 
 	pub(crate) async fn cleanup(&self) -> Result<()> {
+		#[cfg(feature = "sqlite")]
+		self.cleaned_up.store(true, Ordering::Release);
+
 		self.close().await
 	}
 
@@ -318,6 +338,15 @@ impl SqliteDb {
 		self.handle
 			.clone()
 			.ok_or_else(|| sqlite_not_configured("handle"))
+	}
+
+	#[cfg(feature = "sqlite")]
+	fn ensure_not_cleaned_up(&self) -> Result<()> {
+		if self.cleaned_up.load(Ordering::Acquire) {
+			return Err(SqliteRuntimeError::Closed.build());
+		}
+
+		Ok(())
 	}
 }
 

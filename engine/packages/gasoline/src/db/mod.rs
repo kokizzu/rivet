@@ -363,6 +363,7 @@ pub struct SignalData {
 
 pub enum BumpSubSubject {
 	Worker,
+	WorkflowCreated { tag: String },
 	WorkflowComplete { workflow_id: Id },
 	SignalPublish { to_workflow_id: Id },
 }

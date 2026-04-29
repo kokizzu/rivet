@@ -98,6 +98,7 @@ The log name matches the key in `ActorMetrics.startup`. Internal phases use `per
 ## Sleep Shutdown
 
 - Sleep shutdown should wait for in-flight HTTP action work and pending disconnect callbacks before `onSleep`, but should not block on open hibernatable connections alone because existing connection actions may still complete during the graceful shutdown window.
+- Driver tests that wait for a target actor to sleep should record lifecycle events into a separate observer actor; do not poll target actions or hold a normal target connection open while waiting.
 
 ## Drizzle Compatibility Testing
 

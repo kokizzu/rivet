@@ -4,12 +4,11 @@ use anyhow::{Context, Result, ensure};
 use gas::prelude::{Id, util::timestamp};
 use rivet_envoy_protocol as protocol;
 use rivet_pools::NodeId;
-use sqlite_storage::{
-	keys as sqlite_storage_keys,
-	pump::ActorDb,
-	types::{DBHead, DirtyPage, SQLITE_PAGE_SIZE, decode_db_head},
+use depot::{
+	keys as depot_keys,
+	conveyer::{branch as depot_branch, Db},
+	types::{DBHead, DirtyPage, BucketId, SQLITE_PAGE_SIZE, decode_db_head},
 };
-use universalpubsub::{PubSub, driver::memory::MemoryDriver};
 
 use crate::{actor_kv::Recipient, metrics};
 
@@ -31,20 +30,20 @@ pub fn clear_v2_storage_for_destroy(tx: &universaldb::Transaction, actor_id: Id)
 	let actor_id = actor_id.to_string();
 
 	tx.informal()
-		.clear(&sqlite_storage_keys::meta_head_key(&actor_id));
+		.clear(&depot_keys::meta_head_key(&actor_id));
 	tx.informal()
-		.clear(&sqlite_storage_keys::meta_compact_key(&actor_id));
+		.clear(&depot_keys::meta_compact_key(&actor_id));
 	tx.informal()
-		.clear(&sqlite_storage_keys::meta_quota_key(&actor_id));
-	// Clear the lease with the rest of SQLite storage.
+		.clear(&depot_keys::meta_quota_key(&actor_id));
+	// Clear the lease with the rest of Depot.
 	// Otherwise dead lease keys accumulate in UDB indefinitely.
 	tx.informal()
-		.clear(&sqlite_storage_keys::meta_compactor_lease_key(&actor_id));
+		.clear(&depot_keys::meta_compactor_lease_key(&actor_id));
 
 	for prefix in [
-		sqlite_storage_keys::shard_prefix(&actor_id),
-		sqlite_storage_keys::delta_prefix(&actor_id),
-		sqlite_storage_keys::pidx_delta_prefix(&actor_id),
+		depot_keys::shard_prefix(&actor_id),
+		depot_keys::delta_prefix(&actor_id),
+		depot_keys::pidx_delta_prefix(&actor_id),
 	] {
 		let (begin, end) = prefix_range(&prefix);
 		tx.informal().clear_range(&begin, &end);
@@ -92,7 +91,10 @@ async fn maybe_migrate_v1_to_v2(
 
 	let actor_id = recipient.actor_id.to_string();
 
-	if load_v2_head(db, &actor_id).await?.is_some() {
+	if load_v2_head(db, recipient.namespace_id, &actor_id)
+		.await?
+		.is_some()
+	{
 		return Ok(false);
 	}
 
@@ -121,9 +123,9 @@ async fn maybe_migrate_v1_to_v2(
 			bytes: bytes.to_vec(),
 		})
 		.collect::<Vec<_>>();
-	let actor_db = ActorDb::new(
+	let actor_db = Db::new(
 		Arc::new(db.clone()),
-		migration_ups(),
+		recipient.namespace_id,
 		actor_id.clone(),
 		NodeId::new(),
 	);
@@ -144,16 +146,31 @@ async fn maybe_migrate_v1_to_v2(
 	Ok(true)
 }
 
-async fn load_v2_head(db: &universaldb::Database, actor_id: &str) -> Result<Option<DBHead>> {
+async fn load_v2_head(
+	db: &universaldb::Database,
+	namespace_id: Id,
+	actor_id: &str,
+) -> Result<Option<DBHead>> {
 	let actor_id = actor_id.to_string();
+	let bucket_id = BucketId::from_gas_id(namespace_id);
 	db.run(move |tx| {
 		let actor_id = actor_id.clone();
+		let bucket_id = bucket_id;
 		async move {
+			let key = if let Some(branch_id) = depot_branch::resolve_database_branch(
+				&tx,
+				bucket_id,
+				&actor_id,
+				universaldb::utils::IsolationLevel::Snapshot,
+			)
+			.await?
+			{
+				depot_keys::branch_meta_head_key(branch_id)
+			} else {
+				depot_keys::meta_head_key(&actor_id)
+			};
 			tx.informal()
-				.get(
-					&sqlite_storage_keys::meta_head_key(&actor_id),
-					universaldb::utils::IsolationLevel::Snapshot,
-				)
+				.get(&key, universaldb::utils::IsolationLevel::Snapshot)
 				.await?
 				.map(|bytes| decode_db_head(bytes.as_ref()))
 				.transpose()
@@ -161,12 +178,6 @@ async fn load_v2_head(db: &universaldb::Database, actor_id: &str) -> Result<Opti
 		}
 	})
 	.await
-}
-
-fn migration_ups() -> PubSub {
-	PubSub::new(Arc::new(MemoryDriver::new(
-		"sqlite-v1-migration".to_string(),
-	)))
 }
 
 fn migration_error(actor_id: &str, phase: &'static str, err: anyhow::Error) -> anyhow::Error {

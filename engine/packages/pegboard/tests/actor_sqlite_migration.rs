@@ -6,14 +6,13 @@ use gas::prelude::{Id, util::timestamp};
 use pegboard::actor_kv::Recipient;
 use rivet_pools::NodeId;
 use rusqlite::{Connection, params};
-use sqlite_storage::{
-	keys::meta_head_key,
-	pump::ActorDb,
-	types::{DirtyPage, SQLITE_PAGE_SIZE, decode_db_head},
+use depot::{
+	keys::{branch_meta_head_key, meta_head_key},
+	conveyer::{branch as depot_branch, Db},
+	types::{DirtyPage, BucketId, SQLITE_PAGE_SIZE, decode_db_head},
 };
 use tempfile::tempdir;
 use universaldb::driver::RocksDbDatabaseDriver;
-use universalpubsub::{PubSub, driver::memory::MemoryDriver};
 
 const SQLITE_V1_PREFIX: u8 = 0x08;
 const SQLITE_V1_SCHEMA_VERSION: u8 = 0x01;
@@ -29,9 +28,13 @@ const FILE_TAG_SHM: u8 = 0x03;
 fn recipient(actor_id: Id) -> Recipient {
 	Recipient {
 		actor_id,
-		namespace_id: Id::new_v1(1),
+		namespace_id: test_namespace(),
 		name: "test".to_string(),
 	}
+}
+
+fn test_namespace() -> Id {
+	Id::v1(uuid::Uuid::from_u128(0x9999), 1)
 }
 
 async fn test_db() -> Result<universaldb::Database> {
@@ -117,23 +120,17 @@ async fn migrate(
 		db.clone(),
 		pegboard::actor_sqlite::MigrateV1ToV2Input {
 			actor_id,
-			namespace_id: Id::new_v1(1),
+			namespace_id: test_namespace(),
 			name: "test".to_string(),
 		},
 	)
 	.await
 }
 
-fn test_ups() -> PubSub {
-	PubSub::new(Arc::new(MemoryDriver::new(
-		"pegboard-sqlite-migration-test".to_string(),
-	)))
-}
-
-fn actor_db(db: &universaldb::Database, actor_id: &str) -> ActorDb {
-	ActorDb::new(
+fn actor_db(db: &universaldb::Database, actor_id: &str) -> Db {
+	Db::new(
 		Arc::new(db.clone()),
-		test_ups(),
+		test_namespace(),
 		actor_id.to_string(),
 		NodeId::new(),
 	)
@@ -145,12 +142,22 @@ async fn load_v2_bytes(db: &universaldb::Database, actor_id: &str) -> Result<Vec
 		.run(move |tx| {
 			let actor_id = actor_id_for_tx.clone();
 			async move {
+				let bucket_id = BucketId::from_gas_id(test_namespace());
+				let key = if let Some(branch_id) = depot_branch::resolve_database_branch(
+					&tx,
+					bucket_id,
+					&actor_id,
+					universaldb::utils::IsolationLevel::Snapshot,
+				)
+				.await?
+				{
+					branch_meta_head_key(branch_id)
+				} else {
+					meta_head_key(&actor_id)
+				};
 				let bytes = tx
 					.informal()
-					.get(
-						&meta_head_key(&actor_id),
-						universaldb::utils::IsolationLevel::Snapshot,
-					)
+					.get(&key, universaldb::utils::IsolationLevel::Snapshot)
 					.await?
 					.expect("sqlite v2 head should exist");
 				decode_db_head(bytes.as_ref())

@@ -1,6 +1,6 @@
-use anyhow::{Context, bail, ensure};
+use anyhow::{Context, bail};
 use bytes::Bytes;
-use futures_util::TryStreamExt;
+use futures_util::{FutureExt, TryStreamExt};
 use gas::prelude::Id;
 use gas::prelude::*;
 use hyper_tungstenite::tungstenite::Message;
@@ -10,9 +10,15 @@ use rivet_data::converted::{ActorNameKeyData, MetadataKeyData};
 use rivet_envoy_protocol::{self as protocol, PROTOCOL_VERSION, versioned};
 use rivet_guard_core::websocket_handle::WebSocketReceiver;
 use scc::HashMap;
-use sqlite_storage::{error::SqliteStorageError, pump::ActorDb};
+use depot::{
+	conveyer::Db,
+	error::SqliteStorageError,
+	workflows::compaction::{
+		DATABASE_BRANCH_ID_TAG, DbManagerInput, DeltasAvailable,
+		database_branch_tag_value,
+	},
+};
 use std::{
-	collections::BTreeSet,
 	sync::{Arc, atomic::Ordering},
 	time::Instant,
 };
@@ -622,24 +628,21 @@ async fn handle_sqlite_get_pages(
 	conn: &Conn,
 	request: protocol::SqliteGetPagesRequest,
 ) -> Result<protocol::SqliteGetPagesResponse> {
-	validate_sqlite_get_pages_request(&request)?;
 	validate_sqlite_actor(ctx, conn, &request.actor_id).await?;
 
-	let actor_db = actor_db(conn, request.actor_id.clone()).await;
-	match actor_db.get_pages(request.pgnos).await {
-		Ok(pages) => Ok(sqlite_get_pages_ok(pages).await?),
-		Err(err) => Err(err),
-	}
+	let actor_db = actor_db(ctx, conn, request.actor_id.clone()).await?;
+	let pages = actor_db.get_pages(request.pgnos).await?;
+	Ok(sqlite_get_pages_ok(pages).await?)
 }
 
 async fn sqlite_get_pages_ok(
-	pages: Vec<sqlite_storage::types::FetchedPage>,
+	pages: Vec<depot::types::FetchedPage>,
 ) -> Result<protocol::SqliteGetPagesResponse> {
 	Ok(protocol::SqliteGetPagesResponse::SqliteGetPagesOk(
 		protocol::SqliteGetPagesOk {
 			pages: pages
 				.into_iter()
-				.map(sqlite_runtime::protocol_sqlite_pump_fetched_page)
+				.map(sqlite_runtime::protocol_sqlite_conveyer_fetched_page)
 				.collect(),
 		},
 	))
@@ -651,14 +654,13 @@ async fn handle_sqlite_commit(
 	request: protocol::SqliteCommitRequest,
 ) -> Result<protocol::SqliteCommitResponse> {
 	let decode_request_start = Instant::now();
-	validate_sqlite_dirty_pages("sqlite commit", &request.dirty_pages)?;
 	validate_sqlite_actor(ctx, conn, &request.actor_id).await?;
 	let decode_request_duration = decode_request_start.elapsed();
 	crate::metrics::SQLITE_COMMIT_ENVOY_DISPATCH_DURATION
 		.observe(decode_request_duration.as_secs_f64());
 
 	let actor_id = request.actor_id.clone();
-	let actor_db = actor_db(conn, actor_id.clone()).await;
+	let actor_db = actor_db(ctx, conn, actor_id.clone()).await?;
 	let engine_result = actor_db
 		.commit(
 			request
@@ -673,7 +675,7 @@ async fn handle_sqlite_commit(
 	let response_build_start = Instant::now();
 	let response = match engine_result {
 		Ok(()) => Ok(protocol::SqliteCommitResponse::SqliteCommitOk),
-		Err(err) => match sqlite_storage_error(&err) {
+		Err(err) => match depot_error(&err) {
 			Some(SqliteStorageError::CommitTooLarge {
 				actual_size_bytes,
 				max_size_bytes,
@@ -706,62 +708,59 @@ async fn validate_sqlite_actor(ctx: &StandaloneCtx, conn: &Conn, actor_id: &str)
 	Ok(())
 }
 
-fn pump_dirty_page(page: protocol::SqliteDirtyPage) -> sqlite_storage::types::DirtyPage {
-	sqlite_storage::types::DirtyPage {
+fn pump_dirty_page(page: protocol::SqliteDirtyPage) -> depot::types::DirtyPage {
+	depot::types::DirtyPage {
 		pgno: page.pgno,
 		bytes: page.bytes,
 	}
 }
 
-async fn actor_db(conn: &Conn, actor_id: String) -> Arc<ActorDb> {
-	conn.actor_dbs
+async fn actor_db(ctx: &StandaloneCtx, conn: &Conn, actor_id: String) -> Result<Arc<Db>> {
+	let db = conn.actor_dbs
 		.entry_async(actor_id.clone())
 		.await
 		.or_insert_with(|| {
-			Arc::new(ActorDb::new(
+			let signal_ctx = ctx.clone();
+			let workflow_actor_id = actor_id.clone();
+			let compaction_signaler = Arc::new(move |signal: DeltasAvailable| {
+				let signal_ctx = signal_ctx.clone();
+				let actor_id = workflow_actor_id.clone();
+				async move {
+					let tag_value = database_branch_tag_value(signal.database_branch_id);
+					let workflow_id = signal_ctx
+						.workflow(DbManagerInput {
+							database_branch_id: signal.database_branch_id,
+							actor_id: Some(actor_id),
+						})
+						.tag(DATABASE_BRANCH_ID_TAG, &tag_value)
+						.unique()
+						.dispatch()
+						.await?;
+					signal_ctx
+						.signal(signal)
+						.to_workflow_id(workflow_id)
+						.send()
+						.await?;
+					Ok(())
+				}
+				.boxed()
+			});
+
+			Arc::new(Db::new_with_compaction_signaler(
 				conn.udb.clone(),
-				(*conn.ups).clone(),
+				conn.namespace_id,
 				actor_id,
 				conn.node_id,
+				conn.sqlite_cold_tier.clone(),
+				compaction_signaler,
 			))
 		})
 		.get()
-		.clone()
+		.clone();
+	Ok(db)
 }
 
-fn validate_sqlite_get_pages_request(request: &protocol::SqliteGetPagesRequest) -> Result<()> {
-	for pgno in &request.pgnos {
-		ensure!(*pgno > 0, "sqlite get_pages does not accept page 0");
-	}
-
-	Ok(())
-}
-
-fn validate_sqlite_dirty_pages(
-	request_name: &str,
-	dirty_pages: &[protocol::SqliteDirtyPage],
-) -> Result<()> {
-	let mut seen = BTreeSet::new();
-	for page in dirty_pages {
-		ensure!(page.pgno > 0, "{request_name} does not accept page 0");
-		ensure!(
-			page.bytes.len() == sqlite_storage::types::SQLITE_PAGE_SIZE as usize,
-			"{request_name} page {} had {} bytes, expected {}",
-			page.pgno,
-			page.bytes.len(),
-			sqlite_storage::types::SQLITE_PAGE_SIZE
-		);
-		ensure!(
-			seen.insert(page.pgno),
-			"{request_name} duplicated page {} in a single request",
-			page.pgno
-		);
-	}
-
-	Ok(())
-}
-
-fn sqlite_storage_error(err: &anyhow::Error) -> Option<&SqliteStorageError> {
+fn depot_error(err: &anyhow::Error) -> Option<&SqliteStorageError> {
 	err.downcast_ref::<SqliteStorageError>()
 }
 

@@ -486,6 +486,8 @@ export const sleepEnqueue = actor({
 	},
 });
 
+const scheduleAfterKeepAwakeResolvers = new Map<string, () => void>();
+
 export const sleepScheduleAfter = actor({
 	state: {
 		startCount: 0,
@@ -508,7 +510,11 @@ export const sleepScheduleAfter = actor({
 		c.state.startCount += 1;
 		if (c.state.holdAfterWake) {
 			// Keep the alarm wake observable before idle sleep can run again.
-			c.setPreventSleep(true);
+			c.keepAwake(
+				new Promise<void>((resolve) => {
+					scheduleAfterKeepAwakeResolvers.set(c.actorId, resolve);
+				}),
+			);
 		}
 		await c.db.execute(
 			`INSERT INTO sleep_log (event, created_at) VALUES ('wake', ${Date.now()})`,
@@ -539,7 +545,8 @@ export const sleepScheduleAfter = actor({
 			};
 			if (c.state.scheduledActionCount > 0) {
 				c.state.holdAfterWake = false;
-				c.setPreventSleep(false);
+				scheduleAfterKeepAwakeResolvers.get(c.actorId)?.();
+				scheduleAfterKeepAwakeResolvers.delete(c.actorId);
 			}
 			return counts;
 		},
@@ -865,17 +872,14 @@ export {
 	EXCEEDS_GRACE_SLEEP_TIMEOUT,
 };
 
-// Number of sequential DB writes the handler performs. The loop runs long
-// enough that shutdown (close()) runs between two writes. The write that
-// follows close() hits the destroyed DB.
+// Number of sequential DB writes the handler can perform. Tests issue
+// write permits over the WebSocket so shutdown lands at an exact boundary.
 const ACTIVE_DB_WRITE_COUNT = 500;
-const ACTIVE_DB_WRITE_DELAY_MS = 5;
 const ACTIVE_DB_GRACE_PERIOD = 50;
 const ACTIVE_DB_SLEEP_TIMEOUT = 500;
 
 export {
 	ACTIVE_DB_WRITE_COUNT,
-	ACTIVE_DB_WRITE_DELAY_MS,
 	ACTIVE_DB_GRACE_PERIOD,
 	ACTIVE_DB_SLEEP_TIMEOUT,
 };
@@ -916,6 +920,30 @@ export const sleepWsActiveDbExceedsGrace = actor({
 		c.state.sleepCount += 1;
 	},
 	onWebSocket: (c, ws: UniversalWebSocket) => {
+		let queuedWritePermits = 0;
+		let pendingWritePermit: (() => void) | undefined;
+
+		const releaseWritePermit = () => {
+			if (pendingWritePermit) {
+				const resolve = pendingWritePermit;
+				pendingWritePermit = undefined;
+				resolve();
+			} else {
+				queuedWritePermits += 1;
+			}
+		};
+
+		const waitForWritePermit = () => {
+			if (queuedWritePermits > 0) {
+				queuedWritePermits -= 1;
+				return Promise.resolve();
+			}
+
+			return new Promise<void>((resolve) => {
+				pendingWritePermit = resolve;
+			});
+		};
+
 		const sendMessage = (payload: unknown) => {
 			try {
 				const result = (ws as { send(data: string): unknown }).send(
@@ -940,7 +968,12 @@ export const sleepWsActiveDbExceedsGrace = actor({
 		};
 
 		ws.addEventListener("message", async (event: any) => {
-			if (event.data !== "start-writes") return;
+			const message = JSON.parse(String(event.data));
+			if (message.type === "continue-write") {
+				releaseWritePermit();
+				return;
+			}
+			if (message.type !== "start-writes") return;
 
 			sendMessage({ type: "started" });
 
@@ -948,11 +981,18 @@ export const sleepWsActiveDbExceedsGrace = actor({
 			// releases the DB wrapper mutex. Between two writes, the
 			// shutdown's client.close() can slip in and close the DB.
 			for (let i = 0; i < ACTIVE_DB_WRITE_COUNT; i++) {
+				await waitForWritePermit();
+
 				try {
 					await c.db.execute(
 						`INSERT INTO sleep_log (event, created_at) VALUES ('write-${i}', ${Date.now()})`,
 					);
 					c.state.writesCompleted = i + 1;
+					sendMessage({
+						type: "write",
+						index: i,
+						writesCompleted: c.state.writesCompleted,
+					});
 				} catch (error) {
 					c.state.writeError =
 						error instanceof Error ? error.message : String(error);
@@ -963,12 +1003,6 @@ export const sleepWsActiveDbExceedsGrace = actor({
 					});
 					return;
 				}
-
-				// Small delay between writes to yield the event loop and
-				// allow shutdown tasks to run.
-				await new Promise((resolve) =>
-					setTimeout(resolve, ACTIVE_DB_WRITE_DELAY_MS),
-				);
 			}
 
 			sendMessage({ type: "finished" });

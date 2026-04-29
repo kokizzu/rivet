@@ -31,6 +31,23 @@ impl Drop for MemoryDb {
 }
 
 #[test]
+fn query_sql_with_embedded_nul_is_rejected() {
+	let db = MemoryDb::open();
+	let err = query_statement(db.as_ptr(), "SELECT 1\0; --", None)
+		.expect_err("SQL strings with embedded NUL bytes should be rejected");
+
+	let chain = err
+		.chain()
+		.map(|err| err.to_string())
+		.collect::<Vec<_>>()
+		.join(": ");
+	assert!(
+		chain.to_lowercase().contains("nul byte"),
+		"expected CString embedded NUL error, got {chain:?}"
+	);
+}
+
+#[test]
 fn text_with_embedded_nul_round_trips() {
 	let db = MemoryDb::open();
 	exec_statements(

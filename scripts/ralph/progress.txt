@@ -1,311 +1,376 @@
 # Ralph Progress Log
-Started: Wed Apr 29 04:36:56 AM PDT 2026
----
 ## Codebase Patterns
-- `rivet-pools` keeps process-wide metadata on `PoolsInner`; initialize it in both `Pools::new` and `Pools::test`, with the test constructor only omitting optional service pools like ClickHouse.
-- After renaming a hyphenated crate, update both the workspace dependency key (`sqlite-storage-legacy.workspace`) and Rust import path (`sqlite_storage_legacy`) for every consumer.
-- When scaffolding `sqlite-storage` from copied legacy modules, root-level `pub use pump::{...}` preserves legacy `crate::types` and `crate::udb` paths while the real modules live under `pump/`.
-- `sqlite-storage` `actor_range` mirrors UniversalDB's single-key conflict range helper (`actor_prefix + 0`) and should not be treated as a full prefix scan range for suffixed actor keys.
-- Use `vbare::OwnedVersionedData` wrappers with embedded versions for sqlite-storage persisted META structs, even when the latest schema lives directly in `pump::types`.
-- For sqlite-storage byte-key atomic mutations, use `tx.informal().atomic_op(...)`; `Transaction::atomic_op` is for typed `FormalKey` tuple keys.
-- `/META/quota` is a raw signed `i64` little-endian atomic counter; missing means zero, and helper code should mutate it with `MutationType::Add` on `tx.informal()`.
-- `sqlite-storage::pump::ActorDb::new` runs debug-only takeover reconciliation synchronously; keep `takeover::reconcile` sync until the constructor shape changes.
-- For sqlite-storage raw byte prefix scans, build a `universaldb::Subspace` with `tuple::Subspace::from_bytes(prefix)` and use its range; direct `(prefix, end_of_key_range(prefix))` ranges can miss rows on the RocksDB driver.
-- `ActorDb::commit` should update the in-memory PIDX cache only when it was already warm; leave a cold cache empty so the next read performs the full PIDX scan instead of treating a partial commit-updated cache as authoritative.
-- `sqlite-storage::pump::ActorDb::new` carries a `rivet_pools::NodeId`; production callers should pass `pools.node_id()` so pump metrics are labeled by process node.
-- `sqlite-storage` compactor UPS messages use a typed `Subject`, `PublishOpts::one()`, and local vbare encode/decode helpers so dispatch tests can verify the wire payload through the memory driver.
-- `sqlite-storage` compactor lease take/renew helpers must use `Serializable` reads on `/META/compactor_lease`; use `TransactionRetryLimit(1)` in race tests when you need to observe the OCC abort instead of UDB's automatic retry.
-- `sqlite-storage` compactor shard folding uses absolute SQLite page numbers; page 0 is invalid for LTX, so full-shard tests use shard 1 pages `64..128`.
-- `sqlite-storage` raw byte prefix clears need the same `universaldb::Subspace::from(tuple::Subspace::from_bytes(prefix)).range()` shape as prefix scans; `end_of_key_range(prefix)` only clears the single prefix key on the RocksDB driver.
-- `sqlite-storage` compaction pause hooks are global per test binary; serialize tests that install those hooks and any same-actor `compact_default_batch` tests with a small async mutex.
-- `sqlite-storage` compact trigger payloads need namespace id and actor name alongside actor id before the compactor can emit namespace `MetricKey` rollups.
-- Debug-only compactor quota validation is wired from the worker through a per-actor `scc::HashMap<String, u32>` pass counter; the validator itself only scans PIDX, DELTA, and SHARD prefixes before comparing to `/META/quota`.
-- Compactor Prometheus metric vectors use `node_id` as the first label, with secondary labels like `outcome` or `actor_id` after it.
-- Debug takeover reconciliation treats seeded SQLite rows as real invariants; test fixtures with PIDX rows must also seed the referenced DELTA row before constructing `ActorDb`.
-- `sqlite-storage::pump::ActorDb::new` requires a UPS handle so commits can publish detached compaction triggers; tests can use `universalpubsub::driver::memory::MemoryDriver`.
-- Use `tokio::time::Instant` for actor-local trigger throttles so `#[tokio::test(start_paused = true)]` plus `tokio::time::advance` can cover timing deterministically.
-- `pegboard-envoy` SQLite `get_pages` and `commit` handlers lazily populate a per-conn `actor_dbs` cache and must not use it as authoritative actor presence tracking.
-- `pegboard-envoy` should pass `CommandStartActor` through without local SQLite side effects; only `CommandStopActor` touches the per-conn `actor_dbs` cache.
-- Pegboard actor destroy should call `actor_sqlite::clear_v2_storage_for_destroy` inside the same `ClearKv` UDB transaction as actor KV deletion so stateless SQLite META/PIDX/DELTA/SHARD and compactor lease keys are removed atomically.
-- The envoy protocol crate is `rivet-envoy-protocol` at `engine/sdks/rust/envoy-protocol`; its build script derives `PROTOCOL_VERSION` from the highest `engine/sdks/schemas/envoy-protocol/v*.bare` file.
-- Checked-in TS envoy-protocol output lives at `engine/sdks/typescript/envoy-protocol/src/index.ts`; if Rust build.rs skips TS generation because `@bare-ts/tools` is missing, regenerate it with the same BARE schema and post-process import/assert/VERSION like build.rs.
-- Stateless SQLite v3 envoy protocol has only `get_pages` and single-shot `commit`; remove startup-data and commit-stage plumbing from envoy-client, pegboard-envoy, pegboard-outbound, rivetkit-core, and rivetkit-sqlite together.
-- Protocol changes that touch `rivetkit-sqlite/src/vfs.rs` should include `cargo test -p rivetkit-sqlite --lib --no-run` because cfg(test) transport doubles can reference removed wire types even when `cargo check --workspace` passes.
-- After deleting `sqlite-storage-legacy`, pegboard v1 SQLite migration writes directly through `sqlite_storage::pump::ActorDb`; tests should verify bytes by reading v2 pages from `ActorDb` rather than using a legacy `SqliteEngine`.
-- `rivetkit-sqlite` direct VFS tests now use a test-only `DirectStorage` wrapper around `ActorDb`; share it across close/reopen cycles or reopen persistence tests will silently start from empty storage.
-- `rivetkit-napi` needs napi-rs `dyn-symbols` so Rust test binaries can link without Node providing N-API symbols at test-link time.
-- `engine/CLAUDE.md` SQLite guidance now assumes stateless per-conn `ActorDb` caches, tests under `engine/packages/sqlite-storage/tests/`, and a standalone compactor service.
+- VFS success paths should call `clear_last_error()`; use `set_last_error(...)` only for real failure paths and keep diagnostics in structured tracing fields.
+- SQLite bound TEXT values may contain embedded NUL bytes, but SQL statement strings are rejected at `CString::new(sql)` before SQLite prepare.
+- VFS `xDelete` on the main database path should fail loudly with `SQLITE_IOERR_DELETE`; it cannot delete persisted depot state by clearing local memory.
+- SQLite VFS production opens fetch page 1 and seed `page_size` from the header via `fetch_initial_main_page` -> `seed_main_page`; test builds use the direct-storage snapshot path instead.
+- Depot burst-mode cold lag should derive from workflow `CMP/root.cold_watermark_txid`; `branch_manifest_cold_drained_txid_key` is legacy and should be ignored by production paths.
+- PITR interval expiry is owned by the compaction reclaimer's `expired_pitr_interval_rows` lane; use `udb::compare_and_clear`, not helper-level raw clears.
+- Legacy database-scoped depot key helpers (`meta_head_key`, `delta_prefix`, `pidx_delta_prefix`, `shard_prefix`) are v1 pegboard compatibility only; do not use them for current Depot invariant scans.
+- Workflow test matrix macros that wrap caller blocks in async futures should use `async move $body` so per-run locals are created inside each generated future.
+- SQLite VFS `xSync` durability depends on depot's `sqlite_commit` reply waiting for the FDB transaction commit.
+- SQLite VFS page-cache fills should use the internally synchronized `moka::Cache` handle directly; do not hold a VFS state write guard only to call `page_cache.insert(...)`.
+- Path-shimmed Rust unit tests can keep private module access while moving bulky fixtures into sibling `tests/inline/*_support.rs` modules re-exported from the shim.
+- Depot compaction workflows use one module per workflow under `src/workflows/`; shared contracts, companion-loop helpers, and test hooks live under `src/compaction/`, with `depot::workflows::compaction::*` kept as the compatibility facade.
+- VFS crash-recovery tests can inject dirty pages through `direct_vfs_ctx`, force unacked close-time commits with `DirectTransportHooks::fail_next_commit`, and reopen against the same `DirectStorage` to assert only committed state is durable.
+- VFS commit-concurrency tests can pause direct commit transport with `DirectTransportHooks::pause_next_commit`, issue `io_read` through the xRead callback, then release the commit to assert snapshot behavior deterministically.
+- Depot capped ancestor reads cannot trust latest PIDX alone after the parent branch advances; scan capped DELTA history for requested pages before falling through to SHARD/cold.
+- Fork/reopen isolation tests should use fresh `Db` handles for the fork before and after parent writes so assertions prove durable branch state, not a warmed per-handle cache.
+- Direct VFS harnesses should lazy-initialize RocksDB-backed `DirectStorage` with `tokio::sync::OnceCell::get_or_init`; a `OnceLock` get-then-set race can open the same RocksDB path twice and trip the per-path `LOCK`.
+- SQLite VFS process-global registration should live in a dedicated Drop guard so panics after `sqlite3_vfs_register` still call `sqlite3_vfs_unregister`.
+- `NativeDatabase::Drop` dirty-page flushes should use a short `tokio::time::timeout`; if the commit future times out, log and return without calling `sqlite3_close_v2`.
+- Depot shard-cache fill workers should use cloned `async-channel` receivers for multi-consumer dispatch; do not wrap one `mpsc::Receiver` in a mutex.
+- Shard-cache fill idle waiters must create and enable `Notify::notified()` before loading `outstanding`; `notify_waiters()` does not store permits.
+- Db branch read cache state belongs in one `CacheSnapshot`; publish branch id, ancestry, access bucket, and PIDX index under one write lock.
+- Use `tokio::sync::Barrier` for concurrent test start guns; `Notify::notify_waiters()` can lose a start signal before waiters arm.
+- Compaction cold-shard reads must distinguish missing cold objects from sparse pages and re-read the live `CMP/cold_shard` ref under `Serializable` before returning fetched bytes.
+- Debug-only Depot takeover reconcile launched from `Db::new*` must be scheduled in the background; do not join it on the constructor's Tokio worker.
+- Timing-sensitive WebSocket driver tests should use test-issued permit messages and actor acks to advance exact work counts; avoid real-clock delays plus magnitude ranges.
+- TS actor connections expose `connection.ready`; await it instead of polling `isConnected` or retrying startup actions.
+- Driver tests that wait for a target actor to sleep should poll a separate observer actor for lifecycle events; target actions and normal target connections can keep resetting or blocking sleep.
+- Depot `get_pages` sparse semantics are split: in-range pages with no source return a zero page, but corrupted source blobs must return an explicit error.
+- Restore-point creation must re-read the resolved `COMMITS/{txid}` row inside the pin-write transaction; abort with `RestoreTargetExpired` instead of writing a Ready pin for reclaimed history.
+- Restore database rollback and undo restore-point pinning must commit in one UDB transaction; never swap DBPTR before the undo pin is durable.
+- Future DB pins can rely on older cold-backed SHARD coverage; tests should evict the FDB SHARD, clear hot PIDX for the page, and assert reads still resolve through `CMP/cold_shard`.
+- Gasoline workflow-row waiters can subscribe to `BumpSubSubject::WorkflowCreated { tag }`; workflow creation publishes the bump after the UDB commit for each created tag value.
+- Depot inspect decode and pagination logic lives in `depot::inspect`; `api-peer` should only mount thin internal `/depot/inspect/...` handlers and must not expose this surface through public SDKs.
 
-## 2026-04-29 04:44:52 PDT - US-001
-- Implemented a UUID-backed `NodeId` type and stored a generated value on each `Pools` instance.
-- Added `Pools::node_id()` plus public/prelude exports so consumers can use it for leases and metric labels.
-- Fixed stale `test-snapshot-gen` actor-create input fields that blocked `cargo check --workspace`.
-- Files changed: `engine/packages/pools/src/node_id.rs`, `engine/packages/pools/src/lib.rs`, `engine/packages/pools/src/pools.rs`, `engine/packages/pools/src/prelude.rs`, `engine/packages/test-snapshot-gen/src/scenarios/actor_v2_2_1_baseline.rs`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
-- **Learnings for future iterations:**
-  - `uuid` already has workspace `v4` and `serde` features, so new UUID-backed pool metadata does not need dependency changes.
-  - `Pools::test` mirrors `Pools::new` for shared pool state and intentionally leaves ClickHouse unset.
-  - `test-snapshot-gen` is part of `cargo check --workspace`, so stale scenario fixtures can break unrelated package changes.
+Started: Fri May  1 03:05:26 PM PDT 2026
 ---
-## 2026-04-29 04:51:26 PDT - US-002
-- Renamed the existing `sqlite-storage` crate to `sqlite-storage-legacy` with `git mv`.
-- Updated workspace members, workspace dependency keys, consumer manifests, Rust imports, and lockfile package references so the legacy crate remains compilable under its new name.
-- Files changed: `Cargo.toml`, `Cargo.lock`, `engine/packages/sqlite-storage-legacy/**`, `engine/packages/{engine,pegboard,pegboard-envoy,pegboard-outbound}/**`, `rivetkit-rust/packages/rivetkit-sqlite/**`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+## 2026-05-01 15:11:12 PDT - US-001
+- Replaced the `commit_atomic_write` success-path `set_last_error("post-commit atomic write succeeded: ...")` call with `clear_last_error()`.
+- Preserved the requested DB size diagnostic as a structured `tracing::debug!` field instead of encoding it in `last_error`.
+- Files changed: `rivetkit-rust/packages/rivetkit-sqlite/src/vfs.rs`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+- Verification: pre-fix `cargo test -p rivetkit-sqlite commit_atomic_write_clears_last_error_on_success` failed with the success string in `take_last_kv_error()`; after the fix, that test passed and `cargo check -p rivetkit-sqlite` passed.
 - **Learnings for future iterations:**
-  - Hyphenated Rust package names become underscore crate paths, so `sqlite-storage-legacy` is imported as `sqlite_storage_legacy`.
-  - `cargo build -p sqlite-storage-legacy` is a quick package-level check, but `cargo check --workspace` is needed to catch every consumer manifest/import after a rename.
-  - Existing warnings remain in `sqlite-storage-legacy` and `rivetkit-sqlite`; they do not block the rename checks.
+  - VFS success paths should call `clear_last_error()`; reserve `set_last_error(...)` for real failure paths.
+  - Size and timing diagnostics in VFS commit paths belong in structured tracing fields, not SQLite last-error state.
 ---
-## 2026-04-29 04:55:44 PDT - US-003
-- Scaffolded the new `sqlite-storage` crate with `pump/`, `compactor/`, debug-only `takeover.rs`, copied legacy `ltx.rs`, `page_index.rs`, pruned `error.rs`, lifted `test_utils/`, and placeholder integration test files.
-- Added the new crate to the workspace members, workspace dependency table, and lockfile.
-- Verified `cargo check -p sqlite-storage`, `cargo build -p sqlite-storage`, `cargo test -p sqlite-storage`, and `git diff --check`.
-- Files changed: `Cargo.toml`, `Cargo.lock`, `engine/packages/sqlite-storage/**`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+## 2026-05-01 15:13:51 PDT - US-002
+- Implemented the loud-failure contract for main database `xDelete`: `vfs_delete` now sets `last_error` and returns `SQLITE_IOERR_DELETE` when `path == ctx.actor_id`.
+- Tightened the regression test to assert the chosen `SQLITE_IOERR_DELETE` contract and the explicit last-error message.
+- Files changed: `rivetkit-rust/packages/rivetkit-sqlite/src/vfs.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/vfs.rs`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+- Verification: pre-fix `cargo test -p rivetkit-sqlite vfs_delete_main_db_resets_in_memory_state` failed because main-db xDelete returned `SQLITE_OK` with `db_size_pages=2`; after the fix, that test passed and `cargo check -p rivetkit-sqlite` passed.
 - **Learnings for future iterations:**
-  - Copied legacy modules still reference `crate::types` and `crate::udb`; root re-exports keep them compiling until later stories replace the stubs with real modules.
-  - Legacy inline tests were gated behind the opt-in `legacy-inline-tests` feature so the default new-crate test suite stays in `tests/`.
-  - `pump::udb` is intentionally a fail-by-default stub for now; US-005 owns the real UDB compare-and-clear wrapper.
+  - Do not make main DB `xDelete` pretend success by only mutating local VFS state; it cannot delete persisted depot state.
+  - Aux-file deletes remain separate from main DB deletes and still use `delete_aux_file`.
 ---
-## 2026-04-29 04:58:10 PDT - US-004
-- Added `pump::keys` with the four split META subkeys plus lifted PIDX, DELTA, SHARD, actor prefix, and decoder helpers.
-- Re-exported `keys` at the crate root so copied modules using `crate::keys` keep compiling.
-- Replaced the placeholder `pump_keys` integration test with coverage for META suffixes, PIDX big-endian ordering, cross-actor key isolation, and data-key prefixes.
-- Verified `cargo check -p sqlite-storage`, `cargo test -p sqlite-storage --test pump_keys`, `cargo test -p sqlite-storage`, and `git diff --check`.
-- Files changed: `engine/packages/sqlite-storage/src/lib.rs`, `engine/packages/sqlite-storage/src/pump/mod.rs`, `engine/packages/sqlite-storage/src/pump/keys.rs`, `engine/packages/sqlite-storage/tests/pump_keys.rs`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+## 2026-05-01 15:15:20 PDT - US-003
+- Renamed the depot restore-point metric Rust identifier from `SQLITE_RESTORE_POINT_COUNT_PER_NAMESPACE` to `SQLITE_RESTORE_POINT_COUNT_PER_BUCKET`.
+- Kept the Prometheus metric name `sqlite_restore_point_count_per_bucket` unchanged.
+- Files changed: `engine/packages/depot/src/conveyer/metrics.rs`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+- Verification: `rg -n "SQLITE_RESTORE_POINT_COUNT_PER_NAMESPACE|SQLITE_RESTORE_POINT_COUNT_PER_BUCKET" /home/nathan/r2/engine/packages/depot/src /home/nathan/r2/scripts/ralph/prd.json` and `cargo check -p depot` passed.
 - **Learnings for future iterations:**
-  - Keep SQLite v2 storage key paths as literal ASCII suffixes under `[0x02][actor_id]`, with numeric suffixes encoded big-endian for scan ordering.
-  - The new stateless layout has no `/META/static`; constants like page size and shard size live in `pump::keys`.
-  - `actor_range` is inherited from the legacy key module and uses `end_of_key_range`, which creates a single-key conflict range rather than a prefix scan bound.
+  - Depot metric Rust identifiers should match renamed Prometheus concepts when the metric string has already moved to the new terminology.
 ---
-## 2026-04-29 05:01:06 PDT - US-005
-- Added `pump::types::{DBHead, MetaCompact}` for the split META layout, with `DBHead` limited to `head_txid`, `db_size_pages`, and debug-only `generation`.
-- Added vbare embedded-version encode/decode helpers for `/META/head` and `/META/compact`.
-- Added a `pump::udb::compare_and_clear` wrapper over UniversalDB's existing `MutationType::CompareAndClear`.
-- Files changed: `engine/packages/sqlite-storage/Cargo.toml`, `engine/packages/sqlite-storage/src/pump/types.rs`, `engine/packages/sqlite-storage/src/pump/udb.rs`, `Cargo.lock`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+## 2026-05-01 15:19:42 PDT - US-004
+- Removed the legacy `branch_manifest_cold_drained_txid_key` production reads from depot burst-mode and dirty-marker cleanup paths.
+- Changed burst-mode lag to use workflow `CMP/root.cold_watermark_txid`, reusing the already-read compaction root during commit.
+- Updated depot burst/quota tests to seed `branch_compaction_root_key` and keep legacy key writes only as an ignored-key regression.
+- Files changed: `engine/packages/depot/CLAUDE.md` (via `AGENTS.md` symlink), `engine/packages/depot/src/burst_mode.rs`, `engine/packages/depot/src/conveyer/commit/apply.rs`, `engine/packages/depot/src/conveyer/commit/dirty.rs`, `engine/packages/depot/src/conveyer/commit/helpers.rs`, `engine/packages/depot/tests/burst_mode.rs`, `engine/packages/depot/tests/conveyer_commit.rs`, `.agent/notes/sqlite-review-issues.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+- Verification: `rg -n "branch_manifest_cold_drained_txid_key|set.*cold_drained|atomic.*cold_drained" /home/nathan/r2/engine/packages/depot --glob '!target/**'`, `cargo check -p depot`, and `cargo test -p depot` passed.
 - **Learnings for future iterations:**
-  - `sqlite-storage` can keep local persisted META schemas in `pump::types` while still using `vbare::OwnedVersionedData` for version headers.
-  - UniversalDB already exposes compare-and-clear as `MutationType::CompareAndClear`; raw byte keys should call through `tx.informal().atomic_op(...)`.
-  - The new pump types intentionally do not depend on `rivet-sqlite-storage-protocol` because the legacy protocol still contains `next_txid` and `SqliteOrigin`.
+  - Depot burst-mode cold lag comes from workflow `CMP/root.cold_watermark_txid`; do not reintroduce the legacy cold-drained manifest key in production paths.
+  - Tests that need cold-lag recovery should seed `branch_compaction_root_key`, not `branch_manifest_cold_drained_txid_key`.
 ---
-## 2026-04-29 05:03:52 PDT - US-006
-- Implemented `pump::quota` with the 10 GiB quota cap constant, trigger throttle constants, signed little-endian atomic add helper, quota read helper, and quota cap check.
-- Added the typed `SqliteStorageQuotaExceeded { remaining_bytes, payload_size }` error variant and re-exported `quota` from the crate root.
-- Added `pump_quota` integration coverage for missing-key reads, signed atomic add behavior, cap rejection, and trigger constants.
-- Files changed: `engine/packages/sqlite-storage/src/pump/quota.rs`, `engine/packages/sqlite-storage/src/pump/error.rs`, `engine/packages/sqlite-storage/src/pump/mod.rs`, `engine/packages/sqlite-storage/src/lib.rs`, `engine/packages/sqlite-storage/tests/pump_quota.rs`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+## 2026-05-01 15:23:53 PDT - US-005
+- Deleted the dead `delete_expired_pitr_interval_coverage` helper from depot PITR interval utilities.
+- Removed the helper-only regression test/import; PITR expiry is covered by the live compaction reclaimer tests that clear `expired_pitr_interval_rows` with `udb::compare_and_clear`.
+- Files changed: `engine/packages/depot/src/conveyer/pitr_interval.rs`, `engine/packages/depot/tests/conveyer_pitr_interval.rs`, `.agent/notes/sqlite-review-issues.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+- Verification: `rg -n "delete_expired_pitr_interval_coverage" /home/nathan/r2/engine/packages/depot/src /home/nathan/r2/engine/packages/depot/tests --glob '!target/**'` now returns no matches; `cargo test -p depot pitr_interval`, `cargo check -p depot`, and `cargo test -p depot` passed.
 - **Learnings for future iterations:**
-  - Keep `/META/quota` as a raw 8-byte signed LE value rather than vbare so FDB-style atomic add composes exactly.
-  - The new crate's integration tests can spin up a real RocksDB-backed `universaldb::Database` directly when the copied legacy `test_utils` module is intentionally not exported.
-  - Quota cap errors stay typed through `anyhow` when returning `SqliteStorageError::SqliteStorageQuotaExceeded.into()`.
+  - PITR interval expiry should flow through the compaction reclaimer, where stale rows are cleared with `udb::compare_and_clear`.
+  - Keep `pitr_interval` helper tests focused on read/write/scan selection; deletion semantics belong in reclaimer workflow coverage.
 ---
-## 2026-04-29 05:06:10 PDT - US-007
-- Added `pump::actor_db::ActorDb` with the per-actor UDB handle, PIDX cache, quota cache, metering counters, and compaction trigger throttle timestamp.
-- Wired `ActorDb` into `pump/mod.rs`, added the required `new`, `get_pages`, and `commit` public surface, and kept `get_pages`/`commit` as staged `todo!()` implementations for US-008 and US-009.
-- Added the debug-only synchronous `takeover::reconcile` stub called by `ActorDb::new`.
-- Verified `cargo check -p sqlite-storage`, `cargo test -p sqlite-storage`, and `git diff --check`.
-- Files changed: `engine/packages/sqlite-storage/Cargo.toml`, `engine/packages/sqlite-storage/src/pump/actor_db.rs`, `engine/packages/sqlite-storage/src/pump/mod.rs`, `engine/packages/sqlite-storage/src/takeover.rs`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+## 2026-05-01 15:29:34 PDT - US-006
+- Removed the debug takeover scan of legacy database-scoped `META`/`DELTA`/`PIDX`/`SHARD` keys and left `reconcile_inner` as an explicit no-op until a branch-scoped invariant check exists.
+- Kept the legacy key helpers for v1 pegboard actor compatibility and documented that contract in `conveyer/keys.rs` plus depot `AGENTS.md`.
+- Updated `tests/takeover.rs` to prove malformed legacy database-scoped rows are ignored.
+- Carried forward the pre-existing depot tier-matrix test changes already present in the worktree; the workflow matrix macro needed `async move $body` for the full depot suite to compile.
+- Files changed: `engine/packages/depot/AGENTS.md` (via `CLAUDE.md` symlink), `engine/packages/depot/src/conveyer/keys.rs`, `engine/packages/depot/src/takeover.rs`, `engine/packages/depot/tests/takeover.rs`, `engine/packages/depot/tests/conveyer_branch.rs`, `engine/packages/depot/tests/conveyer_restore_point.rs`, `engine/packages/depot/tests/workflow_compaction_skeletons.rs`, `.agent/notes/depot-tier-test-matrix-results.md`, `.agent/notes/sqlite-review-issues.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+- Verification: `rg -n "depot_keys::(meta_head_key|delta_prefix|pidx_delta_prefix|shard_prefix)|\\b(meta_head_key|delta_prefix|pidx_delta_prefix|shard_prefix)\\(" engine/packages --glob '!target/**'`, `cargo test -p depot --test takeover legacy_database_scoped_rows_are_ignored`, `cargo test -p depot`, and `cargo check -p depot -p pegboard` passed.
 - **Learnings for future iterations:**
-  - `ActorDb` owns only per-actor hot-path cache state; the WS connection will own any map of actor ids to `Arc<ActorDb>`.
-  - `takeover::reconcile` is sync for now because `ActorDb::new` is intentionally sync and release builds do no takeover work.
-  - The staged `get_pages` and `commit` methods can import `DirtyPage` and `FetchedPage` from `pump::types` without reintroducing legacy protocol types.
+  - Legacy database-scoped depot key helpers are still load-bearing for v1 pegboard actor cleanup and migration fallback.
+  - Current Depot invariant checks must target branch-scoped storage; scanning legacy database-scoped keys is only checking compatibility debris.
+  - Use `async move $body` in the workflow matrix macro so per-run locals inside the macro body are created inside each generated future.
 ---
-## 2026-04-29 05:10:32 PDT - US-008
-- Implemented `ActorDb::get_pages` in `pump/read.rs` with `/META/head` loading, warm PIDX cache lookup, cold in-tx PIDX prefix scan, DELTA/SHARD blob fetching, stale-PIDX shard fallback, cache eviction, and read-byte rollup increments.
-- Added focused `pump_read` integration coverage for cold PIDX scan, warm cache reuse, stale PIDX fallback to shard, and above-EOF reads against a real RocksDB-backed UDB.
-- Files changed: `engine/packages/sqlite-storage/Cargo.toml`, `engine/packages/sqlite-storage/src/pump/actor_db.rs`, `engine/packages/sqlite-storage/src/pump/mod.rs`, `engine/packages/sqlite-storage/src/pump/read.rs`, `engine/packages/sqlite-storage/tests/pump_read.rs`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+## 2026-05-01 15:33:34 PDT - US-007
+- Documented the SQLite VFS `io_sync` durability contract directly above the callback.
+- Added the same reusable invariant to the repo-level `AGENTS.md` via the `CLAUDE.md` symlink.
+- Files changed: `rivetkit-rust/packages/rivetkit-sqlite/src/vfs.rs`, `CLAUDE.md`, `.agent/notes/sqlite-review-issues.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+- Verification: `cargo check -p rivetkit-sqlite` passed with existing Rust 2024 unsafe-operation warnings.
 - **Learnings for future iterations:**
-  - Raw SQLite storage prefix scans should use `Subspace::from(tuple::Subspace::from_bytes(prefix))` for the range rather than hand-rolled `end_of_key_range` bounds.
-  - `ActorDb` methods implemented in sibling pump modules need `pub(super)` access to the per-actor fields owned by `actor_db.rs`.
-  - The read path can validate cache behavior by deleting PIDX rows after the first read; a warm cache should still route to the cached DELTA until stale fallback evicts it.
+  - SQLite VFS `xSync` returns after `ctx.flush_dirty_pages()` resolves, so byte durability depends on depot's `sqlite_commit` reply waiting for the FDB transaction commit.
+  - If pegboard-envoy ever pre-acks before the FDB tx commit, the VFS `xSync` durability contract is broken.
 ---
-## 2026-04-29 05:15:43 PDT - US-009
-- Implemented `ActorDb::commit` as a single-shot stateless pump write path with lazy `/META/head` init, cold quota loading via `tokio::try_join!`, DELTA chunk writes, PIDX upserts, quota cap checks, local quota/cache updates, and shrink cleanup for above-EOF PIDX/SHARD rows.
-- Replaced the `pump_commit` placeholder with integration coverage for first commit init, steady-state commit plus warm-cache updates, quota rejection before writes, and shrink cleanup.
-- Verified `cargo check -p sqlite-storage`, `cargo test -p sqlite-storage --test pump_commit`, `cargo test -p sqlite-storage`, and `git diff --check`.
-- Files changed: `engine/packages/sqlite-storage/Cargo.toml`, `engine/packages/sqlite-storage/src/pump/actor_db.rs`, `engine/packages/sqlite-storage/src/pump/mod.rs`, `engine/packages/sqlite-storage/src/pump/commit.rs`, `engine/packages/sqlite-storage/tests/pump_commit.rs`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+## 2026-05-01 15:35:33 PDT - US-008
+- Added `query_sql_with_embedded_nul_is_rejected` to pin that SQL strings with embedded NUL bytes are rejected before SQLite prepare.
+- The new test inspects the `anyhow::Error` chain and confirms the `CString::new(sql)` NUL-byte error is surfaced.
+- Files changed: `rivetkit-rust/packages/rivetkit-sqlite/tests/query_text_nul.rs`, `.agent/notes/sqlite-review-issues.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+- Verification: `cargo test -p rivetkit-sqlite query_sql_with_embedded_nul_is_rejected`, `cargo check -p rivetkit-sqlite`, and `cargo test -p rivetkit-sqlite` passed with existing `vfs.rs` Rust 2024 unsafe-operation warnings.
 - **Learnings for future iterations:**
-  - Keep commit's steady-state UDB reads to `/META/head`; a cold quota cache is the only path that should add the `/META/quota` read.
-  - Commit can split encoded LTX bytes across `DELTA/{txid}/{chunk_idx}` rows and the existing read path will concatenate them by prefix scan.
-  - Do not warm a cold PIDX cache from commit alone; otherwise future reads can skip the full PIDX scan and miss older rows.
+  - Keep SQL-string NUL rejection separate from bound TEXT NUL support: `BindParam::Text("a\0b")` round-trips, but SQL text containing `\0` is rejected at `CString::new(sql)`.
+  - For query helper error tests, inspect `anyhow::Error::chain()` so wrapper changes do not hide the underlying CString failure.
 ---
-## 2026-04-29 07:14:10 PDT - US-024
-- Added envoy-protocol `v3.bare` with stateless SQLite `get_pages` and single-shot `commit`, optional debug fence fields, and no startup/open/close/staged-commit operation types.
-- Bumped Rust and TypeScript latest protocol exports to v3, updated vbare version handling, and added protocol round-trip coverage for requests, responses, optional fields, version constants, and removed op names.
-- Removed old SQLite startup-data and staged-commit plumbing from envoy-client, pegboard-envoy, pegboard-outbound, rivetkit-core, and rivetkit-sqlite so the workspace compiles against the v3 protocol.
-- Verified `cargo check -p rivet-envoy-protocol`, `cargo test -p rivet-envoy-protocol`, `cargo check --workspace`, `cargo test -p rivetkit-sqlite --lib --no-run`, `pnpm --filter @rivetkit/engine-envoy-protocol check-types`, and `git diff --check`.
-- Files changed: `engine/sdks/schemas/envoy-protocol/v3.bare`, `engine/sdks/rust/envoy-protocol/**`, `engine/sdks/typescript/envoy-protocol/src/index.ts`, `engine/sdks/rust/envoy-client/**`, `engine/packages/{pegboard-envoy,pegboard-outbound,pegboard,engine}/**`, `rivetkit-rust/packages/{rivetkit-core,rivetkit-sqlite}/**`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+## 2026-05-01 15:42:01 PDT - US-009
+- Re-verified S7 and closed it as `wontfix` instead of changing code.
+- Grep showed `VfsContext::new` calls `fetch_initial_main_page`, and the fetched page flows into `VfsState::seed_main_page`; `cargo check -p rivetkit-sqlite` passed without dead-code warnings for either helper.
+- Files changed: `.agent/notes/sqlite-review-issues.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+- Verification: `rg -n "seed_main_page|fetch_initial_main_page" /home/nathan/r2/rivetkit-rust/packages/rivetkit-sqlite /home/nathan/r2/.agent/notes/sqlite-review-issues.md /home/nathan/r2/scripts/ralph --glob '!target/**'`; `cargo check -p rivetkit-sqlite`.
 - **Learnings for future iterations:**
-  - The PRD path names for envoy-protocol were stale; use `engine/sdks/rust/envoy-protocol` and package name `rivet-envoy-protocol`.
-  - The Rust build can pass while checked-in TS protocol output is stale if `node_modules/@bare-ts/tools` is absent; regenerate or typecheck the TS package explicitly.
-  - Removing SQLite startup data requires updating callback signatures in tests and runtime callbacks, not just the protocol schema.
-  - `rivetkit-sqlite` has test-only transport doubles in `src/vfs.rs`; compile them with `cargo test -p rivetkit-sqlite --lib --no-run` after changing envoy SQLite protocol shapes.
+  - `fetch_initial_main_page` and `seed_main_page` are live on production opens and refresh `page_size` from page 1's SQLite header.
+  - The test-only direct transport path seeds from `snapshot_pages`, so it bypasses the production initial-page fetch under `#[cfg(test)]`.
 ---
-## 2026-04-29 05:18:24 PDT - US-010
-- Added stateless pump Prometheus metrics for commit/get_pages duration, dirty page count, requested page count, and PIDX cold scans, all labeled by `node_id`.
-- Stored `rivet_pools::NodeId` on `ActorDb` so production callers can pass `pools.node_id()` when constructing per-actor handles.
-- Wired commit/read metrics into the existing hot paths and updated current integration tests for the new constructor shape.
-- Verified `cargo check -p sqlite-storage`, `cargo test -p sqlite-storage`, and `git diff --check`.
-- Files changed: `engine/packages/sqlite-storage/Cargo.toml`, `engine/packages/sqlite-storage/src/pump/actor_db.rs`, `engine/packages/sqlite-storage/src/pump/commit.rs`, `engine/packages/sqlite-storage/src/pump/metrics.rs`, `engine/packages/sqlite-storage/src/pump/mod.rs`, `engine/packages/sqlite-storage/src/pump/read.rs`, `engine/packages/sqlite-storage/tests/pump_commit.rs`, `engine/packages/sqlite-storage/tests/pump_read.rs`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+## 2026-05-01 15:43:41 PDT - US-010
+- Removed the unnecessary post-fetch `state.write()` guard in `resolve_pages`.
+- Cloned the internally synchronized `moka::Cache` handle under a short read and used that handle for fetched-page inserts.
+- Cleaned up the shifted `match` and cache-fill loop indentation.
+- Files changed: `rivetkit-rust/packages/rivetkit-sqlite/src/vfs.rs`, `.agent/notes/sqlite-review-issues.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+- Verification: `cargo check -p rivetkit-sqlite`; `cargo test -p rivetkit-sqlite`.
 - **Learnings for future iterations:**
-  - Pump metrics should use the exact `sqlite_pump_*` names from the PRD and a single `node_id` label.
-  - Passing `NodeId` into `ActorDb` keeps metric labeling local to the pump without threading `Pools` through hot-path methods.
-  - Histogram timers from `prometheus` observe on drop, so placing them at method entry records both success and early-error exits.
+  - `moka::Cache` is internally synchronized; VFS code should not hold a broad state write guard only to insert into `page_cache`.
+  - For cache-fill paths, clone the cache handle under a short read when the loop does not need other mutable VFS state.
 ---
-## 2026-04-29 05:22:59 PDT - US-011
-- Added the `sqlite.compact` UPS subject wrapper and fire-and-forget `publish_compact_trigger` helper for compaction triggers.
-- Added a versioned BARE `SqliteCompactPayload` with encode/decode helpers, currently stubbing metering counters to zero until US-016 wires snapshots.
-- Replaced the compactor dispatch placeholder with tests for subject display, payload vbare round trips, unit return type, nonblocking spawn behavior, and UPS memory-driver delivery.
-- Verified `cargo check -p sqlite-storage`, `cargo test -p sqlite-storage --test compactor_dispatch`, and `cargo test -p sqlite-storage`.
-- Files changed: `engine/packages/sqlite-storage/Cargo.toml`, `engine/packages/sqlite-storage/src/compactor/mod.rs`, `engine/packages/sqlite-storage/src/compactor/publish.rs`, `engine/packages/sqlite-storage/src/compactor/subjects.rs`, `engine/packages/sqlite-storage/tests/compactor_dispatch.rs`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+## 2026-05-01 15:48:55 PDT - US-011
+- Moved the VFS direct-storage and mock-protocol test fixtures from `src/vfs.rs` into `tests/inline/vfs_support.rs`.
+- Re-exported those support items from the existing path-shimmed `tests/inline/vfs.rs` module and updated test-only transport references in `src/vfs.rs` to use `tests::...`.
+- Files changed: `rivetkit-rust/packages/rivetkit-sqlite/src/vfs.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/vfs.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/vfs_support.rs`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+- Verification: `cargo check -p rivetkit-sqlite`; `cargo test -p rivetkit-sqlite`.
 - **Learnings for future iterations:**
-  - UPS queue dispatch can be tested with `universalpubsub::driver::memory::MemoryDriver` by queue-subscribing before calling the spawned publisher.
-  - Add `tokio`'s `test-util` feature as a dev-dependency when a crate needs `#[tokio::test(start_paused = true)]`.
-  - The compactor trigger helper intentionally returns `()` so call sites cannot accidentally await publish before responding to the actor.
+  - A path-shimmed Rust test module can own a sibling support module and `pub(super) use` its fixtures back to the production module for `#[cfg(test)]` transport wiring.
+  - Fixture fields that tests mutate directly, such as `MockProtocol::get_pages_response`, need crate-visible access after being moved into a child support module.
 ---
-## 2026-04-29 05:28:41 PDT - US-012
-- Implemented the UDB-backed compactor lease helpers for take, renew, release, and vbare encode/decode of `/META/compactor_lease`.
-- Added lease tests for empty acquisition, held-lease skip, OCC take races, renewal success, stolen/expired renewal detection, and release cleanup.
-- Verified `cargo test -p sqlite-storage --test compactor_lease`, `cargo check -p sqlite-storage`, and `cargo test -p sqlite-storage`.
-- Files changed: `engine/packages/sqlite-storage/src/compactor/lease.rs`, `engine/packages/sqlite-storage/src/compactor/mod.rs`, `engine/packages/sqlite-storage/tests/compactor_lease.rs`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+## 2026-05-01 15:54:29 PDT - US-012
+- Restructured Depot compaction workflows so the concrete workflow entry modules are `src/workflows/db_manager.rs`, `db_hot_compacter.rs`, `db_cold_compacter.rs`, and `db_reclaimer.rs`.
+- Moved shared compaction contracts, helper logic, companion-loop orchestration, and debug test hooks into `src/compaction/`.
+- Preserved the existing public `depot::workflows::compaction::*` facade while deleting the old `src/workflows/compaction.rs` umbrella and `src/workflows/compaction/` directory.
+- Files changed: `engine/packages/depot/src/workflows/mod.rs`, `engine/packages/depot/src/workflows/{db_manager,db_hot_compacter,db_cold_compacter,db_reclaimer}.rs`, `engine/packages/depot/src/compaction/{mod,types,shared,companion,test_hooks}.rs`, `engine/packages/depot/src/lib.rs`, `engine/packages/depot/CLAUDE.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+- Verification: `cargo test -p depot`; `cargo check -p depot`.
 - **Learnings for future iterations:**
-  - Lease values are local vbare payloads with `rivet_pools::NodeId` as the holder, matching the process node id used by future compactor workers.
-  - Lease take and renew must use regular `Serializable` reads so concurrent pods racing the same key conflict through UDB OCC.
-  - UDB's automatic retry hides raw OCC conflicts; set `DatabaseOption::TransactionRetryLimit(1)` in tests that need to assert one racing transaction aborts.
+  - The actual compaction workflow names are `DbManagerWorkflow`, `DbHotCompacterWorkflow`, `DbColdCompacterWorkflow`, and `DbReclaimerWorkflow`; `companion` is shared loop logic.
+  - Public callers should keep importing workflow contracts from `depot::workflows::compaction::*`; internal workflow files can use `crate::compaction::*` and `crate::compaction::shared::*`.
+  - Moving modules out from an old parent may require widening formerly sibling-only `pub(super)` helpers to `pub(crate)`.
 ---
-## 2026-04-29 05:31:59 PDT - US-013
-- Added `compactor::shard::fold_shard` with snapshot SHARD reads, page-size and shard-membership validation, newer update wins merge semantics, and SHARD blob rewrite.
-- Replaced the `compactor_compact` placeholder with real RocksDB-backed tests for empty folds, existing-shard merges, full overwrite, partial overwrite, and distinct-page byte accounting.
-- Verified `cargo check -p sqlite-storage`, `cargo test -p sqlite-storage --test compactor_compact`, `cargo test -p sqlite-storage`, and `git diff --check`.
-- Files changed: `engine/packages/sqlite-storage/src/compactor/shard.rs`, `engine/packages/sqlite-storage/src/compactor/mod.rs`, `engine/packages/sqlite-storage/tests/compactor_compact.rs`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+## 2026-05-01 15:58:02 PDT - US-013
+- Added `direct_engine_crash_with_dirty_buffer_recovers_last_commit` to cover the VFS crash window where dirty pages are buffered locally but the commit never acks.
+- The test seeds a durable row, injects an `empty_db_page()` into the VFS dirty buffer, forces the close-time commit to fail via `DirectTransportHooks::fail_next_commit`, and verifies reopen sees the last successful commit.
+- Files changed: `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/vfs.rs`, `.agent/notes/sqlite-review-issues.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+- Verification: `cargo test -p rivetkit-sqlite direct_engine_crash_with_dirty_buffer_recovers_last_commit`, `cargo check -p rivetkit-sqlite`, and `cargo test -p rivetkit-sqlite` passed with existing Rust 2024 unsafe-operation warnings.
 - **Learnings for future iterations:**
-  - `fold_shard` should be called inside an existing UDB transaction so US-014 can compose SHARD writes with PIDX `COMPARE_AND_CLEAR`, DELTA cleanup, and `/META/compact` updates.
-  - Existing SHARD blobs are read with snapshot isolation; compaction write-phase conflict behavior belongs around `/META/head`, not the per-shard fold helper.
-  - LTX encodes absolute page numbers and rejects page 0, so use page ranges like `64..128` when testing all 64 pages in shard 1.
+  - Use `DirectTransportHooks::fail_next_commit` to simulate a commit request that never becomes durable in the direct VFS test harness.
+  - Reopening against the same `DirectStorage` is the clean way to verify crash-recovery state, because the new VFS context seeds from the committed storage snapshot instead of the dead handle's local dirty buffer.
 ---
-## 2026-04-29 05:38:18 PDT - US-014
-- Implemented `compactor::compact_default_batch` with snapshot planning, fresh write transactions, SHARD folding, PIDX `COMPARE_AND_CLEAR`, DELTA cleanup, compact META updates, quota decrementing, cancellation checks, and compactor counters.
-- Added compaction race coverage for basic folding, stale-PIDX no-op behavior, and shrink conflict aborts.
-- Verified `cargo check -p sqlite-storage`, `cargo test -p sqlite-storage --test compactor_compact`, `cargo test -p sqlite-storage`, and `git diff --check`.
-- Files changed: `engine/packages/sqlite-storage/Cargo.toml`, `engine/packages/sqlite-storage/src/compactor/compact.rs`, `engine/packages/sqlite-storage/src/compactor/metrics.rs`, `engine/packages/sqlite-storage/src/compactor/mod.rs`, `engine/packages/sqlite-storage/tests/compactor_compact.rs`, `CLAUDE.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+## 2026-05-01 16:02:03 PDT - US-014
+- Added `concurrent_reader_during_commit_atomic_observes_consistent_snapshot` to cover a reader issuing xRead while a writer is held mid-`commit_atomic_write`.
+- Extended `DirectTransportHooks` with `pause_next_commit`, a deterministic commit gate used only by the direct VFS test transport.
+- Updated the S9 issue note to remove concurrent-reader coverage from the remaining missing list; PITR-restore-then-write and fork-and-immediately-reopen remain open.
+- Files changed: `rivetkit-rust/packages/rivetkit-sqlite/src/vfs.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/vfs.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/vfs_support.rs`, `.agent/notes/sqlite-review-issues.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+- Verification: `cargo test -p rivetkit-sqlite concurrent_reader_during_commit_atomic_observes_consistent_snapshot`, `cargo check -p rivetkit-sqlite`, and `cargo test -p rivetkit-sqlite` passed with existing Rust 2024 unsafe-operation warnings.
 - **Learnings for future iterations:**
-  - Compaction race tests can use debug-only pause hooks around the plan/write boundary to deterministically interleave commits and shrink transactions.
-  - `COMPARE_AND_CLEAR` does not report whether it cleared, so the current compactor counts no-ops with a post-write snapshot read of attempted PIDX delete keys.
-  - Prefix clears against raw sqlite-storage byte keys should use UniversalDB subspace ranges, matching prefix scan behavior.
+  - Use `DirectTransportHooks::pause_next_commit` when a VFS test needs to pause after the commit request enters direct transport but before the commit ack returns.
+  - For raw xRead coverage, construct a `VfsFile` with the target `VfsContext` and call `io_read` directly from a scoped reader thread.
 ---
-## 2026-04-29 05:48:24 PDT - US-015
-- Implemented the standalone sqlite compactor worker entrypoint, including `CompactorConfig`, `start`, the UPS queue-subscribe loop, bounded per-trigger worker tasks, lease take/renew/release, local deadline cancellation, and graceful shutdown cancellation.
-- Added dispatch coverage for UPS-triggered compaction, renewal extending the local deadline, and renewal failure cancelling an in-flight compaction.
-- Serialized existing compaction pause-hook tests so shared debug hooks cannot trap unrelated same-actor compaction tests.
-- Verified `cargo check -p sqlite-storage`, `cargo test -p sqlite-storage --test compactor_dispatch`, `cargo test -p sqlite-storage --test compactor_compact`, `cargo test -p sqlite-storage`, and `git diff --check`.
-- Files changed: `engine/packages/sqlite-storage/Cargo.toml`, `Cargo.lock`, `engine/packages/sqlite-storage/src/compactor/mod.rs`, `engine/packages/sqlite-storage/src/compactor/worker.rs`, `engine/packages/sqlite-storage/tests/compactor_dispatch.rs`, `engine/packages/sqlite-storage/tests/compactor_compact.rs`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+## 2026-05-01 16:09:20 PDT - US-015
+- Added Depot integration coverage for PITR-restore-then-write via `write_after_pitr_restore_lands_on_restored_branch`.
+- Fixed capped ancestor reads so `get_pages` scans historical DELTA rows up to the ancestor cap when latest PIDX points past the fork/restore point.
+- Files changed: `engine/packages/depot/src/conveyer/read.rs`, `engine/packages/depot/src/conveyer/read/plan.rs`, `engine/packages/depot/tests/conveyer_restore_point.rs`, `engine/packages/depot/CLAUDE.md`, `.agent/notes/sqlite-review-issues.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+- Verification: `cargo test -p depot write_after_pitr_restore_lands_on_restored_branch`, `cargo check -p depot`, and `cargo test -p depot`.
 - **Learnings for future iterations:**
-  - Worker tests can drive the real compactor through `worker::test_hooks::handle_trigger_once` after receiving a UPS memory-driver payload.
-  - Lease renewal tests that use the compaction pause hook should either use real time for renewal-extension assertions or explicitly yield before advancing paused time.
-  - Same-actor `compact_default_batch` tests must not run concurrently with installed pause hooks because the hook slot is process-global.
+  - Latest PIDX is a current-owner map, so capped ancestor reads must scan capped DELTA history when parent commits after the cap have moved PIDX forward.
+  - Depot returns zero-filled bytes for missing in-range pages; only pages above `db_size_pages` return `None`.
+  - A fresh `Db` handle is useful after restore/write tests to prove durable branch state instead of a local cache result.
 ---
-## 2026-04-29 05:56:48 PDT - US-016
-- Added SQLite namespace metric variants for storage used, commit bytes, and read bytes.
-- Wired compactor metering rollup after successful compaction, reading `/META/quota` and emitting rounded commit/read payload counters through `MetricKey` atomic adds.
-- Added `ActorDb::take_metering_snapshot()` and expanded compact trigger payloads to carry optional namespace id, actor name, and counter snapshots.
-- Verified `cargo check -p sqlite-storage`, `cargo check -p namespace`, `cargo test -p sqlite-storage --test compactor_compact`, `cargo test -p sqlite-storage --test compactor_dispatch`, and `cargo test -p sqlite-storage`.
-- Files changed: `Cargo.lock`, `engine/packages/namespace/src/keys/metric.rs`, `engine/packages/sqlite-storage/Cargo.toml`, `engine/packages/sqlite-storage/src/compactor/mod.rs`, `engine/packages/sqlite-storage/src/compactor/publish.rs`, `engine/packages/sqlite-storage/src/compactor/worker.rs`, `engine/packages/sqlite-storage/src/pump/actor_db.rs`, `engine/packages/sqlite-storage/tests/compactor_compact.rs`, `engine/packages/sqlite-storage/tests/compactor_dispatch.rs`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+## 2026-05-01 16:12:16 PDT - US-016
+- Added Depot integration coverage for fork-and-immediately-reopen via `fork_database_immediate_reopen_isolated_from_parent_later_writes`.
+- The test forks at a known source commit, immediately opens a fresh fork `Db`, verifies pre-fork pages plus sparse-page/EOF behavior, advances the parent, and verifies another fresh fork `Db` still excludes the parent's later writes.
+- Files changed: `engine/packages/depot/tests/fork_database.rs`, `.agent/notes/sqlite-review-issues.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+- Verification: `cargo test -p depot fork_database_immediate_reopen_isolated_from_parent_later_writes`, `cargo check -p depot`, and `cargo test -p depot`.
 - **Learnings for future iterations:**
-  - The metric key enum lives in the `namespace` crate at `engine/packages/namespace/src/keys/metric.rs`, even though pegboard call sites reach it through `namespace::keys::metric`.
-  - Keep `publish_compact_trigger(&ups, actor_id)` as a zero-counter compatibility helper; use richer compact payloads for metering-aware paths.
-  - The compactor rounds commit/read rollup counters down to `util::metric::KV_BILLABLE_CHUNK` before emitting namespace metrics.
+  - Fork isolation tests should reopen with a fresh `Db` handle after parent writes to prove branch metadata and storage reads are correct without relying on a warmed cache.
+  - Depot returns zero-filled bytes for missing pages within `db_size_pages`, while pages above the fork head's `db_size_pages` return `None`.
 ---
-## 2026-04-29 06:03:57 PDT - US-017
-- Added debug-only `compactor::compact::validate_quota`, which totals PIDX, DELTA, and SHARD bytes in a separate read-only UDB transaction and compares that manual total with `/META/quota`.
-- Wired worker-side per-actor validation cadence through a debug-only `scc::HashMap<String, u32>` and `quota_validate_every`, with structured mismatch logging, the `sqlite_quota_validate_mismatch_total` metric, and test-only panic behavior.
-- Added compactor coverage for a clean compacted-state quota validation pass.
-- Verified `cargo check -p sqlite-storage`, `cargo test -p sqlite-storage --test compactor_compact`, `cargo test -p sqlite-storage`, and `cargo build -p sqlite-storage --release`.
-- Files changed: `engine/packages/sqlite-storage/src/compactor/compact.rs`, `engine/packages/sqlite-storage/src/compactor/metrics.rs`, `engine/packages/sqlite-storage/src/compactor/worker.rs`, `engine/packages/sqlite-storage/tests/compactor_compact.rs`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+## 2026-05-01 16:15:30 PDT - US-017
+- Added `direct_engine_open_engine_is_concurrency_safe` to reproduce concurrent `DirectEngineHarness::open_engine()` calls racing on the same RocksDB tempdir.
+- Replaced the harness's non-atomic `std::sync::OnceLock` get-then-set storage initialization and 50 x 10ms retry loop with `tokio::sync::OnceCell::get_or_init`.
+- Files changed: `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/vfs.rs`, `.agent/notes/sqlite-review-issues.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+- Verification: pre-fix `cargo test -p rivetkit-sqlite direct_engine_open_engine_is_concurrency_safe -- --nocapture` failed with RocksDB `LOCK` errors; after the fix, that test passed, `cargo test -p rivetkit-sqlite` passed, and `cargo check -p rivetkit-sqlite` passed with existing Rust 2024 unsafe-operation warnings.
 - **Learnings for future iterations:**
-  - Keep the debug quota validator and worker pass counter fully behind `#[cfg(debug_assertions)]`; release builds should have no validation scan, map, or call site.
-  - Put cfg-gated `lazy_static!` metrics in their own cfg-gated macro block. Gating a single static inside a shared block can break release compilation.
-  - `quota_validate_every = 0` is treated as a local debug escape hatch to skip validation cadence and avoid modulo-by-zero.
+  - The flake was not shared tempdirs across tests; it was concurrent lazy initialization inside one harness instance.
+  - RocksDB allows only one open handle per path, so test helpers that cache a RocksDB-backed engine must make initialization atomic instead of retrying failed opens.
 ---
-## 2026-04-29 06:12:47 PDT - US-018
-- Added the full compactor Prometheus metric set, including node-labeled lease, pass, UPS publish, sampled storage, and debug-only invariant counters.
-- Wired metric observations through compaction, lease take/renew/held paths, UPS publishing, quota validation, and metering rollup.
-- Registered `sqlite_compactor` as a restartable Standalone service in engine run config and added the `sqlite-storage` engine dependency.
-- Added `tests/compactor_metrics.rs` coverage for metric registration, node labels, lease outcome labels, and a trigger-level compactor startup sample.
-- Verified `cargo check -p sqlite-storage`, `cargo test -p sqlite-storage --test compactor_metrics`, `cargo check -p rivet-engine`, `cargo check --workspace`, `cargo build --workspace`, and `git diff --check`.
-- Files changed: `Cargo.lock`, `engine/packages/engine/Cargo.toml`, `engine/packages/engine/src/run_config.rs`, `engine/packages/sqlite-storage/src/compactor/{compact.rs,metrics.rs,mod.rs,publish.rs,worker.rs}`, `engine/packages/sqlite-storage/tests/compactor_metrics.rs`, `.agent/specs/sqlite-storage-pitr-forking.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+## 2026-05-01 16:18:51 PDT - US-018
+- Added `vfs_registration_is_removed_after_registration_panic` to prove a uniquely named SQLite VFS is gone from `sqlite3_vfs_find(...)` after a panic unwind.
+- Split SQLite VFS registration into `SqliteVfsRegistration`, a Drop guard that owns `sqlite3_vfs_register`/`sqlite3_vfs_unregister`; `SqliteVfs` now keeps the VFS name and boxed context alive while that guard unregisters.
+- Files changed: `rivetkit-rust/packages/rivetkit-sqlite/src/vfs.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/vfs.rs`, `CLAUDE.md` via `AGENTS.md`, `.agent/notes/sqlite-review-issues.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+- Verification: `cargo test -p rivetkit-sqlite vfs_registration_is_removed_after_registration_panic`, `cargo check -p rivetkit-sqlite`, and `cargo test -p rivetkit-sqlite` passed with existing Rust 2024 unsafe-operation warnings.
 - **Learnings for future iterations:**
-  - `sqlite_compactor` registration needs both a `run_config.rs` service entry and a normal `sqlite-storage.workspace = true` dependency on `rivet-engine`.
-  - Keep compatibility wrappers for compactor helpers, then add `*_with_node_id` variants where production callers can thread `pools.node_id()`.
-  - Integration tests can assert Prometheus vector label shapes through the `Collector::desc()` descriptors without emitting every label combination first.
+  - Keep SQLite VFS process-global registration ownership in a dedicated guard; code between `sqlite3_vfs_register` and final `SqliteVfs` construction can panic.
+  - Store the VFS context in a `Box<VfsContext>` and pass its stable heap pointer to SQLite instead of manually pairing `Box::into_raw` with `Drop for SqliteVfs`.
 ---
-## 2026-04-29 06:19:01 PDT - US-019
-- Implemented the debug-only takeover invariant scanner for PIDX, DELTA, and SHARD rows.
-- Wired `ActorDb::new` to run the scanner in debug builds and record `sqlite_takeover_invariant_violation_total` with structured violation logs before panicking.
-- Replaced the takeover placeholder with coverage for clean state, above-EOF rows, above-head DELTAs, and dangling PIDX references.
-- Fixed the shrink commit fixture so seeded PIDX rows point at an existing DELTA before debug reconciliation runs.
-- Verified `cargo test -p sqlite-storage --test takeover`, `cargo test -p sqlite-storage`, `cargo check -p sqlite-storage`, `cargo build -p sqlite-storage --release`, `cargo check --workspace`, and `git diff --check`.
-- Files changed: `engine/packages/sqlite-storage/src/takeover.rs`, `engine/packages/sqlite-storage/src/pump/actor_db.rs`, `engine/packages/sqlite-storage/tests/takeover.rs`, `engine/packages/sqlite-storage/tests/pump_commit.rs`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+## 2026-05-01 16:25:05 PDT - US-019
+- Added `native_database_drop_times_out_pending_commit` to prove `NativeDatabase::Drop` returns when the commit future never resolves.
+- Added a pending-commit mode to `MockProtocol`, then bounded drop-time dirty-page flushes with `tokio::time::timeout`; on timeout, Drop logs `tracing::error!`, nulls the DB pointer, and returns without calling `sqlite3_close_v2`.
+- Files changed: `rivetkit-rust/packages/rivetkit-sqlite/src/vfs.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/vfs.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/vfs_support.rs`, `CLAUDE.md` via `AGENTS.md`, `.agent/notes/sqlite-review-issues.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+- Verification: `cargo test -p rivetkit-sqlite native_database_drop_times_out_pending_commit` failed before the close-path adjustment by timing out at 2s; after the fix, it passed. `cargo check -p rivetkit-sqlite` and `cargo test -p rivetkit-sqlite` passed with existing Rust 2024 unsafe-operation warnings.
 - **Learnings for future iterations:**
-  - `ActorDb::new` is still synchronous, so the async debug scanner uses a debug-only blocking wrapper on a short-lived runtime.
-  - Takeover invariant labels are limited to `above_eof`, `above_head_txid`, and `dangling_pidx_ref`.
-  - Fixtures that manually seed PIDX rows must also seed the referenced DELTA row or debug reconciliation will panic before the test reaches the code under test.
+  - Build `tokio::time::timeout` inside the `Handle::block_on(async { ... })` context; constructing it outside the runtime panics.
+  - Use a multi-thread Tokio runtime for tests that drop a `NativeDatabase` from a separate `std::thread`, otherwise current-thread timers may not advance there.
+  - If a drop-time commit times out, `sqlite3_close_v2` can re-enter VFS close/flush work, so return immediately after logging.
 ---
-## 2026-04-29 06:23:13 PDT - US-020
-- Wired `ActorDb::commit` to read `/META/compact`, check the compaction delta threshold, throttle per-actor trigger publishes, and send detached UPS compaction payloads after successful commits.
-- Added `COMPACTION_DELTA_THRESHOLD`, threaded UPS through `ActorDb::new`, and updated pump read/commit tests for the new constructor shape.
-- Added paused-time coverage proving first trigger publish, throttle suppression inside 500ms, and a later safety publish after the 30s silence cap.
-- Files changed: `engine/packages/sqlite-storage/src/pump/actor_db.rs`, `engine/packages/sqlite-storage/src/pump/commit.rs`, `engine/packages/sqlite-storage/src/pump/quota.rs`, `engine/packages/sqlite-storage/tests/pump_commit.rs`, `engine/packages/sqlite-storage/tests/pump_read.rs`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+## 2026-05-01 16:29:09 PDT - US-020
+- Replaced the shard-cache fill queue's shared `Arc<Mutex<mpsc::Receiver<ShardCacheFillJob>>>` with `async-channel`.
+- Each cache-fill worker now owns a cloned receiver and awaits jobs directly, removing the serialized receiver lock from the dispatch path.
+- Files changed: `Cargo.lock`, `engine/packages/depot/Cargo.toml`, `engine/packages/depot/src/conveyer/read/cache_fill.rs`, `engine/packages/depot/AGENTS.md`, `.agent/notes/sqlite-review-issues.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+- Verification: `cargo test -p depot`; `cargo check -p depot`.
 - **Learnings for future iterations:**
-  - `ActorDb` now owns a cloned `universalpubsub::PubSub` so the pump can publish compaction hints without adding a separate per-connection wrapper inside `sqlite-storage`.
-  - Commit-trigger tests should subscribe before the commit and then decode the vbare UPS payload rather than inspecting internal `last_trigger_at` state.
-  - The trigger path resets metering counters only when a trigger is actually published; throttled commits keep accumulating counters for the next payload.
+  - Use `async-channel::bounded` when Depot needs bounded multi-consumer worker dispatch.
+  - Keep shard-cache fill backpressure and duplicate coalescing in `ShardCacheFillQueue::enqueue`; only the worker receive side needs multi-consumer cloning.
 ---
-## 2026-04-29 06:31:02 PDT - US-021
-- Added the per-connection `actor_dbs` cache to pegboard-envoy with UDB, UPS, and node id handles for constructing `sqlite_storage::pump::ActorDb`.
-- Routed SQLite `get_pages` and `commit` websocket handlers through lazily inserted `ActorDb` instances and removed the old active-actor generation gate from those hot-path requests.
-- Stopped spawning the legacy in-process `CompactionCoordinator`; the legacy engine remains only for still-existing lifecycle and staged-commit paths until the follow-up protocol/lifecycle stories remove them.
-- Files changed: `Cargo.lock`, `engine/packages/pegboard-envoy/Cargo.toml`, `engine/packages/pegboard-envoy/src/conn.rs`, `engine/packages/pegboard-envoy/src/sqlite_runtime.rs`, `engine/packages/pegboard-envoy/src/ws_to_tunnel_task.rs`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+## 2026-05-01 16:33:36 PDT - US-021
+- Replaced debug-only `takeover::reconcile_blocking` with `takeover::reconcile_nonblocking`, scheduling reconcile on the current Tokio runtime or a detached background thread instead of joining from `Db::new_inner`.
+- Added `db_new_does_not_wait_for_takeover_reconcile`, which pauses the debug reconcile with a `Notify` gate, verifies another runtime task makes progress, and asserts the constructor returns before reconcile is released.
+- Files changed: `engine/packages/depot/src/takeover.rs`, `engine/packages/depot/src/conveyer/db.rs`, `engine/packages/depot/tests/takeover.rs`, `engine/packages/depot/AGENTS.md`, `.agent/notes/sqlite-review-issues.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+- Verification: `cargo test -p depot db_new_does_not_wait_for_takeover_reconcile`, `cargo check -p depot`, `cargo test -p depot --test list_databases parent_tombstone_visibility_is_capped_across_deep_bucket_chain -- --nocapture`, and a clean rerun of `cargo test -p depot`.
 - **Learnings for future iterations:**
-  - `pegboard-envoy` still needs temporary old-protocol META response helpers until US-024 updates the wire schema to the new stateless shape.
-  - `ActorDb::new` needs `udb`, `ups`, `actor_id`, and `node_id`; conn construction is the right place to clone all process handles from `Pools`.
-  - Legacy commit-stage handlers still downcast `sqlite_storage_legacy::error::SqliteStorageError`, while new pump handlers downcast `sqlite_storage::error::SqliteStorageError`.
+  - Debug-only constructor checks still run on hot-path constructors, so schedule long or I/O-backed reconcile work in the background.
+  - Use `oneshot` for test completion signals that may fire before the waiter arms; `Notify::notify_waiters()` does not store a permit.
+  - A `Notify` gate is a deterministic slow-operation fixture when a test needs to hold async work pending without adding a real-clock sleep.
 ---
-## 2026-04-29 06:34:47 PDT - US-022
-- Deleted the pegboard-envoy `start_actor` lifecycle path, removed the per-conn `active_actors` map, and removed actor-stopped/open/close/force-close SQLite lifecycle side effects.
-- Kept `CommandStartActor` forwarding intact while dropping local start-command dispatch; `CommandStopActor` now only evicts the lazy `actor_dbs` cache.
-- Files changed: `engine/packages/pegboard-envoy/src/actor_lifecycle.rs`, `engine/packages/pegboard-envoy/src/conn.rs`, `engine/packages/pegboard-envoy/src/tunnel_to_ws_task.rs`, `engine/packages/pegboard-envoy/src/ws_to_tunnel_task.rs`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+## 2026-05-01 16:39:06 PDT - US-022
+- Replaced the active DB write fixture's `setTimeout(ACTIVE_DB_WRITE_DELAY_MS)` loop pacing with a WebSocket-driven Promise gate.
+- Unskipped and rewrote the active-db-writes sleep test to issue exactly 3 `continue-write` permits, wait for actor `write` acks, trigger sleep, then assert exactly 3 persisted write rows after wake.
+- Files changed: `rivetkit-typescript/packages/rivetkit/fixtures/driver-test-suite/sleep-db.ts`, `rivetkit-typescript/packages/rivetkit/tests/driver/actor-sleep-db.test.ts`, `.agent/notes/sqlite-review-issues.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+- Verification: `pnpm vitest run tests/driver/actor-sleep-db.test.ts -t active-db-writes`; 10x loop of the same filter; `pnpm run check-types`; `pnpm biome check fixtures/driver-test-suite/sleep-db.ts tests/driver/actor-sleep-db.test.ts`; `pnpm run check:test-skips`; `pnpm run check:wait-for-comments`. `pnpm run check` is not defined in the package, and full `pnpm run lint` is blocked by pre-existing unrelated Biome diagnostics.
 - **Learnings for future iterations:**
-  - `actor_lifecycle.rs` is now intentionally cache-only for SQLite lifecycle; do not add actor-presence or legacy engine open/close work back there.
-  - Missed-command replay and tunnel-to-WS forwarding still send `CommandStartActor` to the envoy, but pegboard-envoy should not mutate it for SQLite startup data.
-  - Existing legacy staged-commit request handlers still compile against `sqlite_engine`; US-024 owns removing the old wire operations.
+  - WebSocket driver tests can make in-flight handler progress deterministic by having the actor await test-issued permit messages and ack each completed unit.
+  - Keep exact-count shutdown tests free of real-clock pacing; trigger sleep only after the expected actor ack has arrived.
 ---
-## 2026-04-29 06:48:44 PDT - US-023
-- Added `actor_sqlite::clear_v2_storage_for_destroy` to clear stateless SQLite META, PIDX, DELTA, SHARD, quota, and compactor lease keys through the caller's UDB transaction.
-- Wired both pegboard actor destroy flows to call the helper from the same `ClearKv` transaction that clears actor KV.
-- Added pegboard-envoy lifecycle tests proving `stop_actor` evicts only the cached `ActorDb`, and pegboard tests proving destroy clears the compactor lease and rolls back all SQLite clears with the caller transaction.
-- Verified `cargo test -p pegboard-envoy --test actor_lifecycle`, `cargo test -p pegboard --test actor_sqlite_destroy`, `cargo test -p pegboard-envoy`, `cargo test -p pegboard`, `cargo check --workspace`, and `git diff --check`.
-- Files changed: `Cargo.lock`, `engine/packages/pegboard-envoy/Cargo.toml`, `engine/packages/pegboard-envoy/tests/actor_lifecycle.rs`, `engine/packages/pegboard/Cargo.toml`, `engine/packages/pegboard/src/actor_sqlite.rs`, `engine/packages/pegboard/src/workflows/actor/destroy.rs`, `engine/packages/pegboard/src/workflows/actor2/mod.rs`, `engine/packages/pegboard/tests/actor_sqlite_destroy.rs`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+## 2026-05-01 16:42:45 PDT - US-023
+- Added `ActorConnRaw.ready`, a per-connection Promise that resolves when the centralized connection status transition first reaches `connected`.
+- Added `ready resolves when connection first opens` in `tests/driver/actor-conn.test.ts` without `vi.waitFor`; the test asserts the Promise is initially pending, resolves when `isConnected` becomes true, and remains the same Promise on later reads.
+- Files changed: `rivetkit-typescript/packages/rivetkit/src/client/actor-conn.ts`, `rivetkit-typescript/packages/rivetkit/tests/driver/actor-conn.test.ts`, `.agent/notes/sqlite-review-issues.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+- Verification: `pnpm vitest run tests/driver/actor-conn.test.ts -t "ready resolves when connection first opens"`; `pnpm run check-types`; `pnpm biome check src/client/actor-conn.ts tests/driver/actor-conn.test.ts`; `pnpm run check:wait-for-comments`. `pnpm run check` is not defined for `rivetkit-typescript/packages/rivetkit`.
 - **Learnings for future iterations:**
-  - `stop_actor` is cache-only; storage cleanup belongs to pegboard destroy, not pegboard-envoy lifecycle handling.
-  - Stateless SQLite actor destroy must clear exact META keys plus SHARD/DELTA/PIDX prefix ranges using `sqlite-storage` key builders.
-  - A rollback test around `clear_v2_storage_for_destroy` verifies the compactor lease clear stays in the same UDB transaction as the other SQLite teardown clears.
+  - Await `connection.ready` when tests need the client WebSocket init round trip to complete.
+  - Resolve one-shot connection readiness from `#setConnStatus("connected")` so it stays aligned with `isConnected`.
 ---
-## 2026-04-29 07:42:42 PDT - US-025
-- Deleted `engine/packages/sqlite-storage-legacy` and removed its workspace dependency plus every remaining crate manifest dependency.
-- Rewired pegboard v1 SQLite migration, migration tests, actor v2.2.1 migration tests, pegboard-envoy page sizing, and the `rivetkit-sqlite` direct test transport to use `sqlite_storage::pump::ActorDb`.
-- Fixed stale Rust test shims uncovered by `cargo test --workspace` in `rivet-util`, `rivet-envoy-client`, `rivetkit`, and `rivetkit-napi`; enabled napi-rs `dyn-symbols` so NAPI test binaries link without Node symbols.
-- Verification: `cargo check --workspace` passed; `cargo build --workspace` passed; `cargo test -p pegboard --test actor_sqlite_migration` passed; `cargo test -p rivetkit-sqlite --lib` passed; `rg 'sqlite_storage_legacy|sqlite-storage-legacy' --type rust --type toml Cargo.lock` returned no hits; `git diff --check` passed.
-- `cargo test --workspace` now fails in unrelated `rivet-guard-core` tests with stale `proxy_service`/`custom_serve` imports and callback signatures.
-- Files changed: `Cargo.toml`, `Cargo.lock`, `engine/packages/sqlite-storage-legacy/**`, `engine/packages/{engine,pegboard,pegboard-envoy,pegboard-outbound}/**`, `engine/packages/util/src/check.rs`, `engine/sdks/rust/envoy-client/src/{actor.rs,events.rs}`, `rivetkit-rust/packages/rivetkit-sqlite/**`, `rivetkit-rust/packages/rivetkit/tests/**`, `rivetkit-typescript/packages/rivetkit-napi/Cargo.toml`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+## 2026-05-01 16:47:42 PDT - US-024
+- Replaced startup-race `vi.waitFor` wrappers with `await connection.ready` plus a single direct DB action/read in the four requested driver test files.
+- Removed the obsolete startup/stopping polling comments and unused ready-timeout constants/imports.
+- Files changed: `rivetkit-typescript/packages/rivetkit/tests/driver/actor-db-stress.test.ts`, `rivetkit-typescript/packages/rivetkit/tests/driver/actor-db.test.ts`, `rivetkit-typescript/packages/rivetkit/tests/driver/actor-db-pragma-migration.test.ts`, `rivetkit-typescript/packages/rivetkit/tests/driver/actor-db-raw.test.ts`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+- Verification: `pnpm run check-types`; `pnpm run check:wait-for-comments`; `pnpm vitest run tests/driver/actor-db-stress.test.ts tests/driver/actor-db.test.ts tests/driver/actor-db-pragma-migration.test.ts tests/driver/actor-db-raw.test.ts` passed. `pnpm run check` is not defined in `rivetkit-typescript/packages/rivetkit`; focused `pnpm biome check` is still blocked by pre-existing formatter/non-null diagnostics in touched files.
 - **Learnings for future iterations:**
-  - v1 SQLite migration can skip old staged-commit machinery entirely by committing recovered pages through a temporary `ActorDb` with a memory UPS handle.
-  - `rivetkit-sqlite` direct-storage tests need a shared harness storage across opens to preserve close/reopen semantics.
-  - Full workspace tests currently expose guard-core test drift unrelated to stateless SQLite; address that separately before treating `cargo test --workspace` as a clean gate.
+  - For first-action startup races, await the actor connection's `ready` promise before issuing the action instead of retrying the action itself.
+  - Reacquire keyed actor handles before verification when that is the existing test pattern, but still gate the single read on `ready`.
 ---
-## 2026-04-29 07:46:04 PDT - US-026
-- Updated `engine/CLAUDE.md` SQLite storage and Pegboard Envoy guidance to remove stale `SqliteEngine`, `CompactionCoordinator`, STAGE, takeover cleanup, and old META-fence notes.
-- Added the current stateless design invariants for `ActorDb` WS-conn caches, `/META/quota`, `/META/compactor_lease`, and compaction PIDX `COMPARE_AND_CLEAR`.
-- Verified `cargo check -p sqlite-storage` and `git diff --check`.
-- Files changed: `engine/CLAUDE.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+## 2026-05-01 16:54:53 PDT - US-025
+- Replaced the target-actor `getCount()` polling loop in `actor-db.test.ts` with polling against a separate `lifecycleObserver` actor.
+- Added opt-in lifecycle event recording to `dbActorRaw` so the sleep test can wait for `sleep` events without sending actions to the target actor; the test asserts the recorded sleep timestamp stays within the original sleep observer window.
+- Replaced the hard-crash target-action retry loop with a single wake/read after `hardCrashActor(...)`.
+- Files changed: `rivetkit-typescript/packages/rivetkit/fixtures/driver-test-suite/actor-db-raw.ts`, `rivetkit-typescript/packages/rivetkit/tests/driver/actor-db.test.ts`, `rivetkit-typescript/CLAUDE.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+- Verification: `pnpm vitest run tests/driver/actor-db.test.ts -t "persists across sleep"`; `pnpm vitest run tests/driver/actor-db.test.ts -t "hard crash"`; `pnpm run check-types`; `pnpm run check:wait-for-comments`; `pnpm biome check fixtures/driver-test-suite/actor-db-raw.ts tests/driver/actor-db.test.ts`. `pnpm run check` is not defined in `rivetkit-typescript/packages/rivetkit`.
 - **Learnings for future iterations:**
-  - `engine/CLAUDE.md` should keep SQLite storage bullets at the invariant/test-convention level and avoid legacy implementation names.
-  - The preserved shrink-write and PIDX encoding bullets are still valid under the stateless pump design.
-  - Docs-only stories can still use `cargo check -p sqlite-storage` as the typecheck gate when the touched guidance is storage-specific.
+  - Polling a separate observer actor does not touch the target actor's HTTP request counter, so it can observe sleep without resetting the target sleep timer.
+  - Holding a normal target actor connection open can prevent this DB actor from sleeping; do not use a target connection as the sleep observer for this fixture.
+---
+## 2026-05-01 16:58:38 PDT - US-026
+- Fixed the shard-cache fill `wait_idle_for_test` lost-wakeup race by pre-arming and enabling `idle_notify.notified()` before loading `outstanding`.
+- Added `shard_cache_fill_wait_idle_prearms_before_rechecking_outstanding`, which forces work to drain and call `notify_waiters()` after the waiter sees nonzero outstanding but before it awaits.
+- Files changed: `engine/packages/depot/src/conveyer/read/cache_fill.rs`, `engine/packages/depot/src/conveyer/db.rs`, `engine/packages/depot/tests/conveyer_read.rs`, `engine/packages/depot/CLAUDE.md`, `.agent/notes/sqlite-review-issues.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+- Verification: `cargo test -p depot shard_cache_fill_wait_idle_prearms_before_rechecking_outstanding`; `cargo test -p depot`.
+- **Learnings for future iterations:**
+  - `Notify::notify_waiters()` does not store permits, so counter waiters must create and enable `notified()` before the counter load and then re-check.
+  - A one-shot debug hook after a nonzero counter load can deterministically reproduce arm-after-check races without timing sleeps.
+---
+## 2026-05-01 17:05:30 PDT - US-027
+- Collapsed Depot's branch read cache from separate `branch_id`, `ancestors`, `last_access_bucket`, and PIDX cache fields into one `CacheSnapshot`.
+- Updated `get_pages` and `commit` to read one snapshot for transaction hints and publish one replacement snapshot under a single write lock when branch state changes.
+- Added `branch_cache_snapshot_is_atomic_across_dbptr_move`, which warms the old branch cache, rolls DBPTR to a new branch, starts concurrent reads with a `Barrier`, and observes that the cache never exposes the new branch id with the old ancestry root.
+- Files changed: `engine/packages/depot/src/conveyer/db.rs`, `engine/packages/depot/src/conveyer/read.rs`, `engine/packages/depot/src/conveyer/commit/apply.rs`, `engine/packages/depot/tests/conveyer_read.rs`, `engine/packages/depot/CLAUDE.md`, `.agent/notes/sqlite-review-issues.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+- Verification: `cargo test -p depot branch_cache_snapshot_is_atomic_across_dbptr_move -- --nocapture`; `cargo check -p depot`; `cargo test -p depot`.
+- **Learnings for future iterations:**
+  - Branch id, ancestry, access bucket, and PIDX cache are one logical read-cache snapshot; update them together so DBPTR moves cannot publish mixed cache state.
+  - Use `tokio::sync::Barrier` when a test needs multiple spawned tasks to start together. `Notify::notify_waiters()` is not a safe start gun unless waiters are already armed.
+---
+## 2026-05-01 17:12:05 PDT - US-028
+- Added `cold_ref_retired_during_cold_object_fetch_errors_instead_of_zero_fill`, which pauses a filesystem cold-tier object read, concurrently retires the compaction cold-shard ref and deletes the cold object, then asserts `get_pages` returns `ShardCoverageMissing` instead of a zero-filled page.
+- Updated cold read-through to distinguish missing cold objects from sparse pages; compaction cold-shard object misses now error, while successful object fetches re-read the live `CMP/cold_shard` ref under `Serializable` before returning bytes or scheduling shard-cache fill.
+- Files changed: `engine/packages/depot/src/conveyer/read/cold.rs`, `engine/packages/depot/tests/conveyer_read.rs`, `engine/packages/depot/AGENTS.md`, `.agent/notes/sqlite-review-issues.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+- Verification: `cargo test -p depot cold_ref_retired_during_cold_object_fetch_errors_instead_of_zero_fill -- --nocapture`; `cargo check -p depot`; `cargo test -p depot`.
+- **Learnings for future iterations:**
+  - A compaction cold-shard candidate is a real source edge: if the object disappears, return `ShardCoverageMissing` instead of falling through to sparse-page zero-fill.
+  - `PageMissing` remains distinct from `ObjectMissing` so sparse pages inside an otherwise valid cold object can still use normal zero-fill semantics.
+  - Cold read-through tests can deterministically pause `ColdTier::get_object` with a small wrapper and mutate UDB/cold storage before releasing the read.
+---
+## 2026-05-01 17:15:47 PDT - US-029
+- Added Depot read-path regression coverage for SQLite sparse-page semantics.
+- `get_pages_zero_fills_sparse_page_without_any_source` pins that an in-range page with no source returns a zero page.
+- `get_pages_errors_for_corrupted_delta_source` pins that a corrupted delta source returns a decode error instead of zero-filling.
+- Files changed: `engine/packages/depot/tests/conveyer_read.rs`, `engine/packages/depot/AGENTS.md` via `CLAUDE.md`, `.agent/notes/sqlite-review-issues.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+- Verification: `cargo test -p depot get_pages_ --test conveyer_read`; `cargo test -p depot`.
+- **Learnings for future iterations:**
+  - Depot `get_pages` returns zero-filled bytes for legitimate sparse in-range pages only when no source exists.
+  - Corrupted source blobs should bubble a read/decode error instead of being treated as sparse pages.
+---
+## 2026-05-01 17:21:10 PDT - US-030
+- Added `create_restore_point_revalidates_target_commit_after_resolve_race`, which pauses restore-point creation after tx A resolves a timestamp target, clears the resolved `COMMITS`, `VTX`, and `PITR_INTERVAL` rows to model reclaim winning the gap, then resumes tx B and asserts `RestoreTargetExpired`.
+- Revalidated the resolved target commit row under `Serializable` inside `create_restore_point_for_resolved` before writing any Ready restore-point record, DB pin, pin count, or branch pin.
+- Added a debug-only restore-point pause hook and recorded the invariant in depot `CLAUDE.md` plus `.agent/notes/sqlite-review-issues.md`.
+- Files changed: `engine/packages/depot/src/conveyer/restore_point.rs`, `engine/packages/depot/src/conveyer/restore_point/pinned.rs`, `engine/packages/depot/src/conveyer/restore_point/test_hooks.rs`, `engine/packages/depot/tests/conveyer_restore_point.rs`, `engine/packages/depot/CLAUDE.md`, `.agent/notes/sqlite-review-issues.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+- Verification: `cargo test -p depot create_restore_point_revalidates_target_commit_after_resolve_race -- --nocapture`, `cargo check -p depot`, and `cargo test -p depot`.
+- **Learnings for future iterations:**
+  - A Ready restore-point record is only valid if the target `COMMITS/{txid}` row still exists in the same transaction that writes the pin.
+  - Debug-only pause hooks are useful for Depot race regressions when the production race is between two UDB transactions.
+---
+## 2026-05-01 17:33:35 PDT - US-031
+- Folded `restore_database` rollback and undo restore-point creation into a single UDB transaction.
+- Split reusable transaction-level helpers out of branch rollback and restore-point pin creation so the public restore flow can compose them atomically.
+- Added `restore_database_rollback_and_undo_pin_are_atomic`, which injects a failure after rollback work but before undo pinning and asserts DBPTR stays unchanged with no undo restore point.
+- Made restore-point debug hooks one-shot and gave hooked tests unique database ids so parallel restore-point tests cannot steal hooks or park after a release.
+- Files changed: `engine/packages/depot/AGENTS.md`, `engine/packages/depot/src/conveyer/branch.rs`, `engine/packages/depot/src/conveyer/branch/lifecycle.rs`, `engine/packages/depot/src/conveyer/restore_point/pinned.rs`, `engine/packages/depot/src/conveyer/restore_point/restore.rs`, `engine/packages/depot/src/conveyer/restore_point/test_hooks.rs`, `engine/packages/depot/tests/conveyer_restore_point.rs`, `.agent/notes/sqlite-review-issues.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+- Verification: `cargo test -p depot restore_database_rollback_and_undo_pin_are_atomic -- --nocapture`; `cargo test -p depot --test conveyer_restore_point -- --nocapture`; `cargo check -p depot`; `cargo test -p depot`.
+- **Learnings for future iterations:**
+  - Restore rollback and undo restore-point pinning are one durability boundary; keep the DBPTR swap and undo pin write in the same UDB transaction.
+  - Debug-only restore-point hooks should be one-shot and scoped to unique test database ids because restore-point tests run in parallel.
+---
+## 2026-05-01 17:37:47 PDT - US-032
+- Added `reclaimer_eviction_preserves_future_pin_reads_via_cold_ref` to cover shard-cache eviction when a restore-point pin is newer than the evicted SHARD.
+- The test creates a real DB, pins txid 2, seeds a matching cold-backed SHARD at txid 1, forces reclaim to evict the FDB SHARD row, clears hot PIDX for page 1, and asserts the read returns the nonzero page through `CMP/cold_shard`.
+- Files changed: `engine/packages/depot/tests/workflow_compaction_skeletons.rs`, `engine/packages/depot/AGENTS.md` (via `CLAUDE.md` symlink), `.agent/notes/sqlite-review-issues.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+- Verification: `cargo test -p depot reclaimer_eviction_preserves_future_pin_reads_via_cold_ref -- --nocapture`, `cargo check -p depot`, and `cargo test -p depot` passed.
+- **Learnings for future iterations:**
+  - A DB pin at txid 2 does not exact-match-retain SHARD txid 1; safety comes from the reclaimer requiring matching `CMP/cold_shard` coverage before FDB SHARD eviction.
+  - To prove the post-eviction read uses cold coverage, clear the hot PIDX for the requested page and assert a nonzero page value that only the cold-backed SHARD can supply.
+---
+## 2026-05-01 17:43:55 PDT - US-033
+- Added `BumpSubSubject::WorkflowCreated { tag }` and safe tag-to-subject encoding in Gasoline.
+- Published workflow-created bumps after top-level workflow and sub-workflow creation commits; unique dispatches that return an existing workflow do not emit created bumps.
+- Added `workflow_created_bump_fires_for_workflow_tag`, which subscribes before dispatching a tagged workflow and asserts the bump arrives without polling.
+- Fixed the existing `join_signal!` doctest snippet so the required full Gasoline package test passes.
+- Files changed: `engine/packages/gasoline/src/db/mod.rs`, `engine/packages/gasoline/src/db/kv/mod.rs`, `engine/packages/gasoline/src/db/kv/subjects.rs`, `engine/packages/gasoline/src/signal.rs`, `engine/packages/gasoline/tests/db_bump.rs`, `.agent/notes/sqlite-review-issues.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+- Verification: `cargo test -p gasoline workflow_created_bump_fires_for_workflow_tag`; `cargo test -p gasoline`; `cargo check -p gasoline`.
+- **Learnings for future iterations:**
+  - Use `BumpSubSubject::WorkflowCreated { tag }` to wait for tagged workflow rows instead of polling `find_workflow`.
+  - Workflow-created bumps are emitted after the creation transaction commits, so waiters should still re-read the row after receiving the notification.
+---
+## 2026-05-01 17:48:05 PDT - US-034
+- Replaced the workflow-row wait in `workflow_compaction_skeletons.rs` with a `BumpSubSubject::WorkflowCreated { tag }` subscription.
+- `wait_for_workflow` now subscribes before its first `find_workflow` check and waits on workflow-created bumps instead of the 25ms `wait_until` polling loop.
+- Left `wait_until` in place for signal debug rows and UDB observation rows that still lack notification hooks.
+- Files changed: `engine/packages/depot/tests/workflow_compaction_skeletons.rs`, `engine/packages/depot/AGENTS.md` (via `CLAUDE.md` symlink), `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+- Verification: `cargo test -p depot --test workflow_compaction_skeletons manager_spawns_companions_and_records_deltas_available -- --nocapture`; `cargo test -p depot`; `cargo check -p depot`.
+- **Learnings for future iterations:**
+  - Workflow row waits should subscribe to `BumpSubSubject::WorkflowCreated { tag }` before the first lookup so creation between checks cannot be missed.
+  - The generic `wait_until` helper is still appropriate for Depot test observations without a Gasoline or UDB notification source.
+---
+## 2026-05-01 18:03:33 PDT - US-035
+- Added internal api-peer Depot inspect routes under `/depot/inspect/...` without touching api-public or generated public SDKs.
+- Implemented `depot::inspect` for bounded summary/catalog/bucket/database/branch JSON, paginated branch row-family scans, raw key lookup, raw scans, and best-effort key/value decode with unpadded base64url keys/cursors.
+- Added focused coverage for route registration, limit cap enforcement, cursor pagination, raw scan cursors, and decoded `pidx` rows.
+- Files changed: `.agent/specs/depot-inspect-api.md`, `Cargo.lock`, `engine/packages/api-peer/Cargo.toml`, `engine/packages/api-peer/src/{depot_inspect,lib,router}.rs`, `engine/packages/api-peer/tests/depot_inspect.rs`, `engine/packages/depot/{Cargo.toml,CLAUDE.md}`, `engine/packages/depot/src/{inspect,lib}.rs`, `engine/packages/depot/src/conveyer/keys.rs`, `engine/packages/depot/tests/inspect.rs`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+- Verification: `cargo check -p depot -p rivet-api-peer`; `cargo test -p depot --test inspect`; `cargo test -p rivet-api-peer --test depot_inspect`; `cargo test -p depot`.
+- **Learnings for future iterations:**
+  - Keep Depot inspect scan/decode behavior in the Depot crate so tests can exercise pagination and decoding without going through HTTP.
+  - Use unpadded base64url for raw Depot inspect keys and cursors; branch row cursors are raw FDB keys and must stay inside the requested family prefix.
+  - `api-peer` is the only HTTP mount point for Depot inspect routes; do not add these internal diagnostics to api-public or generated SDKs.
 ---

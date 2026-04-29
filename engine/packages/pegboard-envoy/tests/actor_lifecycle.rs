@@ -1,28 +1,28 @@
 use std::sync::Arc;
 
 use anyhow::Result;
+use gas::prelude::Id;
 use rivet_envoy_protocol as protocol;
 use rivet_pools::NodeId;
 use scc::HashMap;
-use sqlite_storage::{
+use depot::{
 	keys::{
 		delta_chunk_key, meta_compact_key, meta_compactor_lease_key, meta_head_key, meta_quota_key,
 		pidx_delta_key, shard_key,
 	},
-	pump::ActorDb,
+	conveyer::Db,
 };
 use tempfile::Builder;
 use universaldb::utils::IsolationLevel::Snapshot;
-use universalpubsub::{PubSub, driver::memory::MemoryDriver};
 
 mod conn {
 	use std::sync::Arc;
 
 	use scc::HashMap;
-	use sqlite_storage::pump::ActorDb;
+	use depot::conveyer::Db;
 
 	pub struct Conn {
-		pub actor_dbs: HashMap<String, Arc<ActorDb>>,
+		pub actor_dbs: HashMap<String, Arc<Db>>,
 	}
 }
 
@@ -31,6 +31,7 @@ mod conn {
 mod actor_lifecycle;
 
 const TEST_ACTOR: &str = "actor-lifecycle-test";
+const TEST_NAMESPACE_LABEL: u16 = 1;
 
 async fn test_db() -> Result<universaldb::Database> {
 	let path = Builder::new()
@@ -40,12 +41,6 @@ async fn test_db() -> Result<universaldb::Database> {
 	let driver = universaldb::driver::RocksDbDatabaseDriver::new(path).await?;
 
 	Ok(universaldb::Database::new(Arc::new(driver)))
-}
-
-fn test_ups() -> PubSub {
-	PubSub::new(Arc::new(MemoryDriver::new(
-		"pegboard-envoy-actor-lifecycle-test".to_string(),
-	)))
 }
 
 fn checkpoint(actor_id: &str) -> protocol::ActorCheckpoint {
@@ -97,12 +92,11 @@ fn sqlite_keys(actor_id: &str) -> Vec<Vec<u8>> {
 #[tokio::test]
 async fn stop_actor_evicts_cached_actor_db() -> Result<()> {
 	let db = Arc::new(test_db().await?);
-	let actor_db = Arc::new(ActorDb::new(
+	let actor_db = Arc::new(Db::new(
 		db,
-		test_ups(),
+		Id::new_v1(TEST_NAMESPACE_LABEL),
 		TEST_ACTOR.to_string(),
-		NodeId::new(),
-	));
+		NodeId::new()));
 	let conn = conn::Conn {
 		actor_dbs: HashMap::new(),
 	};
@@ -122,12 +116,11 @@ async fn stop_actor_evicts_cached_actor_db() -> Result<()> {
 #[tokio::test]
 async fn stop_actor_does_not_touch_udb() -> Result<()> {
 	let db = Arc::new(test_db().await?);
-	let actor_db = Arc::new(ActorDb::new(
+	let actor_db = Arc::new(Db::new(
 		Arc::clone(&db),
-		test_ups(),
+		Id::new_v1(TEST_NAMESPACE_LABEL),
 		TEST_ACTOR.to_string(),
-		NodeId::new(),
-	));
+		NodeId::new()));
 	let conn = conn::Conn {
 		actor_dbs: HashMap::new(),
 	};

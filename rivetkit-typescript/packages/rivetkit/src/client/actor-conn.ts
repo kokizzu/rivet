@@ -166,6 +166,7 @@ export class ActorConnRaw {
 
 	#actionIdCounter = 0;
 	#queueSender: ReturnType<typeof createQueueSender>;
+	#readyPromise: ReturnType<typeof promiseWithResolvers<void>>;
 
 	/**
 	 * Interval that keeps the NodeJS process alive if this is the only thing running.
@@ -209,6 +210,12 @@ export class ActorConnRaw {
 		this.#getParams = getParams;
 		this.#encoding = encoding;
 		this.#actorResolutionState = actorResolutionState;
+		this.#readyPromise = promiseWithResolvers((reason) =>
+			logger().warn({
+				msg: "unhandled ready promise rejection",
+				reason,
+			}),
+		);
 		// Resolve the actor ID for each queue send so key-based connections do
 		// not pin themselves to an earlier resolution.
 		this.#queueSender = createQueueSender({
@@ -391,6 +398,7 @@ export class ActorConnRaw {
 
 		// Notify open handlers
 		if (status === "connected") {
+			this.#readyPromise.resolve(undefined);
 			for (const handler of [...this.#openHandlers]) {
 				try {
 					handler();
@@ -1087,6 +1095,13 @@ export class ActorConnRaw {
 	 */
 	get isConnected(): boolean {
 		return this.#connStatus === "connected";
+	}
+
+	/**
+	 * Resolves when this connection first reaches the connected state.
+	 */
+	get ready(): Promise<void> {
+		return this.#readyPromise.promise;
 	}
 
 	/**

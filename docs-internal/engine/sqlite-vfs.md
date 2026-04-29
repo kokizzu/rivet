@@ -1,30 +1,13 @@
-# SQLite VFS parity
+# SQLite VFS
 
-Rules for the SQLite VFS implementations.
+Rules for the native SQLite VFS implementation.
 
 ## Package boundaries
 
 - RivetKit SQLite is native-only. VFS and query execution live in `rivetkit-rust/packages/rivetkit-sqlite/`, core owns lifecycle, and NAPI only marshals JS types.
 - RivetKit TypeScript SQLite is exposed through `@rivetkit/rivetkit-napi`, but runtime behavior stays in `rivetkit-rust/packages/rivetkit-sqlite/` and `rivetkit-core`.
 - The Rust KV-backed SQLite implementation lives in `rivetkit-rust/packages/rivetkit-sqlite/src/`. When changing its on-disk or KV layout, update the internal data-channel spec in the same change.
-
-## Native VFS ↔ WASM VFS parity
-
-**The native Rust VFS and the WASM TypeScript VFS must match 1:1.** This includes:
-
-- KV key layout and encoding
-- Chunk size
-- PRAGMA settings
-- VFS callback-to-KV-operation mapping
-- Delete/truncate strategy (both must use `deleteRange`)
-- Journal mode
-
-When changing any VFS behavior in one implementation, update the other.
-
-- Native: `rivetkit-rust/packages/rivetkit-sqlite/src/vfs.rs`, `kv.rs`
-- WASM: `rivetkit-typescript/packages/sqlite-wasm/src/vfs.ts`, `kv.ts`
-
-The native VFS uses the same 4 KiB chunk layout and KV key encoding as the WASM VFS. Data is compatible between backends.
+- The VFS uses a 4 KiB chunk layout for page storage. PRAGMAs are pinned at open: `journal_mode = DELETE`, `locking_mode = EXCLUSIVE`, `auto_vacuum = NONE`. Source: `rivetkit-rust/packages/rivetkit-sqlite/src/vfs.rs`.
 
 ## VFS implementation notes
 

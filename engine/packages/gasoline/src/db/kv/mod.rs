@@ -57,6 +57,11 @@ pub struct DatabaseKv {
 	system: Arc<Mutex<system::SystemInfo>>,
 }
 
+struct DispatchWorkflowResult {
+	workflow_id: Id,
+	created_tags: Vec<String>,
+}
+
 impl DatabaseKv {
 	/// Spawns a new thread and gracefully publishes a bump message to pubsub.
 	fn bump(&self, subject: BumpSubSubject) {
@@ -250,7 +255,7 @@ impl DatabaseKv {
 		input: &serde_json::value::RawValue,
 		unique: bool,
 		tx: &universaldb::Transaction,
-	) -> Result<Id> {
+	) -> Result<DispatchWorkflowResult> {
 		let tx = tx.with_subspace(self.subspace.clone());
 
 		if unique {
@@ -261,7 +266,10 @@ impl DatabaseKv {
 				.await?
 			{
 				tracing::debug!(?existing_workflow_id, "found existing workflow");
-				return Ok(existing_workflow_id);
+				return Ok(DispatchWorkflowResult {
+					workflow_id: existing_workflow_id,
+					created_tags: Vec::new(),
+				});
 			}
 		}
 
@@ -288,6 +296,12 @@ impl DatabaseKv {
 			.flatten()
 			.map(|(k, v)| Ok((k.clone(), value_to_str(v)?)))
 			.collect::<WorkflowResult<Vec<_>>>()?;
+		let mut created_tags = Vec::new();
+		for (_, tag) in &tags {
+			if !created_tags.contains(tag) {
+				created_tags.push(tag.clone());
+			}
+		}
 
 		for (k, v) in &tags {
 			// Write tag key
@@ -350,7 +364,10 @@ impl DatabaseKv {
 			)),
 		);
 
-		Ok(workflow_id)
+		Ok(DispatchWorkflowResult {
+			workflow_id,
+			created_tags,
+		})
 	}
 
 	async fn find_workflow_inner(
@@ -878,7 +895,7 @@ impl Database for DatabaseKv {
 		input: &serde_json::value::RawValue,
 		unique: bool,
 	) -> WorkflowResult<Id> {
-		let workflow_id = self
+		let dispatch_result = self
 			.pools
 			.udb()
 			.map_err(WorkflowError::PoolsGeneric)?
@@ -899,9 +916,12 @@ impl Database for DatabaseKv {
 			.context("failed to dispatch workflow")
 			.map_err(WorkflowError::Udb)?;
 
+		for tag in dispatch_result.created_tags {
+			self.bump(BumpSubSubject::WorkflowCreated { tag });
+		}
 		self.bump(BumpSubSubject::Worker);
 
-		Ok(workflow_id)
+		Ok(dispatch_result.workflow_id)
 	}
 
 	#[tracing::instrument(skip_all, fields(?workflow_ids))]
@@ -2638,12 +2658,12 @@ impl Database for DatabaseKv {
 		_loop_location: Option<&Location>,
 		unique: bool,
 	) -> WorkflowResult<Id> {
-		let sub_workflow_id = self
+		let dispatch_result = self
 			.pools
 			.udb()
 			.map_err(WorkflowError::PoolsGeneric)?
 			.run(|tx| async move {
-				let sub_workflow_id = self
+				let dispatch_result = self
 					.dispatch_workflow_inner(
 						ray_id,
 						sub_workflow_id,
@@ -2663,22 +2683,25 @@ impl Database for DatabaseKv {
 					&location,
 					version,
 					rivet_util::timestamp::now(),
-					sub_workflow_id,
+					dispatch_result.workflow_id,
 					sub_workflow_name,
 					tags,
 					input,
 				)?;
 
-				Ok(sub_workflow_id)
+				Ok(dispatch_result)
 			})
 			.custom_instrument(tracing::info_span!("dispatch_sub_workflow_tx"))
 			.await
 			.context("failed to dispatch sub workflow")
 			.map_err(WorkflowError::Udb)?;
 
+		for tag in dispatch_result.created_tags {
+			self.bump(BumpSubSubject::WorkflowCreated { tag });
+		}
 		self.bump(BumpSubSubject::Worker);
 
-		Ok(sub_workflow_id)
+		Ok(dispatch_result.workflow_id)
 	}
 
 	#[tracing::instrument(skip_all)]
