@@ -215,19 +215,19 @@ impl ActorContext {
 		)
 	}
 
-	pub(crate) fn build(
-		actor_id: String,
-		name: String,
-		key: ActorKey,
-		region: String,
-		config: ActorConfig,
-		kv: Kv,
-		mut sql: SqliteDb,
-	) -> Self {
-		let metrics = ActorMetrics::new(actor_id.clone(), name.clone());
-		#[cfg(feature = "sqlite")]
-		sql.set_vfs_metrics(Arc::new(metrics.clone()));
-		let diagnostics = ActorDiagnostics::new(actor_id.clone());
+		pub(crate) fn build(
+			actor_id: String,
+			name: String,
+			key: ActorKey,
+			region: String,
+			config: ActorConfig,
+			kv: Kv,
+			mut sql: SqliteDb,
+		) -> Self {
+			let metrics = ActorMetrics::new(actor_id.clone(), name.clone());
+			#[cfg(feature = "sqlite")]
+			sql.set_vfs_metrics(Arc::new(metrics.clone()));
+			let diagnostics = ActorDiagnostics::new(actor_id.clone());
 		let lifecycle_event_inbox_capacity = config.lifecycle_event_inbox_capacity;
 		let state_save_interval = config.state_save_interval;
 		let abort_signal = CancellationToken::new();
@@ -365,6 +365,10 @@ impl ActorContext {
 
 	pub async fn db_query(&self, sql: &str, params: Option<&[u8]>) -> Result<Vec<u8>> {
 		self.0.sql.query_rows_cbor(sql, params).await
+	}
+
+	pub async fn db_execute(&self, sql: &str, params: Option<&[u8]>) -> Result<Vec<u8>> {
+		self.0.sql.execute_rows_cbor(sql, params).await
 	}
 
 	pub async fn db_run(&self, sql: &str, params: Option<&[u8]>) -> Result<()> {
@@ -649,12 +653,8 @@ impl ActorContext {
 	/// so overdue scheduled work enters the normal actor event loop.
 	pub async fn drain_overdue_scheduled_events(&self) -> Result<()> {
 		for event in self.due_scheduled_events(now_timestamp_ms()) {
-			self.dispatch_scheduled_action(
-				&event.event_id,
-				event.action,
-				event.args.unwrap_or_default(),
-			)
-			.await;
+			self.dispatch_scheduled_action(&event.event_id, event.action, event.args)
+				.await;
 		}
 
 		self.sync_alarm_logged();
@@ -816,34 +816,6 @@ impl ActorContext {
 	{
 		let conn = self
 			.connect_with_state(params, is_hibernatable, hibernation, request, create_state)
-			.await?;
-		self.record_connections_updated();
-		self.reset_sleep_timer();
-		Ok(conn)
-	}
-
-	pub(crate) async fn connect_conn_with_prepare<F, P>(
-		&self,
-		params: Vec<u8>,
-		is_hibernatable: bool,
-		hibernation: Option<HibernatableConnectionMetadata>,
-		request: Option<Request>,
-		create_state: F,
-		prepare_connection: P,
-	) -> Result<ConnHandle>
-	where
-		F: Future<Output = Result<Vec<u8>>> + Send,
-		P: FnOnce(&ConnHandle) -> Result<()>,
-	{
-		let conn = self
-			.connect_with_state_and_prepare(
-				params,
-				is_hibernatable,
-				hibernation,
-				request,
-				create_state,
-				prepare_connection,
-			)
 			.await?;
 		self.record_connections_updated();
 		self.reset_sleep_timer();

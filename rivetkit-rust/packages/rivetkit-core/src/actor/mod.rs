@@ -4,7 +4,6 @@ pub mod connection;
 pub mod context;
 pub(crate) mod diagnostics;
 pub mod factory;
-pub(crate) mod keys;
 pub mod kv;
 pub mod lifecycle_hooks;
 pub mod messages;
@@ -32,7 +31,9 @@ pub use queue::{
 	CompletableQueueMessage, EnqueueAndWaitOpts, QueueMessage, QueueNextBatchOpts, QueueNextOpts,
 	QueueTryNextBatchOpts, QueueTryNextOpts, QueueWaitOpts,
 };
-pub use sqlite::{BindParam, ColumnValue, ExecResult, QueryResult, SqliteDb};
+pub use sqlite::{
+	BindParam, ColumnValue, ExecResult, ExecuteResult, ExecuteRoute, QueryResult, SqliteDb,
+};
 pub use state::RequestSaveOpts;
 pub use task::{
 	ActionDispatchResult, ActorTask, DispatchCommand, HttpDispatchResult, LifecycleCommand,

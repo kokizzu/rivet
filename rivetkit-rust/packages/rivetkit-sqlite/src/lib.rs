@@ -14,6 +14,9 @@
 //! - Delete and truncate behavior
 //! - Journal and BATCH_ATOMIC behavior
 
+/// Native SQLite read-mode/write-mode connection manager.
+pub mod connection_manager;
+
 /// Unified native database handles and open helpers.
 pub mod database;
 
@@ -23,5 +26,5 @@ pub mod optimization_flags;
 /// SQLite query execution helpers.
 pub mod query;
 
-/// Custom SQLite VFS for actor-side depot transport.
+/// Custom SQLite VFS for actor-side sqlite-storage transport.
 pub mod vfs;
