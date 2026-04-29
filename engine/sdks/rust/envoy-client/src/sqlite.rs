@@ -8,11 +8,13 @@ use crate::kv::KV_EXPIRE_MS;
 #[derive(Clone)]
 pub enum SqliteRequest {
 	GetPages(protocol::SqliteGetPagesRequest),
+	GetPageRange(protocol::SqliteGetPageRangeRequest),
 	Commit(protocol::SqliteCommitRequest),
 }
 
 pub enum SqliteResponse {
 	GetPages(protocol::SqliteGetPagesResponse),
+	GetPageRange(protocol::SqliteGetPageRangeResponse),
 	Commit(protocol::SqliteCommitResponse),
 }
 
@@ -62,6 +64,18 @@ pub async fn handle_sqlite_get_pages_response(
 	);
 }
 
+pub async fn handle_sqlite_get_page_range_response(
+	ctx: &mut EnvoyContext,
+	response: protocol::ToEnvoySqliteGetPageRangeResponse,
+) {
+	handle_sqlite_response(
+		ctx,
+		response.request_id,
+		SqliteResponse::GetPageRange(response.data),
+		"sqlite_get_page_range",
+	);
+}
+
 pub async fn handle_sqlite_commit_response(
 	ctx: &mut EnvoyContext,
 	response: protocol::ToEnvoySqliteCommitResponse,
@@ -105,6 +119,11 @@ pub async fn send_single_sqlite_request(ctx: &mut EnvoyContext, request_id: u32)
 			SqliteRequest::GetPages(data) => protocol::ToRivet::ToRivetSqliteGetPagesRequest(
 				protocol::ToRivetSqliteGetPagesRequest { request_id, data },
 			),
+			SqliteRequest::GetPageRange(data) => {
+				protocol::ToRivet::ToRivetSqliteGetPageRangeRequest(
+					protocol::ToRivetSqliteGetPageRangeRequest { request_id, data },
+				)
+			}
 			SqliteRequest::Commit(data) => protocol::ToRivet::ToRivetSqliteCommitRequest(
 				protocol::ToRivetSqliteCommitRequest { request_id, data },
 			),

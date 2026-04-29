@@ -1,304 +1,474 @@
 # Ralph Progress Log
+Started: Tue Apr 28 11:00:38 PM PDT 2026
+---
 ## Codebase Patterns
-- VFS correctness tests should use `DirectEngineHarness`/`DirectStorage` rather than mock transports; direct-only failure behavior belongs in `DirectTransportHooks`.
-- Strict `DirectStorage` reload tests should call `evict_actor_db` and initialize through real `get_pages`; do not hydrate strict VFS state from the diagnostic page mirror.
-- Depot fault-injection APIs must stay behind `depot/test-faults`, with the feature enabled only from dev/test dependencies.
-- Depot fault rules should use `DepotFaultController::at(...).once()/nth(...).fail()/pause()/delay()/drop_artifact()` and call `assert_expected_fired()` so expected-but-unfired rules fail tests.
-- Forced compaction tests should use `DepotCompactionTestDriver` under `depot/test-faults`; timer-disabled managers must be started with the driver and observed through durable `ForceCompactionResult` records.
-- SQLite fault scenario helpers must run SQLite calls through `tokio::task::block_in_place` because the VFS uses `Handle::block_on` internally.
-- Fault scenarios mirror successful `ctx.sql` and `ctx.exec` calls into `NativeSqliteOracle`; use explicit `OracleCommitSemantics` for pre-commit failures and ambiguous post-commit results.
-- Depot invariant verification should scan UDB depot rows directly through `DepotInvariantScanner`; do not verify durability by reading back through the VFS under test.
-- Commit fault-hook tests should inspect the `anyhow` error chain because UDB wraps injected transaction failures.
-- Read fault hooks should keep fault controller calls behind `depot/test-faults`; use page/shard context for scoped read rules.
-- PIDX-owned missing DELTA chunks are broken source coverage: fall back only to valid SHARD/cold coverage, otherwise return a loud read error.
-- Workflow compaction fault tests should assert durable forced results because manager retries can record a terminal error and still settle later state in the same forced cycle.
-- SQLite fault scenarios that force cold-ref reads should seed a whole cold shard from the DirectStorage mirror before clearing hot/delta rows; single-page cold refs can make reloads look corrupt.
-- FaultScenario strict workloads start after setup by closing the DB, enabling strict DirectStorage, evicting the depot `Db`, and reopening; during the workload, mirror read/fill/seed counters must not change.
-- Forced compaction no-op tests should first settle hot/cold/reclaim work, then issue a second forced request and assert skipped noop reasons.
-- `FaultScenarioCtx` is not `Send`; scenario tests should avoid `tokio::spawn` with it and keep pause/release coordination inside the same scenario task.
-- Production fault-leak checks run through `engine/packages/depot/scripts/check-production-fault-leaks.sh`; the script verifies no-feature release builds, no fault-only IR symbols, hidden fault APIs, hidden `disable_planning_timers`, and dev-only `depot/test-faults` dependencies.
-- Strict VFS initial page fetch may seed an empty page only for known missing/uninitialized depot state; real read faults must fail open/reload before SQLite sees an empty schema.
-- SQLite fault scenarios should install workflow cold-tier test overrides by branch id so `DbColdCompacterWorkflow` uses the same fault-controller-backed tier as DirectStorage.
-- Fault scenarios must assert expected workload faults before verification, and depot invariant verification must use a non-faulting cold-tier view so verifier reads cannot satisfy workload coverage.
-- End-to-end cold compaction/reclaim fault tests should create cold refs through forced depot workflows; keep handcrafted cold refs in clearly named harness-only regression tests.
-- Depot invariant scans should treat hot shard rows below the compaction root as stale cache rows: validate LTX shape and shard ownership, but do not require compacted-away commit rows.
-- Ambiguous post-commit scenario tests should leave the committed oracle at the old state, compute a separate new-state oracle dump, then classify replay as old/new/invalid after reload.
-- Depot invariant scans should require cold-backed PIDX pages to exist in the decoded cold object; cold ref shard and txid range alone are not enough backing evidence.
-- Strict cold-tier read evidence must capture baseline counters before any strict read can enqueue shard-cache fill; a warmed SHARD cache should increase depot reads without increasing cold-tier GETs.
-- Fault scenario VFS opens should disable the internal batch-atomic probe so startup validation cannot consume semantic depot fault rules before the workload does.
-- Heavy SQLite pager workloads should use large pseudorandom blobs when proving depot delta chunking or shard-boundary page coverage; patterned blobs can compress below the intended thresholds.
-- Fault scenario overlap tests should use same-task future joining around depot pause handles because `FaultScenarioCtx` is not `Send`.
-- Register broad read faults immediately before the target read or reload so earlier strict workload reads cannot consume them.
-
-Started: Fri May  1 08:41:41 PM PDT 2026
+- Cold-start benchmark local-envoy runs need `RIVET_TOKEN=dev`; if port 6420 is already owned, use matching `RIVET_ENDPOINT`, `RIVET__GUARD__PORT`, `RIVET__API_PEER__PORT`, and `RIVET__METRICS__PORT` overrides.
+- For non-default cold-start benchmark ports, set both `RIVET_ENDPOINT=http://127.0.0.1:<guard-port>` and `--endpoint http://127.0.0.1:<guard-port> --start-local-envoy`; otherwise the registry can advertise the default 6420 endpoint while the engine starts elsewhere.
+- Native SQLite VFS preload hints are actor-side Rust state; snapshot them with `NativeDatabase::snapshot_preload_hints()` before adding transport or startup preload wiring.
+- SQLite preload hints persist as a separate v2 storage record at `/PRELOAD_HINTS`; keep them generation-fenced and separate from normal page/shard/delta data.
+- Runtime-side SQLite stop/sleep preload-hint flushes should enqueue the persist request before native DB close instead of awaiting the response during actor shutdown.
+- `sqlite-storage::open` should return the same quota-updated `DBHead` that it writes after `encode_db_head_with_usage(...)`, or runtime metadata can disagree with stored metadata.
+- SQLite cold-read optimization flags live in `engine/packages/sqlite-storage/src/optimization_flags.rs`; `rivetkit-sqlite` re-exports them, and tests should use config constructors instead of mutating process env.
+- SQLite open-time preload consumes persisted `/PRELOAD_HINTS` through `OpenConfig.preload_hints`; disabled-path tests can toggle the config fields directly.
+- Adaptive SQLite VFS read-ahead is controlled by `RIVETKIT_SQLITE_OPT_ADAPTIVE_READ_AHEAD`; default-enabled scans can grow to larger windows, while disabled mode keeps the existing shard-sized 64-page prefetch.
+- `sqlite-storage::SqliteEngine::get_pages` returns `GetPagesResult` with fetched pages plus transaction-read meta; successful protocol handlers should reuse `result.meta` instead of calling `load_meta`.
+- pegboard-envoy repeated `get_pages` can fast-path actor validation from `Conn.active_actors` and serverless local-open checks from `Conn.serverless_sqlite_actors`; stale cached generations should surface an explicit SQLite fence mismatch.
+- SQLite range page-read protocol details live in `.agent/specs/sqlite-range-page-read-protocol.md`; keep page-list `get_pages` as the compatibility/random-read fallback and preserve existing generation-fence behavior.
+- `sqlite-storage::SqliteEngine::get_page_range` is the storage primitive for contiguous range reads; it shares `get_pages` source resolution through `read_pages` and clamps requests to 256 pages / 1 MiB.
+- vbare protocol version bumps need enough identity converters for the new latest version; append-only schema changes still panic at runtime if `serialize_converters()` only advertises the previous latest version.
+- Native SQLite VFS range reads should be selected only for default-enabled, large, contiguous forward-scan prefetch windows; keep point, bounded, scattered, and disabled-flag paths on page-list `get_pages`.
+- Large sqlite-storage chunked logical values use a bounded chunk-prefix range read by default; `RIVETKIT_SQLITE_OPT_BATCH_CHUNK_READS=false` preserves the serial 10 KB chunk-get fallback.
+- `sqlite-storage` caches decoded DELTA/SHARD LTX blobs inside `SqliteEngine` by default; `RIVETKIT_SQLITE_OPT_DECODED_LTX_CACHE=false` preserves per-read decode behavior.
+- SQLite startup preload policy knobs live in `sqlite-storage::optimization_flags`; default preload is first page only plus persisted hints, bounded by `RIVETKIT_SQLITE_OPT_STARTUP_PRELOAD_MAX_BYTES` with an 8 MiB hard cap.
+- Native VFS page cache policy knobs live in `sqlite-storage::optimization_flags`; `rivetkit-sqlite` maps them into `VfsConfig`, so avoid direct env reads in the VFS.
+- The kitchen-sink SQLite cold-start benchmark keeps cold wake/open measured with a tiny SQLite action separately from cold full-read throughput; do not reintroduce payload `LIKE` probes into the main read path.
+- The kitchen-sink SQLite cold-start benchmark runs un-compacted and compacted-labelled scenarios separately by default; keep both on inline 64 KiB transactions unless chunked DELTA reads are explicitly under test.
+- Reverse SQLite cold-start VFS benchmarks should use the dedicated `cold_start_reverse_probe` rowid table; large payload overflow rows create scattered reverse page patterns that overfetch.
+- Native SQLite VFS reverse read-ahead should prefetch only exact contiguous descending page runs; scattered or overflow-backed reverse access must fall back to bounded target reads.
+- `sqlite-storage` LTX decoding accepts trailer and legacy no-trailer blobs; validate header, page frames, and page index structure instead of assuming trailer bytes are zero.
 ---
-## 2026-05-01 20:47:11 PDT - US-001
-- Removed the mock SQLite VFS transport path from `SqliteTransport` and deleted `MockProtocol`.
-- Rewrote the former mock-backed VFS tests to run through `DirectStorage`, adding direct test hooks for commit hangs, commit request inspection, and injected read-path errors.
-- Files changed: `rivetkit-rust/packages/rivetkit-sqlite/src/vfs.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/vfs.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/vfs_support.rs`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
-- Verification: `cargo check -p rivetkit-sqlite`; `cargo test -p rivetkit-sqlite native_database_drop_times_out_pending_commit`; `cargo test -p rivetkit-sqlite open_database_supports`; `cargo test -p rivetkit-sqlite aux_files_are_shared_by_path_until_deleted`; focused tests for concurrent aux open, truncate, read-path error, and commit_buffered_pages. Commands pass with pre-existing Rust 2024 unsafe-operation warnings in `vfs.rs`.
+## 2026-04-28 23:01:27 PDT - SQLITE-COLD-001
+- What was implemented
+  - Verified `.agent/notes/sqlite-cold-read-before.txt` exists and contains the required SQLite cold-read baseline metrics.
+  - Confirmed the baseline is a real cold read with 1249 wake read VFS get_pages round trips.
+  - Marked `SQLITE-COLD-001` passing in `prd.json` with the baseline numbers recorded in story notes.
+- Files changed
+  - `.agent/notes/sqlite-cold-read-before.txt`
+  - `scripts/ralph/prd.json`
+  - `scripts/ralph/progress.txt`
 - **Learnings for future iterations:**
-  - `DirectStorage` is the single VFS correctness test transport; production envoy remains available but is not a test matrix variant.
-  - Use `DirectTransportHooks` for direct-path test faults instead of reintroducing protocol mocks.
-  - The direct harness owns a `OnceCell<Arc<DirectStorage>>` because RocksDB permits only one open handle per test path.
+  - Baseline numbers to compare against: insert e2e 16048.5ms, hot read e2e 118.6ms, wake read e2e 20141.0ms, wake read server 19979.9ms, wake overhead estimate 161.2ms, wake VFS get_pages 1249 calls, fetched 20050 pages / 82124800 bytes, prefetch 18801 pages / 77008896 bytes, VFS transport 19332.8ms.
+  - `pnpm --filter kitchen-sink check-types` currently succeeds by printing `skipped - workflow history types broken`; use `pnpm -F rivetkit check-types` for a real package typecheck signal alongside it.
+  - Verification status: `pnpm --filter kitchen-sink check-types` passed; `pnpm -F rivetkit check-types` passed.
 ---
-## 2026-05-01 20:56:39 PDT - US-002
-- Added strict DirectStorage mode with counters for depot reads, mirror reads/fills/seeds, and cold-tier GETs.
-- Made strict VFS initialization use the real `get_pages` path instead of diagnostic mirror snapshots, and added actor Db eviction for reload checks.
-- Added strict tests for poisoned mirrors, mirror fallback/seed rejection, and cold-covered reads through a counting filesystem cold tier.
-- Files changed: `rivetkit-rust/packages/rivetkit-sqlite/Cargo.toml`, `rivetkit-rust/packages/rivetkit-sqlite/src/vfs.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/vfs.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/vfs_support.rs`, `Cargo.lock`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
-- Verification: `cargo check -p rivetkit-sqlite`; `cargo test -p rivetkit-sqlite strict_direct`; `cargo test -p rivetkit-sqlite direct_engine`. Commands pass with pre-existing Rust 2024 unsafe-operation warnings in `vfs.rs`.
+## 2026-04-28 23:07:05 PDT - SQLITE-COLD-002
+- What was implemented
+  - Increased the native SQLite VFS default prefetch depth from 16 pages to 64 pages so forward scans fetch shard-sized batches.
+  - Added focused VFS tests proving sequential reads request a 64-page batch while isolated point reads stay bounded to one page.
+  - Rebuilt the NAPI addon and reran the cold-read benchmark with the updated native VFS.
+- Files changed
+  - `rivetkit-rust/packages/rivetkit-sqlite/src/vfs.rs`
+  - `docs-internal/engine/SQLITE_OPTIMIZATIONS.md`
+  - `.agent/notes/sqlite-cold-read-after-SQLITE-COLD-002.txt`
+  - `scripts/ralph/prd.json`
+  - `scripts/ralph/progress.txt`
 - **Learnings for future iterations:**
-  - Strict DirectStorage should be enabled after setup writes; strict VFS commits skip mirror updates while direct `apply_commit` still fails if called as a mirror seed sentinel.
-  - Cold-ref read tests need a `CMP/root` row whose `manifest_generation` admits the seeded `CMP/cold_shard` ref.
-  - Use `evict_actor_db` before reload assertions so depot `Db` read caches cannot satisfy the check.
+  - SQLITE-COLD-002 benchmark numbers: insert e2e 15001.2ms, hot read e2e 97.6ms, wake read e2e 8078.7ms, wake read server 7932.6ms, wake overhead estimate 146.1ms, wake VFS get_pages 368 calls, fetched 18851 pages / 77213696 bytes, prefetch 18483 pages / 75706368 bytes, VFS transport 7648.0ms.
+  - Compared with baseline/SQLITE-COLD-001: wake get_pages dropped 1249 -> 368, wake e2e dropped 20141.0ms -> 8078.7ms, wake VFS transport dropped 19332.8ms -> 7648.0ms, and hot read improved 118.6ms -> 97.6ms.
+  - The benchmark path uses the compiled NAPI addon; after Rust VFS changes, run `pnpm --filter @rivetkit/rivetkit-napi build:force` before measuring.
+  - Verification status: `cargo check -p rivetkit-sqlite` passed; `cargo test -p rivetkit-sqlite` passed; `pnpm --filter kitchen-sink check-types` passed with the known skip message; `pnpm -F rivetkit check-types` passed; `pnpm --filter @rivetkit/rivetkit-napi build:force` passed.
 ---
-## 2026-05-01 21:02:47 PDT - US-003
-- Added the `depot/test-faults` feature and feature-gated the new `depot::fault` shell.
-- Added fault shell files for controller, points, actions, and checkpoints.
-- Enabled `depot/test-faults` only through the `rivetkit-sqlite` dev dependency and recorded the production-gating rule in `engine/packages/depot/AGENTS.md`.
-- Files changed: `engine/packages/depot/Cargo.toml`, `engine/packages/depot/src/lib.rs`, `engine/packages/depot/src/fault/*`, `engine/packages/depot/AGENTS.md`, `rivetkit-rust/packages/rivetkit-sqlite/Cargo.toml`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
-- Verification: `cargo check -p depot --release`; `cargo check -p depot --features test-faults`; `cargo check -p rivetkit-sqlite --tests`. The SQLite check passes with pre-existing Rust 2024 unsafe-operation warnings in `vfs.rs`.
+## 2026-04-28 23:13:01 PDT - SQLITE-COLD-003
+- What was implemented
+  - Recorded VFS predictor accesses for all-cache-hit reads so prefetched sequential pages keep training forward-scan prediction.
+  - Expanded the VFS debug log around fetches with requested pages, missing pages, prediction budget, predicted pages, prefetch pages, total fetch pages/bytes, and seed page.
+  - Added focused VFS coverage proving cache-hit scan reads produce the next full forward prefetch batch.
+  - Rebuilt the NAPI addon and reran the cold-read benchmark with an alternate local endpoint because 6420 was already occupied.
+- Files changed
+  - `rivetkit-rust/packages/rivetkit-sqlite/src/vfs.rs`
+  - `.agent/notes/sqlite-cold-read-after-SQLITE-COLD-003.txt`
+  - `scripts/ralph/prd.json`
+  - `scripts/ralph/progress.txt`
 - **Learnings for future iterations:**
-  - Keep the `depot::fault` module itself behind `#[cfg(feature = "test-faults")]` so normal release builds do not expose or compile fault-controller symbols.
-  - `rivetkit-sqlite` is the current dev-only crate that needs `depot/test-faults` for future VFS fault tests.
+  - SQLITE-COLD-003 benchmark numbers: insert e2e 14861.4ms, hot read e2e 129.3ms, wake read e2e 5873.2ms, wake read server 5759.7ms, wake overhead estimate 113.4ms, wake VFS get_pages 219 calls, fetched 13713 pages / 56168448 bytes, prefetch 13494 pages / 55271424 bytes, VFS transport 5519.9ms.
+  - Compared with baseline/SQLITE-COLD-001: wake get_pages dropped 1249 -> 219, wake e2e dropped 20141.0ms -> 5873.2ms, wake VFS transport dropped 19332.8ms -> 5519.9ms, and hot read was 118.6ms -> 129.3ms.
+  - Compared with SQLITE-COLD-002: wake get_pages dropped 368 -> 219, wake e2e dropped 8078.7ms -> 5873.2ms, wake VFS transport dropped 7648.0ms -> 5519.9ms, and hot read was 97.6ms -> 129.3ms.
+  - `resolve_pages` previously returned before predictor training on all-cache-hit reads; any future recent-page or scan predictor work should check both miss and hit paths.
+  - Verification status: `cargo check -p rivetkit-sqlite` passed; `cargo test -p rivetkit-sqlite` passed; `pnpm --filter kitchen-sink check-types` passed with the known skip message; `pnpm -F rivetkit check-types` passed; `pnpm --filter @rivetkit/rivetkit-napi build:force` passed.
 ---
-## 2026-05-01 21:09:19 PDT - US-004
-- Implemented the depot fault controller rule API with matching by fault point, actor/database/branch scope, checkpoint, page/shard, seed, and invocation count.
-- Added explicit fault point enums and `FaultBoundary` classification for commit, read, hot/cold compaction, reclaim, cold tier, and shard-cache-fill points.
-- Added replay records for fired and expected-but-unfired faults plus pause/release and bounded-delay behavior.
-- Files changed: `engine/packages/depot/src/fault/actions.rs`, `engine/packages/depot/src/fault/controller.rs`, `engine/packages/depot/src/fault/mod.rs`, `engine/packages/depot/src/fault/points.rs`, `engine/packages/depot/tests/fault_controller.rs`, `engine/packages/depot/AGENTS.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
-- Verification: `cargo check -p depot --features test-faults`; `cargo test -p depot --features test-faults --test fault_controller`; `cargo check -p depot --release`.
+## 2026-04-28 23:19:04 PDT - SQLITE-COLD-004
+- What was implemented
+  - Added a bounded in-memory recent-page hint tracker to the native SQLite VFS.
+  - The tracker records hot pages plus coalesced sequential scan ranges, and active full scans snapshot as a range from the scan start instead of a tail-only page list.
+  - Exposed `NativeDatabase::snapshot_preload_hints()` for future runtime-side flush wiring without adding a JS API.
+  - Added focused tracker and VFS snapshot coverage, updated the SQLite optimization note, rebuilt the NAPI addon, and reran the cold-read benchmark.
+- Files changed
+  - `rivetkit-rust/packages/rivetkit-sqlite/src/vfs.rs`
+  - `docs-internal/engine/SQLITE_OPTIMIZATIONS.md`
+  - `.agent/notes/sqlite-cold-read-after-SQLITE-COLD-004.txt`
+  - `scripts/ralph/prd.json`
+  - `scripts/ralph/progress.txt`
 - **Learnings for future iterations:**
-  - Fault-controller integration tests live in `engine/packages/depot/tests/fault_controller.rs` and are compiled with `--features test-faults`.
-  - Use `pause_handle(checkpoint).wait_reached()` plus `release()` for deterministic race tests instead of sleeping.
-  - `replay_log_with_unfired()` is the source for final scenario replay records because it includes expected rules that never fired.
+  - SQLITE-COLD-004 benchmark numbers: insert e2e 15080.7ms, hot read e2e 161.7ms, wake read e2e 5884.3ms, wake read server 5743.7ms, wake overhead estimate 140.6ms, wake VFS get_pages 220 calls, fetched 13717 pages / 56184832 bytes, prefetch 13497 pages / 55283712 bytes, VFS transport 5410.5ms.
+  - Compared with baseline/SQLITE-COLD-001: wake get_pages dropped 1249 -> 220, wake e2e dropped 20141.0ms -> 5884.3ms, wake VFS transport dropped 19332.8ms -> 5410.5ms, and hot read was 118.6ms -> 161.7ms.
+  - Compared with SQLITE-COLD-003: wake get_pages was 219 -> 220, wake e2e was 5873.2ms -> 5884.3ms, wake VFS transport improved 5519.9ms -> 5410.5ms, and hot read was 129.3ms -> 161.7ms. No cold-read speedup is expected until later stories persist and consume the hints.
+  - Default parallel `cargo test -p rivetkit-sqlite` reproduced the existing large staged-delta decode flake in `bench_large_tx_insert_100mb`; the single test passed, and a clean serialized full suite passed with `cargo test -p rivetkit-sqlite -- --test-threads=1`.
+  - Verification status: `cargo check -p rivetkit-sqlite` passed; focused tracker tests passed; `cargo test -p rivetkit-sqlite -- --test-threads=1` passed; `pnpm --filter kitchen-sink check-types` passed with the known skip message; `pnpm -F rivetkit check-types` passed; `pnpm --filter @rivetkit/rivetkit-napi build:force` passed.
 ---
-## 2026-05-01 21:18:17 PDT - US-005
-- Added a `depot/test-faults` gated `disable_planning_timers` field to `DbManagerInput` and kept normal builds free of the serialized field.
-- Added `DepotCompactionTestDriver` for manager dispatch and forced compaction requests through the existing `ForceCompaction` signal path.
-- Added forced-compaction driver tests covering timer-disabled no-op results and timer-disabled hot compaction result fields.
-- Files changed: `engine/packages/depot/src/compaction/types.rs`, `engine/packages/depot/src/workflows/db_manager.rs`, `engine/packages/depot/src/compaction/mod.rs`, `engine/packages/depot/src/compaction/test_driver.rs`, `engine/packages/depot/src/workflows/mod.rs`, `engine/packages/depot/tests/forced_compaction_test_driver.rs`, `engine/packages/depot/tests/workflow_compaction_skeletons.rs`, `engine/packages/depot/tests/inline/workflows_compaction.rs`, `engine/packages/depot/AGENTS.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
-- Verification: `cargo check -p depot --features test-faults`; `cargo check -p depot --tests --features test-faults`; `cargo test -p depot --features test-faults --test forced_compaction_test_driver`; `cargo check -p depot --release`.
+## 2026-04-28 23:32:03 PDT - SQLITE-COLD-005
+- What was implemented
+  - Added a central `rivetkit-sqlite` optimization flag module backed by `OnceLock` and explicit disable env vars.
+  - Gated the existing shard-sized read-ahead, cache-hit predictor training, and recent-page hint recording/snapshot paths through those flags.
+  - Added focused coverage for default-enabled flag parsing and disabled optimization paths, rebuilt the NAPI addon, and reran the cold-read benchmark.
+- Files changed
+  - `rivetkit-rust/packages/rivetkit-sqlite/src/optimization_flags.rs`
+  - `rivetkit-rust/packages/rivetkit-sqlite/src/lib.rs`
+  - `rivetkit-rust/packages/rivetkit-sqlite/src/vfs.rs`
+  - `.agent/notes/sqlite-cold-read-after-SQLITE-COLD-005.txt`
+  - `scripts/ralph/prd.json`
+  - `scripts/ralph/progress.txt`
 - **Learnings for future iterations:**
-  - Use `DbManagerInput::new(...)` for normal manager dispatch so `test-faults` gated fields do not break struct literals.
-  - `DepotCompactionTestDriver::force_compaction(...)` sends `ForceCompaction`, waits for signal ack, then reads durable manager loop state for the matching `ForceCompactionResult`.
-  - Timer-disabled managers should keep `ManagerPlanningDeadlines::default()` after refresh so no `listen_n_until(...)` path can schedule autonomous refreshes.
+  - SQLITE-COLD-005 benchmark numbers: insert e2e 7755.7ms, hot read e2e 145.1ms, wake read e2e 8287.8ms, wake read server 4170.0ms, wake overhead estimate 4117.8ms, wake VFS get_pages 219 calls, fetched 13713 pages / 56168448 bytes, prefetch 13494 pages / 55271424 bytes, VFS transport 3928.8ms.
+  - Compared with baseline/SQLITE-COLD-001: wake get_pages dropped 1249 -> 219, wake e2e dropped 20141.0ms -> 8287.8ms, wake VFS transport dropped 19332.8ms -> 3928.8ms, and hot read was 118.6ms -> 145.1ms.
+  - Compared with SQLITE-COLD-004: wake get_pages was 220 -> 219, wake e2e was 5884.3ms -> 8287.8ms because local wake overhead was higher, wake server improved 5743.7ms -> 4170.0ms, wake VFS transport improved 5410.5ms -> 3928.8ms, and hot read improved 161.7ms -> 145.1ms.
+  - The flag cache is process-global, so tests should avoid `std::env::set_var` and use `SqliteOptimizationFlags::from_env_reader(...)` or `VfsConfig::from_optimization_flags(...)` for deterministic disabled-path coverage.
+  - Verification status: `cargo check -p rivetkit-sqlite` passed; disabled-path and flag parser tests passed; `cargo test -p rivetkit-sqlite -- --test-threads=1` passed; `pnpm --filter kitchen-sink check-types` passed with the known skip message; `pnpm -F rivetkit check-types` passed; `pnpm --filter @rivetkit/rivetkit-napi build:force` passed.
 ---
-## 2026-05-01 21:26:55 PDT - US-006
-- Added the SQLite fault scenario module shell with `FaultScenario`, `FaultScenarioCtx`, logical workload ops, a deterministic simple test, and an ignored chaos shell.
-- Wired scenarios through strict DirectStorage, clean reload by dropping/reopening the VFS and evicting the depot `Db`, and forced compaction through `DepotCompactionTestDriver`.
-- Files changed: `rivetkit-rust/packages/rivetkit-sqlite/Cargo.toml`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/vfs.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/vfs_support.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/fault/*`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/fault/CLAUDE.md`, `Cargo.lock`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
-- Verification: `cargo check -p rivetkit-sqlite --tests`; `cargo test -p rivetkit-sqlite fault -- --nocapture`. Commands pass with pre-existing Rust 2024 unsafe-operation warnings in `vfs.rs`.
+## 2026-04-28 23:38:14 PDT - SQLITE-COLD-006
+- What was implemented
+  - Added adaptive forward-scan read-ahead to the native SQLite VFS.
+  - Mostly-forward scans now grow beyond the 64-page shard window up to a 256-page / 1 MiB cap, while point reads and scattered accesses stay bounded.
+  - Extended VFS debug logging with selected read-ahead mode, depth, and byte cap.
+  - Rebuilt the NAPI addon and reran the cold-read benchmark.
+- Files changed
+  - `rivetkit-rust/packages/rivetkit-sqlite/src/vfs.rs`
+  - `.agent/notes/sqlite-cold-read-after-SQLITE-COLD-006.txt`
+  - `scripts/ralph/prd.json`
+  - `scripts/ralph/progress.txt`
 - **Learnings for future iterations:**
-  - Scenario SQLite helpers need `tokio::task::block_in_place` because the VFS direct path calls `Handle::block_on` internally.
-  - Use the gasoline `TestCtx` UDB pool for fault scenarios so DirectStorage and the depot compaction test driver observe the same database state.
-  - `FaultScenario::run` should always shut down its gasoline `TestCtx`, even when a stage returns an error.
+  - SQLITE-COLD-006 benchmark numbers: insert e2e 15810.0ms, hot read e2e 171.0ms, wake read e2e 4074.9ms, wake read server 3945.3ms, wake overhead estimate 129.6ms, wake VFS get_pages 69 calls, fetched 13726 pages / 56221696 bytes, prefetch 13657 pages / 55939072 bytes, VFS transport 3723.1ms.
+  - Compared with baseline/SQLITE-COLD-001: wake get_pages dropped 1249 -> 69, wake e2e dropped 20141.0ms -> 4074.9ms, wake VFS transport dropped 19332.8ms -> 3723.1ms, and hot read was 118.6ms -> 171.0ms.
+  - Compared with SQLITE-COLD-005: wake get_pages dropped 219 -> 69, wake e2e dropped 8287.8ms -> 4074.9ms, wake server improved 4170.0ms -> 3945.3ms, wake VFS transport improved 3928.8ms -> 3723.1ms, and hot read was 145.1ms -> 171.0ms.
+  - Adaptive read-ahead depends on cache-hit training during prefetched scans; keep hit-path updates in mind when changing VFS prediction.
+  - Verification status: `cargo check -p rivetkit-sqlite` passed; adaptive and cache-hit focused tests passed; `cargo test -p rivetkit-sqlite -- --test-threads=1` passed; `pnpm --filter kitchen-sink check-types` passed with the known skip message; `pnpm -F rivetkit check-types` passed; `pnpm --filter @rivetkit/rivetkit-napi build:force` passed.
 ---
-## 2026-05-01 21:32:42 PDT - US-007
-- Added the native SQLite oracle module with a separate in-memory SQLite connection, canonical schema/table/value dump comparison, blob hex rendering, and integrity helpers for quick_check, integrity_check, and foreign_key_check.
-- Wired `FaultScenarioCtx` so successful scenario SQL and logical operations are mirrored into the oracle, and added explicit oracle semantics for pre-commit failure, success, and ambiguous post-commit cases.
-- Files changed: `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/fault/oracle.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/fault/scenario.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/fault/mod.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/fault/workload.rs`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
-- Verification: `cargo check -p rivetkit-sqlite --tests`; `cargo test -p rivetkit-sqlite oracle -- --nocapture`; `cargo test -p rivetkit-sqlite fault_scenario_runs_setup_workload_reload_and_verify -- --nocapture`. Commands pass with pre-existing Rust 2024 unsafe-operation warnings in `vfs.rs`.
+## 2026-04-28 23:44:20 PDT - SQLITE-COLD-007
+- What was implemented
+  - Added a SQLite preload-hint persistence request to envoy-protocol, envoy-client, and pegboard-envoy.
+  - Added sqlite-storage v2 `PreloadHints` encoding plus a generation-fenced `/PRELOAD_HINTS` persistence path that stays separate from page data.
+  - Added validation for bounded page/range hints and fence-mismatch responses in pegboard-envoy.
+  - Fixed sqlite-storage open metadata to return the same quota-updated `DBHead` it writes.
+  - Rebuilt the NAPI addon and reran the cold-read benchmark.
+- Files changed
+  - `engine/sdks/schemas/envoy-protocol/v2.bare`
+  - `engine/sdks/typescript/envoy-protocol/src/index.ts`
+  - `engine/sdks/rust/envoy-protocol/src/versioned.rs`
+  - `engine/sdks/rust/envoy-client/src/{envoy.rs,handle.rs,sqlite.rs,stringify.rs,actor.rs,events.rs}`
+  - `engine/sdks/schemas/sqlite-storage/v2.bare`
+  - `engine/sdks/rust/sqlite-storage-protocol/src/{lib.rs,versioned.rs}`
+  - `engine/packages/pegboard-envoy/src/{sqlite_runtime.rs,ws_to_tunnel_task.rs}`
+  - `engine/packages/sqlite-storage/src/{keys.rs,lib.rs,open.rs,types.rs,preload_hints.rs}`
+  - `.agent/notes/sqlite-cold-read-after-SQLITE-COLD-007.txt`
+  - `scripts/ralph/prd.json`
+  - `scripts/ralph/progress.txt`
 - **Learnings for future iterations:**
-  - Keep the oracle as a native SQLite connection opened with `sqlite3_open(":memory:")`; do not route oracle verification through the Rivet VFS.
-  - Scenario helpers should mirror only successful default operations into the oracle, then use `OracleCommitSemantics` when a future fault test needs failed or ambiguous commit behavior.
-  - Canonical oracle comparison should include user schema entries plus ordered user-table rows rendered with typed values and blob hex.
+  - SQLITE-COLD-007 benchmark numbers: insert e2e 15952.7ms, hot read e2e 193.5ms, wake read e2e 4040.1ms, wake read server 3883.5ms, wake overhead estimate 156.5ms, wake VFS get_pages 69 calls, fetched 13726 pages / 56221696 bytes, prefetch 13657 pages / 55939072 bytes, VFS transport 3650.0ms.
+  - Compared with baseline/SQLITE-COLD-001: wake get_pages dropped 1249 -> 69, wake e2e dropped 20141.0ms -> 4040.1ms, wake VFS transport dropped 19332.8ms -> 3650.0ms, and hot read was 118.6ms -> 193.5ms.
+  - Compared with SQLITE-COLD-006: wake get_pages stayed 69 -> 69, wake e2e improved 4074.9ms -> 4040.1ms, wake server improved 3945.3ms -> 3883.5ms, wake VFS transport improved 3723.1ms -> 3650.0ms, and hot read was 171.0ms -> 193.5ms.
+  - Preload hint persistence is transport/storage only in this story; periodic/final flushing and open-time consumption are separate follow-up stories.
+  - `sqlite-storage::open_inner` must propagate the `DBHead` returned from `encode_db_head_with_usage(...)` or returned `SqliteMeta` can report stale usage after the written META changes size.
+  - Verification status: `cargo check -p sqlite-storage` passed; `cargo check -p pegboard-envoy` passed; `cargo check -p rivet-envoy-client` passed; protocol checks passed; `cargo test -p sqlite-storage -- --test-threads=1` passed; `cargo test -p pegboard-envoy` passed; `cargo test -p rivet-envoy-client` passed; protocol tests passed; `pnpm --filter kitchen-sink check-types` passed with the known skip message; `pnpm -F rivetkit check-types` passed; `pnpm --filter @rivetkit/rivetkit-napi build:force` passed with existing Rust 2024 unsafe-operation warnings in `rivetkit-sqlite`.
 ---
-## 2026-05-01 21:45:56 PDT - US-008
-- Added `DepotInvariantScanner` for direct UDB row validation of database pointers, live branch heads, commit continuity, PIDX backing, DELTA/SHARD/CMP rows, dirty markers, retired cold objects, restore points, PITR intervals, and history pins.
-- Wired `FaultScenarioCtx::verify_depot_invariants()` to use the scanner and added corruption regression tests for missing head commits and broken PIDX backing.
-- Files changed: `rivetkit-rust/packages/rivetkit-sqlite/Cargo.toml`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/vfs_support.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/fault/mod.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/fault/scenario.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/fault/verify.rs`, `Cargo.lock`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
-- Verification: `cargo check -p rivetkit-sqlite --tests`; `cargo test -p rivetkit-sqlite depot_invariant_scanner -- --nocapture`; `cargo test -p rivetkit-sqlite fault_scenario_runs_setup_workload_reload_and_verify -- --nocapture`; `cargo test -p rivetkit-sqlite fault -- --nocapture`. Commands pass with pre-existing Rust 2024 unsafe-operation warnings in `vfs.rs`.
+## 2026-04-29 00:02:33 PDT - SQLITE-COLD-008
+- What was implemented
+  - Added a core-owned SQLite preload-hint flush task that starts after native SQLite open and periodically snapshots VFS hints while the actor is alive.
+  - Added a final actor stop/sleep flush that snapshots hints and queues the persist request before closing the native SQLite handle, without waiting indefinitely during shutdown.
+  - Added a `rivet-envoy-client` fire-and-forget helper for preload-hint persistence and reran the cold-read benchmark.
+- Files changed
+  - `engine/sdks/rust/envoy-client/src/handle.rs`
+  - `rivetkit-rust/packages/rivetkit-core/src/actor/sqlite.rs`
+  - `.agent/notes/sqlite-cold-read-after-SQLITE-COLD-008.txt`
+  - `scripts/ralph/prd.json`
+  - `scripts/ralph/progress.txt`
 - **Learnings for future iterations:**
-  - `DepotInvariantScanner` verifies depot durability by scanning UDB rows directly, not by routing reads through SQLite or the VFS.
-  - `DirectStorage::depot_database()` and `DirectStorage::cold_tier()` are the test-only handles for invariant scanners that need raw depot rows and cold-object validation.
-  - Scanner regression tests can corrupt depot rows inside a `FaultScenario` verify stage, then assert `ctx.verify_depot_invariants()` reports the expected violation.
+  - SQLITE-COLD-008 benchmark numbers: insert e2e 15945.6ms, hot read e2e 156.3ms, wake read e2e 4116.3ms, wake read server 3967.7ms, wake overhead estimate 148.6ms, wake VFS get_pages 69 calls, fetched 13726 pages / 56221696 bytes, prefetch 13657 pages / 55939072 bytes, VFS transport 3738.6ms.
+  - Compared with baseline/SQLITE-COLD-001: wake get_pages dropped 1249 -> 69, wake e2e dropped 20141.0ms -> 4116.3ms, wake VFS transport dropped 19332.8ms -> 3738.6ms, and hot read was 118.6ms -> 156.3ms.
+  - Compared with SQLITE-COLD-007: wake get_pages stayed 69 -> 69, wake e2e was 4040.1ms -> 4116.3ms, wake VFS transport was 3650.0ms -> 3738.6ms, and hot read improved 193.5ms -> 156.3ms.
+  - Awaiting preload-hint persistence during actor shutdown can time out after sleep teardown begins; queue the shutdown flush before close and let the periodic task use the normal awaited request path.
+  - Verification status: `cargo check -p rivet-envoy-client` passed; `cargo check -p rivetkit-core --features sqlite` passed; `cargo test -p rivetkit-sqlite -- --test-threads=1` passed; `pnpm --filter kitchen-sink check-types` passed with the known skip message; `pnpm -F rivetkit check-types` passed; `pnpm --filter @rivetkit/rivetkit-napi build:force` passed; benchmark output passed with no preload-hint flush timeout warnings.
 ---
-## 2026-05-01 21:52:39 PDT - US-009
-- Added feature-gated depot commit hooks for all spec-listed `CommitFaultPoint`s in `engine/packages/depot/src/conveyer/commit/apply.rs`.
-- Added a test-only `Db::new_with_fault_controller_for_test` constructor and focused commit fault tests for pre-durable failure and ambiguous after-UDB-commit failure.
-- Files changed: `engine/packages/depot/src/conveyer/commit/apply.rs`, `engine/packages/depot/src/conveyer/db.rs`, `engine/packages/depot/tests/conveyer_commit.rs`, `engine/packages/depot/AGENTS.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
-- Verification: `cargo check -p depot --features test-faults`; `cargo test -p depot --features test-faults --test conveyer_commit`; `cargo test -p depot --test conveyer_commit`; `cargo check -p depot --release`.
+## 2026-04-29 00:12:40 PDT - SQLITE-COLD-009
+- What was implemented
+  - Added open-time loading of persisted SQLite preload hints from `/PRELOAD_HINTS` in `sqlite-storage`.
+  - Added `OpenConfig.preload_hints` with default-enabled hot/early page and scan-range switches backed by the central once-cached SQLite optimization flags.
+  - Moved the shared SQLite optimization flag implementation into `sqlite-storage::optimization_flags`; `rivetkit-sqlite::optimization_flags` now re-exports it for native VFS callers.
+  - Added focused storage tests for default persisted preload, disabled persisted preload, and disabled scan-range preload.
+  - Rebuilt the NAPI addon and reran the cold-read benchmark.
+- Files changed
+  - `engine/packages/sqlite-storage/src/optimization_flags.rs`
+  - `engine/packages/sqlite-storage/src/lib.rs`
+  - `engine/packages/sqlite-storage/src/open.rs`
+  - `rivetkit-rust/packages/rivetkit-sqlite/src/optimization_flags.rs`
+  - `.agent/notes/sqlite-cold-read-after-SQLITE-COLD-009.txt`
+  - `scripts/ralph/prd.json`
+  - `scripts/ralph/progress.txt`
 - **Learnings for future iterations:**
-  - Commit fault hooks should use `DepotFaultPoint::Commit(...)` and carry `database_id` plus `database_branch_id` once branch resolution has happened.
-  - Pre-durable injected failures inside UDB transactions are wrapped as transaction failures, so tests should inspect the `anyhow` error chain.
-  - `AfterUdbCommit` is explicitly ambiguous: the caller gets an error, but a fresh `Db` should observe the committed head and pages.
+  - SQLITE-COLD-009 benchmark numbers: insert e2e 15947.0ms, hot read e2e 167.6ms, wake read e2e 4271.7ms, wake read server 3969.8ms, wake overhead estimate 301.9ms, wake VFS get_pages 69 calls, fetched 13726 pages / 56221696 bytes, prefetch 13657 pages / 55939072 bytes, VFS transport 3749.0ms.
+  - Compared with baseline/SQLITE-COLD-001: wake get_pages dropped 1249 -> 69, wake e2e dropped 20141.0ms -> 4271.7ms, wake VFS transport dropped 19332.8ms -> 3749.0ms, and hot read was 118.6ms -> 167.6ms.
+  - Compared with SQLITE-COLD-008: wake get_pages stayed 69 -> 69, wake e2e was 4116.3ms -> 4271.7ms, wake server was 3967.7ms -> 3969.8ms, wake VFS transport was 3738.6ms -> 3749.0ms, and hot read was 156.3ms -> 167.6ms.
+  - Open-time preload remains bounded by `OpenConfig.max_total_bytes` (1 MiB default), so it improves startup working-set hydration without changing the adaptive full-scan get_pages count in this benchmark.
+  - Verification status: `cargo check -p sqlite-storage` passed; `cargo check -p rivetkit-sqlite` passed with existing Rust 2024 unsafe warnings; `cargo check -p pegboard-envoy` passed; `cargo check -p rivetkit-core --features sqlite` passed with existing warnings; `cargo test -p sqlite-storage -- --test-threads=1` passed; `cargo test -p rivetkit-sqlite -- --test-threads=1` passed with existing Rust 2024 unsafe warnings; `cargo test -p pegboard-envoy` passed; `pnpm --filter kitchen-sink check-types` passed with the known skip message; `pnpm -F rivetkit check-types` passed; `pnpm --filter @rivetkit/rivetkit-napi build:force` passed with existing warnings.
 ---
-## 2026-05-01 22:03:44 PDT - US-010
-- Added feature-gated read-path fault hooks across scope resolution, PIDX scan, DELTA/SHARD/cold selection, cold-object missing, return, and shard-cache-fill enqueue points.
-- Extended `FaultyColdTier` with controller-backed fail, delay, and drop-artifact behavior while keeping normal builds free of controller symbols.
-- Tightened missing PIDX-owned DELTA handling so uncovered missing chunks fail loudly instead of returning zero pages.
-- Files changed: `engine/packages/depot/src/cold_tier/faulty.rs`, `engine/packages/depot/src/conveyer/db.rs`, `engine/packages/depot/src/conveyer/read.rs`, `engine/packages/depot/src/conveyer/read/cold.rs`, `engine/packages/depot/src/conveyer/read/shard.rs`, `engine/packages/depot/tests/cold_tier.rs`, `engine/packages/depot/tests/conveyer_read.rs`, `engine/packages/depot/AGENTS.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
-- Verification: `cargo check -p depot --features test-faults`; `cargo check -p depot --tests --features test-faults`; `cargo check -p depot --release`; `cargo test -p depot --features test-faults --test conveyer_read -- --nocapture`; `cargo test -p depot --features test-faults --test cold_tier -- --nocapture`; `cargo test -p depot --test conveyer_read -- --nocapture`.
+## 2026-04-29 00:18:54 PDT - SQLITE-COLD-010
+- What was implemented
+  - Changed `sqlite-storage` `get_pages` to return `GetPagesResult` containing fetched pages plus the `SqliteMeta` derived from the DBHead already read in the page-read transaction.
+  - Updated pegboard-envoy successful get_pages responses to reuse `result.meta` by default instead of issuing a duplicate `load_meta` read; disabling `RIVETKIT_SQLITE_OPT_DEDUP_GET_PAGES_META` preserves the old duplicate-read path.
+  - Added latency test assertions that the returned get_pages meta matches the committed head while the storage read remains a single RTT.
+  - Updated nearby sqlite-storage AGENTS/CLAUDE notes and reran the cold-read benchmark.
+- Files changed
+  - `engine/packages/sqlite-storage/src/types.rs`
+  - `engine/packages/sqlite-storage/src/read.rs`
+  - `engine/packages/sqlite-storage/tests/latency.rs`
+  - `engine/packages/sqlite-storage/AGENTS.md`
+  - `engine/packages/sqlite-storage/CLAUDE.md`
+  - `engine/packages/pegboard-envoy/src/ws_to_tunnel_task.rs`
+  - `.agent/notes/sqlite-cold-read-after-SQLITE-COLD-010.txt`
+  - `scripts/ralph/prd.json`
+  - `scripts/ralph/progress.txt`
 - **Learnings for future iterations:**
-  - Read fault hooks can use `maybe_fire_read_fault` with optional page/shard scope so rules stay deterministic without global state.
-  - `FaultyColdTier::DropArtifact` has operation-specific semantics: GET returns `None`, while PUT writes bytes first and then returns an injected acknowledgement error.
-  - Tests that need missing first/middle/last delta chunks can replace the committed DELTA blob with many tiny valid chunks, then delete one chunk and assert the real read path fails.
+  - SQLITE-COLD-010 benchmark numbers: insert e2e 14779.2ms, hot read e2e 151.6ms, wake read e2e 4209.9ms, wake read server 3974.3ms, wake overhead estimate 235.5ms, wake VFS get_pages 70 calls, fetched 13722 pages / 56205312 bytes, prefetch 13652 pages / 55918592 bytes, VFS transport 3741.3ms.
+  - Compared with baseline/SQLITE-COLD-001: wake get_pages dropped 1249 -> 70, wake e2e dropped 20141.0ms -> 4209.9ms, wake VFS transport dropped 19332.8ms -> 3741.3ms, and hot read was 118.6ms -> 151.6ms.
+  - Compared with SQLITE-COLD-009: wake get_pages was 69 -> 70, wake e2e improved 4271.7ms -> 4209.9ms, wake server was 3969.8ms -> 3974.3ms, wake VFS transport improved 3749.0ms -> 3741.3ms, and hot read improved 167.6ms -> 151.6ms.
+  - `GetPagesResult` implements slice deref/into-iterator compatibility so most storage callers can continue treating it like the returned pages, but protocol code should explicitly consume `pages` and `meta`.
+  - Verification status: `cargo check -p sqlite-storage` passed; `cargo check -p pegboard-envoy` passed; focused latency test passed; `cargo test -p sqlite-storage -- --test-threads=1` passed; `cargo test -p pegboard-envoy` passed; external get_pages test-target compiles passed for `pegboard` and `rivet-engine`; `pnpm --filter kitchen-sink check-types` passed with the known skip message; `pnpm -F rivetkit check-types` passed.
 ---
-## 2026-05-01 22:20:16 PDT - US-011
-- Added branch-scoped workflow fault controllers for hot compaction, cold compaction, and reclaim workflow hooks.
-- Wired hot stage/install, cold upload/publish, reclaim planning/delete/retire/cleanup hooks, plus a test-only cold delete grace override.
-- Added compaction fault integration tests for delayed hot install, hot install failure after shard publish, cold publish failure after upload, and forced reclaim with shortened grace.
-- Files changed: `engine/packages/depot/src/compaction/companion.rs`, `engine/packages/depot/src/compaction/test_hooks.rs`, `engine/packages/depot/src/workflows/db_hot_compacter.rs`, `engine/packages/depot/src/workflows/db_cold_compacter.rs`, `engine/packages/depot/src/workflows/db_manager.rs`, `engine/packages/depot/src/workflows/db_reclaimer.rs`, `engine/packages/depot/tests/compaction_fault_hooks.rs`, `engine/packages/depot/AGENTS.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
-- Verification: `cargo check -p depot --features test-faults`; `cargo check -p depot --tests --features test-faults`; `cargo check -p depot --release`; `RUST_LOG=error cargo test -p depot --features test-faults --test compaction_fault_hooks`.
+## 2026-04-29 00:23:39 PDT - SQLITE-COLD-011
+- What was implemented
+  - Added a default-enabled pegboard-envoy get_pages fast path behind `RIVETKIT_SQLITE_OPT_CACHE_GET_PAGES_VALIDATION`.
+  - Repeated get_pages requests now reuse `Conn.active_actors` for active actor validation when the SQLite generation matches.
+  - Serverless get_pages requests now reuse `Conn.serverless_sqlite_actors` to skip redundant local-open storage checks when the generation is already open, while stale cached generations return an explicit SQLite fence mismatch.
+  - Added focused unit coverage for active actor cache hits, starting actor fallback, matching serverless generations, stale serverless generation fencing, and central flag parsing.
+  - Reran the cold-read benchmark.
+- Files changed
+  - `engine/packages/pegboard-envoy/src/ws_to_tunnel_task.rs`
+  - `engine/packages/pegboard-envoy/tests/support/ws_to_tunnel_task.rs`
+  - `engine/packages/sqlite-storage/src/optimization_flags.rs`
+  - `.agent/notes/sqlite-cold-read-after-SQLITE-COLD-011.txt`
+  - `scripts/ralph/prd.json`
+  - `scripts/ralph/progress.txt`
 - **Learnings for future iterations:**
-  - Register workflow fault controllers with `compaction::test_hooks::register_workflow_fault_controller(database_branch_id, controller)` so hooks stay branch-scoped.
-  - Forced compaction results can include a terminal error while later retry work has repaired durable state; assert the durable state the driver observes, not transient mid-cycle rows.
-  - Reclaim tests that need cold deletion should use the test-only cold-object grace override instead of sleeping through the production grace window.
+  - SQLITE-COLD-011 benchmark numbers: insert e2e 15413.3ms, hot read e2e 178.9ms, wake read e2e 4771.9ms, wake read server 3904.7ms, wake overhead estimate 867.2ms, wake VFS get_pages 70 calls, fetched 13722 pages / 56205312 bytes, prefetch 13652 pages / 55918592 bytes, VFS transport 3665.3ms.
+  - Compared with baseline/SQLITE-COLD-001: wake get_pages dropped 1249 -> 70, wake e2e dropped 20141.0ms -> 4771.9ms, wake VFS transport dropped 19332.8ms -> 3665.3ms, and hot read was 118.6ms -> 178.9ms.
+  - Compared with SQLITE-COLD-010: wake get_pages stayed 70 -> 70, wake e2e was 4209.9ms -> 4771.9ms due to higher local wake overhead, wake server improved 3974.3ms -> 3904.7ms, wake VFS transport improved 3741.3ms -> 3665.3ms, and hot read was 151.6ms -> 178.9ms.
+  - `Conn.active_actors` is a safe actor-validation fast path only when the request generation matches the active SQLite generation; starting actors should fall back to the full validation path.
+  - `Conn.serverless_sqlite_actors` is a safe local-open fast path for matching generations; mismatched cached generations should return `SqliteStorageError::FenceMismatch` instead of silently re-opening or falling through.
+  - Verification status: `cargo check -p pegboard-envoy` passed; `cargo check -p sqlite-storage` passed; focused pegboard-envoy cache tests passed; focused sqlite-storage flag parser test passed; `cargo test -p pegboard-envoy` passed; `cargo test -p sqlite-storage -- --test-threads=1` passed; `pnpm --filter kitchen-sink check-types` passed with the known skip message; `pnpm -F rivetkit check-types` passed.
 ---
-## 2026-05-01 22:35:25 PDT - US-012
-- Added deterministic simple SQLite depot fault scenarios for failed commit rollback, ambiguous post-commit errors, failed hot compaction, failed cold publish, cold read failure after reclaim, and forced hot/cold/reclaim no-op reporting.
-- Extended scenario replay metadata with workload, branch head before/after workload, oracle result, and fired fault boundary assertions.
-- Wired the SQLite fault harness to a filesystem cold tier plus depot/workflow fault controllers, and added helpers for restore points, forced cold-ref reads, cold-get counters, and cold object delete grace overrides.
-- Files changed: `engine/packages/depot/src/conveyer/db.rs`, `rivetkit-rust/packages/rivetkit-sqlite/Cargo.toml`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/vfs_support.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/fault/scenario.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/fault/simple.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/fault/verify.rs`, `Cargo.lock`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
-- Verification: `RUST_LOG=error cargo test -p rivetkit-sqlite simple_ -- --nocapture`; `cargo check -p rivetkit-sqlite --tests`; `cargo check -p depot --features test-faults`. Commands pass with pre-existing Rust 2024 unsafe-operation warnings in `rivetkit-rust/packages/rivetkit-sqlite/src/vfs.rs`.
+## 2026-04-29 00:26:43 PDT - SQLITE-COLD-012
+- What was implemented
+  - Added the concrete SQLite range page-read protocol spec for the upcoming storage, envoy protocol, and VFS implementation stories.
+  - Documented request/response fields, byte and page caps, generation fencing, stale-owner behavior, page-list fallback, VFS range-read selection, and benchmark artifact naming.
+  - Linked the spec from the SQLite optimization tracker and marked `SQLITE-COLD-012` passing in `prd.json`.
+- Files changed
+  - `.agent/specs/sqlite-range-page-read-protocol.md`
+  - `docs-internal/engine/SQLITE_OPTIMIZATIONS.md`
+  - `scripts/ralph/prd.json`
+  - `scripts/ralph/progress.txt`
 - **Learnings for future iterations:**
-  - The scenario-managed filesystem cold tier must be wrapped with `FaultyColdTier::new_with_fault_controller_for_test` so cold-tier and workflow fault rules hit the same controller.
-  - Cold-ref seeding for reloadable VFS scenarios must write all pages in the shard and compute a real content hash before clearing hot/delta lookup rows.
-- A forced compaction request can legitimately do cold work after a hot-only settle; assert no-op reasons only after a full hot/cold/reclaim settle.
+  - Range reads should reuse existing `get_pages` generation fencing and stale-owner behavior; do not fall back after `SqliteFenceMismatch`.
+  - The VFS should use range reads only for default-enabled `RIVETKIT_SQLITE_OPT_RANGE_READS`, supported protocol versions, forward-scan mode, and contiguous large windows; point, scattered, unsupported, or disabled paths stay on page-list `get_pages`.
+  - Verification status: `pnpm --filter kitchen-sink check-types` passed with the known skip message; `pnpm -F rivetkit check-types` passed; `cargo test -p sqlite-storage -- --test-threads=1` passed; `cargo test -p pegboard-envoy` passed.
 ---
-## 2026-05-01 22:41:19 PDT - US-013
-- Replaced the ignored chaos shell with two replayable ignored chaos seeds that generate deterministic logical workloads and seed-qualified failure context.
-- Added randomized chaos fault schedules across commit pause, read, hot compaction, cold compaction, reclaim, and cold-tier put/get hooks, with repeated strict reloads and forced hot/cold/reclaim cycles.
-- Verified each chaos scenario with SQLite integrity checks, native oracle comparison, depot invariant scanning, and fired-fault replay assertions.
-- Files changed: `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/fault/chaos.rs`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
-- Verification: `cargo check -p rivetkit-sqlite --tests`; `RUST_LOG=error cargo test -p rivetkit-sqlite chaos -- --ignored --nocapture`. Commands pass with pre-existing Rust 2024 unsafe-operation warnings in `rivetkit-rust/packages/rivetkit-sqlite/src/vfs.rs`.
+## 2026-04-29 00:31:43 PDT - SQLITE-COLD-013
+- What was implemented
+  - Added `SqliteEngine::get_page_range(...)` for bounded contiguous SQLite page reads in `sqlite-storage`.
+  - Refactored `get_pages` through shared `read_pages` source resolution so range reads reuse generation fencing, PIDX caching, stale PIDX cleanup, zero-page fallback, and transaction-read meta behavior.
+  - Added focused range-read tests for equivalent bytes/meta, page and byte caps, invalid requests, and generation mismatch.
+  - Recorded the required cold-read benchmark artifact.
+- Files changed
+  - `engine/packages/sqlite-storage/src/read.rs`
+  - `engine/packages/sqlite-storage/CLAUDE.md`
+  - `docs-internal/engine/SQLITE_OPTIMIZATIONS.md`
+  - `.agent/notes/sqlite-cold-read-after-SQLITE-COLD-013.txt`
+  - `scripts/ralph/prd.json`
+  - `scripts/ralph/progress.txt`
 - **Learnings for future iterations:**
-  - `FaultScenarioCtx` is not `Send`, so chaos tests should not move it into `tokio::spawn`.
-  - Cold-tier `DeleteObjects` is not guaranteed to fire in the current reclaim chaos flow; use deterministic `PutObject` and `GetObject` rules when asserting expected cold-tier hooks.
-  - Chaos failure context should include the seed in scenario names, checkpoints, and assertion messages so a failing run can be replayed directly.
+  - SQLITE-COLD-013 benchmark numbers: insert e2e 15808.6ms, hot read e2e 154.6ms, wake read e2e 7599.7ms, wake read server 3933.5ms, wake overhead estimate 3666.2ms, wake VFS get_pages 70 calls, fetched 13722 pages / 56205312 bytes, prefetch 13652 pages / 55918592 bytes, VFS transport 3702.2ms.
+  - Compared with baseline/SQLITE-COLD-001: wake get_pages dropped 1249 -> 70, wake e2e dropped 20141.0ms -> 7599.7ms, wake VFS transport dropped 19332.8ms -> 3702.2ms, and hot read was 118.6ms -> 154.6ms.
+  - Compared with SQLITE-COLD-012/SQLITE-COLD-011: runtime read path is unchanged until protocol/VFS wiring, so wake get_pages stayed 70 -> 70; wake server was 3904.7ms -> 3933.5ms and wake e2e increased because local wake overhead was higher.
+  - Range reads are storage-only in this story; upcoming protocol/VFS stories should gate actual runtime use behind `RIVETKIT_SQLITE_OPT_RANGE_READS`.
+  - Verification status: `cargo check -p sqlite-storage` passed; focused `get_page_range` tests passed; `cargo test -p sqlite-storage -- --test-threads=1` passed; `pnpm --filter kitchen-sink check-types` passed with the known skip message; `pnpm -F rivetkit check-types` passed.
 ---
-## 2026-05-01 22:58:09 PDT - US-014
-- Added a production fault-leak check script for normal depot builds.
-- The script runs the no-feature release check, emits fresh release LLVM IR and scans for fault-only names, probes the no-feature depot artifact with `rustc` to confirm `depot::fault` and `disable_planning_timers` are unavailable, and validates `depot/test-faults` is only used by dev dependencies.
-- Files changed: `engine/packages/depot/scripts/check-production-fault-leaks.sh`, `engine/packages/depot/CLAUDE.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
-- Verification: `engine/packages/depot/scripts/check-production-fault-leaks.sh`.
+## 2026-04-29 00:50:39 PDT - SQLITE-COLD-014
+- What was implemented
+  - Added envoy-protocol v3 with SQLite range page-read request/response structs and top-level wrappers.
+  - Regenerated the TypeScript envoy protocol SDK at `VERSION = 3` and updated the Rust protocol wrapper to re-export v3 as latest while rejecting range messages when serializing to v1/v2.
+  - Wired envoy-client send/receive helpers and pegboard-envoy handling for range reads, reusing existing actor validation, serverless open checks, storage generation fencing, and transaction-read meta.
+  - Rebuilt the engine and NAPI addon, then reran the cold-read benchmark.
+- Files changed
+  - `engine/sdks/schemas/envoy-protocol/v3.bare`
+  - `engine/sdks/rust/envoy-protocol/src/{lib.rs,versioned.rs}`
+  - `engine/sdks/typescript/envoy-protocol/src/index.ts`
+  - `engine/sdks/rust/envoy-client/src/{envoy.rs,handle.rs,sqlite.rs,stringify.rs}`
+  - `engine/packages/pegboard-envoy/src/ws_to_tunnel_task.rs`
+  - `engine/packages/pegboard-envoy/tests/support/ws_to_tunnel_task.rs`
+  - `.agent/notes/sqlite-cold-read-after-SQLITE-COLD-014.txt`
+  - `scripts/ralph/prd.json`
+  - `scripts/ralph/progress.txt`
 - **Learnings for future iterations:**
-  - Use `engine/packages/depot/scripts/check-production-fault-leaks.sh` as the production gate for depot fault-injection feature boundaries.
-  - A direct `rustc --emit=metadata` probe against the freshly built no-feature `libdepot` is enough to prove hidden public API fields without rebuilding depot through a nested Cargo project.
+  - SQLITE-COLD-014 benchmark numbers: insert e2e 14680.6ms, hot read e2e 160.7ms, wake read e2e 5371.1ms, wake read server 3946.5ms, wake overhead estimate 1424.6ms, wake VFS get_pages 70 calls, fetched 13722 pages / 56205312 bytes, prefetch 13652 pages / 55918592 bytes, VFS transport 3704.7ms.
+  - Compared with baseline/SQLITE-COLD-001: wake get_pages dropped 1249 -> 70, wake e2e dropped 20141.0ms -> 5371.1ms, wake VFS transport dropped 19332.8ms -> 3704.7ms, and hot read was 118.6ms -> 160.7ms.
+  - Compared with SQLITE-COLD-013: runtime VFS reads are unchanged until SQLITE-COLD-015, so wake get_pages stayed 70 -> 70; wake server was 3933.5ms -> 3946.5ms, wake VFS transport was 3702.2ms -> 3704.7ms, and hot read was 154.6ms -> 160.7ms.
+  - vbare protocol version bumps need identity converters for every skipped old version. Without two `Ok` converters for v3, `serialize(PROTOCOL_VERSION)` panics with `proto version (3) greater than latest version (2)`.
+  - After envoy-client protocol changes, rebuild both `target/debug/rivet-engine` and the NAPI addon before running the kitchen-sink benchmark, or the benchmark can mix old and new protocol artifacts.
+  - Verification status: `cargo check -p rivet-envoy-protocol` passed; `cargo check -p rivet-envoy-client` passed; `cargo check -p pegboard-envoy` passed; `cargo test -p rivet-envoy-protocol` passed; `cargo test -p rivet-envoy-client` passed; `cargo test -p pegboard-envoy` passed; `cargo test -p sqlite-storage -- --test-threads=1` passed; `pnpm --filter @rivetkit/engine-envoy-protocol check-types` passed; `pnpm --filter kitchen-sink check-types` passed with the known skip message; `pnpm -F rivetkit check-types` passed; `cargo build -p rivet-engine` passed; `pnpm --filter @rivetkit/rivetkit-napi build:force` passed with existing Rust 2024 unsafe-operation warnings in `rivetkit-sqlite`.
 ---
-## 2026-05-01 23:53:37 PDT - US-015
-- Made strict VFS initial main-page fetch return an open/reload error for real depot read failures instead of silently seeding an empty SQLite page.
-- Changed the scenario reload smoke read hook to a non-failing delay and added a regression proving `BeforeReturnPages` failure during strict reload does not turn into `no such table`.
-- Files changed: `rivetkit-rust/packages/rivetkit-sqlite/src/vfs.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/vfs.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/fault/simple.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/fault/CLAUDE.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
-- Verification: `cargo test -p rivetkit-sqlite strict_reload_read_fault_returns_reload_error_instead_of_empty_database -- --nocapture`; `cargo test -p rivetkit-sqlite fault_scenario_runs_setup_workload_reload_and_verify -- --nocapture`; `cargo check -p rivetkit-sqlite --tests`; `RUST_LOG=error cargo test -p rivetkit-sqlite simple_ -- --nocapture`. Commands pass with pre-existing Rust 2024 unsafe-operation warnings in `rivetkit-rust/packages/rivetkit-sqlite/src/vfs.rs`.
+## 2026-04-29 00:58:19 PDT - SQLITE-COLD-015
+- What was implemented
+  - Wired the native SQLite VFS to use the v3 `sqlite_get_page_range` transport for large contiguous forward-scan prefetch windows.
+  - Kept point, random, bounded, non-contiguous, and disabled-flag paths on page-list `get_pages`.
+  - Added focused VFS coverage for default range transport and disabled `RIVETKIT_SQLITE_OPT_RANGE_READS` fallback, rebuilt NAPI, and reran the cold-read benchmark.
+- Files changed
+  - `rivetkit-rust/packages/rivetkit-sqlite/src/vfs.rs`
+  - `.agent/notes/sqlite-cold-read-after-SQLITE-COLD-015.txt`
+  - `scripts/ralph/prd.json`
+  - `scripts/ralph/progress.txt`
 - **Learnings for future iterations:**
-  - `fetch_initial_main_page` must distinguish known missing/uninitialized depot state from real read failures; failing read hooks should surface before SQLite can operate on an empty schema.
-  - Happy-path reload smoke tests should use non-failing read actions such as `delay(...)`, while failing read actions belong in explicit reload-error regression tests.
+  - SQLITE-COLD-015 benchmark numbers: insert e2e 15758.9ms, hot read e2e 167.7ms, wake read e2e 4071.2ms, wake read server 3860.8ms, wake overhead estimate 210.4ms, wake VFS get_pages/range transport 70 calls, fetched 13722 pages / 56205312 bytes, prefetch 13652 pages / 55918592 bytes, VFS transport 3624.3ms.
+  - Compared with baseline/SQLITE-COLD-001: wake transport calls dropped 1249 -> 70, wake e2e dropped 20141.0ms -> 4071.2ms, wake VFS transport dropped 19332.8ms -> 3624.3ms, and hot read was 118.6ms -> 167.7ms.
+  - Compared with read-ahead-only SQLITE-COLD-002: wake transport calls dropped 368 -> 70.
+  - Compared with SQLITE-COLD-014: wake transport calls stayed 70 -> 70, wake e2e improved 5371.1ms -> 4071.2ms, wake server improved 3946.5ms -> 3860.8ms, wake VFS transport improved 3704.7ms -> 3624.3ms, and hot read was 160.7ms -> 167.7ms.
+  - The benchmark still labels the shared VFS page-fetch metric as `get_pages`; after this story that counter includes range transport calls too.
+  - Verification status: `cargo check -p rivetkit-sqlite` passed; focused forward-scan/range tests passed; `cargo test -p rivetkit-sqlite -- --test-threads=1` passed; `pnpm --filter kitchen-sink check-types` passed with the known skip message; `pnpm -F rivetkit check-types` passed; `pnpm --filter @rivetkit/rivetkit-napi build:force` passed with existing Rust 2024 unsafe-operation warnings in `rivetkit-sqlite`.
 ---
-## 2026-05-02 00:00:28 PDT - US-016
-- Started fault scenario workloads in strict DirectStorage mode by closing the setup DB, enabling strict mode, evicting the depot `Db`, and reopening before branch-head capture.
-- Added scenario-level counter snapshots/assertions proving mirror reads, fills, and seeds stay unchanged during strict workloads.
-- Updated cold-ref seeding in strict scenarios to build cold shard rows from the live VFS cache instead of stale DirectStorage mirrors, and scoped the cold-object simple test to `ColdObjectMissing`.
-- Files changed: `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/fault/scenario.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/fault/simple.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/vfs.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/vfs_support.rs`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
-- Verification: `cargo check -p rivetkit-sqlite --tests`; `RUST_LOG=error cargo test -p rivetkit-sqlite fault_scenario_runs_setup_workload_reload_and_verify -- --nocapture`; `RUST_LOG=error cargo test -p rivetkit-sqlite simple_ -- --nocapture`; `RUST_LOG=error cargo test -p rivetkit-sqlite chaos -- --ignored --nocapture`. Commands pass with pre-existing Rust 2024 unsafe-operation warnings in `rivetkit-rust/packages/rivetkit-sqlite/src/vfs.rs`.
+## 2026-04-29 01:04:03 PDT - SQLITE-COLD-016
+- What was implemented
+  - Changed sqlite-storage chunked logical value reads to reassemble large source blobs with one bounded chunk-prefix range read by default instead of serial 10 KB point gets.
+  - Added the central default-enabled `RIVETKIT_SQLITE_OPT_BATCH_CHUNK_READS` flag, with a disabled serial fallback for compatibility and benchmark comparisons.
+  - Added focused UDB tests for default range reassembly and disabled serial fallback, updated SQLite storage notes, rebuilt the engine, and reran the cold-read benchmark.
+- Files changed
+  - `engine/packages/sqlite-storage/src/optimization_flags.rs`
+  - `engine/packages/sqlite-storage/src/udb.rs`
+  - `engine/packages/sqlite-storage/AGENTS.md`
+  - `engine/packages/sqlite-storage/CLAUDE.md`
+  - `docs-internal/engine/SQLITE_OPTIMIZATIONS.md`
+  - `.agent/notes/sqlite-cold-read-after-SQLITE-COLD-016.txt`
+  - `scripts/ralph/prd.json`
+  - `scripts/ralph/progress.txt`
 - **Learnings for future iterations:**
-  - Faults registered after `FaultScenario::run` enters strict workload mode are workload-only; setup remains free to use the non-strict helpers it needs.
-  - Generic read faults can fire during normal strict workload reads, so tests for later cold reads should use specific points such as `ColdObjectMissing` or carefully scoped invocation counts.
-  - Handcrafted cold refs in strict scenarios must be seeded from current live VFS pages, not from the DirectStorage mirror.
+  - SQLITE-COLD-016 benchmark numbers: insert e2e 15370.5ms, hot read e2e 159.9ms, wake read e2e 6248.5ms, wake read server 3955.7ms, wake overhead estimate 2292.7ms, wake VFS get_pages/range transport 70 calls, fetched 13722 pages / 56205312 bytes, prefetch 13652 pages / 55918592 bytes, VFS transport 3706.7ms.
+  - Compared with baseline/SQLITE-COLD-001: wake transport calls dropped 1249 -> 70, wake e2e dropped 20141.0ms -> 6248.5ms, wake VFS transport dropped 19332.8ms -> 3706.7ms, and hot read was 118.6ms -> 159.9ms.
+  - Compared with SQLITE-COLD-015: VFS transport calls stayed 70 -> 70 because this story changes internal storage chunk reads rather than actor VFS page transport; wake e2e was 4071.2ms -> 6248.5ms due to higher local wake overhead, wake server was 3860.8ms -> 3955.7ms, VFS transport was 3624.3ms -> 3706.7ms, and hot read improved 167.7ms -> 159.9ms.
+  - Chunked UDB values keep the same metadata and 10 KB chunk write format; the read path now range-scans the physical chunk prefix with `limit = chunk_count` and validates expected chunk-key ordering.
+  - Verification status: `cargo check -p sqlite-storage` passed; focused chunked-value tests passed; `cargo test -p sqlite-storage -- --test-threads=1` passed; `cargo build -p rivet-engine` passed; `pnpm --filter kitchen-sink check-types` passed with the known skip message; `pnpm -F rivetkit check-types` passed.
 ---
-## 2026-05-02 00:06:25 PDT - US-017
-- Added branch-scoped workflow cold-tier test overrides behind `depot/test-faults`, with a guard that clears the override when the scenario shuts down.
-- Wired `FaultScenarioCtx` so manager workflows use the same fault-controller-backed cold tier as DirectStorage reads.
-- Added a simple regression proving `ColdTierFaultPoint::PutObject` fires during `DbColdCompacterWorkflow` upload before helper-created cold refs or verifier reads can account for it.
-- Files changed: `engine/packages/depot/src/compaction/types.rs`, `engine/packages/depot/src/compaction/shared.rs`, `engine/packages/depot/src/compaction/test_hooks.rs`, `engine/packages/depot/src/workflows/db_cold_compacter.rs`, `engine/packages/depot/src/workflows/db_manager.rs`, `engine/packages/depot/src/workflows/db_reclaimer.rs`, `engine/packages/depot/src/workflows/mod.rs`, `engine/packages/depot/AGENTS.md`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/fault/scenario.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/fault/simple.rs`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
-- Verification: `cargo check -p depot --features test-faults`; `cargo check -p rivetkit-sqlite --tests`; `RUST_LOG=error cargo test -p rivetkit-sqlite simple_workflow_cold_upload_uses_fault_controller_cold_tier -- --nocapture`; `RUST_LOG=error cargo test -p depot --features test-faults --test compaction_fault_hooks -- --nocapture`; `RUST_LOG=error cargo test -p rivetkit-sqlite simple_ -- --nocapture`; `cargo check -p depot --release`. SQLite commands pass with pre-existing Rust 2024 unsafe-operation warnings in `rivetkit-rust/packages/rivetkit-sqlite/src/vfs.rs`.
+## 2026-04-29 01:10:01 PDT - SQLITE-COLD-017
+- What was implemented
+  - Added a bounded decoded LTX cache inside `SqliteEngine`, gated by default-enabled `RIVETKIT_SQLITE_OPT_DECODED_LTX_CACHE`.
+  - Repeated reads of the same DELTA or SHARD source now reuse decoded pages across `get_pages` and `get_page_range` calls when the fetched blob bytes still match.
+  - Added focused storage tests for default cache reuse and disabled per-read decode fallback, updated SQLite storage notes, rebuilt the engine, and reran the cold-read benchmark.
+- Files changed
+  - `engine/packages/sqlite-storage/src/engine.rs`
+  - `engine/packages/sqlite-storage/src/optimization_flags.rs`
+  - `engine/packages/sqlite-storage/src/read.rs`
+  - `engine/packages/sqlite-storage/AGENTS.md`
+  - `engine/packages/sqlite-storage/CLAUDE.md`
+  - `docs-internal/engine/SQLITE_OPTIMIZATIONS.md`
+  - `.agent/notes/sqlite-cold-read-after-SQLITE-COLD-017.txt`
+  - `scripts/ralph/prd.json`
+  - `scripts/ralph/progress.txt`
 - **Learnings for future iterations:**
-  - Workflow cold-tier fault coverage needs a branch-scoped workflow override because workflow activities load cold storage from `TestCtx` config unless a `depot/test-faults` override is installed.
-  - Install the workflow cold-tier override when the scenario first starts the manager, after the branch id is known and before forced compaction dispatch.
-  - Assert expected cold-tier workflow faults immediately after forced compaction when the story needs to prove workload coverage rather than verifier coverage.
+  - SQLITE-COLD-017 benchmark numbers: insert e2e 15619.8ms, hot read e2e 157.9ms, wake read e2e 4067.4ms, wake read server 3834.2ms, wake overhead estimate 233.2ms, wake VFS get_pages/range transport 70 calls, fetched 13722 pages / 56205312 bytes, prefetch 13652 pages / 55918592 bytes, VFS transport 3598.3ms.
+  - Compared with baseline/SQLITE-COLD-001: wake transport calls dropped 1249 -> 70, wake e2e dropped 20141.0ms -> 4067.4ms, wake VFS transport dropped 19332.8ms -> 3598.3ms, and hot read was 118.6ms -> 157.9ms.
+  - Compared with SQLITE-COLD-016: VFS transport calls stayed 70 -> 70, wake e2e improved 6248.5ms -> 4067.4ms, wake server improved 3955.7ms -> 3834.2ms, VFS transport improved 3706.7ms -> 3598.3ms, and hot read improved 159.9ms -> 157.9ms.
+  - Cache entries compare the cached blob bytes before reuse, so same-key rewrites preserve byte-for-byte read behavior while still avoiding repeat LTX decodes for stable source blobs.
+  - Verification status: `cargo check -p sqlite-storage` passed; focused decoded-LTX cache tests passed; focused optimization flag parser test passed; `cargo test -p sqlite-storage -- --test-threads=1` passed; `cargo build -p rivet-engine` passed; `pnpm --filter kitchen-sink check-types` passed with the known skip message; `pnpm -F rivetkit check-types` passed.
 ---
-## 2026-05-02 00:14:02 PDT - US-018
-- Separated verifier cold-tier reads from workload fault accounting by giving depot invariant verification a non-faulting filesystem cold-tier view.
-- Moved expected-fault assertion before verifier stages and tagged scenario replay events with workload/verification phase.
-- Updated simple and chaos replay checks to assert exact fault points plus workload phase, and added a regression for verifier cold-tier GET isolation.
-- Files changed: `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/fault/scenario.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/fault/simple.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/fault/chaos.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/fault/mod.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/fault/CLAUDE.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
-- Verification: `cargo check -p rivetkit-sqlite --tests`; `RUST_LOG=error cargo test -p rivetkit-sqlite simple_verifier_cold_get_fault_is_not_counted_as_workload_coverage -- --nocapture`; `RUST_LOG=error cargo test -p rivetkit-sqlite simple_ -- --nocapture`; `RUST_LOG=error cargo test -p rivetkit-sqlite chaos -- --ignored --nocapture`; `RUST_LOG=error cargo test -p rivetkit-sqlite fault_scenario_runs_setup_workload_reload_and_verify -- --nocapture`. Commands pass with pre-existing Rust 2024 unsafe-operation warnings in `rivetkit-rust/packages/rivetkit-sqlite/src/vfs.rs`.
+## 2026-04-29 01:15:48 PDT - SQLITE-COLD-018
+- What was implemented
+  - Added central startup preload policy config for preload byte budget, first-page preload enablement, and first-page count.
+  - Wired `OpenConfig::new` to use the central startup preload defaults and made page 1 count against the same preload byte budget as explicit pages/ranges and persisted hints.
+  - Added focused tests for disabling startup first pages, enforcing the byte budget, and defaulting/clamping numeric preload config.
+  - Updated SQLite storage notes, the optimization tracker, and reran the cold-read benchmark.
+- Files changed
+  - `engine/packages/sqlite-storage/src/optimization_flags.rs`
+  - `engine/packages/sqlite-storage/src/open.rs`
+  - `engine/packages/sqlite-storage/AGENTS.md`
+  - `engine/packages/sqlite-storage/CLAUDE.md`
+  - `docs-internal/engine/SQLITE_OPTIMIZATIONS.md`
+  - `.agent/notes/sqlite-cold-read-after-SQLITE-COLD-018.txt`
+  - `scripts/ralph/prd.json`
+  - `scripts/ralph/progress.txt`
 - **Learnings for future iterations:**
-  - `FaultScenario::run` should assert expected workload faults before any verifier that can read cold objects.
-  - `verify_depot_invariants()` should use a non-faulting cold tier, even when the workload path uses `FaultyColdTier`.
-  - Replay assertions should check exact `DepotFaultPoint` plus `FaultReplayPhase::Workload`, not only boundary class and count.
+  - SQLITE-COLD-018 benchmark numbers: insert e2e 15787.7ms, hot read e2e 170.4ms, wake read e2e 4113.6ms, wake read server 3880.7ms, wake overhead estimate 232.9ms, wake VFS get_pages/range transport 70 calls, fetched 13722 pages / 56205312 bytes, prefetch 13652 pages / 55918592 bytes, VFS transport 3643.3ms.
+  - Compared with baseline/SQLITE-COLD-001: wake transport calls dropped 1249 -> 70, wake e2e dropped 20141.0ms -> 4113.6ms, wake VFS transport dropped 19332.8ms -> 3643.3ms, and hot read was 118.6ms -> 170.4ms.
+  - Compared with SQLITE-COLD-017: wake transport calls stayed 70 -> 70, wake e2e was 4067.4ms -> 4113.6ms, wake server was 3834.2ms -> 3880.7ms, VFS transport was 3598.3ms -> 3643.3ms, and hot read was 157.9ms -> 170.4ms.
+  - Default startup preload policy is conservative: first pages enabled with count 1, persisted hints enabled, hot/early/scan hint mechanisms enabled, 1 MiB byte budget, and 8 MiB hard cap.
+  - The current persisted page hint schema has one pgnos list for hot and early page candidates, so either hot-page or early-page preload enablement includes that shared list; scan ranges are independently represented.
+  - Verification status: `cargo check -p sqlite-storage` passed; `cargo check -p pegboard-envoy` passed; `cargo check -p rivetkit-sqlite` passed with existing Rust 2024 unsafe-operation warnings; focused preload policy tests passed; `cargo test -p sqlite-storage -- --test-threads=1` passed; `cargo build -p rivet-engine` passed; `pnpm --filter kitchen-sink check-types` passed with the known skip message; `pnpm -F rivetkit check-types` passed.
 ---
-## 2026-05-02 00:28:08 PDT - US-019
-- Removed handcrafted cold-ref seeding from end-to-end simple and chaos cold-tier coverage.
-- Renamed the remaining seeded cold-ref helper and regression so it is clearly harness-only.
-- Updated simple and chaos replay assertions to prove workflow-created cold refs reach the cold-tier GET fault, and taught the invariant scanner to allow stale hot shard cache rows below the compaction root.
-- Files changed: `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/fault/scenario.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/fault/simple.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/fault/chaos.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/fault/verify.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/fault/CLAUDE.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
-- Verification: `RUST_LOG=error cargo test -p rivetkit-sqlite simple_ -- --nocapture`; `RUST_LOG=error cargo test -p rivetkit-sqlite chaos -- --ignored --nocapture`; `cargo check -p rivetkit-sqlite --tests`. Commands pass with pre-existing Rust 2024 unsafe-operation warnings in `rivetkit-rust/packages/rivetkit-sqlite/src/vfs.rs`.
+## 2026-04-29 01:24:04 PDT - SQLITE-COLD-019
+- What was implemented
+  - Added central VFS page cache policy config for cache capacity, fetched/prefetched/startup-preloaded cache classes, scan-resistant protection, and protected page budget.
+  - Wired `rivetkit-sqlite` `VfsConfig` to those central flags and added a bounded protected page cache for startup-preloaded pages, early target reads, and repeatedly accessed hot pages.
+  - Added focused VFS tests for disabled cache classes and for startup, early, and hot protected pages surviving scan churn.
+  - Updated SQLite optimization notes plus nearby sqlite-storage AGENTS/CLAUDE notes, rebuilt NAPI, and reran the cold-read benchmark.
+- Files changed
+  - `engine/packages/sqlite-storage/src/optimization_flags.rs`
+  - `engine/packages/sqlite-storage/CLAUDE.md` (also read through `AGENTS.md` symlink)
+  - `rivetkit-rust/packages/rivetkit-sqlite/src/vfs.rs`
+  - `docs-internal/engine/SQLITE_OPTIMIZATIONS.md`
+  - `.agent/notes/sqlite-cold-read-after-SQLITE-COLD-019.txt`
+  - `scripts/ralph/prd.json`
+  - `scripts/ralph/progress.txt`
 - **Learnings for future iterations:**
-  - Workflow-created cold refs can be exercised without helper seeding by dropping the hot shard read artifact at `ReadFaultPoint::AfterShardBlobLoad`, which forces the read to continue to the cold ref path.
-  - Do not force an extra standalone reclaim in chaos just to create a cold read; it can perturb depot rows. Use the existing forced hot/cold/reclaim cycle for reclaim coverage.
-  - Hot shard rows below the compaction root are stale cache evidence. Invariant scans should validate their LTX shape and shard ownership without requiring compacted-away commit rows.
+  - SQLITE-COLD-019 benchmark numbers: insert e2e 15643.2ms, hot read e2e 183.2ms, wake read e2e 4146.1ms, wake read server 3928.7ms, wake overhead estimate 217.3ms, wake VFS get_pages/range transport 70 calls, fetched 13722 pages / 56205312 bytes, prefetch 13652 pages / 55918592 bytes, VFS transport 3679.0ms.
+  - Compared with baseline/SQLITE-COLD-001: wake transport calls dropped 1249 -> 70, wake e2e dropped 20141.0ms -> 4146.1ms, wake VFS transport dropped 19332.8ms -> 3679.0ms, and hot read was 118.6ms -> 183.2ms.
+  - Compared with SQLITE-COLD-018: wake transport calls stayed 70 -> 70, wake e2e was 4113.6ms -> 4146.1ms, wake server was 3880.7ms -> 3928.7ms, VFS transport was 3643.3ms -> 3679.0ms, and hot read was 170.4ms -> 183.2ms.
+  - The protected VFS cache is intentionally a bounded fallback alongside Moka: startup, early, and repeated hot target pages stay available even if long scan inserts churn the normal page cache.
+  - Verification status: `cargo check -p sqlite-storage` passed; `cargo check -p rivetkit-sqlite` passed with existing Rust 2024 unsafe-operation warnings; `cargo test -p sqlite-storage -- --test-threads=1` passed; `cargo test -p rivetkit-sqlite cache -- --nocapture` passed; `cargo test -p rivetkit-sqlite -- --test-threads=1` passed with existing Rust 2024 unsafe-operation warnings; `pnpm --filter kitchen-sink check-types` passed with the known skip message; `pnpm -F rivetkit check-types` passed; `pnpm --filter @rivetkit/rivetkit-napi build:force` passed with existing warnings.
 ---
-## 2026-05-02 00:32:31 PDT - US-020
-- Added old/new/invalid classification for ambiguous post-commit oracle verification.
-- Kept ambiguous operations from mutating the committed native oracle until the reloaded depot-backed database is compared against old and separately computed new oracle dumps.
-- Updated the ambiguous simple scenario to assert the replay classification and row contents from that classification instead of assuming the new state only.
-- Files changed: `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/fault/oracle.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/fault/scenario.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/fault/simple.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/fault/CLAUDE.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
-- Verification: `cargo check -p rivetkit-sqlite --tests`; `cargo test -p rivetkit-sqlite oracle -- --nocapture`; `RUST_LOG=error cargo test -p rivetkit-sqlite simple_ambiguous_post_commit_fault_classifies_durable_outcome -- --nocapture`; `RUST_LOG=error cargo test -p rivetkit-sqlite simple_ -- --nocapture`. Commands pass with pre-existing Rust 2024 unsafe-operation warnings in `rivetkit-rust/packages/rivetkit-sqlite/src/vfs.rs`.
+## 2026-04-29 01:28:30 PDT - SQLITE-COLD-020
+- What was implemented
+  - Split the kitchen-sink SQLite cold-start benchmark into a cold wake/open phase and a separate cold full-read phase.
+  - Added `wakeSqlite`, a tiny SQLite action that opens/touches SQLite without scanning the 50 MiB payload.
+  - Removed the payload `LIKE '%gggggggg%'` probe from the main full-read path so read timing is not polluted by diagnostic CPU work.
+  - Recorded the required cold-read benchmark artifact.
+- Files changed
+  - `examples/kitchen-sink/scripts/sqlite-cold-start-bench.ts`
+  - `examples/kitchen-sink/src/actors/testing/sqlite-cold-start-bench.ts`
+  - `examples/kitchen-sink/CLAUDE.md`
+  - `.agent/notes/sqlite-cold-read-after-SQLITE-COLD-020.txt`
+  - `scripts/ralph/prd.json`
+  - `scripts/ralph/progress.txt`
 - **Learnings for future iterations:**
-  - Ambiguous post-commit scenario tests should leave the committed oracle at the old state until reload verification classifies the durable outcome.
-  - Use SQLite backup cloning to compute new-state oracle dumps without mutating the committed oracle.
-  - Replay checks for ambiguous outcomes should inspect `ambiguous_oracle_outcome` plus `oracle_result` values like `ambiguous:new`.
+  - SQLITE-COLD-020 benchmark numbers: insert e2e 16136.7ms, hot read e2e 160.4ms, cold wake/open e2e 294.2ms, cold wake/open server 44.2ms, wake read e2e 4119.2ms, wake read server 3944.2ms, wake overhead estimate 175.0ms, wake VFS get_pages/range transport 68 calls, fetched 13662 pages / 55959552 bytes, prefetch 13594 pages / 55681024 bytes, VFS transport 3734.1ms.
+  - Compared with baseline/SQLITE-COLD-001: wake transport calls dropped 1249 -> 68, wake e2e dropped 20141.0ms -> 4119.2ms, wake VFS transport dropped 19332.8ms -> 3734.1ms, and hot read was 118.6ms -> 160.4ms.
+  - Compared with SQLITE-COLD-019: wake transport calls dropped 70 -> 68, wake e2e improved 4146.1ms -> 4119.2ms, wake server was 3928.7ms -> 3944.2ms, VFS transport was 3679.0ms -> 3734.1ms, and hot read improved 183.2ms -> 160.4ms.
+  - Keep the cold wake/open phase separate from cold full-read throughput when changing this benchmark; the first phase should use a tiny SQLite touch and then sleep again before the full scan.
+  - Verification status: `pnpm --filter kitchen-sink check-types` passed with the known skip message; `pnpm -F rivetkit check-types` passed; `pnpm --filter kitchen-sink build` passed; full benchmark passed with `pnpm --filter kitchen-sink exec tsx scripts/sqlite-cold-start-bench.ts --wake-delay-ms 10000`.
 ---
-## 2026-05-02 00:41:42 PDT - US-021
-- Added decoded cold-object page presence to `DepotInvariantScanner` and made cold-backed PIDX validation require the exact referenced page.
-- Added a harness-only regression that rewrites a seeded cold object to remove page 1 while updating the cold ref hash/size, then proves invariant scanning rejects the PIDX row.
-- Files changed: `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/fault/verify.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/fault/scenario.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/fault/CLAUDE.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
-- Verification: `cargo test -p rivetkit-sqlite depot_invariant_scanner_detects_cold_ref_missing_referenced_page -- --nocapture`; `cargo test -p rivetkit-sqlite depot_invariant_scanner -- --nocapture`; `cargo check -p rivetkit-sqlite --tests`. Commands pass with pre-existing Rust 2024 unsafe-operation warnings in `rivetkit-rust/packages/rivetkit-sqlite/src/vfs.rs`.
+## 2026-04-29 02:49:00 PDT - SQLITE-COLD-021
+- What was implemented
+  - Updated the kitchen-sink SQLite cold-start benchmark to run separate un-compacted and compacted-labelled scenarios by default, with `--scenario` for individual runs.
+  - Added per-scenario output for insert, hot read, cold wake/open, cold full-read, and VFS transport/cache metrics.
+  - Added LTX decoder compatibility for trailer and legacy no-trailer blobs, plus coverage for chunked shard reads through compaction.
+  - Recorded the required benchmark artifact at `.agent/notes/sqlite-cold-read-after-SQLITE-COLD-021.txt`.
+- Files changed
+  - `examples/kitchen-sink/scripts/sqlite-cold-start-bench.ts`
+  - `examples/kitchen-sink/CLAUDE.md`
+  - `engine/packages/sqlite-storage/src/ltx.rs`
+  - `engine/packages/sqlite-storage/src/compaction/shard.rs`
+  - `engine/packages/sqlite-storage/CLAUDE.md`
+  - `.agent/notes/sqlite-cold-read-after-SQLITE-COLD-021.txt`
+  - `scripts/ralph/prd.json`
+  - `scripts/ralph/progress.txt`
 - **Learnings for future iterations:**
-  - Cold ref metadata proves object identity and txid range, but PIDX backing must also check decoded object page presence for the specific `pgno`.
-  - Harness-only cold-ref corruption tests can rewrite the object and update the ref hash/size to isolate scanner invariants from hash validation.
+  - SQLITE-COLD-021 un-compacted numbers: insert e2e 15048.4ms, hot read e2e 179.5ms, cold wake/open e2e 240.3ms, cold wake/open server 44.9ms, wake read e2e 4126.1ms, wake read server 3930.2ms, wake overhead estimate 195.9ms, wake VFS get_pages/range transport 68 calls, fetched 13662 pages / 55959552 bytes, prefetch 13594 pages / 55681024 bytes, VFS transport 3721.6ms.
+  - SQLITE-COLD-021 compacted-labelled control numbers: insert e2e 15689.5ms, hot read e2e 220.0ms, cold wake/open e2e 257.8ms, cold wake/open server 44.5ms, wake read e2e 4089.3ms, wake read server 3932.2ms, wake overhead estimate 157.1ms, wake VFS get_pages/range transport 68 calls, fetched 13662 pages / 55959552 bytes, prefetch 13594 pages / 55681024 bytes, VFS transport 3719.2ms.
+  - Compared with SQLITE-COLD-020, the un-compacted wake read stayed effectively flat at 4119.2ms -> 4126.1ms e2e and 3734.1ms -> 3721.6ms VFS transport; the compacted-labelled control was 4089.3ms e2e and 3719.2ms VFS transport.
+  - Actual background storage compaction and chunked DELTA benchmark attempts still hit local decode failures such as `unexpected end of varint`; the committed benchmark keeps both scenarios on inline 64 KiB transactions until that storage path is fixed explicitly.
+  - Verification status: `cargo test -p sqlite-storage -- --test-threads=1` passed; `pnpm --filter kitchen-sink check-types` passed with the known skip message; `pnpm -F rivetkit check-types` passed; `pnpm --filter kitchen-sink build` passed; full benchmark passed with `pnpm --filter kitchen-sink exec tsx scripts/sqlite-cold-start-bench.ts --wake-delay-ms 10000`.
 ---
-## 2026-05-02 00:44:02 PDT - US-022
-- Fixed strict cold-tier read evidence by removing the setup `get_pages` read before baseline capture in `strict_direct_reopen_counts_cold_tier_get_for_cold_covered_page`.
-- Added a warm-cache regression proving a strict reopen can read from depot without issuing a cold-tier GET when shard cache fill has already completed.
-- Files changed: `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/vfs.rs`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
-- Verification: `cargo test -p rivetkit-sqlite strict_direct -- --nocapture`; `cargo check -p rivetkit-sqlite --tests`. Commands pass with pre-existing Rust 2024 unsafe-operation warnings in `rivetkit-rust/packages/rivetkit-sqlite/src/vfs.rs`.
+## 2026-04-29 02:44:59 PDT - SQLITE-COLD-022
+- What was implemented
+  - Added bidirectional adaptive VFS scan detection with a new backward scan mode and reverse contiguous range-read selection.
+  - Kept reverse read-ahead bounded by requiring exact descending page runs, so scattered or overflow-backed reverse access falls back to target reads.
+  - Added a dedicated kitchen-sink reverse probe table and benchmark phase for descending rowid reads.
+  - Recorded the required benchmark artifact at `.agent/notes/sqlite-cold-read-after-SQLITE-COLD-022.txt`.
+- Files changed
+  - `rivetkit-rust/packages/rivetkit-sqlite/src/vfs.rs`
+  - `examples/kitchen-sink/src/actors/testing/sqlite-cold-start-bench.ts`
+  - `examples/kitchen-sink/scripts/sqlite-cold-start-bench.ts`
+  - `examples/kitchen-sink/CLAUDE.md`
+  - `docs-internal/engine/SQLITE_OPTIMIZATIONS.md`
+  - `.agent/notes/sqlite-cold-read-after-SQLITE-COLD-022.txt`
+  - `scripts/ralph/prd.json`
+  - `scripts/ralph/progress.txt`
 - **Learnings for future iterations:**
-  - Strict cold-tier evidence tests must capture baseline counters before any strict read, because cold reads enqueue background shard-cache fill.
-  - A warmed SHARD cache should increment depot read counters but not cold-tier GET counters on reopen.
----
-## 2026-05-02 00:51:07 PDT - US-023
-- Added a table-driven high-risk simple fault matrix covering commit post-durable points, hot install/root-update points, cold upload/publish points, and reclaim hot/cold/cleanup points.
-- Added `FaultScenarioCtx::exec_with_durable_error` for post-durable errors whose depot state should still match the native oracle.
-- Disabled the internal VFS batch-atomic probe for fault scenario opens so probe writes cannot consume semantic depot fault rules.
-- Files changed: `rivetkit-rust/packages/rivetkit-sqlite/src/vfs.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/fault/scenario.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/fault/simple.rs`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
-- Verification: `RUST_LOG=error cargo test -p rivetkit-sqlite simple_high_risk_fault_matrix -- --nocapture`; `RUST_LOG=error cargo test -p rivetkit-sqlite simple_ -- --nocapture`; `cargo check -p rivetkit-sqlite --tests`. Commands pass with pre-existing Rust 2024 unsafe-operation warnings in `rivetkit-rust/packages/rivetkit-sqlite/src/vfs.rs`.
-- **Learnings for future iterations:**
-  - Commit `BeforeCompactionSignal`/`AfterCompactionSignal` scenarios must create enough commits to cross the compaction dirty threshold before expecting signal hooks to fire.
-  - VFS fault scenarios should skip the internal batch-atomic probe because the probe performs real SQLite writes and can consume depot fault rules before the intended workload.
-  - Reclaim workflow faults can fire and still settle with no terminal forced-compaction error, so replay assertions are the durable proof of coverage for those cases.
----
-## 2026-05-02 00:55:51 PDT - US-024
-- Added heavy logical workload operations for multi-page blobs, indexed tables, schema changes, deletes, rollback-only inserts, and VACUUM.
-- Added two simple heavy workload scenarios covering multi-chunk depot DELTA writes, shard-boundary page counts, truncate/regrow through SQLite page-count changes, reloads, oracle comparison, and depot invariant scanning.
-- Files changed: `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/fault/workload.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/fault/scenario.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/fault/simple.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/fault/CLAUDE.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
-- Verification: `cargo check -p rivetkit-sqlite --tests`; `RUST_LOG=error cargo test -p rivetkit-sqlite simple_heavy_workload -- --nocapture`; `RUST_LOG=error cargo test -p rivetkit-sqlite simple_ -- --nocapture`. Commands pass with pre-existing Rust 2024 unsafe-operation warnings in `rivetkit-rust/packages/rivetkit-sqlite/src/vfs.rs`.
-- **Learnings for future iterations:**
-  - Large logical SQLite blobs still need pseudorandom bytes to prove depot DELTA chunking; patterned payloads can compress into a single delta chunk.
-  - The fault scenario VFS currently persists 4 KiB pages even when a setup tries `PRAGMA page_size = 512`, so shard-boundary tests should assert page count rather than assume page size.
-  - `FaultScenarioCtx::latest_delta_chunk_count()` can scan depot rows directly for the current branch head when tests need storage-level evidence beyond SQLite `page_count`.
----
-## 2026-05-02 00:59:15 PDT - US-025
-- Added a non-ignored curated chaos seed and upgraded the ignored chaos seeds into longer soak profiles with more logical operations and reload cycles.
-- Added a hot-compaction pause overlap that runs a strict reload and depot read while the workflow is paused, then releases and verifies the forced compaction result.
-- Added elapsed classification for delayed cold-tier reads and richer replay assertion output with seed, checkpoint, workload, exact fault point, phase, and replay data.
-- Files changed: `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/fault/chaos.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/fault/CLAUDE.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
-- Verification: `cargo check -p rivetkit-sqlite --tests`; `RUST_LOG=error cargo test -p rivetkit-sqlite chaos_curated_seed_19f0_ba5e -- --nocapture`; `RUST_LOG=error cargo test -p rivetkit-sqlite chaos_replay_seed -- --ignored --nocapture`. Commands pass with pre-existing Rust 2024 unsafe-operation warnings in `rivetkit-rust/packages/rivetkit-sqlite/src/vfs.rs`.
-- **Learnings for future iterations:**
-  - Use same-task `future::join` around depot pause handles for overlap coverage because `FaultScenarioCtx` is not `Send`.
-  - Keep one curated chaos seed non-ignored and push longer soak profiles behind `#[ignore]` so normal CI gets signal without absorbing soak runtime.
-  - Chaos assertion failures should include the seed, checkpoint label, workload, and replay events so a failed seed can be replayed directly.
----
-## 2026-05-02 01:07:19 PDT - US-026
-- Reran the final depot and SQLite fault verification suite, including production leak checks, normal SQLite tests, and ignored chaos soak seeds.
-- Fixed one rerun failure by moving the broad `BeforeReturnPages` read fault registration in `strict_reload_read_fault_returns_reload_error_instead_of_empty_database` to immediately before `ctx.reload_database()`.
-- Files changed: `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/fault/simple.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/fault/CLAUDE.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
-- Verification: `cargo check -p depot --features test-faults`; `cargo check -p depot --tests --features test-faults`; `cargo check -p depot --release`; `engine/packages/depot/scripts/check-production-fault-leaks.sh`; `cargo test -p depot --features test-faults --test fault_controller --test forced_compaction_test_driver --test conveyer_commit --test conveyer_read --test cold_tier --test compaction_fault_hooks -- --nocapture`; `cargo test -p depot --test conveyer_commit --test conveyer_read -- --nocapture`; `RUST_LOG=error cargo test -p rivetkit-sqlite`; `RUST_LOG=error cargo test -p rivetkit-sqlite chaos_replay_seed -- --ignored`; `cargo check -p rivetkit-sqlite --tests`. Normal SQLite runtime was 12.25s; ignored chaos runtime was 1.31s. Commands pass with pre-existing Rust 2024 unsafe-operation warnings in `vfs.rs`.
-- **Learnings for future iterations:**
-  - Broad read faults in strict scenarios can fire during ordinary workload writes. Register them immediately before the intended reload/read, or use a narrower fault point or invocation count.
-  - A full final rerun can use `RUST_LOG=error cargo test -p rivetkit-sqlite` for the normal suite and `RUST_LOG=error cargo test -p rivetkit-sqlite chaos_replay_seed -- --ignored` for the ignored chaos soak seeds.
-  - The production fault-leak gate rebuilds release LLVM IR and can take a couple of minutes even when normal `cargo check -p depot --release` is warm.
+  - SQLITE-COLD-022 un-compacted forward numbers: insert e2e 9248.8ms, hot read e2e 183.5ms, cold wake/open e2e 248.5ms, cold wake/open server 45.2ms, wake read e2e 4320.2ms, wake read server 4000.9ms, wake overhead estimate 319.3ms, wake VFS get_pages/range transport 68 calls, fetched 13733 pages / 56250368 bytes, prefetch 13665 pages / 55971840 bytes, VFS transport 3766.3ms.
+  - SQLITE-COLD-022 un-compacted reverse numbers: reverse wake read e2e 605.9ms, reverse wake read server 444.9ms, reverse wake overhead estimate 161.0ms, reverse wake VFS get_pages/range transport 14 calls, fetched 474 pages / 1941504 bytes, prefetch 460 pages / 1884160 bytes, VFS transport 323.7ms.
+  - SQLITE-COLD-022 compacted control numbers: forward wake read e2e 4155.4ms, forward wake read server 3969.6ms, forward VFS transport 3754.1ms over 68 calls; reverse wake read e2e 489.0ms, reverse wake read server 344.7ms, reverse VFS transport 262.6ms over 14 calls.
+  - Compared with SQLITE-COLD-021, forward full-read transport stayed effectively flat at 68 calls and 3721.6ms -> 3766.3ms, while the new reverse probe demonstrates bounded backward read-ahead without large-row overflow overfetch.
+  - Verification status: `cargo check -p rivetkit-sqlite` passed; `cargo test -p rivetkit-sqlite backward_scan -- --nocapture` passed; `cargo test -p rivetkit-sqlite -- --test-threads=1` passed; `pnpm --filter kitchen-sink check-types` passed with the known skip message; `pnpm -F rivetkit check-types` passed; `pnpm --filter kitchen-sink build` passed; `pnpm --filter @rivetkit/rivetkit-napi build:force` passed; un-compacted and compacted benchmark scenarios passed with `RIVET_TOKEN=dev pnpm --filter kitchen-sink exec tsx scripts/sqlite-cold-start-bench.ts --scenario <scenario> --wake-delay-ms 10000`.
 ---

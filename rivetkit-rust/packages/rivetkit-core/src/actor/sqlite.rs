@@ -22,7 +22,7 @@ pub use rivetkit_sqlite::query::{BindParam, ColumnValue, ExecResult, QueryResult
 use rivetkit_sqlite::{
 	database::{NativeDatabaseHandle, open_database_from_envoy},
 	query::{exec_statements, execute_statement, query_statement},
-	vfs::SqliteVfsMetricsSnapshot,
+	vfs::{SqliteVfsMetrics, SqliteVfsMetricsSnapshot},
 };
 
 #[cfg(not(feature = "sqlite"))]
@@ -89,6 +89,8 @@ pub struct SqliteDb {
 	db: Arc<Mutex<Option<NativeDatabaseHandle>>>,
 	#[cfg(feature = "sqlite")]
 	cleaned_up: Arc<AtomicBool>,
+	#[cfg(feature = "sqlite")]
+	vfs_metrics: Option<Arc<dyn SqliteVfsMetrics>>,
 }
 
 impl SqliteDb {
@@ -105,7 +107,14 @@ impl SqliteDb {
 			db: Default::default(),
 			#[cfg(feature = "sqlite")]
 			cleaned_up: Default::default(),
+			#[cfg(feature = "sqlite")]
+			vfs_metrics: None,
 		}
+	}
+
+	#[cfg(feature = "sqlite")]
+	pub(crate) fn set_vfs_metrics(&mut self, metrics: Arc<dyn SqliteVfsMetrics>) {
+		self.vfs_metrics = Some(metrics);
 	}
 
 	pub fn is_enabled(&self) -> bool {
@@ -134,6 +143,7 @@ impl SqliteDb {
 			let config = self.runtime_config()?;
 			let db = self.db.clone();
 			let cleaned_up = self.cleaned_up.clone();
+			let vfs_metrics = self.vfs_metrics.clone();
 			let rt_handle = tokio::runtime::Handle::try_current()
 				.context("open sqlite database requires a tokio runtime")?;
 
@@ -154,6 +164,7 @@ impl SqliteDb {
 					config.handle,
 					config.actor_id,
 					rt_handle,
+					vfs_metrics,
 				)?;
 				*guard = Some(native_db);
 				Ok(())

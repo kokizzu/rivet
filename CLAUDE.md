@@ -111,6 +111,7 @@ docker-compose up -d
 - SQLite VFS process-global registrations must be owned by a Drop guard so panics unwind through `sqlite3_vfs_unregister`.
 - `NativeDatabase::Drop` must bound dirty-page flushes with a short timeout and return after logging if the commit future never resolves.
 - Actor2 workflows and envoy actors always use the SQLite v2 storage format; only old actor v1 workflows and pegboard runners use the v1 storage format. ("v2" here refers to the on-disk storage format, not envoy-protocol v2.)
+- Native SQLite VFS recent-page preload hints are actor-side Rust state surfaced by `NativeDatabase::snapshot_preload_hints()`; persist and consume them through runtime/envoy wiring, not JS APIs.
 - For NAPI bridge wiring (TSF callback layout, cancellation tokens, `#[napi(object)]` rules), see `docs-internal/engine/napi-bridge.md`.
 
 ## Agent Working Directory
@@ -293,6 +294,7 @@ Load these only when the task touches the topic.
 - **[NAPI bridge](docs-internal/engine/napi-bridge.md)** — TSF callback slots, `ActorContextShared` cache reset, `#[napi(object)]` payload rules, cancellation token bridging, error prefix encoding. Read before touching `rivetkit-napi`.
 - **[BARE protocol crates](docs-internal/engine/bare-protocol-crates.md)** — vbare schema ordering, identity converters, `build.rs` TS codec generation pattern. Read before adding/changing protocol crates.
 - **[SQLite VFS](docs-internal/engine/sqlite-vfs.md)** — native-only VFS rules, v2 storage keys, chunk layout, delete/truncate strategy. Read before touching the VFS.
+- **[SQLite optimizations](docs-internal/engine/SQLITE_OPTIMIZATIONS.md)** — brief tracker for SQLite cold-read, VFS, storage, preload, and benchmark optimization ideas.
 - **[Depot crash course](docs-internal/engine/depot.md)** — META/PIDX/DELTA/SHARD layout, read/write/compaction paths, generation vs `head_txid` fences, in-RAM caches. Read before touching `engine/packages/depot/`.
 - **[TLS trust roots](docs-internal/engine/tls-trust-roots.md)** — rustls native+webpki union rationale, which clients use which backend.
 - **[Sleep sequence](docs-internal/engine/sleep-sequence.md)** — engine lifecycle authority, `keepAwake` vs `waitUntil` semantics, grace deadline shutdown-token abort, `can_arm_sleep_timer` vs `can_finalize_sleep` predicates. Read before touching sleep/destroy lifecycle.

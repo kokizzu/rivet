@@ -222,9 +222,11 @@ impl ActorContext {
 		region: String,
 		config: ActorConfig,
 		kv: Kv,
-		sql: SqliteDb,
+		mut sql: SqliteDb,
 	) -> Self {
 		let metrics = ActorMetrics::new(actor_id.clone(), name.clone());
+		#[cfg(feature = "sqlite")]
+		sql.set_vfs_metrics(Arc::new(metrics.clone()));
 		let diagnostics = ActorDiagnostics::new(actor_id.clone());
 		let lifecycle_event_inbox_capacity = config.lifecycle_event_inbox_capacity;
 		let state_save_interval = config.state_save_interval;

@@ -2,7 +2,7 @@
 //!
 //! This crate now owns the KV-backed SQLite behavior used by `rivetkit-napi`.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::ptr;
 use std::slice;
@@ -18,12 +18,23 @@ use rivet_envoy_client::handle::EnvoyHandle;
 use rivet_envoy_protocol as protocol;
 use tokio::runtime::Handle;
 
+use crate::optimization_flags::{SqliteOptimizationFlags, sqlite_optimization_flags};
+
 const DEFAULT_CACHE_CAPACITY_PAGES: u64 = 50_000;
-const DEFAULT_PREFETCH_DEPTH: usize = 16;
+const DEFAULT_PREFETCH_DEPTH: usize = 64;
+const LEGACY_PREFETCH_DEPTH: usize = 16;
 const DEFAULT_MAX_PREFETCH_BYTES: usize = 256 * 1024;
+const DEFAULT_ADAPTIVE_PREFETCH_DEPTH: usize = 256;
+const DEFAULT_ADAPTIVE_MAX_PREFETCH_BYTES: usize = 1024 * 1024;
 const DEFAULT_MAX_PAGES_PER_STAGE: usize = 4_000;
+const DEFAULT_RECENT_HINT_PAGE_BUDGET: usize = 128;
+const DEFAULT_RECENT_HINT_RANGE_BUDGET: usize = 16;
 const DEFAULT_PAGE_SIZE: usize = 4096;
 const NATIVE_DATABASE_DROP_FLUSH_TIMEOUT: Duration = Duration::from_millis(250);
+const MIN_RECENT_SCAN_RANGE_PAGES: u32 = 8;
+const FORWARD_SCAN_SCORE_THRESHOLD: i32 = 6;
+const FORWARD_SCAN_SCORE_MAX: i32 = 12;
+const FORWARD_SCAN_GAP_TOLERANCE: u32 = 8;
 const MAX_PATHNAME: c_int = 64;
 const TEMP_AUX_PATH_PREFIX: &str = "__sqlite_temp__";
 const SQLITE_HEADER_MAGIC: &[u8; 16] = b"SQLite format 3\0";
@@ -221,23 +232,67 @@ fn sqlite_now_ms() -> Result<i64> {
 pub struct VfsConfig {
 	pub cache_capacity_pages: u64,
 	pub prefetch_depth: usize,
+	pub adaptive_prefetch_depth: usize,
 	pub max_prefetch_bytes: usize,
+	pub adaptive_max_prefetch_bytes: usize,
 	pub max_pages_per_stage: usize,
+	pub recent_hint_page_budget: usize,
+	pub recent_hint_range_budget: usize,
+	pub cache_hit_predictor_training: bool,
+	pub recent_page_hints: bool,
+	pub adaptive_read_ahead: bool,
 	#[cfg(test)]
 	pub assert_batch_atomic: bool,
 }
 
 impl Default for VfsConfig {
 	fn default() -> Self {
+		Self::from_optimization_flags(*sqlite_optimization_flags())
+	}
+}
+
+impl VfsConfig {
+	pub fn from_optimization_flags(flags: SqliteOptimizationFlags) -> Self {
 		Self {
 			cache_capacity_pages: DEFAULT_CACHE_CAPACITY_PAGES,
-			prefetch_depth: DEFAULT_PREFETCH_DEPTH,
-			max_prefetch_bytes: DEFAULT_MAX_PREFETCH_BYTES,
-			max_pages_per_stage: DEFAULT_MAX_PAGES_PER_STAGE,
-			#[cfg(test)]
-			assert_batch_atomic: true,
+			prefetch_depth: if flags.read_ahead {
+				DEFAULT_PREFETCH_DEPTH
+			} else {
+				LEGACY_PREFETCH_DEPTH
+			},
+				adaptive_prefetch_depth: DEFAULT_ADAPTIVE_PREFETCH_DEPTH,
+				max_prefetch_bytes: DEFAULT_MAX_PREFETCH_BYTES,
+				adaptive_max_prefetch_bytes: DEFAULT_ADAPTIVE_MAX_PREFETCH_BYTES,
+				max_pages_per_stage: DEFAULT_MAX_PAGES_PER_STAGE,
+				recent_hint_page_budget: if flags.recent_page_hints {
+					DEFAULT_RECENT_HINT_PAGE_BUDGET
+				} else {
+					0
+				},
+				recent_hint_range_budget: if flags.recent_page_hints {
+					DEFAULT_RECENT_HINT_RANGE_BUDGET
+				} else {
+					0
+				},
+				cache_hit_predictor_training: flags.cache_hit_predictor_training,
+				recent_page_hints: flags.recent_page_hints,
+				adaptive_read_ahead: flags.adaptive_read_ahead,
+				#[cfg(test)]
+				assert_batch_atomic: true,
+			}
 		}
 	}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VfsPreloadHintRange {
+	pub start_pgno: u32,
+	pub page_count: u32,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VfsPreloadHintSnapshot {
+	pub pgnos: Vec<u32>,
+	pub ranges: Vec<VfsPreloadHintRange>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -274,6 +329,30 @@ pub struct SqliteVfsMetricsSnapshot {
 	pub state_update_ns: u64,
 	pub total_ns: u64,
 	pub commit_count: u64,
+}
+
+pub trait SqliteVfsMetrics: Send + Sync {
+	fn record_resolve_pages(&self, _requested_pages: u64) {}
+
+	fn record_resolve_cache_hits(&self, _pages: u64) {}
+
+	fn record_resolve_cache_misses(&self, _pages: u64) {}
+
+	fn record_get_pages_request(&self, _pages: u64, _prefetch_pages: u64, _page_size: u64) {}
+
+	fn observe_get_pages_duration(&self, _duration_ns: u64) {}
+
+	fn record_commit(&self) {}
+
+	fn observe_commit_phases(
+		&self,
+		_request_build_ns: u64,
+		_serialize_ns: u64,
+		_transport_ns: u64,
+		_state_update_ns: u64,
+		_total_ns: u64,
+	) {
+	}
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -313,6 +392,7 @@ pub struct VfsContext {
 	pub commit_transport_ns: AtomicU64,
 	pub commit_state_update_ns: AtomicU64,
 	pub commit_duration_ns_total: AtomicU64,
+	metrics: Option<Arc<dyn SqliteVfsMetrics>>,
 }
 
 #[derive(Debug, Clone)]
@@ -322,6 +402,8 @@ struct VfsState {
 	page_cache: Cache<u32, Vec<u8>>,
 	write_buffer: WriteBuffer,
 	predictor: PrefetchPredictor,
+	read_ahead: AdaptiveReadAhead,
+	recent_pages: RecentPageTracker,
 	dead: bool,
 }
 
@@ -339,6 +421,45 @@ struct PrefetchPredictor {
 	stride_run_len: usize,
 	// Inspired by mvSQLite's Markov + stride predictor design (Apache-2.0).
 	transitions: HashMap<i64, HashMap<i64, u32>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadAheadMode {
+	Bounded,
+	ForwardScan,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ReadAheadPlan {
+	mode: ReadAheadMode,
+	depth: usize,
+	max_bytes: usize,
+	seed_pgno: Option<u32>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct AdaptiveReadAhead {
+	last_pgno: Option<u32>,
+	scan_tip_pgno: Option<u32>,
+	score: i32,
+}
+
+#[derive(Debug, Clone)]
+struct RecentPageTracker {
+	page_budget: usize,
+	range_budget: usize,
+	hot_pages: HashMap<u32, RecentPageAccess>,
+	ranges: VecDeque<VfsPreloadHintRange>,
+	active_scan_start: Option<u32>,
+	active_scan_end: u32,
+	last_pgno: Option<u32>,
+	access_seq: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RecentPageAccess {
+	count: u32,
+	last_access_seq: u64,
 }
 
 #[derive(Debug)]
@@ -465,6 +586,253 @@ impl PrefetchPredictor {
 	}
 }
 
+impl AdaptiveReadAhead {
+	fn record_and_plan(&mut self, pgnos: &[u32], config: &VfsConfig) -> ReadAheadPlan {
+		let mut scan_seed_pgno = None;
+		for pgno in pgnos.iter().copied() {
+			if self.record(pgno) {
+				scan_seed_pgno = Some(pgno);
+			}
+		}
+
+		if config.adaptive_read_ahead
+			&& self.score >= FORWARD_SCAN_SCORE_THRESHOLD
+			&& scan_seed_pgno.is_some()
+		{
+			let depth = if self.score >= FORWARD_SCAN_SCORE_THRESHOLD + 4 {
+				config.adaptive_prefetch_depth
+			} else {
+				config
+					.adaptive_prefetch_depth
+					.min(config.prefetch_depth.saturating_mul(2))
+			};
+			ReadAheadPlan {
+				mode: ReadAheadMode::ForwardScan,
+				depth,
+				max_bytes: config.adaptive_max_prefetch_bytes,
+				seed_pgno: scan_seed_pgno,
+			}
+		} else {
+			ReadAheadPlan {
+				mode: ReadAheadMode::Bounded,
+				depth: config.prefetch_depth,
+				max_bytes: config.max_prefetch_bytes,
+				seed_pgno: pgnos.last().copied(),
+			}
+		}
+	}
+
+	fn record(&mut self, pgno: u32) -> bool {
+		let forward_from_last = self
+			.last_pgno
+			.and_then(|last_pgno| pgno.checked_sub(last_pgno))
+			.is_some_and(|delta| (1..=FORWARD_SCAN_GAP_TOLERANCE).contains(&delta));
+		let forward_from_scan_tip = self
+			.scan_tip_pgno
+			.and_then(|tip_pgno| pgno.checked_sub(tip_pgno))
+			.is_some_and(|delta| (1..=FORWARD_SCAN_GAP_TOLERANCE).contains(&delta));
+		let repeated = self.last_pgno == Some(pgno);
+
+		let forward_scan_page = forward_from_last || forward_from_scan_tip;
+		if forward_scan_page {
+			self.score = (self.score + 2).min(FORWARD_SCAN_SCORE_MAX);
+			self.scan_tip_pgno = Some(pgno);
+		} else if !repeated {
+			if self.score >= FORWARD_SCAN_SCORE_THRESHOLD && self.scan_tip_pgno.is_some() {
+				self.score = (self.score - 1).max(0);
+			} else {
+				self.score = (self.score - 4).max(0);
+				self.scan_tip_pgno = Some(pgno);
+			}
+		}
+
+		self.last_pgno = Some(pgno);
+		forward_scan_page
+	}
+}
+
+impl VfsPreloadHintRange {
+	fn new(start_pgno: u32, end_pgno: u32) -> Self {
+		Self {
+			start_pgno,
+			page_count: end_pgno.saturating_sub(start_pgno).saturating_add(1),
+		}
+	}
+
+	fn end_pgno(&self) -> u32 {
+		self.start_pgno
+			.saturating_add(self.page_count)
+			.saturating_sub(1)
+	}
+
+	fn contains(&self, pgno: u32) -> bool {
+		(self.start_pgno..=self.end_pgno()).contains(&pgno)
+	}
+}
+
+impl RecentPageTracker {
+	fn new(page_budget: usize, range_budget: usize) -> Self {
+		Self {
+			page_budget,
+			range_budget,
+			hot_pages: HashMap::new(),
+			ranges: VecDeque::new(),
+			active_scan_start: None,
+			active_scan_end: 0,
+			last_pgno: None,
+			access_seq: 0,
+		}
+	}
+
+	fn record_pages(&mut self, pgnos: impl IntoIterator<Item = u32>) {
+		for pgno in pgnos {
+			self.record_page(pgno);
+		}
+	}
+
+	fn record_page(&mut self, pgno: u32) {
+		self.access_seq = self.access_seq.saturating_add(1);
+		self.record_hot_page(pgno);
+		self.record_scan_page(pgno);
+	}
+
+	fn record_hot_page(&mut self, pgno: u32) {
+		if self.page_budget == 0 {
+			return;
+		}
+
+		if let Some(access) = self.hot_pages.get_mut(&pgno) {
+			access.count = access.count.saturating_add(1);
+			access.last_access_seq = self.access_seq;
+			return;
+		}
+
+		if self.hot_pages.len() >= self.page_budget {
+			if let Some(evict_pgno) = self
+				.hot_pages
+				.iter()
+				.min_by_key(|(_, access)| (access.count, access.last_access_seq))
+				.map(|(pgno, _)| *pgno)
+			{
+				self.hot_pages.remove(&evict_pgno);
+			}
+		}
+
+		self.hot_pages.insert(
+			pgno,
+			RecentPageAccess {
+				count: 1,
+				last_access_seq: self.access_seq,
+			},
+		);
+	}
+
+	fn record_scan_page(&mut self, pgno: u32) {
+		match self.last_pgno {
+			Some(last_pgno) if pgno == last_pgno.saturating_add(1) => {
+				if self.active_scan_start.is_none() {
+					self.active_scan_start = Some(last_pgno);
+				}
+				self.active_scan_end = pgno;
+			}
+			Some(last_pgno) if pgno == last_pgno => {}
+			Some(_) | None => {
+				self.finish_active_scan();
+				self.active_scan_start = None;
+				self.active_scan_end = 0;
+			}
+		}
+		self.last_pgno = Some(pgno);
+	}
+
+	fn finish_active_scan(&mut self) {
+		let Some(start_pgno) = self.active_scan_start else {
+			return;
+		};
+		if self.active_scan_end < start_pgno {
+			return;
+		}
+		let page_count = self.active_scan_end - start_pgno + 1;
+		if page_count < MIN_RECENT_SCAN_RANGE_PAGES {
+			return;
+		}
+		self.push_range(VfsPreloadHintRange::new(start_pgno, self.active_scan_end));
+	}
+
+	fn push_range(&mut self, range: VfsPreloadHintRange) {
+		if self.range_budget == 0 || range.page_count == 0 {
+			return;
+		}
+		push_coalesced_range(&mut self.ranges, range);
+		while self.ranges.len() > self.range_budget {
+			self.ranges.pop_front();
+		}
+	}
+
+	fn snapshot(&self) -> VfsPreloadHintSnapshot {
+		let mut ranges = self.ranges.clone();
+		if let Some(start_pgno) = self.active_scan_start {
+			if self.active_scan_end >= start_pgno {
+				let page_count = self.active_scan_end - start_pgno + 1;
+				if page_count >= MIN_RECENT_SCAN_RANGE_PAGES {
+					push_coalesced_range(
+						&mut ranges,
+						VfsPreloadHintRange::new(start_pgno, self.active_scan_end),
+					);
+				}
+			}
+		}
+		while ranges.len() > self.range_budget {
+			ranges.pop_front();
+		}
+
+		let mut scored_pages = self
+			.hot_pages
+			.iter()
+			.filter(|(pgno, _)| !ranges.iter().any(|range| range.contains(**pgno)))
+			.map(|(pgno, access)| (*pgno, *access))
+			.collect::<Vec<_>>();
+		scored_pages.sort_by(|(left_pgno, left), (right_pgno, right)| {
+			right
+				.count
+				.cmp(&left.count)
+				.then_with(|| right.last_access_seq.cmp(&left.last_access_seq))
+				.then_with(|| left_pgno.cmp(right_pgno))
+		});
+
+		let mut pgnos = scored_pages
+			.into_iter()
+			.take(self.page_budget)
+			.map(|(pgno, _)| pgno)
+			.collect::<Vec<_>>();
+		pgnos.sort_unstable();
+
+		VfsPreloadHintSnapshot {
+			pgnos,
+			ranges: ranges.into_iter().collect(),
+		}
+	}
+}
+
+fn push_coalesced_range(ranges: &mut VecDeque<VfsPreloadHintRange>, range: VfsPreloadHintRange) {
+	let mut start_pgno = range.start_pgno;
+	let mut end_pgno = range.end_pgno();
+	let mut retained = VecDeque::new();
+	while let Some(existing) = ranges.pop_front() {
+		let existing_end = existing.end_pgno();
+		if existing.start_pgno <= end_pgno.saturating_add(1)
+			&& start_pgno <= existing_end.saturating_add(1)
+		{
+			start_pgno = start_pgno.min(existing.start_pgno);
+			end_pgno = end_pgno.max(existing_end);
+		} else {
+			retained.push_back(existing);
+		}
+	}
+	retained.push_back(VfsPreloadHintRange::new(start_pgno, end_pgno));
+	*ranges = retained;
+}
+
 impl VfsState {
 	fn new(config: &VfsConfig) -> Self {
 		let page_cache = Cache::builder()
@@ -478,6 +846,11 @@ impl VfsState {
 			page_cache,
 			write_buffer: WriteBuffer::default(),
 			predictor: PrefetchPredictor::default(),
+			read_ahead: AdaptiveReadAhead::default(),
+			recent_pages: RecentPageTracker::new(
+				config.recent_hint_page_budget,
+				config.recent_hint_range_budget,
+			),
 			dead: false,
 		}
 	}
@@ -500,6 +873,7 @@ impl VfsContext {
 		transport: SqliteTransport,
 		config: VfsConfig,
 		io_methods: sqlite3_io_methods,
+		metrics: Option<Arc<dyn SqliteVfsMetrics>>,
 	) -> std::result::Result<Self, String> {
 		let mut state = VfsState::new(&config);
 		#[cfg(test)]
@@ -549,6 +923,7 @@ impl VfsContext {
 			commit_transport_ns: AtomicU64::new(0),
 			commit_state_update_ns: AtomicU64::new(0),
 			commit_duration_ns_total: AtomicU64::new(0),
+			metrics,
 		})
 	}
 
@@ -575,6 +950,15 @@ impl VfsContext {
 		state_update_ns: u64,
 		total_ns: u64,
 	) {
+		if let Some(metrics) = &self.metrics {
+			metrics.observe_commit_phases(
+				request_build_ns,
+				transport_metrics.serialize_ns,
+				transport_metrics.transport_ns,
+				state_update_ns,
+				total_ns,
+			);
+		}
 		self.commit_request_build_ns
 			.fetch_add(request_build_ns, Ordering::Relaxed);
 		self.commit_serialize_ns
@@ -671,6 +1055,13 @@ impl VfsContext {
 		self.state.write().dead = true;
 	}
 
+	fn snapshot_preload_hints(&self) -> VfsPreloadHintSnapshot {
+		if !self.config.recent_page_hints {
+			return VfsPreloadHintSnapshot::default();
+		}
+		self.state.read().recent_pages.snapshot()
+	}
+
 	fn resolve_pages(
 		&self,
 		target_pgnos: &[u32],
@@ -678,6 +1069,9 @@ impl VfsContext {
 	) -> std::result::Result<HashMap<u32, Option<Vec<u8>>>, GetPagesError> {
 		use std::sync::atomic::Ordering::Relaxed;
 		self.resolve_pages_total.fetch_add(1, Relaxed);
+		if let Some(metrics) = &self.metrics {
+			metrics.record_resolve_pages(target_pgnos.len() as u64);
+		}
 
 		let mut resolved = HashMap::new();
 		let mut missing = Vec::new();
@@ -710,34 +1104,77 @@ impl VfsContext {
 		if missing.is_empty() {
 			self.resolve_pages_cache_hits
 				.fetch_add(target_pgnos.len() as u64, Relaxed);
+			let mut state = self.state.write();
+			if self.config.cache_hit_predictor_training {
+				for pgno in target_pgnos.iter().copied() {
+					state.predictor.record(pgno);
+				}
+			}
+			state.read_ahead.record_and_plan(target_pgnos, &self.config);
+			if self.config.recent_page_hints {
+				state.recent_pages.record_pages(target_pgnos.iter().copied());
+			}
+			if let Some(metrics) = &self.metrics {
+				metrics.record_resolve_cache_hits(target_pgnos.len() as u64);
+			}
 			return Ok(resolved);
 		}
 		self.resolve_pages_cache_hits
 			.fetch_add((seen.len() - missing.len()) as u64, Relaxed);
+		if let Some(metrics) = &self.metrics {
+			metrics.record_resolve_cache_hits((seen.len() - missing.len()) as u64);
+			metrics.record_resolve_cache_misses(missing.len() as u64);
+		}
 
-		let to_fetch = {
+		let (
+			to_fetch,
+			page_size,
+			read_ahead_mode,
+			read_ahead_depth,
+			read_ahead_max_bytes,
+			seed_pgno,
+			prediction_budget,
+			predicted_pgnos,
+		) = {
 			let mut state = self.state.write();
 			for pgno in target_pgnos.iter().copied() {
 				state.predictor.record(pgno);
 			}
+			let read_ahead_plan = state.read_ahead.record_and_plan(target_pgnos, &self.config);
+			if self.config.recent_page_hints {
+				state.recent_pages.record_pages(target_pgnos.iter().copied());
+			}
 
 			let mut to_fetch = missing.clone();
+			let seed_pgno = read_ahead_plan.seed_pgno;
+			let mut prediction_budget = 0;
+			let mut predicted_pgnos = Vec::new();
 			if prefetch {
-				let page_budget = (self.config.max_prefetch_bytes / state.page_size.max(1)).max(1);
-				let prediction_budget = page_budget.saturating_sub(to_fetch.len());
-				let seed_pgno = target_pgnos.last().copied().unwrap_or_default();
-				for predicted in state.predictor.multi_predict(
-					seed_pgno,
-					prediction_budget.min(self.config.prefetch_depth),
-					state.db_size_pages.max(seed_pgno),
-				) {
+				let page_budget = (read_ahead_plan.max_bytes / state.page_size.max(1)).max(1);
+				prediction_budget = page_budget.saturating_sub(to_fetch.len());
+				let seed = seed_pgno.unwrap_or_default();
+				predicted_pgnos = state.predictor.multi_predict(
+					seed,
+					prediction_budget.min(read_ahead_plan.depth),
+					state.db_size_pages.max(seed),
+				);
+				for predicted in predicted_pgnos.iter().copied() {
 					if resolved.contains_key(&predicted) || to_fetch.contains(&predicted) {
 						continue;
 					}
 					to_fetch.push(predicted);
 				}
 			}
-			to_fetch
+			(
+				to_fetch,
+				state.page_size.max(1),
+				read_ahead_plan.mode,
+				read_ahead_plan.depth,
+				read_ahead_plan.max_bytes,
+				seed_pgno,
+				prediction_budget,
+				predicted_pgnos,
+			)
 		};
 
 		{
@@ -747,14 +1184,30 @@ impl VfsContext {
 				.fetch_add(to_fetch.len() as u64, Relaxed);
 			self.prefetch_pages_total
 				.fetch_add(prefetch_count as u64, Relaxed);
+			if let Some(metrics) = &self.metrics {
+				metrics.record_get_pages_request(
+					to_fetch.len() as u64,
+					prefetch_count as u64,
+					page_size as u64,
+				);
+			}
 			tracing::debug!(
-				missing = missing.len(),
-				prefetch = prefetch_count,
-				total_fetch = to_fetch.len(),
+				requested_pages = ?target_pgnos,
+				missing_pages = ?missing,
+				read_ahead_mode = ?read_ahead_mode,
+				read_ahead_depth,
+				read_ahead_max_bytes,
+				prediction_budget,
+				predicted_pages = ?predicted_pgnos,
+				prefetch_pages = prefetch_count,
+				total_fetch_pages = to_fetch.len(),
+				total_fetch_bytes = to_fetch.len().saturating_mul(page_size),
+				seed_pgno,
 				"vfs get_pages fetch"
 			);
 		}
 
+		let get_pages_start = Instant::now();
 		let response = self
 			.runtime
 			.block_on(self.transport.get_pages(protocol::SqliteGetPagesRequest {
@@ -764,6 +1217,9 @@ impl VfsContext {
 				expected_head_txid: None,
 			}))
 			.map_err(|err| GetPagesError::Other(err.to_string()))?;
+		if let Some(metrics) = &self.metrics {
+			metrics.observe_get_pages_duration(get_pages_start.elapsed().as_nanos() as u64);
+		}
 
 		match response {
 			protocol::SqliteGetPagesResponse::SqliteGetPagesOk(ok) => {
@@ -849,6 +1305,9 @@ impl VfsContext {
 		};
 		self.commit_total
 			.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+		if let Some(metrics) = &self.metrics {
+			metrics.record_commit();
+		}
 		tracing::debug!(
 			dirty_pages = request.dirty_pages.len(),
 			path = ?outcome.path,
@@ -943,6 +1402,9 @@ impl VfsContext {
 		};
 		self.commit_total
 			.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+		if let Some(metrics) = &self.metrics {
+			metrics.record_commit();
+		}
 		tracing::debug!(
 			dirty_pages = request.dirty_pages.len(),
 			path = ?outcome.path,
@@ -1979,6 +2441,7 @@ impl SqliteVfs {
 		actor_id: String,
 		runtime: Handle,
 		config: VfsConfig,
+		metrics: Option<Arc<dyn SqliteVfsMetrics>>,
 	) -> std::result::Result<Self, String> {
 		Self::register_with_transport(
 			name,
@@ -1986,6 +2449,7 @@ impl SqliteVfs {
 			actor_id,
 			runtime,
 			config,
+			metrics,
 		)
 	}
 
@@ -1997,12 +2461,17 @@ impl SqliteVfs {
 		self.ctx.clone_last_error()
 	}
 
+	fn snapshot_preload_hints(&self) -> VfsPreloadHintSnapshot {
+		unsafe { (*self.ctx_ptr).snapshot_preload_hints() }
+	}
+
 	fn register_with_transport(
 		name: &str,
 		transport: SqliteTransport,
 		actor_id: String,
 		runtime: Handle,
 		config: VfsConfig,
+		metrics: Option<Arc<dyn SqliteVfsMetrics>>,
 	) -> std::result::Result<Self, String> {
 		let mut io_methods: sqlite3_io_methods = unsafe { std::mem::zeroed() };
 		io_methods.iVersion = 1;
@@ -2020,7 +2489,7 @@ impl SqliteVfs {
 		io_methods.xDeviceCharacteristics = Some(io_device_characteristics);
 
 		let mut ctx = Box::new(VfsContext::new(
-			actor_id, runtime, transport, config, io_methods,
+			actor_id, runtime, transport, config, io_methods, metrics,
 		)?);
 		let ctx_ptr = (&mut *ctx) as *mut VfsContext;
 		let name_cstring = CString::new(name).map_err(|err| err.to_string())?;
@@ -2102,6 +2571,10 @@ impl NativeDatabase {
 
 	pub fn sqlite_vfs_metrics(&self) -> SqliteVfsMetricsSnapshot {
 		self._vfs.ctx.sqlite_vfs_metrics()
+	}
+
+	pub fn snapshot_preload_hints(&self) -> VfsPreloadHintSnapshot {
+		self._vfs.snapshot_preload_hints()
 	}
 }
 

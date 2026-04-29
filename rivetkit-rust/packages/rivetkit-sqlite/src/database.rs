@@ -1,8 +1,10 @@
+use std::sync::Arc;
+
 use anyhow::{Result, anyhow};
 use rivet_envoy_client::handle::EnvoyHandle;
 use tokio::runtime::Handle;
 
-use crate::vfs::{NativeDatabase, SqliteVfs, VfsConfig};
+use crate::vfs::{NativeDatabase, SqliteVfs, SqliteVfsMetrics, VfsConfig};
 
 pub type NativeDatabaseHandle = NativeDatabase;
 
@@ -10,6 +12,7 @@ pub fn open_database_from_envoy(
 	handle: EnvoyHandle,
 	actor_id: String,
 	rt_handle: Handle,
+	metrics: Option<Arc<dyn SqliteVfsMetrics>>,
 ) -> Result<NativeDatabaseHandle> {
 	let vfs_name = format!("envoy-sqlite-{actor_id}");
 	let vfs = SqliteVfs::register(
@@ -18,6 +21,7 @@ pub fn open_database_from_envoy(
 		actor_id.clone(),
 		rt_handle,
 		VfsConfig::default(),
+		metrics,
 	)
 	.map_err(|e| anyhow!("failed to register sqlite VFS: {e}"))?;
 

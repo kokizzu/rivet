@@ -49,6 +49,12 @@ Use `test-snapshot-gen` to generate and load RocksDB snapshots of the full UDB K
 
 - If a full engine test sweep fails during workflow-worker startup with `ActiveWorkerIdxKey` and `bad code, found 2`, treat it as a sporadic harness issue and retry the affected test once.
 
+## Metrics
+
+- RivetKit core exposes per-actor Prometheus metrics at `/gateway/<actor_id>/metrics`, gated by `_RIVET_METRICS_TOKEN`; prefer this endpoint for actor and VFS performance tuning metrics.
+- Track SQLite cold-read, VFS, storage, and preload optimization ideas in `docs-internal/engine/SQLITE_OPTIMIZATIONS.md`.
+- Track SQLite cold-read optimization implementation and per-step benchmark deltas in `scripts/ralph/prd.json`.
+
 ## Depot tests
 
 - For Depot key layout, component responsibilities, VFS interaction, design constraints, and prior-art comparisons, read `docs-internal/engine/sqlite/`.
