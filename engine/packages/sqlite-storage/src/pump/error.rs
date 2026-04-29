@@ -5,9 +5,7 @@ pub enum SqliteStorageError {
 	#[error("sqlite meta missing for {operation}")]
 	MetaMissing { operation: &'static str },
 
-	#[error("sqlite db is not open for {operation}")]
-	DbNotOpen { operation: &'static str },
-
+	#[cfg(debug_assertions)]
 	#[error("FenceMismatch: {reason}")]
 	FenceMismatch { reason: String },
 
@@ -19,8 +17,13 @@ pub enum SqliteStorageError {
 		max_size_bytes: u64,
 	},
 
-	#[error("StageNotFound: stage {stage_id} missing")]
-	StageNotFound { stage_id: u64 },
+	#[error(
+		"SqliteStorageQuotaExceeded: not enough space left in sqlite storage ({remaining_bytes} bytes remaining, current payload is {payload_size} bytes)"
+	)]
+	SqliteStorageQuotaExceeded {
+		remaining_bytes: i64,
+		payload_size: i64,
+	},
 
 	#[error("invalid sqlite v1 migration state")]
 	InvalidV1MigrationState,

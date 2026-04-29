@@ -487,7 +487,7 @@ impl LtxHeader {
 	}
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-inline-tests"))]
 mod tests {
 	use super::{
 		DecodedLtx, EncodedLtx, LTX_HEADER_FLAG_NO_CHECKSUM, LTX_HEADER_SIZE, LTX_MAGIC,

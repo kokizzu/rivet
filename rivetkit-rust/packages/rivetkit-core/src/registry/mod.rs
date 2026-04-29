@@ -993,7 +993,6 @@ impl RegistryDispatcher {
 		generation: u32,
 		actor_name: &str,
 		key: ActorKey,
-		sqlite_startup_data: Option<protocol::SqliteStartupData>,
 		factory: &ActorFactory,
 	) -> ActorContext {
 		let ctx = ActorContext::build(
@@ -1006,7 +1005,6 @@ impl RegistryDispatcher {
 			SqliteDb::new(
 				handle.clone(),
 				actor_id.to_owned(),
-				sqlite_startup_data,
 				factory.config().has_database,
 			),
 		);
