@@ -13,11 +13,12 @@ crate-type = ["lib"]
 [dependencies]
 anyhow.workspace = true
 libsqlite3-sys = { version = "0.30", features = ["bundled"] }
-rivet-envoy-client.workspace = true
+rivet-envoy-client = { workspace = true, features = ["native-transport"] }
 tokio.workspace = true
 tracing.workspace = true
 getrandom = "0.2"
 rivet-envoy-protocol.workspace = true
+rivetkit-sqlite-types.workspace = true
 moka = { version = "0.12", default-features = false, features = ["sync"] }
 parking_lot.workspace = true
 

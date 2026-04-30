@@ -3,12 +3,15 @@ use std::fmt;
 use std::future::pending;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
+
+use crate::time::{Instant, SystemTime, UNIX_EPOCH, sleep};
 
 use anyhow::{Context, Result};
 use rivet_error::RivetError;
 use rivetkit_actor_persist::{generated::v4 as persist_v4, versioned as persist_versioned};
 use serde::{Deserialize, Serialize};
+#[cfg(not(target_arch = "wasm32"))]
 use tokio::runtime::{Builder, Handle};
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
@@ -23,6 +26,8 @@ use crate::actor::persist::{
 };
 use crate::actor::preload::PreloadedKv;
 use crate::actor::task_types::UserTaskKind;
+#[cfg(target_arch = "wasm32")]
+use crate::error::ActorRuntime;
 use crate::types::ListOpts;
 
 #[derive(Clone, Debug, Default)]
@@ -847,7 +852,7 @@ impl ActorContext {
 					_ = notified => WaitOutcome::Notified,
 					_ = actor_aborted => WaitOutcome::Aborted,
 					_ = external_aborted => WaitOutcome::Aborted,
-					_ = tokio::time::sleep(timeout) => WaitOutcome::TimedOut,
+					_ = sleep(timeout) => WaitOutcome::TimedOut,
 				}
 			}
 			None => {
@@ -887,7 +892,7 @@ impl ActorContext {
 				tokio::select! {
 					response = &mut receiver => CompletionWaitOutcome::Response(response),
 					_ = external_aborted => CompletionWaitOutcome::Aborted,
-					_ = tokio::time::sleep(timeout) => CompletionWaitOutcome::TimedOut,
+					_ = sleep(timeout) => CompletionWaitOutcome::TimedOut,
 				}
 			}
 			None => {
@@ -911,14 +916,27 @@ impl ActorContext {
 	}
 
 	fn block_on<T>(&self, future: impl std::future::Future<Output = Result<T>>) -> Result<T> {
-		if let Ok(handle) = Handle::try_current() {
-			tokio::task::block_in_place(|| handle.block_on(future))
-		} else {
-			Builder::new_current_thread()
-				.enable_all()
-				.build()
-				.context("build temporary runtime for queue operation")?
-				.block_on(future)
+		#[cfg(not(target_arch = "wasm32"))]
+		{
+			if let Ok(handle) = Handle::try_current() {
+				tokio::task::block_in_place(|| handle.block_on(future))
+			} else {
+				Builder::new_current_thread()
+					.enable_all()
+					.build()
+					.context("build temporary runtime for queue operation")?
+					.block_on(future)
+			}
+		}
+
+		#[cfg(target_arch = "wasm32")]
+		{
+			drop(future);
+			Err(ActorRuntime::InvalidOperation {
+				operation: "queue.try_next_batch".to_owned(),
+				reason: "synchronous queue receive requires native runtime support".to_owned(),
+			}
+			.build())
 		}
 	}
 

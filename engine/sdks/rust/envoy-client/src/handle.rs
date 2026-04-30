@@ -2,12 +2,12 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use rivet_envoy_protocol as protocol;
-use rivet_util::async_counter::AsyncCounter;
+use crate::async_counter::AsyncCounter;
 use tokio::sync::oneshot;
 
 use crate::context::SharedContext;
 use crate::envoy::{ActorInfo, ToEnvoyMessage};
-use crate::sqlite::{SqliteRequest, SqliteResponse};
+use crate::sqlite::{RemoteSqliteRequest, RemoteSqliteResponse, SqliteRequest, SqliteResponse};
 use crate::tunnel::HibernatingWebSocketMetadata;
 
 /// Handle for interacting with the envoy from callbacks.
@@ -46,7 +46,7 @@ impl EnvoyHandle {
 	///
 	/// Returning does NOT imply successful delivery of pending KV/SQLite/tunnel
 	/// requests. The cleanup block errors out every outstanding request with
-	/// `"envoy shutting down"`. Callers needing durability must wait on individual
+	/// `EnvoyShutdownError`. Callers needing durability must wait on individual
 	/// request acks before invoking shutdown.
 	///
 	/// Latched: safe to call before, during, or after the envoy loop exits.
@@ -406,19 +406,6 @@ impl EnvoyHandle {
 		}
 	}
 
-	pub async fn sqlite_get_page_range(
-		&self,
-		request: protocol::SqliteGetPageRangeRequest,
-	) -> anyhow::Result<protocol::SqliteGetPageRangeResponse> {
-		match self
-			.send_sqlite_request(SqliteRequest::GetPageRange(request))
-			.await?
-		{
-			SqliteResponse::GetPageRange(response) => Ok(response),
-			_ => anyhow::bail!("unexpected sqlite get_page_range response type"),
-		}
-	}
-
 	pub async fn sqlite_commit(
 		&self,
 		request: protocol::SqliteCommitRequest,
@@ -429,6 +416,45 @@ impl EnvoyHandle {
 		{
 			SqliteResponse::Commit(response) => Ok(response),
 			_ => anyhow::bail!("unexpected sqlite commit response type"),
+		}
+	}
+
+	pub async fn remote_sqlite_exec(
+		&self,
+		request: protocol::SqliteExecRequest,
+	) -> anyhow::Result<protocol::SqliteExecResponse> {
+		match self
+			.send_remote_sqlite_request(RemoteSqliteRequest::Exec(request))
+			.await?
+		{
+			RemoteSqliteResponse::Exec(response) => Ok(response),
+			_ => anyhow::bail!("unexpected remote sqlite exec response type"),
+		}
+	}
+
+	pub async fn remote_sqlite_execute(
+		&self,
+		request: protocol::SqliteExecuteRequest,
+	) -> anyhow::Result<protocol::SqliteExecuteResponse> {
+		match self
+			.send_remote_sqlite_request(RemoteSqliteRequest::Execute(request))
+			.await?
+		{
+			RemoteSqliteResponse::Execute(response) => Ok(response),
+			_ => anyhow::bail!("unexpected remote sqlite execute response type"),
+		}
+	}
+
+	pub async fn remote_sqlite_execute_write(
+		&self,
+		request: protocol::SqliteExecuteWriteRequest,
+	) -> anyhow::Result<protocol::SqliteExecuteWriteResponse> {
+		match self
+			.send_remote_sqlite_request(RemoteSqliteRequest::ExecuteWrite(request))
+			.await?
+		{
+			RemoteSqliteResponse::ExecuteWrite(response) => Ok(response),
+			_ => anyhow::bail!("unexpected remote sqlite execute_write response type"),
 		}
 	}
 
@@ -555,6 +581,22 @@ impl EnvoyHandle {
 			.map_err(|_| anyhow::anyhow!("envoy channel closed"))?;
 		rx.await
 			.map_err(|_| anyhow::anyhow!("sqlite response channel closed"))?
+	}
+
+	async fn send_remote_sqlite_request(
+		&self,
+		request: RemoteSqliteRequest,
+	) -> anyhow::Result<RemoteSqliteResponse> {
+		let (tx, rx) = tokio::sync::oneshot::channel();
+		self.shared
+			.envoy_tx
+			.send(ToEnvoyMessage::RemoteSqliteRequest {
+				request,
+				response_tx: tx,
+			})
+			.map_err(|_| anyhow::anyhow!("envoy channel closed"))?;
+		rx.await
+			.map_err(|_| anyhow::anyhow!("remote sqlite response channel closed"))?
 	}
 }
 

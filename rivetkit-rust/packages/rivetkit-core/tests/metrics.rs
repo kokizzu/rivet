@@ -35,7 +35,7 @@ mod moved_tests {
 		);
 	}
 
-	#[cfg(feature = "sqlite")]
+	#[cfg(feature = "sqlite-local")]
 	#[test]
 	fn sqlite_read_pool_metrics_render() {
 		use rivetkit_sqlite::vfs::SqliteVfsMetrics;

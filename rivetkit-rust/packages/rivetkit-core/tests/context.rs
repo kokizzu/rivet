@@ -199,7 +199,7 @@ mod moved_tests {
 	use std::collections::{BTreeSet, HashMap, HashSet};
 	use std::sync::atomic::{AtomicUsize, Ordering};
 	use std::sync::{Arc, Mutex};
-	use std::time::{Duration, SystemTime, UNIX_EPOCH};
+	use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 	use anyhow::anyhow;
 	use rivet_envoy_client::config::{
@@ -211,7 +211,7 @@ mod moved_tests {
 	use rivet_envoy_client::protocol;
 	use rivet_envoy_client::tunnel::HibernatingWebSocketMetadata;
 	use tokio::sync::mpsc;
-	use tokio::time::{Instant, sleep};
+	use tokio::time::sleep;
 
 	use super::ActorContext;
 	use crate::actor::connection::ConnHandle;
@@ -335,7 +335,7 @@ mod moved_tests {
 				SharedActorEntry {
 					handle: mpsc::unbounded_channel().0,
 					active_http_request_count: Arc::new(
-						rivet_util::async_counter::AsyncCounter::new(),
+						rivet_envoy_client::async_counter::AsyncCounter::new(),
 					),
 				},
 			);

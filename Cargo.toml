@@ -63,7 +63,10 @@ members = [
   "rivetkit-rust/packages/actor-persist",
   "rivetkit-rust/packages/rivetkit-core",
   "rivetkit-rust/packages/shared-types",
-  "rivetkit-typescript/packages/rivetkit-napi"
+  "rivetkit-rust/packages/rivetkit-sqlite",
+  "rivetkit-rust/packages/rivetkit-sqlite-types",
+  "rivetkit-typescript/packages/rivetkit-napi",
+  "rivetkit-typescript/packages/rivetkit-wasm"
 ]
 
   [workspace.package]
@@ -122,7 +125,6 @@ members = [
   regex = "1.4"
   replace_with = "0.1.8"
   rstest = "0.26.1"
-  rusqlite = { version = "0.32.1", features = [ "bundled" ] }
   rustls-pemfile = "2.2.0"
   rustyline = "15.0.0"
   scc = "3.6.12"
@@ -539,6 +541,7 @@ members = [
 
     [workspace.dependencies.rivet-envoy-client]
     path = "engine/sdks/rust/envoy-client"
+    default-features = false
 
     [workspace.dependencies.rivet-envoy-protocol]
     path = "engine/sdks/rust/envoy-protocol"
@@ -557,6 +560,9 @@ members = [
 
     [workspace.dependencies.rivetkit-sqlite]
     path = "rivetkit-rust/packages/rivetkit-sqlite"
+
+    [workspace.dependencies.rivetkit-sqlite-types]
+    path = "rivetkit-rust/packages/rivetkit-sqlite-types"
 
     [workspace.dependencies.rivetkit-core]
     path = "rivetkit-rust/packages/rivetkit-core"

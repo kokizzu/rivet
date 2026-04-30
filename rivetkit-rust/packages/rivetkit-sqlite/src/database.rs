@@ -2,7 +2,6 @@ use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
 use rivet_envoy_client::handle::EnvoyHandle;
-use rivet_envoy_protocol as protocol;
 use tokio::runtime::Handle;
 
 use crate::{
@@ -38,23 +37,20 @@ pub fn vfs_name_for_actor_database(actor_id: &str, generation: u64) -> String {
 pub async fn open_database_from_envoy(
 	handle: EnvoyHandle,
 	actor_id: String,
-	startup_data: Option<protocol::SqliteStartupData>,
+	generation: u64,
 	rt_handle: Handle,
 	metrics: Option<Arc<dyn SqliteVfsMetrics>>,
 ) -> Result<NativeDatabaseHandle> {
-	let startup =
-		startup_data.ok_or_else(|| anyhow!("missing sqlite startup data for actor {actor_id}"))?;
-	let vfs_name = vfs_name_for_actor_database(&actor_id, startup.generation);
-	let vfs = SqliteVfs::register(
+	let vfs_name = vfs_name_for_actor_database(&actor_id, generation);
+	let vfs = Arc::new(SqliteVfs::register(
 		&vfs_name,
 		handle,
 		actor_id.clone(),
 		rt_handle,
-		startup,
 		VfsConfig::default(),
 		metrics.clone(),
 	)
-	.map_err(|e| anyhow!("failed to register sqlite VFS: {e}"))?;
+	.map_err(|e| anyhow!("failed to register sqlite VFS: {e}"))?);
 
 	let native_db = NativeDatabaseHandle::new_with_metrics(
 		vfs,

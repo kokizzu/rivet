@@ -20,51 +20,9 @@ use libsqlite3_sys::{
 	sqlite3_column_type, sqlite3_errmsg, sqlite3_finalize, sqlite3_last_insert_rowid,
 	sqlite3_prepare_v2, sqlite3_set_authorizer, sqlite3_step, sqlite3_stmt_readonly,
 };
-
-#[derive(Clone, Debug, PartialEq)]
-pub enum BindParam {
-	Null,
-	Integer(i64),
-	Float(f64),
-	Text(String),
-	Blob(Vec<u8>),
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct ExecResult {
-	pub changes: i64,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct QueryResult {
-	pub columns: Vec<String>,
-	pub rows: Vec<Vec<ColumnValue>>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ExecuteRoute {
-	Read,
-	Write,
-	WriteFallback,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct ExecuteResult {
-	pub columns: Vec<String>,
-	pub rows: Vec<Vec<ColumnValue>>,
-	pub changes: i64,
-	pub last_insert_row_id: Option<i64>,
-	pub route: ExecuteRoute,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub enum ColumnValue {
-	Null,
-	Integer(i64),
-	Float(f64),
-	Text(String),
-	Blob(Vec<u8>),
-}
+pub use rivetkit_sqlite_types::{
+	BindParam, ColumnValue, ExecResult, ExecuteResult, ExecuteRoute, QueryResult,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StatementClassification {
@@ -105,6 +63,16 @@ impl StatementAuthorizerSummary {
 			|| self.temp_writes
 			|| self.write_operations
 	}
+}
+
+pub fn reader_authorizer_allows_classification(
+	classification: &StatementClassification,
+) -> bool {
+	classification
+		.authorizer
+		.actions
+		.iter()
+		.all(reader_authorizer_allows_action)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -681,36 +649,42 @@ unsafe extern "C" fn reader_authorizer_action(
 	let first_arg = unsafe { optional_c_string(first_arg) };
 	let second_arg = unsafe { optional_c_string(second_arg) };
 
-	if kind.is_data_write()
-		|| kind.is_schema_write()
-		|| kind.is_temp_schema_write()
-		|| (kind.is_data_write() && database_name.as_deref() == Some("temp"))
+	if reader_authorizer_allows_action(&StatementAuthorizerAction {
+		kind,
+		first_arg,
+		second_arg,
+		database_name,
+		trigger_or_view_name: None,
+	}) {
+		SQLITE_OK
+	} else {
+		SQLITE_DENY
+	}
+}
+
+fn reader_authorizer_allows_action(action: &StatementAuthorizerAction) -> bool {
+	if action.kind.is_data_write()
+		|| action.kind.is_schema_write()
+		|| action.kind.is_temp_schema_write()
+		|| (action.kind.is_data_write() && action.database_name.as_deref() == Some("temp"))
 	{
-		return SQLITE_DENY;
+		return false;
 	}
 
-	match kind {
+	match action.kind {
 		StatementAuthorizerActionKind::Transaction
 		| StatementAuthorizerActionKind::Savepoint
 		| StatementAuthorizerActionKind::Attach
-		| StatementAuthorizerActionKind::Detach => SQLITE_DENY,
+		| StatementAuthorizerActionKind::Detach => false,
 		StatementAuthorizerActionKind::Pragma => {
-			if reader_pragma_allowed(first_arg.as_deref(), second_arg.as_deref()) {
-				SQLITE_OK
-			} else {
-				SQLITE_DENY
-			}
+			reader_pragma_allowed(action.first_arg.as_deref(), action.second_arg.as_deref())
 		}
 		StatementAuthorizerActionKind::Function => {
-			if reader_function_allowed(first_arg.as_deref(), second_arg.as_deref()) {
-				SQLITE_OK
-			} else {
-				SQLITE_DENY
-			}
+			reader_function_allowed(action.first_arg.as_deref(), action.second_arg.as_deref())
 		}
 		StatementAuthorizerActionKind::Read
 		| StatementAuthorizerActionKind::Select
-		| StatementAuthorizerActionKind::Other(_) => SQLITE_OK,
+		| StatementAuthorizerActionKind::Other(_) => true,
 		StatementAuthorizerActionKind::Insert
 		| StatementAuthorizerActionKind::Update
 		| StatementAuthorizerActionKind::Delete
@@ -734,7 +708,7 @@ unsafe extern "C" fn reader_authorizer_action(
 		| StatementAuthorizerActionKind::DropTempView
 		| StatementAuthorizerActionKind::AlterTable
 		| StatementAuthorizerActionKind::Reindex
-		| StatementAuthorizerActionKind::Analyze => SQLITE_DENY,
+		| StatementAuthorizerActionKind::Analyze => false,
 	}
 }
 
@@ -742,12 +716,25 @@ fn reader_pragma_allowed(first_arg: Option<&str>, second_arg: Option<&str>) -> b
 	let Some(name) = first_arg else {
 		return false;
 	};
+
+	let name = name.to_ascii_lowercase();
 	if second_arg.is_some() {
-		return false;
+		return matches!(
+			name.as_str(),
+			"foreign_key_check"
+				| "foreign_key_list"
+				| "index_info"
+				| "index_list"
+				| "index_xinfo"
+				| "integrity_check"
+				| "quick_check"
+				| "table_info"
+				| "table_xinfo"
+		);
 	}
 
 	matches!(
-		name.to_ascii_lowercase().as_str(),
+		name.as_str(),
 		"application_id"
 			| "busy_timeout"
 			| "cache_size"

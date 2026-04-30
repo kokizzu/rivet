@@ -11,7 +11,6 @@ use parking_lot::{RwLock, RwLockReadGuard};
 use rivet_error::RivetError;
 use rivetkit_actor_persist::{generated::v4 as persist_v4, versioned as persist_versioned};
 use serde::Serialize;
-use tokio::time::timeout;
 use uuid::Uuid;
 
 use tokio::sync::oneshot;
@@ -27,6 +26,7 @@ use crate::actor::persist::{
 use crate::actor::preload::PreloadedKv;
 use crate::actor::state::RequestSaveOpts;
 use crate::error::ActorRuntime;
+use crate::time::timeout;
 use crate::types::ConnId;
 use crate::types::ListOpts;
 

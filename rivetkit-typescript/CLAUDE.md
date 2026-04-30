@@ -12,6 +12,16 @@
 - Core drivers must remain SQLite-agnostic. Any SQLite-specific wiring belongs behind the native database provider boundary.
 - Before deleting a `rivetkit/*` package export, grep `examples/`, `website/`, and `frontend/` for self-imports. Those consumers are part of the supported package surface on this branch.
 
+## Runtime Boundary
+
+- Select runtime behavior from `CoreRuntime.kind`, not `instanceof` adapter classes; NAPI maps to the native runtime kind and wasm maps to wasm.
+- Keep `CoreRuntime` SQL methods on the portable `RuntimeSql*` structs from `packages/rivetkit/src/registry/runtime.ts`; NAPI-only `Buffer` conversion belongs inside `NapiCoreRuntime`.
+- Keep `RuntimeSqlBindParam` variants exact and `RuntimeSqlExecuteResult.route` limited to `read`, `write`, or `writeFallback`; normalize generated adapter output before returning it.
+- Keep `CoreRuntime` byte payloads on `RuntimeBytes`/`Uint8Array`; NAPI-only `Buffer` conversion belongs inside `NapiCoreRuntime`.
+- Shared actor glue in `packages/rivetkit/src/registry/native.ts` should construct `RuntimeBytes`/`Uint8Array`; leave `Buffer` creation to `NapiCoreRuntime`.
+- Wasm bindings for NAPI-supported runtime APIs should forward to `rivetkit-core`; avoid placeholder returns that break runtime parity.
+- Use public `sqlite` config for runtime SQLite backend selection; wasm defaults unset SQLite to remote and must reject local before runtime construction.
+
 ## Native SQLite v2
 
 - If `packages/rivetkit` still needs a BARE codec after schema-generator removal, vendor only the live generated modules under `src/common/bare/` and import them from source instead of `dist/schemas/**`.
@@ -112,9 +122,24 @@ cd rivetkit-typescript/packages/rivetkit
 
 The script installs each drizzle-orm version, typechecks `scripts/drizzle-compat-smoke.ts` against the `rivetkit/db/drizzle` public surface, and reports pass/fail per version. It restores the original package.json and lockfile on exit. Update the `DEFAULT_VERSIONS` array in the script when adding support for new drizzle releases.
 
+## Test Harness
+
+- Shared local `rivet-engine` lifecycle for TypeScript tests lives in `packages/rivetkit/tests/shared-engine.ts`; driver and platform tests should reuse it instead of launching a separate engine.
+- Platform wasm smoke tests should reuse `packages/rivetkit/tests/platforms/shared-registry.ts` for the raw-SQL SQLite counter actor and public wasm `setup(...)` shape.
+- Platform smoke tests should use `packages/rivetkit/tests/platforms/shared-platform-harness.ts` for serverless runner setup, app process logging, temp app dirs, health checks, and pinned `pnpm dlx` CLI launches.
+
 ## Cloudflare Workers Compatibility
 
 Cloudflare Workers forbid `setTimeout`, `fetch`, `connect`, and other async I/O in global scope (outside a request handler). The `Registry` constructor runs in global scope, so it must never call these APIs unconditionally. Any deferred work (e.g., prestarting the runtime) must be gated behind a synchronous config check before scheduling a timer. See `packages/rivetkit/src/registry/index.ts` for the pattern: the outer `if` guards `setTimeout`, and the inner `if` re-checks after the tick to pick up late config mutations.
+
+## Wasm Binding Package
+
+- Treat `packages/rivetkit-wasm/pkg/` as wasm-pack output; commit source and build scripts, then regenerate package artifacts during package builds.
+- Export wasm raw WebSocket handles as `WebSocketHandle`, not `WebSocket`, because wasm-bindgen rejects classes that shadow the host global.
+- Keep wasm runtime adapter byte normalization on `Uint8Array`; do not add Node `Buffer` dependencies to `packages/rivetkit/src/registry/wasm-runtime.ts`.
+- Pass platform wasm bindings through `setup({ wasm: { bindings, initInput } })`; do not add hidden `globalThis` binding hooks.
+- Wasm `CoreRegistry` serverless startup must use a `BuildingServerless` waiter state; shutdown during build must wake waiters and drain any newly built runtime.
+- Run `pnpm --filter @rivetkit/rivetkit-wasm run check:package` after wasm package export or files changes to verify the published tarball includes the root entrypoint and wasm artifacts.
 
 ## Workflow Context Actor Access Guards
 

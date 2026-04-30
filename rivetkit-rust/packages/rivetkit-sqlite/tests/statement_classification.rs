@@ -3,7 +3,8 @@ use std::ptr;
 
 use libsqlite3_sys::{SQLITE_OK, sqlite3, sqlite3_close, sqlite3_open};
 use rivetkit_sqlite::query::{
-	StatementAuthorizerActionKind, classify_statement, exec_statements,
+	ExecuteRoute, StatementAuthorizerActionKind, classify_statement, exec_statements,
+	execute_single_statement, install_reader_authorizer,
 };
 
 struct MemoryDb(*mut sqlite3);
@@ -56,6 +57,28 @@ fn readonly_pragma_is_reader_eligible_and_captures_pragma_usage() {
 	assert!(classification.sqlite_readonly);
 	assert!(classification.reader_eligible());
 	assert!(classification.authorizer.pragma_usage);
+}
+
+#[test]
+fn readonly_schema_pragma_with_argument_is_allowed_on_reader() {
+	let db = MemoryDb::open();
+	exec_statements(
+		db.as_ptr(),
+		"CREATE TABLE items(id INTEGER PRIMARY KEY, label TEXT);",
+	)
+	.unwrap();
+
+	let classification = classify_statement(db.as_ptr(), "PRAGMA table_info(items)").unwrap();
+
+	assert!(classification.sqlite_readonly);
+	assert!(classification.reader_eligible());
+	assert!(classification.authorizer.pragma_usage);
+	install_reader_authorizer(db.as_ptr()).unwrap();
+	let result =
+		execute_single_statement(db.as_ptr(), "PRAGMA table_info(items)", None, ExecuteRoute::Read)
+			.unwrap();
+	assert!(result.columns.iter().any(|column| column == "name"));
+	assert_eq!(result.rows.len(), 2);
 }
 
 #[test]

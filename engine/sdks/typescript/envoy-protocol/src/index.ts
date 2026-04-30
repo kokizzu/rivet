@@ -551,6 +551,16 @@ export function writeSqlitePgno(bc: bare.ByteCursor, x: SqlitePgno): void {
     bare.writeU32(bc, x)
 }
 
+export type SqliteGeneration = u64
+
+export function readSqliteGeneration(bc: bare.ByteCursor): SqliteGeneration {
+    return bare.readU64(bc)
+}
+
+export function writeSqliteGeneration(bc: bare.ByteCursor, x: SqliteGeneration): void {
+    bare.writeU64(bc, x)
+}
+
 export type SqlitePageBytes = ArrayBuffer
 
 export function readSqlitePageBytes(bc: bare.ByteCursor): SqlitePageBytes {
@@ -812,6 +822,581 @@ export function writeSqliteCommitResponse(bc: bare.ByteCursor, x: SqliteCommitRe
     }
 }
 
+export type SqliteValueNull = null
+
+export type SqliteValueInteger = {
+    readonly value: i64
+}
+
+export function readSqliteValueInteger(bc: bare.ByteCursor): SqliteValueInteger {
+    return {
+        value: bare.readI64(bc),
+    }
+}
+
+export function writeSqliteValueInteger(bc: bare.ByteCursor, x: SqliteValueInteger): void {
+    bare.writeI64(bc, x.value)
+}
+
+export type SqliteValueFloat = {
+    readonly value: ArrayBuffer
+}
+
+export function readSqliteValueFloat(bc: bare.ByteCursor): SqliteValueFloat {
+    return {
+        value: bare.readFixedData(bc, 8),
+    }
+}
+
+export function writeSqliteValueFloat(bc: bare.ByteCursor, x: SqliteValueFloat): void {
+    {
+        assert(x.value.byteLength === 8)
+        bare.writeFixedData(bc, x.value)
+    }
+}
+
+export type SqliteValueText = {
+    readonly value: string
+}
+
+export function readSqliteValueText(bc: bare.ByteCursor): SqliteValueText {
+    return {
+        value: bare.readString(bc),
+    }
+}
+
+export function writeSqliteValueText(bc: bare.ByteCursor, x: SqliteValueText): void {
+    bare.writeString(bc, x.value)
+}
+
+export type SqliteValueBlob = {
+    readonly value: ArrayBuffer
+}
+
+export function readSqliteValueBlob(bc: bare.ByteCursor): SqliteValueBlob {
+    return {
+        value: bare.readData(bc),
+    }
+}
+
+export function writeSqliteValueBlob(bc: bare.ByteCursor, x: SqliteValueBlob): void {
+    bare.writeData(bc, x.value)
+}
+
+export type SqliteBindParam =
+    | { readonly tag: "SqliteValueNull"; readonly val: SqliteValueNull }
+    | { readonly tag: "SqliteValueInteger"; readonly val: SqliteValueInteger }
+    | { readonly tag: "SqliteValueFloat"; readonly val: SqliteValueFloat }
+    | { readonly tag: "SqliteValueText"; readonly val: SqliteValueText }
+    | { readonly tag: "SqliteValueBlob"; readonly val: SqliteValueBlob }
+
+export function readSqliteBindParam(bc: bare.ByteCursor): SqliteBindParam {
+    const offset = bc.offset
+    const tag = bare.readU8(bc)
+    switch (tag) {
+        case 0:
+            return { tag: "SqliteValueNull", val: null }
+        case 1:
+            return { tag: "SqliteValueInteger", val: readSqliteValueInteger(bc) }
+        case 2:
+            return { tag: "SqliteValueFloat", val: readSqliteValueFloat(bc) }
+        case 3:
+            return { tag: "SqliteValueText", val: readSqliteValueText(bc) }
+        case 4:
+            return { tag: "SqliteValueBlob", val: readSqliteValueBlob(bc) }
+        default: {
+            bc.offset = offset
+            throw new bare.BareError(offset, "invalid tag")
+        }
+    }
+}
+
+export function writeSqliteBindParam(bc: bare.ByteCursor, x: SqliteBindParam): void {
+    switch (x.tag) {
+        case "SqliteValueNull": {
+            bare.writeU8(bc, 0)
+            break
+        }
+        case "SqliteValueInteger": {
+            bare.writeU8(bc, 1)
+            writeSqliteValueInteger(bc, x.val)
+            break
+        }
+        case "SqliteValueFloat": {
+            bare.writeU8(bc, 2)
+            writeSqliteValueFloat(bc, x.val)
+            break
+        }
+        case "SqliteValueText": {
+            bare.writeU8(bc, 3)
+            writeSqliteValueText(bc, x.val)
+            break
+        }
+        case "SqliteValueBlob": {
+            bare.writeU8(bc, 4)
+            writeSqliteValueBlob(bc, x.val)
+            break
+        }
+    }
+}
+
+export type SqliteColumnValue =
+    | { readonly tag: "SqliteValueNull"; readonly val: SqliteValueNull }
+    | { readonly tag: "SqliteValueInteger"; readonly val: SqliteValueInteger }
+    | { readonly tag: "SqliteValueFloat"; readonly val: SqliteValueFloat }
+    | { readonly tag: "SqliteValueText"; readonly val: SqliteValueText }
+    | { readonly tag: "SqliteValueBlob"; readonly val: SqliteValueBlob }
+
+export function readSqliteColumnValue(bc: bare.ByteCursor): SqliteColumnValue {
+    const offset = bc.offset
+    const tag = bare.readU8(bc)
+    switch (tag) {
+        case 0:
+            return { tag: "SqliteValueNull", val: null }
+        case 1:
+            return { tag: "SqliteValueInteger", val: readSqliteValueInteger(bc) }
+        case 2:
+            return { tag: "SqliteValueFloat", val: readSqliteValueFloat(bc) }
+        case 3:
+            return { tag: "SqliteValueText", val: readSqliteValueText(bc) }
+        case 4:
+            return { tag: "SqliteValueBlob", val: readSqliteValueBlob(bc) }
+        default: {
+            bc.offset = offset
+            throw new bare.BareError(offset, "invalid tag")
+        }
+    }
+}
+
+export function writeSqliteColumnValue(bc: bare.ByteCursor, x: SqliteColumnValue): void {
+    switch (x.tag) {
+        case "SqliteValueNull": {
+            bare.writeU8(bc, 0)
+            break
+        }
+        case "SqliteValueInteger": {
+            bare.writeU8(bc, 1)
+            writeSqliteValueInteger(bc, x.val)
+            break
+        }
+        case "SqliteValueFloat": {
+            bare.writeU8(bc, 2)
+            writeSqliteValueFloat(bc, x.val)
+            break
+        }
+        case "SqliteValueText": {
+            bare.writeU8(bc, 3)
+            writeSqliteValueText(bc, x.val)
+            break
+        }
+        case "SqliteValueBlob": {
+            bare.writeU8(bc, 4)
+            writeSqliteValueBlob(bc, x.val)
+            break
+        }
+    }
+}
+
+function read9(bc: bare.ByteCursor): readonly string[] {
+    const len = bare.readUintSafe(bc)
+    if (len === 0) {
+        return []
+    }
+    const result = [bare.readString(bc)]
+    for (let i = 1; i < len; i++) {
+        result[i] = bare.readString(bc)
+    }
+    return result
+}
+
+function write9(bc: bare.ByteCursor, x: readonly string[]): void {
+    bare.writeUintSafe(bc, x.length)
+    for (let i = 0; i < x.length; i++) {
+        bare.writeString(bc, x[i])
+    }
+}
+
+function read10(bc: bare.ByteCursor): readonly SqliteColumnValue[] {
+    const len = bare.readUintSafe(bc)
+    if (len === 0) {
+        return []
+    }
+    const result = [readSqliteColumnValue(bc)]
+    for (let i = 1; i < len; i++) {
+        result[i] = readSqliteColumnValue(bc)
+    }
+    return result
+}
+
+function write10(bc: bare.ByteCursor, x: readonly SqliteColumnValue[]): void {
+    bare.writeUintSafe(bc, x.length)
+    for (let i = 0; i < x.length; i++) {
+        writeSqliteColumnValue(bc, x[i])
+    }
+}
+
+function read11(bc: bare.ByteCursor): readonly (readonly SqliteColumnValue[])[] {
+    const len = bare.readUintSafe(bc)
+    if (len === 0) {
+        return []
+    }
+    const result = [read10(bc)]
+    for (let i = 1; i < len; i++) {
+        result[i] = read10(bc)
+    }
+    return result
+}
+
+function write11(bc: bare.ByteCursor, x: readonly (readonly SqliteColumnValue[])[]): void {
+    bare.writeUintSafe(bc, x.length)
+    for (let i = 0; i < x.length; i++) {
+        write10(bc, x[i])
+    }
+}
+
+export type SqliteQueryResult = {
+    readonly columns: readonly string[]
+    readonly rows: readonly (readonly SqliteColumnValue[])[]
+}
+
+export function readSqliteQueryResult(bc: bare.ByteCursor): SqliteQueryResult {
+    return {
+        columns: read9(bc),
+        rows: read11(bc),
+    }
+}
+
+export function writeSqliteQueryResult(bc: bare.ByteCursor, x: SqliteQueryResult): void {
+    write9(bc, x.columns)
+    write11(bc, x.rows)
+}
+
+export enum SqliteExecuteRoute {
+    Read = "Read",
+    Write = "Write",
+    WriteFallback = "WriteFallback",
+}
+
+export function readSqliteExecuteRoute(bc: bare.ByteCursor): SqliteExecuteRoute {
+    const offset = bc.offset
+    const tag = bare.readU8(bc)
+    switch (tag) {
+        case 0:
+            return SqliteExecuteRoute.Read
+        case 1:
+            return SqliteExecuteRoute.Write
+        case 2:
+            return SqliteExecuteRoute.WriteFallback
+        default: {
+            bc.offset = offset
+            throw new bare.BareError(offset, "invalid tag")
+        }
+    }
+}
+
+export function writeSqliteExecuteRoute(bc: bare.ByteCursor, x: SqliteExecuteRoute): void {
+    switch (x) {
+        case SqliteExecuteRoute.Read: {
+            bare.writeU8(bc, 0)
+            break
+        }
+        case SqliteExecuteRoute.Write: {
+            bare.writeU8(bc, 1)
+            break
+        }
+        case SqliteExecuteRoute.WriteFallback: {
+            bare.writeU8(bc, 2)
+            break
+        }
+    }
+}
+
+function read12(bc: bare.ByteCursor): i64 | null {
+    return bare.readBool(bc) ? bare.readI64(bc) : null
+}
+
+function write12(bc: bare.ByteCursor, x: i64 | null): void {
+    bare.writeBool(bc, x != null)
+    if (x != null) {
+        bare.writeI64(bc, x)
+    }
+}
+
+export type SqliteExecuteResult = {
+    readonly columns: readonly string[]
+    readonly rows: readonly (readonly SqliteColumnValue[])[]
+    readonly changes: i64
+    readonly lastInsertRowId: i64 | null
+    readonly route: SqliteExecuteRoute
+}
+
+export function readSqliteExecuteResult(bc: bare.ByteCursor): SqliteExecuteResult {
+    return {
+        columns: read9(bc),
+        rows: read11(bc),
+        changes: bare.readI64(bc),
+        lastInsertRowId: read12(bc),
+        route: readSqliteExecuteRoute(bc),
+    }
+}
+
+export function writeSqliteExecuteResult(bc: bare.ByteCursor, x: SqliteExecuteResult): void {
+    write9(bc, x.columns)
+    write11(bc, x.rows)
+    bare.writeI64(bc, x.changes)
+    write12(bc, x.lastInsertRowId)
+    writeSqliteExecuteRoute(bc, x.route)
+}
+
+export type SqliteExecRequest = {
+    readonly namespaceId: Id
+    readonly actorId: Id
+    readonly generation: SqliteGeneration
+    readonly sql: string
+}
+
+export function readSqliteExecRequest(bc: bare.ByteCursor): SqliteExecRequest {
+    return {
+        namespaceId: readId(bc),
+        actorId: readId(bc),
+        generation: readSqliteGeneration(bc),
+        sql: bare.readString(bc),
+    }
+}
+
+export function writeSqliteExecRequest(bc: bare.ByteCursor, x: SqliteExecRequest): void {
+    writeId(bc, x.namespaceId)
+    writeId(bc, x.actorId)
+    writeSqliteGeneration(bc, x.generation)
+    bare.writeString(bc, x.sql)
+}
+
+function read13(bc: bare.ByteCursor): readonly SqliteBindParam[] {
+    const len = bare.readUintSafe(bc)
+    if (len === 0) {
+        return []
+    }
+    const result = [readSqliteBindParam(bc)]
+    for (let i = 1; i < len; i++) {
+        result[i] = readSqliteBindParam(bc)
+    }
+    return result
+}
+
+function write13(bc: bare.ByteCursor, x: readonly SqliteBindParam[]): void {
+    bare.writeUintSafe(bc, x.length)
+    for (let i = 0; i < x.length; i++) {
+        writeSqliteBindParam(bc, x[i])
+    }
+}
+
+function read14(bc: bare.ByteCursor): readonly SqliteBindParam[] | null {
+    return bare.readBool(bc) ? read13(bc) : null
+}
+
+function write14(bc: bare.ByteCursor, x: readonly SqliteBindParam[] | null): void {
+    bare.writeBool(bc, x != null)
+    if (x != null) {
+        write13(bc, x)
+    }
+}
+
+export type SqliteExecuteRequest = {
+    readonly namespaceId: Id
+    readonly actorId: Id
+    readonly generation: SqliteGeneration
+    readonly sql: string
+    readonly params: readonly SqliteBindParam[] | null
+}
+
+export function readSqliteExecuteRequest(bc: bare.ByteCursor): SqliteExecuteRequest {
+    return {
+        namespaceId: readId(bc),
+        actorId: readId(bc),
+        generation: readSqliteGeneration(bc),
+        sql: bare.readString(bc),
+        params: read14(bc),
+    }
+}
+
+export function writeSqliteExecuteRequest(bc: bare.ByteCursor, x: SqliteExecuteRequest): void {
+    writeId(bc, x.namespaceId)
+    writeId(bc, x.actorId)
+    writeSqliteGeneration(bc, x.generation)
+    bare.writeString(bc, x.sql)
+    write14(bc, x.params)
+}
+
+export type SqliteExecuteWriteRequest = {
+    readonly namespaceId: Id
+    readonly actorId: Id
+    readonly generation: SqliteGeneration
+    readonly sql: string
+    readonly params: readonly SqliteBindParam[] | null
+}
+
+export function readSqliteExecuteWriteRequest(bc: bare.ByteCursor): SqliteExecuteWriteRequest {
+    return {
+        namespaceId: readId(bc),
+        actorId: readId(bc),
+        generation: readSqliteGeneration(bc),
+        sql: bare.readString(bc),
+        params: read14(bc),
+    }
+}
+
+export function writeSqliteExecuteWriteRequest(bc: bare.ByteCursor, x: SqliteExecuteWriteRequest): void {
+    writeId(bc, x.namespaceId)
+    writeId(bc, x.actorId)
+    writeSqliteGeneration(bc, x.generation)
+    bare.writeString(bc, x.sql)
+    write14(bc, x.params)
+}
+
+export type SqliteExecOk = {
+    readonly result: SqliteQueryResult
+}
+
+export function readSqliteExecOk(bc: bare.ByteCursor): SqliteExecOk {
+    return {
+        result: readSqliteQueryResult(bc),
+    }
+}
+
+export function writeSqliteExecOk(bc: bare.ByteCursor, x: SqliteExecOk): void {
+    writeSqliteQueryResult(bc, x.result)
+}
+
+export type SqliteExecuteOk = {
+    readonly result: SqliteExecuteResult
+}
+
+export function readSqliteExecuteOk(bc: bare.ByteCursor): SqliteExecuteOk {
+    return {
+        result: readSqliteExecuteResult(bc),
+    }
+}
+
+export function writeSqliteExecuteOk(bc: bare.ByteCursor, x: SqliteExecuteOk): void {
+    writeSqliteExecuteResult(bc, x.result)
+}
+
+export type SqliteExecuteWriteOk = {
+    readonly result: SqliteExecuteResult
+}
+
+export function readSqliteExecuteWriteOk(bc: bare.ByteCursor): SqliteExecuteWriteOk {
+    return {
+        result: readSqliteExecuteResult(bc),
+    }
+}
+
+export function writeSqliteExecuteWriteOk(bc: bare.ByteCursor, x: SqliteExecuteWriteOk): void {
+    writeSqliteExecuteResult(bc, x.result)
+}
+
+export type SqliteExecResponse =
+    | { readonly tag: "SqliteExecOk"; readonly val: SqliteExecOk }
+    | { readonly tag: "SqliteErrorResponse"; readonly val: SqliteErrorResponse }
+
+export function readSqliteExecResponse(bc: bare.ByteCursor): SqliteExecResponse {
+    const offset = bc.offset
+    const tag = bare.readU8(bc)
+    switch (tag) {
+        case 0:
+            return { tag: "SqliteExecOk", val: readSqliteExecOk(bc) }
+        case 1:
+            return { tag: "SqliteErrorResponse", val: readSqliteErrorResponse(bc) }
+        default: {
+            bc.offset = offset
+            throw new bare.BareError(offset, "invalid tag")
+        }
+    }
+}
+
+export function writeSqliteExecResponse(bc: bare.ByteCursor, x: SqliteExecResponse): void {
+    switch (x.tag) {
+        case "SqliteExecOk": {
+            bare.writeU8(bc, 0)
+            writeSqliteExecOk(bc, x.val)
+            break
+        }
+        case "SqliteErrorResponse": {
+            bare.writeU8(bc, 1)
+            writeSqliteErrorResponse(bc, x.val)
+            break
+        }
+    }
+}
+
+export type SqliteExecuteResponse =
+    | { readonly tag: "SqliteExecuteOk"; readonly val: SqliteExecuteOk }
+    | { readonly tag: "SqliteErrorResponse"; readonly val: SqliteErrorResponse }
+
+export function readSqliteExecuteResponse(bc: bare.ByteCursor): SqliteExecuteResponse {
+    const offset = bc.offset
+    const tag = bare.readU8(bc)
+    switch (tag) {
+        case 0:
+            return { tag: "SqliteExecuteOk", val: readSqliteExecuteOk(bc) }
+        case 1:
+            return { tag: "SqliteErrorResponse", val: readSqliteErrorResponse(bc) }
+        default: {
+            bc.offset = offset
+            throw new bare.BareError(offset, "invalid tag")
+        }
+    }
+}
+
+export function writeSqliteExecuteResponse(bc: bare.ByteCursor, x: SqliteExecuteResponse): void {
+    switch (x.tag) {
+        case "SqliteExecuteOk": {
+            bare.writeU8(bc, 0)
+            writeSqliteExecuteOk(bc, x.val)
+            break
+        }
+        case "SqliteErrorResponse": {
+            bare.writeU8(bc, 1)
+            writeSqliteErrorResponse(bc, x.val)
+            break
+        }
+    }
+}
+
+export type SqliteExecuteWriteResponse =
+    | { readonly tag: "SqliteExecuteWriteOk"; readonly val: SqliteExecuteWriteOk }
+    | { readonly tag: "SqliteErrorResponse"; readonly val: SqliteErrorResponse }
+
+export function readSqliteExecuteWriteResponse(bc: bare.ByteCursor): SqliteExecuteWriteResponse {
+    const offset = bc.offset
+    const tag = bare.readU8(bc)
+    switch (tag) {
+        case 0:
+            return { tag: "SqliteExecuteWriteOk", val: readSqliteExecuteWriteOk(bc) }
+        case 1:
+            return { tag: "SqliteErrorResponse", val: readSqliteErrorResponse(bc) }
+        default: {
+            bc.offset = offset
+            throw new bare.BareError(offset, "invalid tag")
+        }
+    }
+}
+
+export function writeSqliteExecuteWriteResponse(bc: bare.ByteCursor, x: SqliteExecuteWriteResponse): void {
+    switch (x.tag) {
+        case "SqliteExecuteWriteOk": {
+            bare.writeU8(bc, 0)
+            writeSqliteExecuteWriteOk(bc, x.val)
+            break
+        }
+        case "SqliteErrorResponse": {
+            bare.writeU8(bc, 1)
+            writeSqliteErrorResponse(bc, x.val)
+            break
+        }
+    }
+}
+
 /**
  * Core
  */
@@ -862,22 +1447,22 @@ export function writeActorName(bc: bare.ByteCursor, x: ActorName): void {
     writeJson(bc, x.metadata)
 }
 
-function read9(bc: bare.ByteCursor): string | null {
+function read15(bc: bare.ByteCursor): string | null {
     return bare.readBool(bc) ? bare.readString(bc) : null
 }
 
-function write9(bc: bare.ByteCursor, x: string | null): void {
+function write15(bc: bare.ByteCursor, x: string | null): void {
     bare.writeBool(bc, x != null)
     if (x != null) {
         bare.writeString(bc, x)
     }
 }
 
-function read10(bc: bare.ByteCursor): ArrayBuffer | null {
+function read16(bc: bare.ByteCursor): ArrayBuffer | null {
     return bare.readBool(bc) ? bare.readData(bc) : null
 }
 
-function write10(bc: bare.ByteCursor, x: ArrayBuffer | null): void {
+function write16(bc: bare.ByteCursor, x: ArrayBuffer | null): void {
     bare.writeBool(bc, x != null)
     if (x != null) {
         bare.writeData(bc, x)
@@ -894,17 +1479,17 @@ export type ActorConfig = {
 export function readActorConfig(bc: bare.ByteCursor): ActorConfig {
     return {
         name: bare.readString(bc),
-        key: read9(bc),
+        key: read15(bc),
         createTs: bare.readI64(bc),
-        input: read10(bc),
+        input: read16(bc),
     }
 }
 
 export function writeActorConfig(bc: bare.ByteCursor, x: ActorConfig): void {
     bare.writeString(bc, x.name)
-    write9(bc, x.key)
+    write15(bc, x.key)
     bare.writeI64(bc, x.createTs)
-    write10(bc, x.input)
+    write16(bc, x.input)
 }
 
 export type ActorCheckpoint = {
@@ -979,13 +1564,13 @@ export type ActorStateStopped = {
 export function readActorStateStopped(bc: bare.ByteCursor): ActorStateStopped {
     return {
         code: readStopCode(bc),
-        message: read9(bc),
+        message: read15(bc),
     }
 }
 
 export function writeActorStateStopped(bc: bare.ByteCursor, x: ActorStateStopped): void {
     writeStopCode(bc, x.code)
-    write9(bc, x.message)
+    write15(bc, x.message)
 }
 
 export type ActorState =
@@ -1052,29 +1637,18 @@ export function writeEventActorStateUpdate(bc: bare.ByteCursor, x: EventActorSta
     writeActorState(bc, x.state)
 }
 
-function read11(bc: bare.ByteCursor): i64 | null {
-    return bare.readBool(bc) ? bare.readI64(bc) : null
-}
-
-function write11(bc: bare.ByteCursor, x: i64 | null): void {
-    bare.writeBool(bc, x != null)
-    if (x != null) {
-        bare.writeI64(bc, x)
-    }
-}
-
 export type EventActorSetAlarm = {
     readonly alarmTs: i64 | null
 }
 
 export function readEventActorSetAlarm(bc: bare.ByteCursor): EventActorSetAlarm {
     return {
-        alarmTs: read11(bc),
+        alarmTs: read12(bc),
     }
 }
 
 export function writeEventActorSetAlarm(bc: bare.ByteCursor, x: EventActorSetAlarm): void {
-    write11(bc, x.alarmTs)
+    write12(bc, x.alarmTs)
 }
 
 export type Event =
@@ -1156,7 +1730,7 @@ export function writePreloadedKvEntry(bc: bare.ByteCursor, x: PreloadedKvEntry):
     writeKvMetadata(bc, x.metadata)
 }
 
-function read12(bc: bare.ByteCursor): readonly PreloadedKvEntry[] {
+function read17(bc: bare.ByteCursor): readonly PreloadedKvEntry[] {
     const len = bare.readUintSafe(bc)
     if (len === 0) {
         return []
@@ -1168,7 +1742,7 @@ function read12(bc: bare.ByteCursor): readonly PreloadedKvEntry[] {
     return result
 }
 
-function write12(bc: bare.ByteCursor, x: readonly PreloadedKvEntry[]): void {
+function write17(bc: bare.ByteCursor, x: readonly PreloadedKvEntry[]): void {
     bare.writeUintSafe(bc, x.length)
     for (let i = 0; i < x.length; i++) {
         writePreloadedKvEntry(bc, x[i])
@@ -1183,14 +1757,14 @@ export type PreloadedKv = {
 
 export function readPreloadedKv(bc: bare.ByteCursor): PreloadedKv {
     return {
-        entries: read12(bc),
+        entries: read17(bc),
         requestedGetKeys: read0(bc),
         requestedPrefixes: read0(bc),
     }
 }
 
 export function writePreloadedKv(bc: bare.ByteCursor, x: PreloadedKv): void {
-    write12(bc, x.entries)
+    write17(bc, x.entries)
     write0(bc, x.requestedGetKeys)
     write0(bc, x.requestedPrefixes)
 }
@@ -1212,7 +1786,7 @@ export function writeHibernatingRequest(bc: bare.ByteCursor, x: HibernatingReque
     writeRequestId(bc, x.requestId)
 }
 
-function read13(bc: bare.ByteCursor): readonly HibernatingRequest[] {
+function read18(bc: bare.ByteCursor): readonly HibernatingRequest[] {
     const len = bare.readUintSafe(bc)
     if (len === 0) {
         return []
@@ -1224,18 +1798,18 @@ function read13(bc: bare.ByteCursor): readonly HibernatingRequest[] {
     return result
 }
 
-function write13(bc: bare.ByteCursor, x: readonly HibernatingRequest[]): void {
+function write18(bc: bare.ByteCursor, x: readonly HibernatingRequest[]): void {
     bare.writeUintSafe(bc, x.length)
     for (let i = 0; i < x.length; i++) {
         writeHibernatingRequest(bc, x[i])
     }
 }
 
-function read14(bc: bare.ByteCursor): PreloadedKv | null {
+function read19(bc: bare.ByteCursor): PreloadedKv | null {
     return bare.readBool(bc) ? readPreloadedKv(bc) : null
 }
 
-function write14(bc: bare.ByteCursor, x: PreloadedKv | null): void {
+function write19(bc: bare.ByteCursor, x: PreloadedKv | null): void {
     bare.writeBool(bc, x != null)
     if (x != null) {
         writePreloadedKv(bc, x)
@@ -1251,15 +1825,15 @@ export type CommandStartActor = {
 export function readCommandStartActor(bc: bare.ByteCursor): CommandStartActor {
     return {
         config: readActorConfig(bc),
-        hibernatingRequests: read13(bc),
-        preloadedKv: read14(bc),
+        hibernatingRequests: read18(bc),
+        preloadedKv: read19(bc),
     }
 }
 
 export function writeCommandStartActor(bc: bare.ByteCursor, x: CommandStartActor): void {
     writeActorConfig(bc, x.config)
-    write13(bc, x.hibernatingRequests)
-    write14(bc, x.preloadedKv)
+    write18(bc, x.hibernatingRequests)
+    write19(bc, x.preloadedKv)
 }
 
 export enum StopActorReason {
@@ -1466,7 +2040,7 @@ export function writeMessageId(bc: bare.ByteCursor, x: MessageId): void {
     writeMessageIndex(bc, x.messageIndex)
 }
 
-function read15(bc: bare.ByteCursor): ReadonlyMap<string, string> {
+function read20(bc: bare.ByteCursor): ReadonlyMap<string, string> {
     const len = bare.readUintSafe(bc)
     const result = new Map<string, string>()
     for (let i = 0; i < len; i++) {
@@ -1481,7 +2055,7 @@ function read15(bc: bare.ByteCursor): ReadonlyMap<string, string> {
     return result
 }
 
-function write15(bc: bare.ByteCursor, x: ReadonlyMap<string, string>): void {
+function write20(bc: bare.ByteCursor, x: ReadonlyMap<string, string>): void {
     bare.writeUintSafe(bc, x.size)
     for (const kv of x) {
         bare.writeString(bc, kv[0])
@@ -1506,8 +2080,8 @@ export function readToEnvoyRequestStart(bc: bare.ByteCursor): ToEnvoyRequestStar
         actorId: readId(bc),
         method: bare.readString(bc),
         path: bare.readString(bc),
-        headers: read15(bc),
-        body: read10(bc),
+        headers: read20(bc),
+        body: read16(bc),
         stream: bare.readBool(bc),
     }
 }
@@ -1516,8 +2090,8 @@ export function writeToEnvoyRequestStart(bc: bare.ByteCursor, x: ToEnvoyRequestS
     writeId(bc, x.actorId)
     bare.writeString(bc, x.method)
     bare.writeString(bc, x.path)
-    write15(bc, x.headers)
-    write10(bc, x.body)
+    write20(bc, x.headers)
+    write16(bc, x.body)
     bare.writeBool(bc, x.stream)
 }
 
@@ -1550,16 +2124,16 @@ export type ToRivetResponseStart = {
 export function readToRivetResponseStart(bc: bare.ByteCursor): ToRivetResponseStart {
     return {
         status: bare.readU16(bc),
-        headers: read15(bc),
-        body: read10(bc),
+        headers: read20(bc),
+        body: read16(bc),
         stream: bare.readBool(bc),
     }
 }
 
 export function writeToRivetResponseStart(bc: bare.ByteCursor, x: ToRivetResponseStart): void {
     bare.writeU16(bc, x.status)
-    write15(bc, x.headers)
-    write10(bc, x.body)
+    write20(bc, x.headers)
+    write16(bc, x.body)
     bare.writeBool(bc, x.stream)
 }
 
@@ -1595,14 +2169,14 @@ export function readToEnvoyWebSocketOpen(bc: bare.ByteCursor): ToEnvoyWebSocketO
     return {
         actorId: readId(bc),
         path: bare.readString(bc),
-        headers: read15(bc),
+        headers: read20(bc),
     }
 }
 
 export function writeToEnvoyWebSocketOpen(bc: bare.ByteCursor, x: ToEnvoyWebSocketOpen): void {
     writeId(bc, x.actorId)
     bare.writeString(bc, x.path)
-    write15(bc, x.headers)
+    write20(bc, x.headers)
 }
 
 export type ToEnvoyWebSocketMessage = {
@@ -1622,11 +2196,11 @@ export function writeToEnvoyWebSocketMessage(bc: bare.ByteCursor, x: ToEnvoyWebS
     bare.writeBool(bc, x.binary)
 }
 
-function read16(bc: bare.ByteCursor): u16 | null {
+function read21(bc: bare.ByteCursor): u16 | null {
     return bare.readBool(bc) ? bare.readU16(bc) : null
 }
 
-function write16(bc: bare.ByteCursor, x: u16 | null): void {
+function write21(bc: bare.ByteCursor, x: u16 | null): void {
     bare.writeBool(bc, x != null)
     if (x != null) {
         bare.writeU16(bc, x)
@@ -1640,14 +2214,14 @@ export type ToEnvoyWebSocketClose = {
 
 export function readToEnvoyWebSocketClose(bc: bare.ByteCursor): ToEnvoyWebSocketClose {
     return {
-        code: read16(bc),
-        reason: read9(bc),
+        code: read21(bc),
+        reason: read15(bc),
     }
 }
 
 export function writeToEnvoyWebSocketClose(bc: bare.ByteCursor, x: ToEnvoyWebSocketClose): void {
-    write16(bc, x.code)
-    write9(bc, x.reason)
+    write21(bc, x.code)
+    write15(bc, x.reason)
 }
 
 export type ToRivetWebSocketOpen = {
@@ -1703,15 +2277,15 @@ export type ToRivetWebSocketClose = {
 
 export function readToRivetWebSocketClose(bc: bare.ByteCursor): ToRivetWebSocketClose {
     return {
-        code: read16(bc),
-        reason: read9(bc),
+        code: read21(bc),
+        reason: read15(bc),
         hibernate: bare.readBool(bc),
     }
 }
 
 export function writeToRivetWebSocketClose(bc: bare.ByteCursor, x: ToRivetWebSocketClose): void {
-    write16(bc, x.code)
-    write9(bc, x.reason)
+    write21(bc, x.code)
+    write15(bc, x.reason)
     bare.writeBool(bc, x.hibernate)
 }
 
@@ -1919,7 +2493,7 @@ export function writeToEnvoyPing(bc: bare.ByteCursor, x: ToEnvoyPing): void {
     bare.writeI64(bc, x.ts)
 }
 
-function read17(bc: bare.ByteCursor): ReadonlyMap<string, ActorName> {
+function read22(bc: bare.ByteCursor): ReadonlyMap<string, ActorName> {
     const len = bare.readUintSafe(bc)
     const result = new Map<string, ActorName>()
     for (let i = 0; i < len; i++) {
@@ -1934,7 +2508,7 @@ function read17(bc: bare.ByteCursor): ReadonlyMap<string, ActorName> {
     return result
 }
 
-function write17(bc: bare.ByteCursor, x: ReadonlyMap<string, ActorName>): void {
+function write22(bc: bare.ByteCursor, x: ReadonlyMap<string, ActorName>): void {
     bare.writeUintSafe(bc, x.size)
     for (const kv of x) {
         bare.writeString(bc, kv[0])
@@ -1942,22 +2516,22 @@ function write17(bc: bare.ByteCursor, x: ReadonlyMap<string, ActorName>): void {
     }
 }
 
-function read18(bc: bare.ByteCursor): ReadonlyMap<string, ActorName> | null {
-    return bare.readBool(bc) ? read17(bc) : null
+function read23(bc: bare.ByteCursor): ReadonlyMap<string, ActorName> | null {
+    return bare.readBool(bc) ? read22(bc) : null
 }
 
-function write18(bc: bare.ByteCursor, x: ReadonlyMap<string, ActorName> | null): void {
+function write23(bc: bare.ByteCursor, x: ReadonlyMap<string, ActorName> | null): void {
     bare.writeBool(bc, x != null)
     if (x != null) {
-        write17(bc, x)
+        write22(bc, x)
     }
 }
 
-function read19(bc: bare.ByteCursor): Json | null {
+function read24(bc: bare.ByteCursor): Json | null {
     return bare.readBool(bc) ? readJson(bc) : null
 }
 
-function write19(bc: bare.ByteCursor, x: Json | null): void {
+function write24(bc: bare.ByteCursor, x: Json | null): void {
     bare.writeBool(bc, x != null)
     if (x != null) {
         writeJson(bc, x)
@@ -1974,14 +2548,14 @@ export type ToRivetMetadata = {
 
 export function readToRivetMetadata(bc: bare.ByteCursor): ToRivetMetadata {
     return {
-        prepopulateActorNames: read18(bc),
-        metadata: read19(bc),
+        prepopulateActorNames: read23(bc),
+        metadata: read24(bc),
     }
 }
 
 export function writeToRivetMetadata(bc: bare.ByteCursor, x: ToRivetMetadata): void {
-    write18(bc, x.prepopulateActorNames)
-    write19(bc, x.metadata)
+    write23(bc, x.prepopulateActorNames)
+    write24(bc, x.metadata)
 }
 
 export type ToRivetEvents = readonly EventWrapper[]
@@ -2005,7 +2579,7 @@ export function writeToRivetEvents(bc: bare.ByteCursor, x: ToRivetEvents): void 
     }
 }
 
-function read20(bc: bare.ByteCursor): readonly ActorCheckpoint[] {
+function read25(bc: bare.ByteCursor): readonly ActorCheckpoint[] {
     const len = bare.readUintSafe(bc)
     if (len === 0) {
         return []
@@ -2017,7 +2591,7 @@ function read20(bc: bare.ByteCursor): readonly ActorCheckpoint[] {
     return result
 }
 
-function write20(bc: bare.ByteCursor, x: readonly ActorCheckpoint[]): void {
+function write25(bc: bare.ByteCursor, x: readonly ActorCheckpoint[]): void {
     bare.writeUintSafe(bc, x.length)
     for (let i = 0; i < x.length; i++) {
         writeActorCheckpoint(bc, x[i])
@@ -2030,12 +2604,12 @@ export type ToRivetAckCommands = {
 
 export function readToRivetAckCommands(bc: bare.ByteCursor): ToRivetAckCommands {
     return {
-        lastCommandCheckpoints: read20(bc),
+        lastCommandCheckpoints: read25(bc),
     }
 }
 
 export function writeToRivetAckCommands(bc: bare.ByteCursor, x: ToRivetAckCommands): void {
-    write20(bc, x.lastCommandCheckpoints)
+    write25(bc, x.lastCommandCheckpoints)
 }
 
 export type ToRivetStopping = null
@@ -2108,6 +2682,57 @@ export function writeToRivetSqliteCommitRequest(bc: bare.ByteCursor, x: ToRivetS
     writeSqliteCommitRequest(bc, x.data)
 }
 
+export type ToRivetSqliteExecRequest = {
+    readonly requestId: u32
+    readonly data: SqliteExecRequest
+}
+
+export function readToRivetSqliteExecRequest(bc: bare.ByteCursor): ToRivetSqliteExecRequest {
+    return {
+        requestId: bare.readU32(bc),
+        data: readSqliteExecRequest(bc),
+    }
+}
+
+export function writeToRivetSqliteExecRequest(bc: bare.ByteCursor, x: ToRivetSqliteExecRequest): void {
+    bare.writeU32(bc, x.requestId)
+    writeSqliteExecRequest(bc, x.data)
+}
+
+export type ToRivetSqliteExecuteRequest = {
+    readonly requestId: u32
+    readonly data: SqliteExecuteRequest
+}
+
+export function readToRivetSqliteExecuteRequest(bc: bare.ByteCursor): ToRivetSqliteExecuteRequest {
+    return {
+        requestId: bare.readU32(bc),
+        data: readSqliteExecuteRequest(bc),
+    }
+}
+
+export function writeToRivetSqliteExecuteRequest(bc: bare.ByteCursor, x: ToRivetSqliteExecuteRequest): void {
+    bare.writeU32(bc, x.requestId)
+    writeSqliteExecuteRequest(bc, x.data)
+}
+
+export type ToRivetSqliteExecuteWriteRequest = {
+    readonly requestId: u32
+    readonly data: SqliteExecuteWriteRequest
+}
+
+export function readToRivetSqliteExecuteWriteRequest(bc: bare.ByteCursor): ToRivetSqliteExecuteWriteRequest {
+    return {
+        requestId: bare.readU32(bc),
+        data: readSqliteExecuteWriteRequest(bc),
+    }
+}
+
+export function writeToRivetSqliteExecuteWriteRequest(bc: bare.ByteCursor, x: ToRivetSqliteExecuteWriteRequest): void {
+    bare.writeU32(bc, x.requestId)
+    writeSqliteExecuteWriteRequest(bc, x.data)
+}
+
 export type ToRivet =
     | { readonly tag: "ToRivetMetadata"; readonly val: ToRivetMetadata }
     | { readonly tag: "ToRivetEvents"; readonly val: ToRivetEvents }
@@ -2118,6 +2743,9 @@ export type ToRivet =
     | { readonly tag: "ToRivetTunnelMessage"; readonly val: ToRivetTunnelMessage }
     | { readonly tag: "ToRivetSqliteGetPagesRequest"; readonly val: ToRivetSqliteGetPagesRequest }
     | { readonly tag: "ToRivetSqliteCommitRequest"; readonly val: ToRivetSqliteCommitRequest }
+    | { readonly tag: "ToRivetSqliteExecRequest"; readonly val: ToRivetSqliteExecRequest }
+    | { readonly tag: "ToRivetSqliteExecuteRequest"; readonly val: ToRivetSqliteExecuteRequest }
+    | { readonly tag: "ToRivetSqliteExecuteWriteRequest"; readonly val: ToRivetSqliteExecuteWriteRequest }
 
 export function readToRivet(bc: bare.ByteCursor): ToRivet {
     const offset = bc.offset
@@ -2141,6 +2769,12 @@ export function readToRivet(bc: bare.ByteCursor): ToRivet {
             return { tag: "ToRivetSqliteGetPagesRequest", val: readToRivetSqliteGetPagesRequest(bc) }
         case 8:
             return { tag: "ToRivetSqliteCommitRequest", val: readToRivetSqliteCommitRequest(bc) }
+        case 9:
+            return { tag: "ToRivetSqliteExecRequest", val: readToRivetSqliteExecRequest(bc) }
+        case 10:
+            return { tag: "ToRivetSqliteExecuteRequest", val: readToRivetSqliteExecuteRequest(bc) }
+        case 11:
+            return { tag: "ToRivetSqliteExecuteWriteRequest", val: readToRivetSqliteExecuteWriteRequest(bc) }
         default: {
             bc.offset = offset
             throw new bare.BareError(offset, "invalid tag")
@@ -2192,6 +2826,21 @@ export function writeToRivet(bc: bare.ByteCursor, x: ToRivet): void {
         case "ToRivetSqliteCommitRequest": {
             bare.writeU8(bc, 8)
             writeToRivetSqliteCommitRequest(bc, x.val)
+            break
+        }
+        case "ToRivetSqliteExecRequest": {
+            bare.writeU8(bc, 9)
+            writeToRivetSqliteExecRequest(bc, x.val)
+            break
+        }
+        case "ToRivetSqliteExecuteRequest": {
+            bare.writeU8(bc, 10)
+            writeToRivetSqliteExecuteRequest(bc, x.val)
+            break
+        }
+        case "ToRivetSqliteExecuteWriteRequest": {
+            bare.writeU8(bc, 11)
+            writeToRivetSqliteExecuteWriteRequest(bc, x.val)
             break
         }
     }
@@ -2280,12 +2929,12 @@ export type ToEnvoyAckEvents = {
 
 export function readToEnvoyAckEvents(bc: bare.ByteCursor): ToEnvoyAckEvents {
     return {
-        lastEventCheckpoints: read20(bc),
+        lastEventCheckpoints: read25(bc),
     }
 }
 
 export function writeToEnvoyAckEvents(bc: bare.ByteCursor, x: ToEnvoyAckEvents): void {
-    write20(bc, x.lastEventCheckpoints)
+    write25(bc, x.lastEventCheckpoints)
 }
 
 export type ToEnvoyKvResponse = {
@@ -2339,6 +2988,57 @@ export function writeToEnvoySqliteCommitResponse(bc: bare.ByteCursor, x: ToEnvoy
     writeSqliteCommitResponse(bc, x.data)
 }
 
+export type ToEnvoySqliteExecResponse = {
+    readonly requestId: u32
+    readonly data: SqliteExecResponse
+}
+
+export function readToEnvoySqliteExecResponse(bc: bare.ByteCursor): ToEnvoySqliteExecResponse {
+    return {
+        requestId: bare.readU32(bc),
+        data: readSqliteExecResponse(bc),
+    }
+}
+
+export function writeToEnvoySqliteExecResponse(bc: bare.ByteCursor, x: ToEnvoySqliteExecResponse): void {
+    bare.writeU32(bc, x.requestId)
+    writeSqliteExecResponse(bc, x.data)
+}
+
+export type ToEnvoySqliteExecuteResponse = {
+    readonly requestId: u32
+    readonly data: SqliteExecuteResponse
+}
+
+export function readToEnvoySqliteExecuteResponse(bc: bare.ByteCursor): ToEnvoySqliteExecuteResponse {
+    return {
+        requestId: bare.readU32(bc),
+        data: readSqliteExecuteResponse(bc),
+    }
+}
+
+export function writeToEnvoySqliteExecuteResponse(bc: bare.ByteCursor, x: ToEnvoySqliteExecuteResponse): void {
+    bare.writeU32(bc, x.requestId)
+    writeSqliteExecuteResponse(bc, x.data)
+}
+
+export type ToEnvoySqliteExecuteWriteResponse = {
+    readonly requestId: u32
+    readonly data: SqliteExecuteWriteResponse
+}
+
+export function readToEnvoySqliteExecuteWriteResponse(bc: bare.ByteCursor): ToEnvoySqliteExecuteWriteResponse {
+    return {
+        requestId: bare.readU32(bc),
+        data: readSqliteExecuteWriteResponse(bc),
+    }
+}
+
+export function writeToEnvoySqliteExecuteWriteResponse(bc: bare.ByteCursor, x: ToEnvoySqliteExecuteWriteResponse): void {
+    bare.writeU32(bc, x.requestId)
+    writeSqliteExecuteWriteResponse(bc, x.data)
+}
+
 export type ToEnvoy =
     | { readonly tag: "ToEnvoyInit"; readonly val: ToEnvoyInit }
     | { readonly tag: "ToEnvoyCommands"; readonly val: ToEnvoyCommands }
@@ -2348,6 +3048,9 @@ export type ToEnvoy =
     | { readonly tag: "ToEnvoyPing"; readonly val: ToEnvoyPing }
     | { readonly tag: "ToEnvoySqliteGetPagesResponse"; readonly val: ToEnvoySqliteGetPagesResponse }
     | { readonly tag: "ToEnvoySqliteCommitResponse"; readonly val: ToEnvoySqliteCommitResponse }
+    | { readonly tag: "ToEnvoySqliteExecResponse"; readonly val: ToEnvoySqliteExecResponse }
+    | { readonly tag: "ToEnvoySqliteExecuteResponse"; readonly val: ToEnvoySqliteExecuteResponse }
+    | { readonly tag: "ToEnvoySqliteExecuteWriteResponse"; readonly val: ToEnvoySqliteExecuteWriteResponse }
 
 export function readToEnvoy(bc: bare.ByteCursor): ToEnvoy {
     const offset = bc.offset
@@ -2369,6 +3072,12 @@ export function readToEnvoy(bc: bare.ByteCursor): ToEnvoy {
             return { tag: "ToEnvoySqliteGetPagesResponse", val: readToEnvoySqliteGetPagesResponse(bc) }
         case 7:
             return { tag: "ToEnvoySqliteCommitResponse", val: readToEnvoySqliteCommitResponse(bc) }
+        case 8:
+            return { tag: "ToEnvoySqliteExecResponse", val: readToEnvoySqliteExecResponse(bc) }
+        case 9:
+            return { tag: "ToEnvoySqliteExecuteResponse", val: readToEnvoySqliteExecuteResponse(bc) }
+        case 10:
+            return { tag: "ToEnvoySqliteExecuteWriteResponse", val: readToEnvoySqliteExecuteWriteResponse(bc) }
         default: {
             bc.offset = offset
             throw new bare.BareError(offset, "invalid tag")
@@ -2416,6 +3125,21 @@ export function writeToEnvoy(bc: bare.ByteCursor, x: ToEnvoy): void {
         case "ToEnvoySqliteCommitResponse": {
             bare.writeU8(bc, 7)
             writeToEnvoySqliteCommitResponse(bc, x.val)
+            break
+        }
+        case "ToEnvoySqliteExecResponse": {
+            bare.writeU8(bc, 8)
+            writeToEnvoySqliteExecResponse(bc, x.val)
+            break
+        }
+        case "ToEnvoySqliteExecuteResponse": {
+            bare.writeU8(bc, 9)
+            writeToEnvoySqliteExecuteResponse(bc, x.val)
+            break
+        }
+        case "ToEnvoySqliteExecuteWriteResponse": {
+            bare.writeU8(bc, 10)
+            writeToEnvoySqliteExecuteWriteResponse(bc, x.val)
             break
         }
     }
@@ -2690,4 +3414,4 @@ function assert(condition: boolean, message?: string): asserts condition {
     if (!condition) throw new Error(message ?? "Assertion failed")
 }
 
-export const VERSION = 3;
+export const VERSION = 4;

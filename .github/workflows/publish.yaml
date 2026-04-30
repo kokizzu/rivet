@@ -79,7 +79,7 @@ jobs:
           fi
 
   # ---------------------------------------------------------------------------
-  # build — matrix of 10 native/engine artifacts (11 on release for Windows)
+  # build — matrix of native/engine artifacts
   # ---------------------------------------------------------------------------
   build:
     needs: [context]
@@ -233,6 +233,45 @@ jobs:
           if-no-files-found: error
 
   # ---------------------------------------------------------------------------
+  # build-wasm — wasm package artifact built in parallel with native artifacts
+  # ---------------------------------------------------------------------------
+  build-wasm:
+    needs: [context]
+    name: "Build rivetkit-wasm"
+    if: needs.context.outputs.is_fork != 'true'
+    runs-on: depot-ubuntu-24.04-8
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: ${{ needs.context.outputs.trigger == 'release' }}
+      - run: corepack enable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          target: wasm32-unknown-unknown
+          rustflags: ""
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "rivetkit-wasm-publish"
+          cache-on-failure: true
+      - name: Install wasm package dependencies
+        run: pnpm install --frozen-lockfile --filter=@rivetkit/rivetkit-wasm
+      - name: Build wasm package
+        run: pnpm --filter=@rivetkit/rivetkit-wasm build
+      - name: Upload wasm package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wasm-package
+          path: rivetkit-typescript/packages/rivetkit-wasm/pkg
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
   # docker-images — per-arch runtime images pushed to Docker Hub
   # ---------------------------------------------------------------------------
   docker-images:
@@ -298,12 +337,13 @@ jobs:
   # publish — npm publish + R2 upload + Docker manifest + release tail
   # ---------------------------------------------------------------------------
   publish:
-    needs: [context, build, docker-images]
+    needs: [context, build, build-wasm, docker-images]
     name: "Publish"
     if: |
       !cancelled() &&
       needs.context.outputs.is_fork != 'true' &&
       needs.build.result == 'success' &&
+      needs.build-wasm.result == 'success' &&
       needs.docker-images.result == 'success'
     runs-on: depot-ubuntu-24.04-8
     permissions:
@@ -343,6 +383,16 @@ jobs:
           path: engine-artifacts
           pattern: engine-*
           merge-multiple: true
+      - name: Download wasm package artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: wasm-package
+          path: rivetkit-typescript/packages/rivetkit-wasm/pkg
+      - name: Validate wasm package artifact
+        run: |
+          test -f rivetkit-typescript/packages/rivetkit-wasm/pkg/rivetkit_wasm.js
+          test -f rivetkit-typescript/packages/rivetkit-wasm/pkg/rivetkit_wasm.d.ts
+          test -f rivetkit-typescript/packages/rivetkit-wasm/pkg/rivetkit_wasm_bg.wasm
 
       - name: Place native binaries in platform packages
         run: |
@@ -397,7 +447,9 @@ jobs:
 
       # ---- build TypeScript packages (turbo dep graph picks up native) ----
       - name: Build TypeScript packages
-        run: pnpm build -F rivetkit -F '@rivetkit/*' -F '!@rivetkit/shared-data' -F '!@rivetkit/engine-frontend' -F '!@rivetkit/mcp-hub' -F '!@rivetkit/rivetkit-napi'
+        env:
+          SKIP_WASM_BUILD: "1"
+        run: pnpm build -F rivetkit -F '@rivetkit/*' -F '!@rivetkit/shared-data' -F '!@rivetkit/engine-frontend' -F '!@rivetkit/mcp-hub' -F '!@rivetkit/rivetkit-napi' -F '!@rivetkit/rivetkit-wasm'
 
       # ---- shared publish (runs for all triggers) ----
       - name: Finalize package versions for publish

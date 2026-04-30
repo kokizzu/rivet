@@ -64,7 +64,7 @@ pub async fn task_inner(
 	loop {
 		match recv_msg(&mut ws_rx, &mut ws_to_tunnel_abort_rx, &mut term_signal).await? {
 			Ok(Some(msg)) => {
-				handle_message(&ctx, &conn, event_demuxer, msg).await?;
+				handle_message(&ctx, conn.clone(), event_demuxer, msg).await?;
 			}
 			Ok(None) => {}
 			Err(lifecycle_res) => return Ok(lifecycle_res),
@@ -118,7 +118,7 @@ async fn recv_msg(
 #[tracing::instrument(skip_all)]
 async fn handle_message(
 	ctx: &StandaloneCtx,
-	conn: &Conn,
+	conn: Arc<Conn>,
 	event_demuxer: &mut ActorEventDemuxer,
 	msg: Bytes,
 ) -> Result<()> {
@@ -383,22 +383,56 @@ async fn handle_message(
 			}
 		}
 		protocol::ToRivet::ToRivetSqliteGetPagesRequest(req) => {
-			let response = handle_sqlite_get_pages_response(ctx, conn, req.data).await;
-			send_sqlite_get_pages_response(conn, req.request_id, response).await?;
+			let response = handle_sqlite_get_pages_response(ctx, &conn, req.data).await;
+			send_sqlite_get_pages_response(&conn, req.request_id, response).await?;
 		}
 		protocol::ToRivet::ToRivetSqliteCommitRequest(req) => {
 			let actor_id = req.data.actor_id.clone();
 			let request_id = req.request_id;
-			let timed_response = async { handle_sqlite_commit_response(ctx, conn, req.data).await }
+			let timed_response = async { handle_sqlite_commit_response(ctx, &conn, req.data).await }
 				.instrument(tracing::debug_span!(
 					"handle_sqlite_commit",
 					actor_id = %actor_id,
 					request_id = ?request_id
 				))
 				.await;
-			send_sqlite_commit_response(conn, request_id, timed_response.response).await?;
+			send_sqlite_commit_response(&conn, request_id, timed_response.response).await?;
 			crate::metrics::SQLITE_COMMIT_ENVOY_RESPONSE_DURATION
 				.observe(timed_response.commit_completed_at.elapsed().as_secs_f64());
+		}
+		protocol::ToRivet::ToRivetSqliteExecRequest(req) => {
+			send_sqlite_exec_response(
+				&conn,
+				req.request_id,
+				protocol::SqliteExecResponse::SqliteErrorResponse(protocol::SqliteErrorResponse {
+					message: "remote sqlite exec handling is not wired".to_string(),
+				}),
+			)
+			.await?;
+		}
+		protocol::ToRivet::ToRivetSqliteExecuteRequest(req) => {
+			send_sqlite_execute_response(
+				&conn,
+				req.request_id,
+				protocol::SqliteExecuteResponse::SqliteErrorResponse(
+					protocol::SqliteErrorResponse {
+						message: "remote sqlite execute handling is not wired".to_string(),
+					},
+				),
+			)
+			.await?;
+		}
+		protocol::ToRivet::ToRivetSqliteExecuteWriteRequest(req) => {
+			send_sqlite_execute_write_response(
+				&conn,
+				req.request_id,
+				protocol::SqliteExecuteWriteResponse::SqliteErrorResponse(
+					protocol::SqliteErrorResponse {
+						message: "remote sqlite execute_write handling is not wired".to_string(),
+					},
+				),
+			)
+			.await?;
 		}
 		protocol::ToRivet::ToRivetTunnelMessage(tunnel_msg) => {
 			handle_tunnel_message(ctx, &conn.authorized_tunnel_routes, tunnel_msg)
@@ -846,6 +880,53 @@ async fn send_sqlite_commit_response(
 			data,
 		}),
 		"sqlite commit response",
+	)
+	.await
+}
+
+async fn send_sqlite_exec_response(
+	conn: &Conn,
+	request_id: u32,
+	data: protocol::SqliteExecResponse,
+) -> Result<()> {
+	send_to_envoy(
+		conn,
+		protocol::ToEnvoy::ToEnvoySqliteExecResponse(protocol::ToEnvoySqliteExecResponse {
+			request_id,
+			data,
+		}),
+		"sqlite exec response",
+	)
+	.await
+}
+
+async fn send_sqlite_execute_response(
+	conn: &Conn,
+	request_id: u32,
+	data: protocol::SqliteExecuteResponse,
+) -> Result<()> {
+	send_to_envoy(
+		conn,
+		protocol::ToEnvoy::ToEnvoySqliteExecuteResponse(protocol::ToEnvoySqliteExecuteResponse {
+			request_id,
+			data,
+		}),
+		"sqlite execute response",
+	)
+	.await
+}
+
+async fn send_sqlite_execute_write_response(
+	conn: &Conn,
+	request_id: u32,
+	data: protocol::SqliteExecuteWriteResponse,
+) -> Result<()> {
+	send_to_envoy(
+		conn,
+		protocol::ToEnvoy::ToEnvoySqliteExecuteWriteResponse(
+			protocol::ToEnvoySqliteExecuteWriteResponse { request_id, data },
+		),
+		"sqlite execute_write response",
 	)
 	.await
 }

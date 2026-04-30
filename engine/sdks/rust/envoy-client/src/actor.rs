@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use rivet_envoy_protocol as protocol;
-use rivet_util::async_counter::AsyncCounter;
+use crate::async_counter::AsyncCounter;
 use rivet_util_serde::HashableMap;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
@@ -16,7 +16,9 @@ use crate::connection::ws_send;
 use crate::context::SharedContext;
 use crate::handle::EnvoyHandle;
 use crate::stringify::stringify_to_rivet_tunnel_message_kind;
-use crate::utils::{BufferMap, id_to_str, wrapping_add_u16, wrapping_lte_u16, wrapping_sub_u16};
+use crate::utils::{
+	BufferMap, id_to_str, spawn_detached, wrapping_add_u16, wrapping_lte_u16, wrapping_sub_u16,
+};
 
 pub enum ToActor {
 	Intent {
@@ -128,7 +130,7 @@ pub fn create_actor(
 ) -> (mpsc::UnboundedSender<ToActor>, Arc<AsyncCounter>) {
 	let (tx, rx) = mpsc::unbounded_channel();
 	let active_http_request_count = Arc::new(AsyncCounter::new());
-	tokio::spawn(actor_inner(
+	spawn_detached(actor_inner(
 		shared,
 		actor_id,
 		generation,
@@ -540,27 +542,30 @@ fn handle_req_start(
 	let request_id = message_id.request_id;
 	let request_guard = ActiveHttpRequestGuard::new(ctx.active_http_request_count.clone());
 
-	http_request_tasks.spawn(
-		async move {
-			let _request_guard = request_guard;
-			let response = shared
-				.config
-				.callbacks
-				.fetch(handle_clone, actor_id, gateway_id, request_id, request)
-				.await;
+	let task = async move {
+		let _request_guard = request_guard;
+		let response = shared
+			.config
+			.callbacks
+			.fetch(handle_clone, actor_id, gateway_id, request_id, request)
+			.await;
 
-			match response {
-				Ok(response) => {
-					send_response(&shared, gateway_id, request_id, response).await;
-				}
-				Err(error) => {
-					tracing::error!(?error, "fetch failed");
-					send_fetch_error_response(&shared, gateway_id, request_id).await;
-				}
+		match response {
+			Ok(response) => {
+				send_response(&shared, gateway_id, request_id, response).await;
+			}
+			Err(error) => {
+				tracing::error!(?error, "fetch failed");
+				send_fetch_error_response(&shared, gateway_id, request_id).await;
 			}
 		}
-		.in_current_span(),
-	);
+	}
+	.in_current_span();
+
+	#[cfg(target_arch = "wasm32")]
+	http_request_tasks.spawn_local(task);
+	#[cfg(not(target_arch = "wasm32"))]
+	http_request_tasks.spawn(task);
 
 	if !req.stream {
 		ctx.pending_requests
@@ -684,7 +689,7 @@ fn spawn_ws_outgoing_task(
 			}
 		}
 	};
-	tokio::spawn(ws_task.in_current_span());
+	spawn_detached(ws_task.in_current_span());
 }
 
 async fn handle_ws_open(

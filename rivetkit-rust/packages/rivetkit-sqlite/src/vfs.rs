@@ -353,6 +353,28 @@ pub trait SqliteVfsMetrics: Send + Sync {
 		_total_ns: u64,
 	) {
 	}
+
+	fn set_read_pool_active_readers(&self, _readers: u64) {}
+
+	fn set_read_pool_idle_readers(&self, _readers: u64) {}
+
+	fn observe_read_pool_read_wait(&self, _duration: Duration) {}
+
+	fn observe_read_pool_write_wait(&self, _duration: Duration) {}
+
+	fn record_read_pool_routed_read_query(&self) {}
+
+	fn record_read_pool_write_fallback_query(&self) {}
+
+	fn observe_read_pool_manual_transaction(&self, _duration: Duration) {}
+
+	fn record_read_pool_reader_open(&self) {}
+
+	fn record_read_pool_reader_close(&self, _count: u64) {}
+
+	fn record_read_pool_rejected_reader_mutation(&self) {}
+
+	fn record_read_pool_mode_transition(&self, _from: &str, _to: &str) {}
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -503,10 +525,13 @@ struct SqliteVfsRegistration {
 
 pub struct NativeDatabase {
 	db: *mut sqlite3,
-	_vfs: SqliteVfs,
+	_vfs: NativeVfsHandle,
 }
 
 unsafe impl Send for NativeDatabase {}
+
+pub type NativeVfsHandle = Arc<SqliteVfs>;
+pub type NativeConnection = NativeDatabase;
 
 impl PrefetchPredictor {
 	fn record(&mut self, pgno: u32) {
@@ -939,7 +964,7 @@ impl VfsContext {
 		self.last_error.lock().clone()
 	}
 
-	fn take_last_error(&self) -> Option<String> {
+	pub(crate) fn take_last_error(&self) -> Option<String> {
 		self.last_error.lock().take()
 	}
 
@@ -1055,7 +1080,7 @@ impl VfsContext {
 		self.state.write().dead = true;
 	}
 
-	fn snapshot_preload_hints(&self) -> VfsPreloadHintSnapshot {
+	pub(crate) fn snapshot_preload_hints(&self) -> VfsPreloadHintSnapshot {
 		if !self.config.recent_page_hints {
 			return VfsPreloadHintSnapshot::default();
 		}
@@ -2453,7 +2478,7 @@ impl SqliteVfs {
 		)
 	}
 
-	fn take_last_error(&self) -> Option<String> {
+	pub(crate) fn take_last_error(&self) -> Option<String> {
 		self.ctx.take_last_error()
 	}
 
@@ -2461,8 +2486,8 @@ impl SqliteVfs {
 		self.ctx.clone_last_error()
 	}
 
-	fn snapshot_preload_hints(&self) -> VfsPreloadHintSnapshot {
-		unsafe { (*self.ctx_ptr).snapshot_preload_hints() }
+	pub(crate) fn snapshot_preload_hints(&self) -> VfsPreloadHintSnapshot {
+		self.ctx.snapshot_preload_hints()
 	}
 
 	fn register_with_transport(
@@ -2631,6 +2656,19 @@ pub fn open_database(
 	vfs: SqliteVfs,
 	file_name: &str,
 ) -> std::result::Result<NativeDatabase, String> {
+	open_connection(Arc::new(vfs), file_name, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE)
+		.and_then(|connection| {
+			configure_connection_for_database(connection.as_ptr(), &connection._vfs, file_name)?;
+			verify_batch_atomic_writes(connection.as_ptr(), &connection._vfs, file_name)?;
+			Ok(connection)
+		})
+}
+
+pub fn open_connection(
+	vfs: NativeVfsHandle,
+	file_name: &str,
+	flags: c_int,
+) -> std::result::Result<NativeConnection, String> {
 	let c_name = CString::new(file_name).map_err(|err| err.to_string())?;
 	let mut db: *mut sqlite3 = ptr::null_mut();
 
@@ -2638,7 +2676,7 @@ pub fn open_database(
 		sqlite3_open_v2(
 			c_name.as_ptr(),
 			&mut db,
-			SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE,
+			flags,
 			vfs.name_ptr(),
 		)
 	};
@@ -2659,6 +2697,17 @@ pub fn open_database(
 		return Err(format!("sqlite3_open_v2 failed with code {rc}: {message}"));
 	}
 
+	Ok(NativeDatabase {
+		db,
+		_vfs: vfs,
+	})
+}
+
+pub fn configure_connection_for_database(
+	db: *mut sqlite3,
+	vfs: &SqliteVfs,
+	file_name: &str,
+) -> std::result::Result<(), String> {
 	for pragma in &[
 		"PRAGMA page_size = 4096;",
 		"PRAGMA journal_mode = DELETE;",
@@ -2675,13 +2724,18 @@ pub fn open_database(
 				last_error = ?vfs.clone_last_error(),
 				"failed to configure sqlite database"
 			);
-			unsafe {
-				sqlite3_close(db);
-			}
 			return Err(err);
 		}
 	}
 
+	Ok(())
+}
+
+pub fn verify_batch_atomic_writes(
+	db: *mut sqlite3,
+	vfs: &SqliteVfs,
+	file_name: &str,
+) -> std::result::Result<(), String> {
 	#[cfg(test)]
 	let assert_batch_atomic = vfs.ctx.config.assert_batch_atomic;
 	#[cfg(not(test))]
@@ -2694,14 +2748,11 @@ pub fn open_database(
 				last_error = ?vfs.clone_last_error(),
 				"failed to verify sqlite batch atomic writes"
 			);
-			unsafe {
-				sqlite3_close(db);
-			}
 			return Err(err);
 		}
 	}
 
-	Ok(NativeDatabase { db, _vfs: vfs })
+	Ok(())
 }
 
 #[cfg(test)]

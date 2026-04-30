@@ -24,6 +24,7 @@ use crate::{actor_lifecycle, errors, metrics, utils::UrlData};
 
 pub struct Conn {
 	pub namespace_id: Id,
+	pub namespace_name: String,
 	pub pool_name: String,
 	pub envoy_key: String,
 	pub protocol_version: u16,
@@ -307,12 +308,13 @@ pub async fn init_conn(
 
 	let conn = Arc::new(Conn {
 		namespace_id: namespace.namespace_id,
+		namespace_name,
 		pool_name,
 		envoy_key,
-			protocol_version,
-			ws_handle,
-			authorized_tunnel_routes: HashMap::new(),
-			udb: conn_udb,
+		protocol_version,
+		ws_handle,
+		authorized_tunnel_routes: HashMap::new(),
+		udb: conn_udb,
 		node_id,
 		sqlite_cold_tier,
 		actor_dbs: HashMap::new(),

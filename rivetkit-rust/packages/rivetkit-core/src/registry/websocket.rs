@@ -3,7 +3,7 @@ use super::dispatch::*;
 use super::inspector::encode_json_as_cbor;
 use super::*;
 use crate::error::ProtocolError;
-use tokio::time::timeout;
+use crate::time::timeout;
 use tracing::Instrument;
 
 impl RegistryDispatcher {
@@ -247,9 +247,8 @@ impl RegistryDispatcher {
 		let on_message_dispatch_capacity =
 			instance.factory.config().dispatch_command_inbox_capacity;
 
-		let on_open: Option<
-			Box<dyn FnOnce(WebSocketSender) -> futures::future::BoxFuture<'static, ()> + Send>,
-		> = if is_restoring_hibernatable {
+		let on_open: Option<Box<dyn FnOnce(WebSocketSender) -> EnvoyBoxFuture<()> + Send>> =
+			if is_restoring_hibernatable {
 			None
 		} else {
 			Some(Box::new(move |sender| {
@@ -356,8 +355,8 @@ impl RegistryDispatcher {
 							let conn = conn.clone();
 							let message_index = message.message_index;
 							let actor_id = ctx.actor_id().to_owned();
-							tokio::spawn(
-								async move {
+								RuntimeSpawner::spawn(
+									async move {
 									let response = match dispatch_action_through_task(
 										&dispatch,
 										on_message_dispatch_capacity,

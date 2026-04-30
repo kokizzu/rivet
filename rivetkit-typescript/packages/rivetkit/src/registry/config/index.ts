@@ -1,22 +1,23 @@
 import { z } from "zod";
 import { getRunMetadata } from "@/actor/config";
 import type {
-	BaseActorDefinition,
 	AnyActorDefinition,
+	BaseActorDefinition,
 } from "@/actor/definition";
 import {
 	KEYS,
-	queueMetadataKey,
 	queueMessagesPrefix,
+	queueMetadataKey,
 	workflowStoragePrefix,
 } from "@/actor/keys";
 import { ENGINE_ENDPOINT } from "@/common/engine";
 import { type Logger, LogLevelSchema } from "@/common/log";
-import { DeepReadonly, VERSION } from "@/utils";
+import { VERSION } from "@/utils";
 import { tryParseEndpoint } from "@/utils/endpoint-parser";
 import {
 	getRivetEndpoint,
 	getRivetEngine,
+	getRivetkitRuntime,
 	getRivetNamespace,
 	getRivetRunEngine,
 	getRivetRunEngineVersion,
@@ -34,8 +35,41 @@ export const ActorsSchema = z.record(
 );
 export type RegistryActors = z.infer<typeof ActorsSchema>;
 
-export const TestConfigSchema = z.object({ enabled: z.boolean() });
+export const RuntimeKindSchema = z.enum(["auto", "native", "wasm"]);
+export type RuntimeKind = z.infer<typeof RuntimeKindSchema>;
+export type WasmRuntimeBindings = typeof import("@rivetkit/rivetkit-wasm");
+export type WasmRuntimeInitInput = Parameters<
+	WasmRuntimeBindings["default"]
+>[0];
+export const SqliteBackendSchema = z.enum(["local", "remote"]);
+export type SqliteBackend = z.infer<typeof SqliteBackendSchema>;
+
+export const TestConfigSchema = z.object({
+	enabled: z.boolean().optional().default(false),
+	sqliteBackend: SqliteBackendSchema.optional(),
+});
 export type TestConfig = z.infer<typeof TestConfigSchema>;
+
+export const WasmRuntimeConfigSchema = z.object({
+	bindings: z.custom<WasmRuntimeBindings>().optional(),
+	initInput: z.custom<WasmRuntimeInitInput>().optional(),
+});
+export type WasmRuntimeConfig = z.infer<typeof WasmRuntimeConfigSchema>;
+
+export const SqliteConfigSchema = z
+	.union([
+		SqliteBackendSchema,
+		z.object({
+			backend: SqliteBackendSchema,
+		}),
+	])
+	.optional()
+	.transform((config) => {
+		if (config === undefined) return undefined;
+		if (typeof config === "string") return { backend: config };
+		return config;
+	});
+export type SqliteConfig = z.infer<typeof SqliteConfigSchema>;
 
 // TODO: Add sane defaults for NODE_ENV=development
 export const RegistryConfigSchema = z
@@ -60,6 +94,44 @@ export const RegistryConfigSchema = z
 		maxOutgoingMessageSize: z.number().optional().default(1_048_576),
 
 		// MARK: Runtime
+		/**
+		 * @experimental
+		 *
+		 * Runtime binding to use for RivetKit core.
+		 * */
+		runtime: RuntimeKindSchema.optional().transform((val, ctx) => {
+			const rawRuntime = val ?? getRivetkitRuntime();
+			if (rawRuntime === undefined) {
+				return "auto";
+			}
+
+			const parsed = RuntimeKindSchema.safeParse(rawRuntime);
+			if (!parsed.success) {
+				ctx.addIssue({
+					code: "custom",
+					message:
+						"RIVETKIT_RUNTIME must be one of auto, native, or wasm",
+				});
+				return "auto";
+			}
+
+			return parsed.data;
+		}),
+
+		/**
+		 * @experimental
+		 *
+		 * WebAssembly runtime configuration.
+		 * */
+		wasm: WasmRuntimeConfigSchema.optional().default(() => ({})),
+
+		/**
+		 * @experimental
+		 *
+		 * SQLite backend selection.
+		 * */
+		sqlite: SqliteConfigSchema,
+
 		/**
 		 * @experimental
 		 *
@@ -193,7 +265,12 @@ export const RegistryConfigSchema = z
 				 *
 				 * Must be >= rivetkit-core's drain timeout (20s) + margin.
 				 */
-				gracePeriodMs: z.number().int().min(1_000).optional().default(30_000),
+				gracePeriodMs: z
+					.number()
+					.int()
+					.min(1_000)
+					.optional()
+					.default(30_000),
 				/**
 				 * If true, rivetkit will not install SIGINT/SIGTERM handlers.
 				 * Use when the host application owns signal policy and will
@@ -202,10 +279,32 @@ export const RegistryConfigSchema = z
 				disableSignalHandlers: z.boolean().optional().default(false),
 			})
 			.optional()
-			.default(() => ({ gracePeriodMs: 30_000, disableSignalHandlers: false })),
+			.default(() => ({
+				gracePeriodMs: 30_000,
+				disableSignalHandlers: false,
+			})),
 	})
 	.transform((config, ctx) => {
 		const isDevEnv = isDev();
+		const sqliteBackend =
+			config.sqlite?.backend ?? config.test?.sqliteBackend;
+
+		if (config.runtime === "wasm" && sqliteBackend === "local") {
+			ctx.addIssue({
+				code: "custom",
+				message:
+					"WebAssembly runtime cannot use local SQLite. Use remote SQLite instead.",
+				path:
+					config.sqlite?.backend === "local"
+						? ["sqlite"]
+						: ["test", "sqliteBackend"],
+			});
+		}
+
+		const sqlite =
+			config.runtime === "wasm" && config.sqlite === undefined
+				? { backend: "remote" as const }
+				: config.sqlite;
 
 		// Parse endpoint string (env var fallback is applied via transform above)
 		const parsedEndpoint = config.endpoint
@@ -282,6 +381,7 @@ export const RegistryConfigSchema = z
 		// If endpoint is set or starting the engine, we'll use the engine driver.
 		return {
 			...config,
+			sqlite,
 			endpoint,
 			namespace,
 			token,
@@ -443,6 +543,15 @@ export const DocEnvoyConfigSchema = z
 	})
 	.describe("Configuration for envoy mode.");
 
+export const DocSqliteConfigSchema = z
+	.object({
+		backend: SqliteBackendSchema.optional().describe(
+			"SQLite backend to use. Native defaults to local. Wasm defaults to remote and cannot use local.",
+		),
+	})
+	.optional()
+	.describe("SQLite runtime configuration.");
+
 export const DocRegistryConfigSchema = z
 	.object({
 		use: z
@@ -466,6 +575,7 @@ export const DocRegistryConfigSchema = z
 			.boolean()
 			.optional()
 			.describe("Disable the welcome message on startup. Default: false"),
+		sqlite: DocSqliteConfigSchema,
 		logging: z
 			.object({
 				level: LogLevelSchema.optional().describe(

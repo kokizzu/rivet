@@ -138,6 +138,10 @@ pub async fn route_request(
 		return Ok(Some(RoutingOutput::CustomServe(Arc::new(CorsPreflight))));
 	}
 
+	if !req_ctx.is_websocket() && !is_actor_http_request_path(req_ctx.path()) {
+		return Ok(None);
+	}
+
 	// Attach CORS headers to the actual (non-OPTIONS) response so both the
 	// actor response and any early error are readable by the browser.
 	set_non_preflight_cors(req_ctx);
@@ -225,6 +229,14 @@ pub async fn route_request(
 	)
 	.await
 	.map(Some)
+}
+
+fn is_actor_http_request_path(path: &str) -> bool {
+	let Some(stripped) = path.strip_prefix("/request") else {
+		return false;
+	};
+
+	stripped.is_empty() || matches!(stripped.as_bytes().first(), Some(b'/') | Some(b'?'))
 }
 
 async fn route_request_inner(

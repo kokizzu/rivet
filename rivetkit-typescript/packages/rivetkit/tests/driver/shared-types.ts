@@ -1,5 +1,8 @@
 import type { Encoding } from "../../src/client/mod";
 
+export type DriverRuntime = "native" | "wasm";
+export type DriverSqliteBackend = "local" | "remote";
+
 export interface SkipTests {
 	schedule?: boolean;
 	sleep?: boolean;
@@ -23,6 +26,8 @@ export interface DriverDeployOutput {
 
 export interface DriverTestConfig {
 	start(): Promise<DriverDeployOutput>;
+	runtime: DriverRuntime;
+	sqliteBackend: DriverSqliteBackend;
 	useRealTimers?: boolean;
 	HACK_skipCleanupNet?: boolean;
 	skip?: SkipTests;

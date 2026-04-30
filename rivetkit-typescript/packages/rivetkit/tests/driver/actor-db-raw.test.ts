@@ -91,5 +91,6 @@ describeDriverMatrix("Actor Db Raw", (driverTestConfig) => {
 				expect(values[0].value).toBe("test");
 			});
 		});
+
 	});
 });

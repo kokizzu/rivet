@@ -27,4 +27,6 @@ pub mod optimization_flags;
 pub mod query;
 
 /// Custom SQLite VFS for actor-side sqlite-storage transport.
+
+pub use rivetkit_sqlite_types as types;
 pub mod vfs;

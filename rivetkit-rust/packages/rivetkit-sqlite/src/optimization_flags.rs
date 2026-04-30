@@ -14,6 +14,7 @@ pub const PRELOAD_HINTS_ON_OPEN_ENV: &str = "RIVETKIT_SQLITE_OPT_PRELOAD_HINTS_O
 pub const PRELOAD_HINT_HOT_PAGES_ENV: &str = "RIVETKIT_SQLITE_OPT_PRELOAD_HINT_HOT_PAGES";
 pub const PRELOAD_HINT_EARLY_PAGES_ENV: &str = "RIVETKIT_SQLITE_OPT_PRELOAD_HINT_EARLY_PAGES";
 pub const PRELOAD_HINT_SCAN_RANGES_ENV: &str = "RIVETKIT_SQLITE_OPT_PRELOAD_HINT_SCAN_RANGES";
+pub const DEDUP_GET_PAGES_META_ENV: &str = "RIVETKIT_SQLITE_OPT_DEDUP_GET_PAGES_META";
 pub const CACHE_GET_PAGES_VALIDATION_ENV: &str = "RIVETKIT_SQLITE_OPT_CACHE_GET_PAGES_VALIDATION";
 pub const RANGE_READS_ENV: &str = "RIVETKIT_SQLITE_OPT_RANGE_READS";
 pub const BATCH_CHUNK_READS_ENV: &str = "RIVETKIT_SQLITE_OPT_BATCH_CHUNK_READS";
@@ -98,6 +99,7 @@ pub struct SqliteOptimizationFlags {
 	pub preload_hint_hot_pages: bool,
 	pub preload_hint_early_pages: bool,
 	pub preload_hint_scan_ranges: bool,
+	pub dedup_get_pages_meta: bool,
 	pub cache_get_pages_validation: bool,
 	pub range_reads: bool,
 	pub batch_chunk_reads: bool,
@@ -126,6 +128,7 @@ impl Default for SqliteOptimizationFlags {
 			preload_hint_hot_pages: true,
 			preload_hint_early_pages: true,
 			preload_hint_scan_ranges: true,
+			dedup_get_pages_meta: true,
 			cache_get_pages_validation: true,
 			range_reads: true,
 			batch_chunk_reads: true,
@@ -181,6 +184,7 @@ impl SqliteOptimizationFlags {
 			preload_hint_scan_ranges: enabled_by_default(
 				read_env(PRELOAD_HINT_SCAN_RANGES_ENV).as_deref(),
 			),
+			dedup_get_pages_meta: enabled_by_default(read_env(DEDUP_GET_PAGES_META_ENV).as_deref()),
 			cache_get_pages_validation: enabled_by_default(
 				read_env(CACHE_GET_PAGES_VALIDATION_ENV).as_deref(),
 			),
@@ -236,7 +240,6 @@ fn enabled_by_default(value: Option<&str>) -> bool {
 		_ => true,
 	}
 }
-
 fn usize_bounded_by_default(value: Option<&str>, default: usize, max: usize) -> usize {
 	value
 		.and_then(|value| value.trim().parse::<usize>().ok())

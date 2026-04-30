@@ -4,12 +4,13 @@ use std::io::Cursor;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use crate::time::{Instant, timeout};
 
 use ::http::StatusCode;
 use anyhow::{Context, Result};
 use parking_lot::Mutex;
-use reqwest::Url;
 use rivet_envoy_client::config::{
 	ActorStopHandle, BoxFuture as EnvoyBoxFuture, EnvoyCallbacks, HttpRequest, HttpResponse,
 	WebSocketHandler, WebSocketMessage, WebSocketSender,
@@ -26,6 +27,7 @@ use serde_json::{Value as JsonValue, json};
 use tokio::sync::{Mutex as TokioMutex, Notify, broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+use url::Url;
 use vbare::OwnedVersionedData;
 
 use crate::actor::action::ActionDispatchError;
@@ -48,6 +50,7 @@ use crate::actor::task::{
 	try_send_lifecycle_command,
 };
 use crate::actor::task_types::ShutdownKind;
+#[cfg(feature = "native-runtime")]
 use crate::engine_process::EngineProcessManager;
 use crate::error::{ActorLifecycle as ActorLifecycleError, ActorRuntime};
 use crate::inspector::protocol::{
@@ -55,6 +58,7 @@ use crate::inspector::protocol::{
 };
 use crate::inspector::{Inspector, InspectorAuth, InspectorSignal, InspectorSubscription};
 use crate::kv::Kv;
+use crate::runtime::RuntimeSpawner;
 use crate::sqlite::SqliteDb;
 use crate::types::{ActorKey, ActorKeySegment, WsMessage};
 use crate::websocket::WebSocket;
@@ -65,6 +69,7 @@ mod envoy_callbacks;
 mod http;
 mod inspector;
 mod inspector_ws;
+#[cfg(feature = "native-runtime")]
 mod runner_config;
 mod websocket;
 
@@ -183,6 +188,7 @@ pub struct ServeConfig {
 	pub serverless_client_token: Option<String>,
 	pub serverless_validate_endpoint: bool,
 	pub serverless_max_start_payload_bytes: usize,
+	pub serverless_cache_envoy: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -428,12 +434,19 @@ impl CoreRegistry {
 		shutdown: CancellationToken,
 	) -> Result<()> {
 		let dispatcher = self.into_dispatcher(&config);
+		#[cfg(feature = "native-runtime")]
 		let _engine_process = match config.engine_binary_path.as_ref() {
 			Some(binary_path) => {
 				Some(EngineProcessManager::start(binary_path, &config.endpoint).await?)
 			}
 			None => None,
 		};
+		#[cfg(not(feature = "native-runtime"))]
+		if config.engine_binary_path.is_some() {
+			anyhow::bail!("engine process spawning requires the `native-runtime` feature");
+		}
+
+		#[cfg(feature = "native-runtime")]
 		runner_config::ensure_local_normal_runner_config(&config).await?;
 		let callbacks = Arc::new(RegistryCallbacks {
 			dispatcher: dispatcher.clone(),
@@ -475,7 +488,7 @@ impl CoreRegistry {
 		// Bounded drain. If envoy cannot reach the engine (reconnect loop stuck),
 		// we fall back to immediate `Stop` rather than hanging indefinitely.
 		// The outer host (TS signal handler / Rust binary) is the backstop.
-		match tokio::time::timeout(SHUTDOWN_DRAIN_TIMEOUT, handle.shutdown_and_wait(false)).await {
+		match timeout(SHUTDOWN_DRAIN_TIMEOUT, handle.shutdown_and_wait(false)).await {
 			Ok(()) => {}
 			Err(_) => {
 				tracing::warn!("envoy shutdown drain exceeded timeout; forcing immediate stop");
@@ -627,7 +640,7 @@ impl RegistryDispatcher {
 		)
 		.with_preloaded_persisted_actor(request.preload_persisted_actor)
 		.with_preloaded_kv(request.preloaded_kv);
-		let join = tokio::spawn(task.run());
+		let join = RuntimeSpawner::spawn(task.run());
 
 		let (start_tx, start_rx) = oneshot::channel();
 		let result: Result<Arc<ActorTaskHandle>> = async {
@@ -686,7 +699,7 @@ impl RegistryDispatcher {
 						.await;
 
 					let dispatcher = self.clone();
-					tokio::spawn(async move {
+					RuntimeSpawner::spawn(async move {
 						if let Err(error) = dispatcher
 							.shutdown_started_instance(
 								&actor_id,
@@ -788,6 +801,16 @@ impl RegistryDispatcher {
 				ActorInstanceState::Active(instance) => {
 					let instance = instance.clone();
 					if instance.ctx.started() {
+						if instance.ctx.destroy_requested() || instance.ctx.sleep_requested() {
+							instance
+								.ctx
+								.warn_work_sent_to_stopping_instance("active_actor");
+							return Err(if instance.ctx.destroy_requested() {
+								ActorLifecycleError::Destroying.build()
+							} else {
+								ActorLifecycleError::Stopping.build()
+							});
+						}
 						return Ok(instance);
 					}
 
@@ -917,7 +940,7 @@ impl RegistryDispatcher {
 				Instant::now() + instance.factory.config().effective_sleep_grace_period();
 			if !instance
 				.ctx
-				.wait_for_internal_keep_awake_idle(shutdown_deadline.into())
+				.wait_for_internal_keep_awake_idle(shutdown_deadline)
 				.await
 			{
 				instance.ctx.record_direct_subsystem_shutdown_warning(
@@ -931,7 +954,7 @@ impl RegistryDispatcher {
 			}
 			if !instance
 				.ctx
-				.wait_for_http_requests_drained(shutdown_deadline.into())
+				.wait_for_http_requests_drained(shutdown_deadline)
 				.await
 			{
 				instance
@@ -1002,10 +1025,12 @@ impl RegistryDispatcher {
 			self.region.clone(),
 			factory.config().clone(),
 			Kv::new(handle.clone(), actor_id.to_owned()),
-			SqliteDb::new(
+			SqliteDb::new_with_remote_sqlite(
 				handle.clone(),
 				actor_id.to_owned(),
+				Some(generation as u64),
 				factory.config().has_database,
+				factory.config().remote_sqlite,
 			),
 		);
 		ctx.configure_envoy(handle, Some(generation));

@@ -37,6 +37,7 @@ use std::sync::Arc;
 #[cfg(test)]
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use futures::FutureExt;
@@ -44,13 +45,12 @@ use futures::FutureExt;
 use parking_lot::Mutex;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::{JoinError, JoinHandle};
-use tokio::time::{Duration, Instant, sleep_until, timeout};
-use tracing::Instrument;
-use tracing::instrument::WithSubscriber;
+use tracing::{Instrument, instrument::WithSubscriber};
 
 use crate::actor::action::ActionDispatchError;
 use crate::actor::connection::ConnHandle;
 use crate::actor::context::ActorContext;
+#[cfg(not(target_arch = "wasm32"))]
 use crate::actor::diagnostics::record_actor_warning;
 use crate::actor::factory::ActorFactory;
 use crate::actor::keys::{LAST_PUSHED_ALARM_KEY, PERSIST_DATA_KEY};
@@ -63,6 +63,10 @@ use crate::actor::preload::{PreloadedKv, PreloadedPersistedActor};
 use crate::actor::state::{PersistedActor, decode_last_pushed_alarm, decode_persisted_actor};
 use crate::actor::task_types::ShutdownKind;
 use crate::error::{ActorLifecycle as ActorLifecycleError, ActorRuntime};
+use crate::runtime::RuntimeSpawner;
+#[cfg(test)]
+use crate::time::sleep;
+use crate::time::{Instant, sleep_until, timeout};
 use crate::types::{SaveStateOpts, format_actor_key};
 use crate::websocket::WebSocket;
 
@@ -208,39 +212,53 @@ pub(crate) fn actor_channel_overloaded_error(
 			_ => {}
 		}
 	}
-	if let Some(metrics) = metrics {
-		if let Some(suppression) =
-			record_actor_warning(metrics.actor_id(), "actor_channel_overloaded")
-		{
+	#[cfg(not(target_arch = "wasm32"))]
+	{
+		if let Some(metrics) = metrics {
+			if let Some(suppression) =
+				record_actor_warning(metrics.actor_id(), "actor_channel_overloaded")
+			{
+				tracing::warn!(
+					actor_id = %suppression.actor_id,
+					channel,
+					capacity,
+					operation,
+					event = if channel == LIFECYCLE_EVENT_INBOX_CHANNEL {
+						operation
+					} else {
+						""
+					},
+					per_actor_suppressed = suppression.per_actor_suppressed,
+					global_suppressed = suppression.global_suppressed,
+					"actor bounded channel overloaded"
+				);
+			}
+		} else {
 			tracing::warn!(
-				actor_id = %suppression.actor_id,
 				channel,
 				capacity,
 				operation,
-				event = if channel == LIFECYCLE_EVENT_INBOX_CHANNEL {
-					operation
-				} else {
-					""
-				},
-				per_actor_suppressed = suppression.per_actor_suppressed,
-				global_suppressed = suppression.global_suppressed,
 				"actor bounded channel overloaded"
 			);
 		}
-	} else {
-		tracing::warn!(
-			channel,
+	}
+	#[cfg(target_arch = "wasm32")]
+	{
+		let _ = metrics;
+		anyhow!(
+			"actor bounded channel overloaded: channel={channel}, capacity={capacity}, operation={operation}"
+		)
+	}
+
+	#[cfg(not(target_arch = "wasm32"))]
+	{
+		ActorLifecycleError::Overloaded {
+			channel: channel.to_owned(),
 			capacity,
-			operation,
-			"actor bounded channel overloaded"
-		);
+			operation: operation.to_owned(),
+		}
+		.build()
 	}
-	ActorLifecycleError::Overloaded {
-		channel: channel.to_owned(),
-		capacity,
-		operation: operation.to_owned(),
-	}
-	.build()
 }
 
 pub(crate) fn try_send_lifecycle_command(
@@ -868,22 +886,20 @@ impl ActorTask {
 	fn core_dispatched_hook_reply(&self, operation: &'static str) -> Reply<()> {
 		let (tx, rx) = oneshot::channel();
 		let ctx = self.ctx.clone();
-		tokio::spawn(
-			async move {
-				match rx.await {
-					Ok(Ok(())) => {}
-					Ok(Err(error)) => {
-						tracing::error!(?error, operation, "core dispatched hook failed");
-					}
-					Err(error) => {
-						tracing::error!(?error, operation, "core dispatched hook reply dropped");
-					}
+		let task = async move {
+			match rx.await {
+				Ok(Ok(())) => {}
+				Ok(Err(error)) => {
+					tracing::error!(?error, operation, "core dispatched hook failed");
 				}
-				ctx.mark_core_dispatched_hook_completed();
+				Err(error) => {
+					tracing::error!(?error, operation, "core dispatched hook reply dropped");
+				}
 			}
-			.in_current_span()
-			.with_current_subscriber(),
-		);
+			ctx.mark_core_dispatched_hook_completed();
+		}
+		.in_current_span();
+		RuntimeSpawner::spawn(task);
 		tx.into()
 	}
 
@@ -1138,6 +1154,15 @@ impl ActorTask {
 	}
 
 	fn dispatch_lifecycle_error(&self) -> Option<anyhow::Error> {
+		if self.ctx.destroy_requested() {
+			self.ctx.warn_work_sent_to_stopping_instance("dispatch");
+			return Some(ActorLifecycleError::Destroying.build());
+		}
+		if self.ctx.sleep_requested() {
+			self.ctx.warn_work_sent_to_stopping_instance("dispatch");
+			return Some(ActorLifecycleError::Stopping.build());
+		}
+
 		match self.lifecycle {
 			LifecycleState::Started => None,
 			LifecycleState::SleepGrace
@@ -1317,7 +1342,8 @@ impl ActorTask {
 			startup_ready: startup_ready_tx,
 		};
 		let factory = self.factory.clone();
-		self.run_handle = Some(tokio::spawn(
+		let run_dispatch = tracing::dispatcher::get_default(Clone::clone);
+		self.run_handle = Some(RuntimeSpawner::spawn(
 			async move {
 				match AssertUnwindSafe(factory.start(start)).catch_unwind().await {
 					Ok(result) => result,
@@ -1328,7 +1354,7 @@ impl ActorTask {
 				}
 			}
 			.in_current_span()
-			.with_current_subscriber(),
+			.with_subscriber(run_dispatch),
 		));
 		if let Some(startup_ready_rx) = startup_ready_rx {
 			startup_ready_rx
@@ -1567,7 +1593,7 @@ impl ActorTask {
 		let started_at = Instant::now();
 		tokio::select! {
 			result = ctx.wait_for_shutdown_tasks(deadline) => result,
-			_ = tokio::time::sleep(LONG_SHUTDOWN_DRAIN_WARNING_THRESHOLD) => {
+			_ = sleep(LONG_SHUTDOWN_DRAIN_WARNING_THRESHOLD) => {
 				if ctx.wait_for_shutdown_tasks(Instant::now()).await {
 					true
 				} else {

@@ -1,18 +1,3 @@
-import type {
-	JsActorConfig,
-	JsHttpResponse,
-	JsServeConfig,
-	ActorContext as NativeActorContext,
-	NapiActorFactory as NativeActorFactory,
-	CancellationToken as NativeCancellationToken,
-	ConnHandle as NativeConnHandle,
-	CoreRegistry as NativeCoreRegistry,
-	Queue as NativeQueue,
-	QueueMessage as NativeQueueMessage,
-	Schedule as NativeSchedule,
-	StateDeltaPayload as NativeStateDeltaPayload,
-	WebSocket as NativeWebSocket,
-} from "@rivetkit/rivetkit-napi";
 import { VirtualWebSocket } from "@rivetkit/virtual-websocket";
 import {
 	ACTOR_CONTEXT_INTERNAL_SYMBOL,
@@ -25,11 +10,11 @@ import type { AnyActorDefinition } from "@/actor/definition";
 import {
 	decodeBridgeRivetError,
 	encodeBridgeRivetError,
-	type RivetErrorLike,
 	forbiddenError,
 	INTERNAL_ERROR_CODE,
 	isRivetErrorLike,
 	RivetError,
+	type RivetErrorLike,
 	toRivetError,
 } from "@/actor/errors";
 import { makePrefixedKey, removePrefixFromKey } from "@/actor/keys";
@@ -51,19 +36,9 @@ import {
 import type * as protocol from "@/common/client-protocol";
 import {
 	CURRENT_VERSION as CLIENT_PROTOCOL_CURRENT_VERSION,
-	HTTP_ACTION_REQUEST_VERSIONED,
-	HTTP_ACTION_RESPONSE_VERSIONED,
-	HTTP_QUEUE_SEND_REQUEST_VERSIONED,
-	HTTP_QUEUE_SEND_RESPONSE_VERSIONED,
 	HTTP_RESPONSE_ERROR_VERSIONED,
 } from "@/common/client-protocol-versioned";
 import {
-	HttpActionRequestSchema,
-	HttpActionResponseSchema,
-	type HttpQueueSendRequest as HttpQueueSendRequestJson,
-	HttpQueueSendRequestSchema,
-	type HttpQueueSendResponse as HttpQueueSendResponseJson,
-	HttpQueueSendResponseSchema,
 	type HttpResponseError as HttpResponseErrorJson,
 	HttpResponseErrorSchema,
 } from "@/common/client-protocol-zod";
@@ -80,16 +55,21 @@ import type {
 } from "@/common/websocket-interface";
 import { RemoteEngineControlClient } from "@/engine-client/mod";
 import type { Registry } from "@/registry";
-import type { RegistryConfig } from "@/registry/config";
+import type {
+	RegistryConfig,
+	RuntimeKind,
+	SqliteBackend,
+} from "@/registry/config";
 import {
 	contentTypeForEncoding,
 	decodeCborCompat,
-	deserializeWithEncoding,
+	decodeCborJsonCompat,
 	encodeCborCompat,
 	serializeWithEncoding,
 } from "@/serde";
-import { bufferToArrayBuffer, VERSION } from "@/utils";
+import { getEnvUniversal, VERSION } from "@/utils";
 import { logger } from "./log";
+import { loadNapiRuntime } from "./napi-runtime";
 import {
 	type NativeValidationConfig,
 	validateActionArgs,
@@ -98,34 +78,182 @@ import {
 	validateQueueBody,
 	validateQueueComplete,
 } from "./native-validation";
+import type {
+	ActorContextHandle,
+	ActorFactoryHandle,
+	CancellationTokenHandle,
+	ConnHandle,
+	CoreRuntime,
+	RegistryHandle,
+	RuntimeActorConfig,
+	RuntimeBytes,
+	RuntimeHttpResponse,
+	RuntimeQueueMessage,
+	RuntimeServeConfig,
+	RuntimeStateDeltaPayload,
+	WebSocketHandle,
+} from "./runtime";
+import { loadWasmRuntime } from "./wasm-runtime";
 
-type NativeBindings = typeof import("@rivetkit/rivetkit-napi");
-type NativeWebSocketEvent =
-	| {
-			kind: "message";
-			data: string | Buffer;
-			binary: boolean;
-			messageIndex?: number;
-	  }
-	| {
-			kind: "close";
-			code: number;
-			reason: string;
-			wasClean: boolean;
-	  };
-type NativeWebSocketWithEvents = NativeWebSocket & {
-	setEventCallback: (callback: (event: NativeWebSocketEvent) => void) => void;
-};
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
+type ResolvedRuntimeKind = Exclude<RuntimeKind, "auto">;
+type RuntimeHostKind = "node-like" | "edge-like";
+export type RuntimeLoaders = {
+	loadNative: () => ReturnType<typeof loadNapiRuntime>;
+	loadWasm: (
+		config?: RegistryConfig["wasm"],
+	) => ReturnType<typeof loadWasmRuntime>;
+	detectHost: () => RuntimeHostKind;
+};
 type SerializeStateReason = "save" | "inspector";
 type NativeOnStateChangeHandler = (
-	ctx: NativeActorContextAdapter,
+	ctx: ActorContextHandleAdapter,
 	state: unknown,
 ) => void | Promise<void>;
 type NativePersistConnState = {
 	state: unknown;
 };
+
+const defaultRuntimeLoaders: RuntimeLoaders = {
+	loadNative: loadNapiRuntime,
+	loadWasm: loadWasmRuntime,
+	detectHost: detectRuntimeHost,
+};
+
+function trySetProcessEnv(key: string, value: string) {
+	if (typeof process === "undefined") return;
+	try {
+		process.env[key] = value;
+	} catch {
+		// Some edge runtimes expose a read-only Node-compatible process.env.
+	}
+}
+
+export function detectRuntimeHost(): RuntimeHostKind {
+	const globalScope = globalThis as typeof globalThis & {
+		Bun?: unknown;
+		Deno?: unknown;
+		process?: { versions?: { node?: string } };
+		self?: unknown;
+		window?: unknown;
+	};
+
+	if (
+		globalScope.Deno !== undefined ||
+		globalScope.Bun !== undefined ||
+		typeof globalScope.process?.versions?.node === "string"
+	) {
+		return "node-like";
+	}
+
+	return "edge-like";
+}
+
+export function resolveRuntimeKind(
+	runtime: RuntimeKind | undefined,
+): RuntimeKind {
+	return runtime ?? "auto";
+}
+
+function loadedRuntimeKind(runtime: CoreRuntime): ResolvedRuntimeKind {
+	switch (runtime.kind) {
+		case "napi":
+			return "native";
+		case "wasm":
+			return "wasm";
+	}
+
+	throw new RivetError(
+		"config",
+		"unknown_runtime",
+		"RivetKit runtime must be NAPI or wasm.",
+		{
+			public: true,
+			statusCode: 500,
+		},
+	);
+}
+
+export async function loadAutoRuntime(
+	config: RegistryConfig,
+	loaders: RuntimeLoaders = defaultRuntimeLoaders,
+): Promise<CoreRuntime> {
+	if (loaders.detectHost() === "edge-like") {
+		return (await loaders.loadWasm(config.wasm)).runtime;
+	}
+
+	try {
+		return (await loaders.loadNative()).runtime;
+	} catch {
+		return (await loaders.loadWasm(config.wasm)).runtime;
+	}
+}
+
+export async function loadConfiguredRuntime(
+	config: RegistryConfig,
+	loaders: RuntimeLoaders = defaultRuntimeLoaders,
+): Promise<CoreRuntime> {
+	const requested = resolveRuntimeKind(config.runtime);
+
+	if (requested === "native") {
+		return (await loaders.loadNative()).runtime;
+	}
+
+	if (requested === "wasm") {
+		return (await loaders.loadWasm(config.wasm)).runtime;
+	}
+
+	return loadAutoRuntime(config, loaders);
+}
+
+function sqliteBackendForConfig(
+	config: RegistryConfig,
+): SqliteBackend | undefined {
+	return config.sqlite?.backend ?? config.test?.sqliteBackend;
+}
+
+export function normalizeRuntimeConfigForKind(
+	config: RegistryConfig,
+	runtimeKind: ResolvedRuntimeKind,
+): RegistryConfig {
+	if (runtimeKind === "native") {
+		return config;
+	}
+
+	if (sqliteBackendForConfig(config) === "local") {
+		throw new RivetError(
+			"config",
+			"wasm_local_sqlite",
+			"WebAssembly runtime cannot use local SQLite. Use remote SQLite instead.",
+			{
+				public: true,
+				statusCode: 400,
+				metadata: { runtime: "wasm", sqliteBackend: "local" },
+			},
+		);
+	}
+
+	return {
+		...config,
+		sqlite: {
+			...config.sqlite,
+			backend: "remote",
+		},
+		test: {
+			...config.test,
+			enabled: config.test?.enabled ?? false,
+			sqliteBackend: "remote",
+		},
+	};
+}
+
+export function normalizeRuntimeConfig(
+	config: RegistryConfig,
+	runtime: CoreRuntime,
+): RegistryConfig {
+	return normalizeRuntimeConfigForKind(config, loadedRuntimeKind(runtime));
+}
 type NativePersistActorState = {
 	state: unknown;
 	isInOnStateChange: boolean;
@@ -151,10 +279,11 @@ type NativeActorRuntimeState = {
 // of actorId-keyed module globals so same-key recreates start from a fresh
 // generation.
 function getNativeRuntimeState(
-	ctx: NativeActorContext,
+	runtime: CoreRuntime,
+	ctx: ActorContextHandle,
 ): NativeActorRuntimeState {
 	const runtimeState = callNativeSync(() =>
-		ctx.runtimeState(),
+		runtime.actorRuntimeState(ctx),
 	) as NativeActorRuntimeState;
 	if (!runtimeState.destroyGate) {
 		runtimeState.destroyGate = {};
@@ -170,9 +299,14 @@ function getNativeRuntimeState(
 }
 
 function getNativePersistState(
-	ctx: NativeActorContext,
+	runtime: CoreRuntime,
+	ctx: ActorContextHandle,
 ): NativePersistActorState {
-	return getNativeRuntimeState(ctx).persistState!;
+	const persistState = getNativeRuntimeState(runtime, ctx).persistState;
+	if (!persistState) {
+		throw new Error("native persist state was not initialized");
+	}
+	return persistState;
 }
 
 function isPromiseLike(value: unknown): value is PromiseLike<void> {
@@ -185,11 +319,12 @@ function isPromiseLike(value: unknown): value is PromiseLike<void> {
 }
 
 function getNativeConnPersistState(
-	ctx: NativeActorContext,
-	conn: NativeConnHandle,
+	runtime: CoreRuntime,
+	ctx: ActorContextHandle,
+	conn: ConnHandle,
 ): NativePersistConnState {
-	const persistState = getNativePersistState(ctx);
-	const connId = callNativeSync(() => conn.id());
+	const persistState = getNativePersistState(runtime, ctx);
+	const connId = callNativeSync(() => runtime.connId(conn));
 	let connState = persistState.connStates.get(connId);
 	if (!connState) {
 		connState = {
@@ -244,21 +379,28 @@ function nativeEndpointNotConfiguredError(): RivetError {
 	);
 }
 
-function getNativeDestroyGate(ctx: NativeActorContext) {
-	return getNativeRuntimeState(ctx).destroyGate!;
+function getNativeDestroyGate(runtime: CoreRuntime, ctx: ActorContextHandle) {
+	const destroyGate = getNativeRuntimeState(runtime, ctx).destroyGate;
+	if (!destroyGate) {
+		throw new Error("native destroy gate was not initialized");
+	}
+	return destroyGate;
 }
 
-function markNativeDestroyRequested(ctx: NativeActorContext) {
-	const gate = getNativeDestroyGate(ctx);
+function markNativeDestroyRequested(
+	runtime: CoreRuntime,
+	ctx: ActorContextHandle,
+) {
+	const gate = getNativeDestroyGate(runtime, ctx);
 	if (!gate.destroyCompletion) {
 		gate.destroyCompletion = new Promise<void>((resolve) => {
-			gate!.resolveDestroy = resolve;
+			gate.resolveDestroy = resolve;
 		});
 	}
 }
 
-function resolveNativeDestroy(ctx: NativeActorContext) {
-	const gate = getNativeRuntimeState(ctx).destroyGate;
+function resolveNativeDestroy(runtime: CoreRuntime, ctx: ActorContextHandle) {
+	const gate = getNativeRuntimeState(runtime, ctx).destroyGate;
 	if (!gate?.resolveDestroy) {
 		return;
 	}
@@ -269,9 +411,10 @@ function resolveNativeDestroy(ctx: NativeActorContext) {
 }
 
 function closeNativeSqlDatabase(
-	ctx: NativeActorContext,
+	runtime: CoreRuntime,
+	ctx: ActorContextHandle,
 ): Promise<void> | undefined {
-	const runtimeState = getNativeRuntimeState(ctx);
+	const runtimeState = getNativeRuntimeState(runtime, ctx);
 	const database = runtimeState.sql;
 	if (!database) {
 		return;
@@ -282,9 +425,10 @@ function closeNativeSqlDatabase(
 }
 
 async function closeNativeDatabaseClient(
-	ctx: NativeActorContext,
+	runtime: CoreRuntime,
+	ctx: ActorContextHandle,
 ): Promise<void> {
-	const runtimeState = getNativeRuntimeState(ctx);
+	const runtimeState = getNativeRuntimeState(runtime, ctx);
 	const entry = runtimeState.databaseClient;
 	if (!entry) {
 		return;
@@ -303,27 +447,50 @@ async function closeNativeDatabaseClient(
 }
 
 function getOrCreateNativeSqlDatabase(
-	ctx: NativeActorContext,
+	runtime: CoreRuntime,
+	ctx: ActorContextHandle,
 ): ReturnType<typeof wrapJsNativeDatabase> {
-	const runtimeState = getNativeRuntimeState(ctx);
+	const runtimeState = getNativeRuntimeState(runtime, ctx);
 	const cachedDatabase = runtimeState.sql;
 	if (cachedDatabase) {
 		return cachedDatabase;
 	}
 
-	const database = wrapJsNativeDatabase(callNativeSync(() => ctx.sql()));
+	const database = wrapJsNativeDatabase({
+		exec: (sql) => runtime.actorSqlExec(ctx, sql),
+		execute: (sql, params) => runtime.actorSqlExecute(ctx, sql, params),
+		executeWrite: (sql, params) =>
+			runtime.actorSqlExecuteWrite(ctx, sql, params),
+		query: (sql, params) => runtime.actorSqlQuery(ctx, sql, params),
+		run: (sql, params) => runtime.actorSqlRun(ctx, sql, params),
+		takeLastKvError: () => runtime.actorSqlTakeLastKvError(ctx),
+		close: () => runtime.actorSqlClose(ctx),
+	});
 	runtimeState.sql = database;
 	return database;
 }
 
-function toBuffer(value: string | Uint8Array | ArrayBuffer): Buffer {
+function toRuntimeBytes(
+	value: string | Uint8Array | ArrayBuffer,
+): RuntimeBytes {
 	if (typeof value === "string") {
-		return Buffer.from(textEncoder.encode(value));
+		return textEncoder.encode(value);
 	}
 	if (value instanceof Uint8Array) {
-		return Buffer.from(value);
+		return value;
 	}
-	return Buffer.from(value);
+	return new Uint8Array(value);
+}
+
+function arrayBufferViewToRuntimeBytes(value: ArrayBufferView): RuntimeBytes {
+	return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+}
+
+function runtimeBytesToArrayBuffer(value: RuntimeBytes): ArrayBuffer {
+	return value.buffer.slice(
+		value.byteOffset,
+		value.byteOffset + value.byteLength,
+	) as ArrayBuffer;
 }
 
 type NativeKvValueType = "text" | "arrayBuffer" | "binary";
@@ -402,24 +569,20 @@ function decodeNativeKvValue<T extends NativeKvValueType = "text">(
 	}
 }
 
-async function loadNativeBindings(): Promise<NativeBindings> {
-	return import(["@rivetkit", "rivetkit-napi"].join("/"));
-}
-
 async function loadEngineCli(): Promise<typeof import("@rivetkit/engine-cli")> {
 	return import(["@rivetkit", "engine-cli"].join("/"));
 }
 
-function decodeValue<T>(value?: Buffer | Uint8Array | null): T {
+function decodeValue<T>(value?: RuntimeBytes | null): T {
 	if (!value || value.length === 0) {
 		return undefined as T;
 	}
 
-	return decodeCborCompat(Buffer.from(value));
+	return decodeCborJsonCompat(value);
 }
 
-function encodeValue(value: unknown): Buffer {
-	return Buffer.from(encodeCborCompat(value));
+function encodeValue(value: unknown): RuntimeBytes {
+	return encodeCborCompat(value);
 }
 
 function unwrapTsfnPayload<T>(error: unknown, payload: T): T {
@@ -574,6 +737,14 @@ function encodeNativeCallbackError(error: unknown): Error {
 		: deconstructError(error, logger(), {
 				bridge: "native_callback",
 			});
+	let stack: string | undefined;
+	if (error instanceof Error) {
+		try {
+			stack = error.stack;
+		} catch {
+			stack = undefined;
+		}
+	}
 
 	logger().warn({
 		msg: "native callback error encoded for bridge",
@@ -582,7 +753,7 @@ function encodeNativeCallbackError(error: unknown): Error {
 		message: structuredError.message,
 		metadata: structuredError.metadata,
 		originalError: stringifyError(error),
-		stack: error instanceof Error ? error.stack : undefined,
+		stack,
 		bridge: "native_callback",
 	});
 
@@ -638,23 +809,25 @@ function isClosedTaskRegistrationError(error: unknown): boolean {
 	);
 }
 
-async function createNativeCancellationToken(signal?: AbortSignal): Promise<{
-	token?: NativeCancellationToken;
+async function createCancellationTokenHandle(
+	runtime: CoreRuntime,
+	signal?: AbortSignal,
+): Promise<{
+	token?: CancellationTokenHandle;
 	cleanup?: () => void;
 }> {
 	if (!signal) {
 		return {};
 	}
 
-	const bindings = await loadNativeBindings();
-	const token = new bindings.CancellationToken();
+	const token = runtime.createCancellationToken();
 
 	if (signal.aborted) {
-		token.cancel();
+		runtime.cancelCancellationToken(token);
 		return { token };
 	}
 
-	const abort = () => token.cancel();
+	const abort = () => runtime.cancelCancellationToken(token);
 	signal.addEventListener("abort", abort, { once: true });
 	return {
 		token,
@@ -993,7 +1166,7 @@ function wrapNativeCallback<Args extends Array<unknown>, Result>(
 	};
 }
 
-function decodeArgs(value?: Buffer | Uint8Array | null): unknown[] {
+function decodeArgs(value?: RuntimeBytes | null): unknown[] {
 	const decoded = decodeValue<unknown>(value);
 	return Array.isArray(decoded)
 		? decoded
@@ -1055,12 +1228,15 @@ function buildRequest(init: {
 	method: string;
 	uri: string;
 	headers?: Record<string, string>;
-	body?: Buffer;
+	body?: RuntimeBytes;
 }): Request {
 	const url = init.uri.startsWith("http")
 		? init.uri
 		: new URL(init.uri, "http://127.0.0.1").toString();
-	const body = init.body && init.body.length > 0 ? init.body : undefined;
+	const body =
+		init.body && init.body.length > 0
+			? runtimeBytesToArrayBuffer(init.body)
+			: undefined;
 	return new Request(url, {
 		method: init.method,
 		headers: init.headers,
@@ -1068,9 +1244,11 @@ function buildRequest(init: {
 	});
 }
 
-async function toJsHttpResponse(response: Response): Promise<JsHttpResponse> {
+async function toRuntimeHttpResponse(
+	response: Response,
+): Promise<RuntimeHttpResponse> {
 	const headers = Object.fromEntries(response.headers.entries());
-	const body = Buffer.from(await response.arrayBuffer());
+	const body = new Uint8Array(await response.arrayBuffer());
 	return {
 		status: response.status,
 		headers,
@@ -1093,17 +1271,20 @@ function toActorKey(
 }
 
 class NativeConnAdapter {
-	#conn: NativeConnHandle;
+	#runtime: CoreRuntime;
+	#conn: ConnHandle;
 	#schemas: NativeValidationConfig;
-	#ctx?: NativeActorContext;
+	#ctx?: ActorContextHandle;
 	#queueHibernationRemoval?: (connId: string) => void;
 
 	constructor(
-		conn: NativeConnHandle,
+		runtime: CoreRuntime,
+		conn: ConnHandle,
 		schemas: NativeValidationConfig = {},
-		ctx?: NativeActorContext,
+		ctx?: ActorContextHandle,
 		queueHibernationRemoval?: (connId: string) => void,
 	) {
+		this.#runtime = runtime;
 		this.#conn = conn;
 		this.#schemas = schemas;
 		this.#ctx = ctx;
@@ -1122,13 +1303,13 @@ class NativeConnAdapter {
 	}
 
 	get id(): string {
-		return this.#conn.id();
+		return this.#runtime.connId(this.#conn);
 	}
 
 	get params(): unknown {
 		return validateConnParams(
 			this.#schemas.connParamsSchema,
-			decodeValue(this.#conn.params()),
+			decodeValue(this.#runtime.connParams(this.#conn)),
 		);
 	}
 
@@ -1148,7 +1329,9 @@ class NativeConnAdapter {
 	}
 
 	get isHibernatable(): boolean {
-		return callNativeSync(() => this.#conn.isHibernatable());
+		return callNativeSync(() =>
+			this.#runtime.connIsHibernatable(this.#conn),
+		);
 	}
 
 	send(name: string, ...args: unknown[]): void {
@@ -1157,12 +1340,20 @@ class NativeConnAdapter {
 			name,
 			args,
 		);
-		callNativeSync(() => this.#conn.send(name, encodeValue(validatedArgs)));
+		callNativeSync(() =>
+			this.#runtime.connSend(
+				this.#conn,
+				name,
+				encodeValue(validatedArgs),
+			),
+		);
 	}
 
 	async disconnect(reason?: string): Promise<void> {
 		const connId = this.id;
-		await callNative(() => this.#conn.disconnect(reason));
+		await callNative(() =>
+			this.#runtime.connDisconnect(this.#conn, reason),
+		);
 		if (this.isHibernatable) {
 			this.#queueHibernationRemoval?.(connId);
 		}
@@ -1170,12 +1361,16 @@ class NativeConnAdapter {
 
 	#readState(): unknown {
 		if (!this.#ctx) {
-			return decodeValue(this.#conn.state());
+			return decodeValue(this.#runtime.connState(this.#conn));
 		}
 
-		const connState = getNativeConnPersistState(this.#ctx, this.#conn);
+		const connState = getNativeConnPersistState(
+			this.#runtime,
+			this.#ctx,
+			this.#conn,
+		);
 		if (connState.state === undefined) {
-			connState.state = decodeValue(this.#conn.state());
+			connState.state = decodeValue(this.#runtime.connState(this.#conn));
 		}
 		return connState.state;
 	}
@@ -1188,23 +1383,29 @@ class NativeConnAdapter {
 	): void {
 		const encoded = encodeValue(value);
 		if (!this.#ctx) {
-			this.#conn.setState(encoded);
+			this.#runtime.connSetState(this.#conn, encoded);
 			return;
 		}
 
-		const connState = getNativeConnPersistState(this.#ctx, this.#conn);
+		const connState = getNativeConnPersistState(
+			this.#runtime,
+			this.#ctx,
+			this.#conn,
+		);
 		connState.state = value;
 		if (options.writeNative) {
-			this.#conn.setState(encoded);
+			this.#runtime.connSetState(this.#conn, encoded);
 		}
 	}
 }
 
 class NativeScheduleAdapter {
-	#schedule: NativeSchedule;
+	#runtime: CoreRuntime;
+	#ctx: ActorContextHandle;
 
-	constructor(schedule: NativeSchedule) {
-		this.#schedule = schedule;
+	constructor(runtime: CoreRuntime, ctx: ActorContextHandle) {
+		this.#runtime = runtime;
+		this.#ctx = ctx;
 	}
 
 	async after(
@@ -1213,7 +1414,12 @@ class NativeScheduleAdapter {
 		...args: unknown[]
 	): Promise<void> {
 		callNativeSync(() =>
-			this.#schedule.after(duration, action, encodeValue(args)),
+			this.#runtime.actorScheduleAfter(
+				this.#ctx,
+				duration,
+				action,
+				encodeValue(args),
+			),
 		);
 	}
 
@@ -1223,16 +1429,23 @@ class NativeScheduleAdapter {
 		...args: unknown[]
 	): Promise<void> {
 		callNativeSync(() =>
-			this.#schedule.at(timestamp, action, encodeValue(args)),
+			this.#runtime.actorScheduleAt(
+				this.#ctx,
+				timestamp,
+				action,
+				encodeValue(args),
+			),
 		);
 	}
 }
 
 class NativeKvAdapter {
-	#kv: ReturnType<NativeActorContext["kv"]>;
+	#runtime: CoreRuntime;
+	#ctx: ActorContextHandle;
 
-	constructor(kv: ReturnType<NativeActorContext["kv"]>) {
-		this.#kv = kv;
+	constructor(runtime: CoreRuntime, ctx: ActorContextHandle) {
+		this.#runtime = runtime;
+		this.#ctx = ctx;
 	}
 
 	async get<T extends NativeKvValueType = "text">(
@@ -1240,8 +1453,9 @@ class NativeKvAdapter {
 		options?: NativeKvValueOptions<T>,
 	): Promise<NativeKvValueTypeMap[T] | null> {
 		const value = await callNative(() =>
-			this.#kv.get(
-				Buffer.from(makePrefixedKey(encodeNativeKvUserKey(key))),
+			this.#runtime.actorKvGet(
+				this.#ctx,
+				makePrefixedKey(encodeNativeKvUserKey(key)),
 			),
 		);
 		return value
@@ -1255,17 +1469,19 @@ class NativeKvAdapter {
 		_options?: NativeKvValueOptions,
 	): Promise<void> {
 		await callNative(() =>
-			this.#kv.put(
-				Buffer.from(makePrefixedKey(encodeNativeKvUserKey(key))),
-				toBuffer(value),
+			this.#runtime.actorKvPut(
+				this.#ctx,
+				makePrefixedKey(encodeNativeKvUserKey(key)),
+				toRuntimeBytes(value),
 			),
 		);
 	}
 
 	async delete(key: string | Uint8Array): Promise<void> {
 		await callNative(() =>
-			this.#kv.delete(
-				Buffer.from(makePrefixedKey(encodeNativeKvUserKey(key))),
+			this.#runtime.actorKvDelete(
+				this.#ctx,
+				makePrefixedKey(encodeNativeKvUserKey(key)),
 			),
 		);
 	}
@@ -1275,16 +1491,17 @@ class NativeKvAdapter {
 		end: string | Uint8Array,
 	): Promise<void> {
 		await callNative(() =>
-			this.#kv.deleteRange(
-				Buffer.from(makePrefixedKey(encodeNativeKvUserKey(start))),
-				Buffer.from(makePrefixedKey(encodeNativeKvUserKey(end))),
+			this.#runtime.actorKvDeleteRange(
+				this.#ctx,
+				makePrefixedKey(encodeNativeKvUserKey(start)),
+				makePrefixedKey(encodeNativeKvUserKey(end)),
 			),
 		);
 	}
 
 	async rawDeleteRange(start: Uint8Array, end: Uint8Array): Promise<void> {
 		await callNative(() =>
-			this.#kv.deleteRange(Buffer.from(start), Buffer.from(end)),
+			this.#runtime.actorKvDeleteRange(this.#ctx, start, end),
 		);
 	}
 
@@ -1296,13 +1513,12 @@ class NativeKvAdapter {
 		options?: NativeKvListOptions<T, K>,
 	): Promise<Array<[NativeKvKeyTypeMap[K], NativeKvValueTypeMap[T]]>> {
 		const entries = await callNative(() =>
-			this.#kv.listPrefix(
-				Buffer.from(
-					makePrefixedKey(
-						encodeNativeKvUserKey(
-							prefix as NativeKvKeyTypeMap[K],
-							options?.keyType,
-						),
+			this.#runtime.actorKvListPrefix(
+				this.#ctx,
+				makePrefixedKey(
+					encodeNativeKvUserKey(
+						prefix as NativeKvKeyTypeMap[K],
+						options?.keyType,
 					),
 				),
 				{
@@ -1324,7 +1540,7 @@ class NativeKvAdapter {
 		prefix: Uint8Array,
 	): Promise<Array<[Uint8Array, Uint8Array]>> {
 		const entries = await callNative(() =>
-			this.#kv.listPrefix(Buffer.from(prefix), {}),
+			this.#runtime.actorKvListPrefix(this.#ctx, prefix, {}),
 		);
 		return entries.map((entry) => [
 			new Uint8Array(entry.key),
@@ -1341,21 +1557,18 @@ class NativeKvAdapter {
 		options?: NativeKvListOptions<T, K>,
 	): Promise<Array<[NativeKvKeyTypeMap[K], NativeKvValueTypeMap[T]]>> {
 		const entries = await callNative(() =>
-			this.#kv.listRange(
-				Buffer.from(
-					makePrefixedKey(
-						encodeNativeKvUserKey(
-							start as NativeKvKeyTypeMap[K],
-							options?.keyType,
-						),
+			this.#runtime.actorKvListRange(
+				this.#ctx,
+				makePrefixedKey(
+					encodeNativeKvUserKey(
+						start as NativeKvKeyTypeMap[K],
+						options?.keyType,
 					),
 				),
-				Buffer.from(
-					makePrefixedKey(
-						encodeNativeKvUserKey(
-							end as NativeKvKeyTypeMap[K],
-							options?.keyType,
-						),
+				makePrefixedKey(
+					encodeNativeKvUserKey(
+						end as NativeKvKeyTypeMap[K],
+						options?.keyType,
 					),
 				),
 				{
@@ -1385,17 +1598,18 @@ class NativeKvAdapter {
 
 	async batchGet(keys: Uint8Array[]): Promise<Array<Uint8Array | null>> {
 		const values = await callNative(() =>
-			this.#kv.batchGet(keys.map((key) => Buffer.from(key))),
+			this.#runtime.actorKvBatchGet(this.#ctx, keys),
 		);
 		return values.map((value) => (value ? new Uint8Array(value) : null));
 	}
 
 	async batchPut(entries: [Uint8Array, Uint8Array][]): Promise<void> {
 		await callNative(() =>
-			this.#kv.batchPut(
+			this.#runtime.actorKvBatchPut(
+				this.#ctx,
 				entries.map(([key, value]) => ({
-					key: Buffer.from(key),
-					value: Buffer.from(value),
+					key,
+					value,
 				})),
 			),
 		);
@@ -1403,13 +1617,13 @@ class NativeKvAdapter {
 
 	async batchDelete(keys: Uint8Array[]): Promise<void> {
 		await callNative(() =>
-			this.#kv.batchDelete(keys.map((key) => Buffer.from(key))),
+			this.#runtime.actorKvBatchDelete(this.#ctx, keys),
 		);
 	}
 }
 
 function wrapQueueMessage(
-	message: NativeQueueMessage,
+	message: RuntimeQueueMessage,
 	schemas: NativeValidationConfig["queues"],
 ) {
 	const name = callNativeSync(() => message.name());
@@ -1442,15 +1656,18 @@ function wrapQueueMessage(
 }
 
 class NativeQueueAdapter {
-	#queue: NativeQueue;
+	#runtime: CoreRuntime;
+	#ctx: ActorContextHandle;
 	#schemas: NativeValidationConfig["queues"];
 	#pendingCompletableMessageIds = new Set<string>();
 
 	constructor(
-		queue: NativeQueue,
+		runtime: CoreRuntime,
+		ctx: ActorContextHandle,
 		schemas: NativeValidationConfig["queues"] = undefined,
 	) {
-		this.#queue = queue;
+		this.#runtime = runtime;
+		this.#ctx = ctx;
 		this.#schemas = schemas;
 	}
 
@@ -1458,7 +1675,11 @@ class NativeQueueAdapter {
 		const validatedBody = validateQueueBody(this.#schemas, name, body);
 		return wrapQueueMessage(
 			await callNative(() =>
-				this.#queue.send(name, encodeValue(validatedBody)),
+				this.#runtime.actorQueueSend(
+					this.#ctx,
+					name,
+					encodeValue(validatedBody),
+				),
 			),
 			this.#schemas,
 		);
@@ -1500,13 +1721,15 @@ class NativeQueueAdapter {
 			);
 		}
 
-		const { token, cleanup } = await createNativeCancellationToken(
+		const { token, cleanup } = await createCancellationTokenHandle(
+			this.#runtime,
 			options?.signal,
 		);
 
 		try {
 			const messages = await callNative(() =>
-				this.#queue.nextBatch(
+				this.#runtime.actorQueueNextBatch(
+					this.#ctx,
 					{
 						names: this.#normalizeNames(options?.names),
 						count: options?.count,
@@ -1537,14 +1760,16 @@ class NativeQueueAdapter {
 			completable?: boolean;
 		},
 	) {
-		const { token, cleanup } = await createNativeCancellationToken(
+		const { token, cleanup } = await createCancellationTokenHandle(
+			this.#runtime,
 			options?.signal,
 		);
 
 		try {
 			return wrapQueueMessage(
 				await callNative(() =>
-					this.#queue.waitForNames(
+					this.#runtime.actorQueueWaitForNames(
+						this.#ctx,
 						[...names],
 						{
 							timeoutMs: options?.timeout,
@@ -1569,9 +1794,13 @@ class NativeQueueAdapter {
 	) {
 		if (!options?.signal) {
 			await callNative(() =>
-				this.#queue.waitForNamesAvailable([...names], {
-					timeoutMs: options?.timeout,
-				}),
+				this.#runtime.actorQueueWaitForNamesAvailable(
+					this.#ctx,
+					[...names],
+					{
+						timeoutMs: options?.timeout,
+					},
+				),
 			);
 			return;
 		}
@@ -1597,9 +1826,13 @@ class NativeQueueAdapter {
 
 			try {
 				await callNative(() =>
-					this.#queue.waitForNamesAvailable([...names], {
-						timeoutMs: sliceTimeout,
-					}),
+					this.#runtime.actorQueueWaitForNamesAvailable(
+						this.#ctx,
+						[...names],
+						{
+							timeoutMs: sliceTimeout,
+						},
+					),
 				);
 				return;
 			} catch (error) {
@@ -1630,13 +1863,15 @@ class NativeQueueAdapter {
 		},
 	) {
 		const validatedBody = validateQueueBody(this.#schemas, name, body);
-		const { token, cleanup } = await createNativeCancellationToken(
+		const { token, cleanup } = await createCancellationTokenHandle(
+			this.#runtime,
 			options?.signal,
 		);
 
 		try {
 			const response = await callNative(() =>
-				this.#queue.enqueueAndWait(
+				this.#runtime.actorQueueEnqueueAndWait(
+					this.#ctx,
 					name,
 					encodeValue(validatedBody),
 					{
@@ -1683,16 +1918,24 @@ class NativeQueueAdapter {
 			});
 		}
 
-		const messages = callNativeSync(() =>
-			this.#queue.tryNextBatch({
-				names: this.#normalizeNames(options?.names),
+		try {
+			return await this.nextBatch({
+				names: options?.names,
 				count: options?.count,
+				timeout: 0,
 				completable: false,
-			}),
-		);
-		return messages.map((message) =>
-			wrapQueueMessage(message, this.#schemas),
-		);
+			});
+		} catch (error) {
+			if (
+				(error as { group?: string; code?: string }).group ===
+					"queue" &&
+				(error as { group?: string; code?: string }).code ===
+					"timed_out"
+			) {
+				return [];
+			}
+			throw error;
+		}
 	}
 
 	async *iter(options?: {
@@ -1765,50 +2008,56 @@ class NativeQueueAdapter {
 					);
 				}
 
-				try {
-					await message.complete(response);
-					completed = true;
-					this.#pendingCompletableMessageIds.delete(messageId);
-				} catch (error) {
-					throw error;
-				}
+				await message.complete(response);
+				completed = true;
+				this.#pendingCompletableMessageIds.delete(messageId);
 			},
 		};
 	}
 }
 
 class NativeWebSocketAdapter {
-	#ws: NativeWebSocketWithEvents;
+	#runtime: CoreRuntime;
+	#ws: WebSocketHandle;
 	#virtual: VirtualWebSocket;
 	#readyState: 0 | 1 | 2 | 3 = VirtualWebSocket.OPEN;
 
-	constructor(ws: NativeWebSocket) {
-		this.#ws = ws as NativeWebSocketWithEvents;
+	constructor(runtime: CoreRuntime, ws: WebSocketHandle) {
+		this.#runtime = runtime;
+		this.#ws = ws;
 		this.#virtual = new VirtualWebSocket({
 			getReadyState: () => this.#readyState,
 			onSend: (data) => {
 				if (typeof data === "string") {
 					callNativeSync(() =>
-						this.#ws.send(Buffer.from(data), false),
+						this.#runtime.webSocketSend(
+							this.#ws,
+							textEncoder.encode(data),
+							false,
+						),
 					);
 					return;
 				}
 
-				const buffer = ArrayBuffer.isView(data)
-					? Buffer.from(data.buffer, data.byteOffset, data.byteLength)
-					: Buffer.from(data as ArrayBufferLike);
-				callNativeSync(() => this.#ws.send(buffer, true));
+				const bytes = ArrayBuffer.isView(data)
+					? arrayBufferViewToRuntimeBytes(data)
+					: new Uint8Array(data as ArrayBufferLike);
+				callNativeSync(() =>
+					this.#runtime.webSocketSend(this.#ws, bytes, true),
+				);
 			},
 			onClose: (code, reason) => {
 				this.#readyState = VirtualWebSocket.CLOSING;
-				void callNative(() => this.#ws.close(code, reason));
+				void callNative(() =>
+					this.#runtime.webSocketClose(this.#ws, code, reason),
+				);
 			},
 		});
-		this.#ws.setEventCallback((event) => {
+		this.#runtime.webSocketSetEventCallback(this.#ws, (event) => {
 			if (event.kind === "message") {
 				this.#virtual.triggerMessage(
 					event.binary
-						? bufferToArrayBuffer(event.data as Buffer)
+						? runtimeBytesToArrayBuffer(event.data as RuntimeBytes)
 						: event.data,
 					event.messageIndex,
 				);
@@ -1933,8 +2182,8 @@ class NativeWebSocketAdapter {
 
 type TrackedWebSocketListener = (event: any) => void | Promise<void>;
 
-class TrackedNativeWebSocketAdapter implements UniversalWebSocket {
-	#ctx: NativeActorContextAdapter;
+class TrackedWebSocketHandleAdapter implements UniversalWebSocket {
+	#ctx: ActorContextHandleAdapter;
 	#inner: UniversalWebSocket;
 	#listeners = new Map<string, TrackedWebSocketListener[]>();
 	#onopen: ((event: RivetEvent) => void | Promise<void>) | null = null;
@@ -1943,7 +2192,7 @@ class TrackedNativeWebSocketAdapter implements UniversalWebSocket {
 	#onmessage: ((event: RivetMessageEvent) => void | Promise<void>) | null =
 		null;
 
-	constructor(ctx: NativeActorContextAdapter, inner: UniversalWebSocket) {
+	constructor(ctx: ActorContextHandleAdapter, inner: UniversalWebSocket) {
 		this.#ctx = ctx;
 		this.#inner = inner;
 
@@ -2014,10 +2263,12 @@ class TrackedNativeWebSocketAdapter implements UniversalWebSocket {
 	}
 
 	addEventListener(type: string, listener: TrackedWebSocketListener): void {
-		if (!this.#listeners.has(type)) {
-			this.#listeners.set(type, []);
+		let listeners = this.#listeners.get(type);
+		if (!listeners) {
+			listeners = [];
+			this.#listeners.set(type, listeners);
 		}
-		this.#listeners.get(type)!.push(listener);
+		listeners.push(listener);
 	}
 
 	removeEventListener(
@@ -2181,9 +2432,9 @@ class TrackedNativeWebSocketAdapter implements UniversalWebSocket {
 	}
 }
 
-export class NativeActorContextAdapter {
-	#bindings: NativeBindings;
-	#ctx: NativeActorContext;
+export class ActorContextHandleAdapter {
+	#runtime: CoreRuntime;
+	#ctx: ActorContextHandle;
 	#schemas: NativeValidationConfig;
 	#abortSignal?: AbortSignal;
 	#abortSignalCleanup?: () => void;
@@ -2192,7 +2443,7 @@ export class NativeActorContextAdapter {
 	#databaseProvider?: Exclude<AnyDatabaseProvider, undefined>;
 	#db?: unknown;
 	#dbProxy?: unknown;
-	#dispatchCancelToken?: NativeCancellationToken;
+	#dispatchCancelToken?: CancellationTokenHandle;
 	#kv?: NativeKvAdapter;
 	#queue?: NativeQueueAdapter;
 	#request?: Request;
@@ -2203,8 +2454,8 @@ export class NativeActorContextAdapter {
 	#stateEnabled: boolean;
 
 	constructor(
-		bindings: NativeBindings,
-		ctx: NativeActorContext,
+		runtime: CoreRuntime,
+		ctx: ActorContextHandle,
 		clientFactory?: () => AnyClient,
 		schemas: NativeValidationConfig = {},
 		databaseProvider?: AnyDatabaseProvider,
@@ -2212,9 +2463,9 @@ export class NativeActorContextAdapter {
 		stateEnabled = true,
 		runHandlerActiveProvider?: () => boolean,
 		onStateChange?: NativeOnStateChangeHandler,
-		dispatchCancelToken?: NativeCancellationToken,
+		dispatchCancelToken?: CancellationTokenHandle,
 	) {
-		this.#bindings = bindings;
+		this.#runtime = runtime;
 		this.#ctx = ctx;
 		this.#clientFactory = clientFactory;
 		this.#schemas = schemas;
@@ -2227,7 +2478,7 @@ export class NativeActorContextAdapter {
 		}
 		this.#request = request;
 		(
-			this as NativeActorContextAdapter & {
+			this as ActorContextHandleAdapter & {
 				[ACTOR_CONTEXT_INTERNAL_SYMBOL]?: unknown;
 			}
 		)[ACTOR_CONTEXT_INTERNAL_SYMBOL] = new NativeWorkflowRuntimeAdapter(
@@ -2237,14 +2488,14 @@ export class NativeActorContextAdapter {
 
 	get kv() {
 		if (!this.#kv) {
-			this.#kv = new NativeKvAdapter(this.#ctx.kv());
+			this.#kv = new NativeKvAdapter(this.#runtime, this.#ctx);
 		}
 		return this.#kv;
 	}
 
 	get sql() {
 		if (!this.#sql) {
-			this.#sql = getOrCreateNativeSqlDatabase(this.#ctx);
+			this.#sql = getOrCreateNativeSqlDatabase(this.#runtime, this.#ctx);
 		}
 		return this.#sql;
 	}
@@ -2314,7 +2565,7 @@ export class NativeActorContextAdapter {
 	}
 
 	get vars(): unknown {
-		const runtimeState = getNativeRuntimeState(this.#ctx);
+		const runtimeState = getNativeRuntimeState(this.#runtime, this.#ctx);
 		if (runtimeState.varsInitialized) {
 			return runtimeState.vars;
 		}
@@ -2325,7 +2576,7 @@ export class NativeActorContextAdapter {
 	}
 
 	set vars(value: unknown) {
-		const runtimeState = getNativeRuntimeState(this.#ctx);
+		const runtimeState = getNativeRuntimeState(this.#runtime, this.#ctx);
 		runtimeState.varsInitialized = true;
 		runtimeState.vars = value;
 	}
@@ -2333,7 +2584,8 @@ export class NativeActorContextAdapter {
 	get queue(): NativeQueueAdapter {
 		if (!this.#queue) {
 			this.#queue = new NativeQueueAdapter(
-				callNativeSync(() => this.#ctx.queue()),
+				this.#runtime,
+				this.#ctx,
 				this.#schemas.queues,
 			);
 		}
@@ -2343,42 +2595,51 @@ export class NativeActorContextAdapter {
 	get schedule(): NativeScheduleAdapter {
 		if (!this.#schedule) {
 			this.#schedule = new NativeScheduleAdapter(
-				callNativeSync(() => this.#ctx.schedule()),
+				this.#runtime,
+				this.#ctx,
 			);
 		}
 		return this.#schedule;
 	}
 
 	get actorId(): string {
-		return callNativeSync(() => this.#ctx.actorId());
+		return callNativeSync(() => this.#runtime.actorId(this.#ctx));
 	}
 
 	get name(): string {
-		return callNativeSync(() => this.#ctx.name());
+		return callNativeSync(() => this.#runtime.actorName(this.#ctx));
 	}
 
 	get key(): string[] {
-		return toActorKey(callNativeSync(() => this.#ctx.key()));
+		return toActorKey(
+			callNativeSync(() => this.#runtime.actorKey(this.#ctx)),
+		);
 	}
 
 	get region(): string {
-		return callNativeSync(() => this.#ctx.region());
+		return callNativeSync(() => this.#runtime.actorRegion(this.#ctx));
 	}
 
 	get conns(): Map<string, NativeConnAdapter> {
 		return new Map(
-			callNativeSync(() => this.#ctx.conns()).map((conn) => [
-				conn.id(),
-				new NativeConnAdapter(
-					conn,
-					this.#schemas,
-					this.#ctx,
-					(connId) =>
-						callNativeSync(() =>
-							this.#ctx.queueHibernationRemoval(connId),
-						),
-				),
-			]),
+			callNativeSync(() => this.#runtime.actorConns(this.#ctx)).map(
+				(conn) => [
+					this.#runtime.connId(conn),
+					new NativeConnAdapter(
+						this.#runtime,
+						conn,
+						this.#schemas,
+						this.#ctx,
+						(connId) =>
+							callNativeSync(() =>
+								this.#runtime.actorQueueHibernationRemoval(
+									this.#ctx,
+									connId,
+								),
+							),
+					),
+				],
+			),
 		);
 	}
 
@@ -2409,7 +2670,9 @@ export class NativeActorContextAdapter {
 
 				if (
 					actorSignal.aborted ||
-					this.#dispatchCancelToken.aborted()
+					this.#runtime.cancellationTokenAborted(
+						this.#dispatchCancelToken,
+					)
 				) {
 					controller.abort();
 				} else {
@@ -2419,10 +2682,13 @@ export class NativeActorContextAdapter {
 						once: true,
 					});
 					callNativeSync(() =>
-						dispatchCancelToken.onCancelled(() => {
-							cleanup();
-							controller.abort();
-						}),
+						this.#runtime.onCancellationTokenCancelled(
+							dispatchCancelToken,
+							() => {
+								cleanup();
+								controller.abort();
+							},
+						),
 					);
 				}
 
@@ -2449,7 +2715,7 @@ export class NativeActorContextAdapter {
 			return this.#db;
 		}
 
-		const runtimeState = getNativeRuntimeState(this.#ctx);
+		const runtimeState = getNativeRuntimeState(this.#runtime, this.#ctx);
 		const cachedClient = runtimeState.databaseClient;
 		if (cachedClient) {
 			this.#db = cachedClient.client;
@@ -2481,7 +2747,10 @@ export class NativeActorContextAdapter {
 			nativeDatabaseProvider: {
 				open: async (requestedActorId) => {
 					void requestedActorId;
-					return getOrCreateNativeSqlDatabase(this.#ctx);
+					return getOrCreateNativeSqlDatabase(
+						this.#runtime,
+						this.#ctx,
+					);
 				},
 			},
 		});
@@ -2513,8 +2782,8 @@ export class NativeActorContextAdapter {
 	async closeDatabase(): Promise<void> {
 		this.#db = undefined;
 		this.#sql = undefined;
-		await closeNativeDatabaseClient(this.#ctx);
-		await closeNativeSqlDatabase(this.#ctx);
+		await closeNativeDatabaseClient(this.#runtime, this.#ctx);
+		await closeNativeSqlDatabase(this.#runtime, this.#ctx);
 	}
 
 	broadcast(name: string, ...args: unknown[]): void {
@@ -2524,7 +2793,11 @@ export class NativeActorContextAdapter {
 			args,
 		);
 		callNativeSync(() =>
-			this.#ctx.broadcast(name, encodeValue(validatedArgs)),
+			this.#runtime.actorBroadcast(
+				this.#ctx,
+				name,
+				encodeValue(validatedArgs),
+			),
 		);
 	}
 
@@ -2534,41 +2807,47 @@ export class NativeActorContextAdapter {
 	}): Promise<void> {
 		if (opts?.immediate) {
 			await callNative(() =>
-				this.#ctx.requestSaveAndWait({ immediate: true }),
+				this.#runtime.actorRequestSaveAndWait(this.#ctx, {
+					immediate: true,
+				}),
 			);
 			return;
 		}
 
 		if (opts?.maxWait != null) {
 			callNativeSync(() =>
-				this.#ctx.requestSave({ maxWaitMs: opts.maxWait }),
+				this.#runtime.actorRequestSave(this.#ctx, {
+					maxWaitMs: opts.maxWait,
+				}),
 			);
 			return;
 		}
 
-		callNativeSync(() => this.#ctx.requestSave({ immediate: false }));
+		callNativeSync(() =>
+			this.#runtime.actorRequestSave(this.#ctx, { immediate: false }),
+		);
 	}
 
-	serializeForTick(reason: SerializeStateReason): NativeStateDeltaPayload {
+	serializeForTick(reason: SerializeStateReason): RuntimeStateDeltaPayload {
 		void reason;
-		const actorState = getNativePersistState(this.#ctx);
+		const actorState = getNativePersistState(this.#runtime, this.#ctx);
 		const connHibernationRemoved = callNativeSync(() =>
-			this.#ctx.takePendingHibernationChanges(),
+			this.#runtime.actorTakePendingHibernationChanges(this.#ctx),
 		);
 		for (const connId of connHibernationRemoved) {
 			actorState.connStates.delete(connId);
 		}
 		const state =
 			this.#stateEnabled && this.#readState() !== undefined
-				? Buffer.from(encodeValue(this.#readState()))
+				? encodeValue(this.#readState())
 				: undefined;
 		const connHibernation = callNativeSync(() =>
-			this.#ctx.dirtyHibernatableConns(),
+			this.#runtime.actorDirtyHibernatableConns(this.#ctx),
 		).map((conn) => {
-			const connId = callNativeSync(() => conn.id());
+			const connId = callNativeSync(() => this.#runtime.connId(conn));
 			return {
 				connId,
-				bytes: Buffer.from(callNativeSync(() => conn.state())),
+				bytes: callNativeSync(() => this.#runtime.connState(conn)),
 			};
 		});
 
@@ -2581,13 +2860,13 @@ export class NativeActorContextAdapter {
 
 	async restartRunHandler(): Promise<void> {
 		await callNative(async () => {
-			this.#ctx.restartRunHandler();
+			this.#runtime.actorRestartRunHandler(this.#ctx);
 		});
 	}
 
 	async setAlarm(timestampMs?: number): Promise<void> {
 		await callNative(async () => {
-			this.#ctx.setAlarm(timestampMs);
+			this.#runtime.actorSetAlarm(this.#ctx, timestampMs);
 		});
 	}
 
@@ -2609,7 +2888,10 @@ export class NativeActorContextAdapter {
 		// gating logic. Logging the rejection avoids unhandled-promise warnings
 		// without blocking the caller.
 		callNative(() =>
-			this.#ctx.keepAwake(Promise.resolve(promise).then(() => null)),
+			this.#runtime.actorKeepAwake(
+				this.#ctx,
+				Promise.resolve(promise).then(() => null),
+			),
 		).catch((error) => {
 			if (!isClosedTaskRegistrationError(error)) {
 				logger().warn({
@@ -2629,7 +2911,9 @@ export class NativeActorContextAdapter {
 		const promise = typeof run === "function" ? run() : run;
 		const trackedPromise = promise.then(() => null);
 		try {
-			callNativeSync(() => this.#ctx.registerTask(trackedPromise));
+			callNativeSync(() =>
+				this.#runtime.actorRegisterTask(this.#ctx, trackedPromise),
+			);
 		} catch (error) {
 			if (!isClosedTaskRegistrationError(error)) {
 				throw error;
@@ -2641,7 +2925,9 @@ export class NativeActorContextAdapter {
 	waitUntil(promise: Promise<unknown>): void {
 		const trackedPromise = Promise.resolve(promise).then(() => null);
 		try {
-			callNativeSync(() => this.#ctx.waitUntil(trackedPromise));
+			callNativeSync(() =>
+				this.#runtime.actorWaitUntil(this.#ctx, trackedPromise),
+			);
 		} catch (error) {
 			if (!isClosedTaskRegistrationError(error)) {
 				throw error;
@@ -2650,11 +2936,18 @@ export class NativeActorContextAdapter {
 	}
 
 	beginWebSocketCallback(): number {
-		return callNativeSync(() => this.#ctx.beginWebsocketCallback());
+		return callNativeSync(() =>
+			this.#runtime.actorBeginWebsocketCallback(this.#ctx),
+		);
 	}
 
 	endWebSocketCallback(callbackRegionId: number): void {
-		callNativeSync(() => this.#ctx.endWebsocketCallback(callbackRegionId));
+		callNativeSync(() =>
+			this.#runtime.actorEndWebsocketCallback(
+				this.#ctx,
+				callbackRegionId,
+			),
+		);
 	}
 
 	// Intentionally a no-op. `setPreventSleep` / `preventSleep` are kept on the
@@ -2678,15 +2971,15 @@ export class NativeActorContextAdapter {
 	}
 
 	sleep(): void {
-		callNativeSync(() => this.#ctx.sleep());
+		callNativeSync(() => this.#runtime.actorSleep(this.#ctx));
 	}
 
 	destroy(): void {
 		// Call the native destroy first so it can throw `actor/starting` or
 		// `actor/stopping` without leaving an unresolved destroyCompletion
 		// promise behind in the native runtime state.
-		callNativeSync(() => this.#ctx.destroy());
-		markNativeDestroyRequested(this.#ctx);
+		callNativeSync(() => this.#runtime.actorDestroy(this.#ctx));
+		markNativeDestroyRequested(this.#runtime, this.#ctx);
 	}
 
 	client<T = AnyClient>(): T extends Registry<any> ? Client<T> : T {
@@ -2706,7 +2999,9 @@ export class NativeActorContextAdapter {
 	}
 
 	#createActorAbortSignal(): AbortSignal {
-		const nativeSignal = callNativeSync(() => this.#ctx.abortSignal());
+		const nativeSignal = callNativeSync(() =>
+			this.#runtime.actorAbortSignal(this.#ctx),
+		);
 		const controller = new AbortController();
 		if (nativeSignal.aborted) {
 			controller.abort();
@@ -2719,10 +3014,10 @@ export class NativeActorContextAdapter {
 	}
 
 	#readState(): unknown {
-		const actorState = getNativePersistState(this.#ctx);
+		const actorState = getNativePersistState(this.#runtime, this.#ctx);
 		if (actorState.state === undefined) {
 			actorState.state = decodeValue(
-				callNativeSync(() => this.#ctx.state()),
+				callNativeSync(() => this.#runtime.actorState(this.#ctx)),
 			);
 		}
 		return actorState.state;
@@ -2735,7 +3030,7 @@ export class NativeActorContextAdapter {
 		},
 	): void {
 		encodeValue(value);
-		const actorState = getNativePersistState(this.#ctx);
+		const actorState = getNativePersistState(this.#runtime, this.#ctx);
 		actorState.state = value;
 		if (!options.scheduleSave) {
 			return;
@@ -2744,23 +3039,25 @@ export class NativeActorContextAdapter {
 	}
 
 	#assertCanMutateState(): void {
-		const actorState = getNativePersistState(this.#ctx);
+		const actorState = getNativePersistState(this.#runtime, this.#ctx);
 		if (actorState.isInOnStateChange) {
 			throw stateMutationReentrantError();
 		}
 	}
 
 	#handleStateChange(): void {
-		const actorState = getNativePersistState(this.#ctx);
+		const actorState = getNativePersistState(this.#runtime, this.#ctx);
 		encodeValue(actorState.state);
-		callNativeSync(() => this.#ctx.requestSave({ immediate: false }));
+		callNativeSync(() =>
+			this.#runtime.actorRequestSave(this.#ctx, { immediate: false }),
+		);
 
 		if (!this.#onStateChange) {
 			return;
 		}
 
 		actorState.isInOnStateChange = true;
-		callNativeSync(() => this.#ctx.beginOnStateChange());
+		callNativeSync(() => this.#runtime.actorBeginOnStateChange(this.#ctx));
 		let shouldFinish = true;
 		try {
 			const result = this.#onStateChange(
@@ -2778,13 +3075,17 @@ export class NativeActorContextAdapter {
 					})
 					.finally(() => {
 						actorState.isInOnStateChange = false;
-						callNativeSync(() => this.#ctx.endOnStateChange());
+						callNativeSync(() =>
+							this.#runtime.actorEndOnStateChange(this.#ctx),
+						);
 					});
 			}
 		} finally {
 			if (shouldFinish) {
 				actorState.isInOnStateChange = false;
-				callNativeSync(() => this.#ctx.endOnStateChange());
+				callNativeSync(() =>
+					this.#runtime.actorEndOnStateChange(this.#ctx),
+				);
 			}
 		}
 	}
@@ -2795,7 +3096,7 @@ type NativeWorkflowQueueMessage = Awaited<
 >;
 
 class NativeWorkflowRuntimeAdapter {
-	#ctx: NativeActorContextAdapter;
+	#ctx: ActorContextHandleAdapter;
 	#completions = new Map<string, (response?: unknown) => Promise<void>>();
 
 	readonly id: string;
@@ -2860,7 +3161,7 @@ class NativeWorkflowRuntimeAdapter {
 		}) => Promise<void>;
 	};
 
-	constructor(ctx: NativeActorContextAdapter) {
+	constructor(ctx: ActorContextHandleAdapter) {
 		this.#ctx = ctx;
 		this.id = ctx.actorId;
 		this.driver = {
@@ -2976,38 +3277,21 @@ class NativeWorkflowRuntimeAdapter {
 	}
 }
 
-function buildNativeHttpRequest(
-	request: Request,
-	body?: Uint8Array,
-): {
-	method: string;
-	uri: string;
-	headers: Record<string, string>;
-	body?: Buffer;
-} {
-	return {
-		method: request.method,
-		uri: request.url,
-		headers: Object.fromEntries(request.headers.entries()),
-		body: body && body.byteLength > 0 ? Buffer.from(body) : undefined,
-	};
-}
-
 function withConnContext(
-	bindings: NativeBindings,
-	ctx: NativeActorContext,
-	conn: NativeConnHandle,
+	runtime: CoreRuntime,
+	ctx: ActorContextHandle,
+	conn: ConnHandle,
 	clientFactory?: () => AnyClient,
 	schemas: NativeValidationConfig = {},
 	databaseProvider?: AnyDatabaseProvider,
 	request?: Request,
 	stateEnabled = true,
 	onStateChange?: NativeOnStateChangeHandler,
-	dispatchCancelToken?: NativeCancellationToken,
+	dispatchCancelToken?: CancellationTokenHandle,
 ) {
 	return Object.assign(
-		new NativeActorContextAdapter(
-			bindings,
+		new ActorContextHandleAdapter(
+			runtime,
 			ctx,
 			clientFactory,
 			schemas,
@@ -3019,8 +3303,10 @@ function withConnContext(
 			dispatchCancelToken,
 		),
 		{
-			conn: new NativeConnAdapter(conn, schemas, ctx, (connId) =>
-				callNativeSync(() => ctx.queueHibernationRemoval(connId)),
+			conn: new NativeConnAdapter(runtime, conn, schemas, ctx, (connId) =>
+				callNativeSync(() =>
+					runtime.actorQueueHibernationRemoval(ctx, connId),
+				),
 			),
 		},
 	);
@@ -3058,7 +3344,9 @@ function buildNativeRequestErrorResponse(
 			metadata:
 				value.metadata === undefined
 					? null
-					: bufferToArrayBuffer(encodeCborCompat(value.metadata)),
+					: runtimeBytesToArrayBuffer(
+							encodeCborCompat(value.metadata),
+						),
 		}),
 	);
 
@@ -3073,7 +3361,7 @@ function buildNativeRequestErrorResponse(
 function buildActorConfig(
 	definition: AnyActorDefinition,
 	registryConfig: RegistryConfig,
-): JsActorConfig {
+): RuntimeActorConfig {
 	const config = definition.config as unknown as Record<string, unknown>;
 	const options = (config.options ?? {}) as Record<string, unknown>;
 	const canHibernate = options.canHibernateWebSocket;
@@ -3082,6 +3370,9 @@ function buildActorConfig(
 		name: options.name as string | undefined,
 		icon: options.icon as string | undefined,
 		hasDatabase: config.db !== undefined,
+		remoteSqlite:
+			config.db !== undefined &&
+			sqliteBackendForConfig(registryConfig) === "remote",
 		hasState:
 			config.state !== undefined ||
 			typeof config.createState === "function",
@@ -3128,10 +3419,10 @@ function buildActorConfig(
 }
 
 export function buildNativeFactory(
-	bindings: NativeBindings,
+	runtime: CoreRuntime,
 	registryConfig: RegistryConfig,
 	definition: AnyActorDefinition,
-): NativeActorFactory {
+): ActorFactoryHandle {
 	const config = definition.config as Record<string, any>;
 	const databaseProvider = config.db as AnyDatabaseProvider;
 	const schemaConfig: NativeValidationConfig = {
@@ -3155,18 +3446,18 @@ export function buildNativeFactory(
 			{ encoding: "bare" },
 		);
 	const nativeRunHandlerActiveByActorId = new Map<string, boolean>();
-	const isNativeRunHandlerActive = (ctx: NativeActorContext) =>
+	const isNativeRunHandlerActive = (ctx: ActorContextHandle) =>
 		nativeRunHandlerActiveByActorId.get(
-			callNativeSync(() => ctx.actorId()),
+			callNativeSync(() => runtime.actorId(ctx)),
 		) ?? false;
-	const getNativeWorkflowInspector = (ctx: NativeActorContext) =>
+	const getNativeWorkflowInspector = (ctx: ActorContextHandle) =>
 		getRunInspectorConfig(
 			config.run,
-			callNativeSync(() => ctx.actorId()),
+			callNativeSync(() => runtime.actorId(ctx)),
 		)?.workflow as NativeWorkflowInspectorConfig | undefined;
 	const onStateChange =
 		typeof config.onStateChange === "function"
-			? (actorCtx: NativeActorContextAdapter, nextState: unknown) => {
+			? (actorCtx: ActorContextHandleAdapter, nextState: unknown) => {
 					config.onStateChange(actorCtx, nextState);
 				}
 			: undefined;
@@ -3174,6 +3465,8 @@ export function buildNativeFactory(
 	const hasStaticVars = "vars" in config;
 	const hasStaticConnState = Object.hasOwn(config, "connState");
 	const hasDynamicConnState = typeof config.createConnState === "function";
+	const onSleep =
+		typeof config.onSleep === "function" ? config.onSleep : undefined;
 	const needsDisconnectCallback =
 		typeof config.onDisconnect === "function" ||
 		hasStaticConnState ||
@@ -3182,12 +3475,12 @@ export function buildNativeFactory(
 	const stateEnabled =
 		config.state !== undefined || typeof config.createState === "function";
 	const makeActorCtx = (
-		ctx: NativeActorContext,
+		ctx: ActorContextHandle,
 		request?: Request,
-		cancelToken?: NativeCancellationToken,
+		cancelToken?: CancellationTokenHandle,
 	) =>
-		new NativeActorContextAdapter(
-			bindings,
+		new ActorContextHandleAdapter(
+			runtime,
 			ctx,
 			createClient,
 			schemaConfig,
@@ -3199,13 +3492,13 @@ export function buildNativeFactory(
 			cancelToken,
 		);
 	const makeConnCtx = (
-		ctx: NativeActorContext,
-		conn: NativeConnHandle,
+		ctx: ActorContextHandle,
+		conn: ConnHandle,
 		request?: Request,
-		cancelToken?: NativeCancellationToken,
+		cancelToken?: CancellationTokenHandle,
 	) =>
 		withConnContext(
-			bindings,
+			runtime,
 			ctx,
 			conn,
 			createClient,
@@ -3217,12 +3510,12 @@ export function buildNativeFactory(
 			cancelToken,
 		);
 	const maybeHandleNativeInspectorRequest = async (
-		ctx: NativeActorContext,
-		rawRequest: {
+		ctx: ActorContextHandle,
+		_rawRequest: {
 			method: string;
 			uri: string;
 			headers?: Record<string, string>;
-			body?: Buffer;
+			body?: RuntimeBytes;
 		},
 		jsRequest: Request,
 	): Promise<Response | undefined> => {
@@ -3257,7 +3550,8 @@ export function buildNativeFactory(
 			);
 		};
 		try {
-			await ctx.verifyInspectorAuth(
+			await runtime.actorVerifyInspectorAuth(
+				ctx,
 				jsRequest.headers
 					.get("authorization")
 					?.replace(/^Bearer\s+/i, "") ?? null,
@@ -3331,8 +3625,8 @@ export function buildNativeFactory(
 					Number.isFinite(parsedLimit) && parsedLimit > 0
 						? Math.floor(parsedLimit)
 						: 100;
-				const queue = ctx.queue();
-				const allMessages = await queue.inspectMessages();
+				const allMessages =
+					await runtime.actorQueueInspectMessages(ctx);
 				const truncated = allMessages.length > limit;
 				const messages = allMessages.slice(0, limit).map((m) => ({
 					id: m.id,
@@ -3341,7 +3635,7 @@ export function buildNativeFactory(
 				}));
 				return jsonResponse({
 					size: allMessages.length,
-					maxSize: queue.maxSize(),
+					maxSize: runtime.actorQueueMaxSize(ctx),
 					truncated,
 					messages,
 				});
@@ -3503,7 +3797,7 @@ export function buildNativeFactory(
 				jsRequest.method === "GET"
 			) {
 				const inspectorSnapshot = callNativeSync(() =>
-					ctx.inspectorSnapshot(),
+					runtime.actorInspectorSnapshot(ctx),
 				);
 				return jsonResponse({
 					state: stateEnabled ? actorCtx.state : undefined,
@@ -3588,10 +3882,10 @@ export function buildNativeFactory(
 						async (
 							error: unknown,
 							payload: {
-								ctx: NativeActorContext;
-								input?: Buffer;
+								ctx: ActorContextHandle;
+								input?: RuntimeBytes;
 							},
-						): Promise<Buffer> => {
+						): Promise<RuntimeBytes> => {
 							const { ctx, input } = unwrapTsfnPayload(
 								error,
 								payload,
@@ -3624,8 +3918,8 @@ export function buildNativeFactory(
 						async (
 							error: unknown,
 							payload: {
-								ctx: NativeActorContext;
-								input?: Buffer;
+								ctx: ActorContextHandle;
+								input?: RuntimeBytes;
 							},
 						): Promise<void> => {
 							const { ctx, input } = unwrapTsfnPayload(
@@ -3649,7 +3943,7 @@ export function buildNativeFactory(
 				? wrapNativeCallback(
 						async (
 							error: unknown,
-							payload: { ctx: NativeActorContext },
+							payload: { ctx: ActorContextHandle },
 						): Promise<void> => {
 							const { ctx } = unwrapTsfnPayload(error, payload);
 							const actorCtx = makeActorCtx(ctx);
@@ -3679,7 +3973,7 @@ export function buildNativeFactory(
 						async (
 							error: unknown,
 							payload: {
-								ctx: NativeActorContext;
+								ctx: ActorContextHandle;
 								isNew: boolean;
 							},
 						) => {
@@ -3710,7 +4004,7 @@ export function buildNativeFactory(
 				? wrapNativeCallback(
 						async (
 							error: unknown,
-							payload: { ctx: NativeActorContext },
+							payload: { ctx: ActorContextHandle },
 						) => {
 							const { ctx } = unwrapTsfnPayload(error, payload);
 							const actorCtx = makeActorCtx(ctx);
@@ -3732,7 +4026,7 @@ export function buildNativeFactory(
 				? wrapNativeCallback(
 						async (
 							error: unknown,
-							payload: { ctx: NativeActorContext },
+							payload: { ctx: ActorContextHandle },
 						) => {
 							const { ctx } = unwrapTsfnPayload(error, payload);
 							const actorCtx = makeActorCtx(ctx);
@@ -3744,31 +4038,30 @@ export function buildNativeFactory(
 						},
 					)
 				: undefined,
-		onSleep:
-			typeof config.onSleep === "function"
-				? wrapNativeCallback(
-						async (
-							error: unknown,
-							payload: { ctx: NativeActorContext },
-						) => {
-							const { ctx } = unwrapTsfnPayload(error, payload);
-							const actorCtx = makeActorCtx(ctx);
-							try {
-								await config.onSleep!(actorCtx);
-								await actorCtx.saveState({ immediate: true });
-							} finally {
-								await actorCtx.dispose();
-							}
-						},
-					)
-				: undefined,
+		onSleep: onSleep
+			? wrapNativeCallback(
+					async (
+						error: unknown,
+						payload: { ctx: ActorContextHandle },
+					) => {
+						const { ctx } = unwrapTsfnPayload(error, payload);
+						const actorCtx = makeActorCtx(ctx);
+						try {
+							await onSleep(actorCtx);
+							await actorCtx.saveState({ immediate: true });
+						} finally {
+							await actorCtx.dispose();
+						}
+					},
+				)
+			: undefined,
 		onDestroy:
 			typeof config.onDestroy === "function" ||
 			databaseProvider !== undefined
 				? wrapNativeCallback(
 						async (
 							error: unknown,
-							payload: { ctx: NativeActorContext },
+							payload: { ctx: ActorContextHandle },
 						) => {
 							const { ctx } = unwrapTsfnPayload(error, payload);
 							const actorCtx = makeActorCtx(ctx);
@@ -3777,7 +4070,7 @@ export function buildNativeFactory(
 									await config.onDestroy(actorCtx);
 								}
 							} finally {
-								resolveNativeDestroy(ctx);
+								resolveNativeDestroy(runtime, ctx);
 								await actorCtx.closeDatabase();
 								await actorCtx.dispose();
 							}
@@ -3790,13 +4083,13 @@ export function buildNativeFactory(
 						async (
 							error: unknown,
 							payload: {
-								ctx: NativeActorContext;
-								params: Buffer;
+								ctx: ActorContextHandle;
+								params: RuntimeBytes;
 								request?: {
 									method: string;
 									uri: string;
 									headers?: Record<string, string>;
-									body?: Buffer;
+									body?: RuntimeBytes;
 								};
 							},
 						) => {
@@ -3828,17 +4121,17 @@ export function buildNativeFactory(
 						async (
 							error: unknown,
 							payload: {
-								ctx: NativeActorContext;
-								conn: NativeConnHandle;
-								params: Buffer;
+								ctx: ActorContextHandle;
+								conn: ConnHandle;
+								params: RuntimeBytes;
 								request?: {
 									method: string;
 									uri: string;
 									headers?: Record<string, string>;
-									body?: Buffer;
+									body?: RuntimeBytes;
 								};
 							},
-						): Promise<Buffer> => {
+						): Promise<RuntimeBytes> => {
 							const { ctx, conn, params, request } =
 								unwrapTsfnPayload(error, payload);
 							const actorCtx = makeActorCtx(
@@ -3846,12 +4139,16 @@ export function buildNativeFactory(
 								request ? buildRequest(request) : undefined,
 							);
 							const connAdapter = new NativeConnAdapter(
+								runtime,
 								conn,
 								schemaConfig,
 								ctx,
 								(connId) =>
 									callNativeSync(() =>
-										ctx.queueHibernationRemoval(connId),
+										runtime.actorQueueHibernationRemoval(
+											ctx,
+											connId,
+										),
 									),
 							);
 							try {
@@ -3878,13 +4175,13 @@ export function buildNativeFactory(
 						async (
 							error: unknown,
 							payload: {
-								ctx: NativeActorContext;
-								conn: NativeConnHandle;
+								ctx: ActorContextHandle;
+								conn: ConnHandle;
 								request?: {
 									method: string;
 									uri: string;
 									headers?: Record<string, string>;
-									body?: Buffer;
+									body?: RuntimeBytes;
 								};
 							},
 						) => {
@@ -3897,12 +4194,16 @@ export function buildNativeFactory(
 								request ? buildRequest(request) : undefined,
 							);
 							const connAdapter = new NativeConnAdapter(
+								runtime,
 								conn,
 								schemaConfig,
 								ctx,
 								(connId) =>
 									callNativeSync(() =>
-										ctx.queueHibernationRemoval(connId),
+										runtime.actorQueueHibernationRemoval(
+											ctx,
+											connId,
+										),
 									),
 							);
 							try {
@@ -3923,8 +4224,8 @@ export function buildNativeFactory(
 					async (
 						error: unknown,
 						payload: {
-							ctx: NativeActorContext;
-							conn: NativeConnHandle;
+							ctx: ActorContextHandle;
+							conn: ConnHandle;
 						},
 					) => {
 						const { ctx, conn } = unwrapTsfnPayload(error, payload);
@@ -3936,12 +4237,14 @@ export function buildNativeFactory(
 								await config.onDisconnect(
 									actorCtx,
 									new NativeConnAdapter(
+										runtime,
 										conn,
 										schemaConfig,
 										ctx,
 										(connId) =>
 											callNativeSync(() =>
-												ctx.queueHibernationRemoval(
+												runtime.actorQueueHibernationRemoval(
+													ctx,
 													connId,
 												),
 											),
@@ -3965,8 +4268,8 @@ export function buildNativeFactory(
 						async (
 							error: unknown,
 							payload: {
-								ctx: NativeActorContext;
-								conn: NativeConnHandle;
+								ctx: ActorContextHandle;
+								conn: ConnHandle;
 								eventName: string;
 							},
 						) => {
@@ -4004,10 +4307,10 @@ export function buildNativeFactory(
 						async (
 							error: unknown,
 							payload: {
-								ctx: NativeActorContext;
+								ctx: ActorContextHandle;
 								name: string;
-								args: Buffer;
-								output: Buffer;
+								args: RuntimeBytes;
+								output: RuntimeBytes;
 							},
 						) => {
 							const { ctx, name, args, output } =
@@ -4032,14 +4335,14 @@ export function buildNativeFactory(
 			async (
 				error: unknown,
 				payload: {
-					ctx: NativeActorContext;
+					ctx: ActorContextHandle;
 					request: {
 						method: string;
 						uri: string;
 						headers?: Record<string, string>;
-						body?: Buffer;
+						body?: RuntimeBytes;
 					};
-					cancelToken?: NativeCancellationToken;
+					cancelToken?: CancellationTokenHandle;
 				},
 			) => {
 				try {
@@ -4055,11 +4358,11 @@ export function buildNativeFactory(
 							jsRequest,
 						);
 					if (inspectorResponse) {
-						return await toJsHttpResponse(inspectorResponse);
+						return await toRuntimeHttpResponse(inspectorResponse);
 					}
 
 					if (typeof config.onRequest !== "function") {
-						return await toJsHttpResponse(
+						return await toRuntimeHttpResponse(
 							new Response(null, { status: 404 }),
 						);
 					}
@@ -4069,7 +4372,7 @@ export function buildNativeFactory(
 					let requestCtx:
 						| ReturnType<typeof withConnContext>
 						| undefined;
-					let conn: NativeConnHandle | undefined;
+					let conn: ConnHandle | undefined;
 					try {
 						const connParams = validateConnParams(
 							schemaConfig.connParamsSchema,
@@ -4078,7 +4381,11 @@ export function buildNativeFactory(
 								: undefined,
 						);
 						conn = await callNative(() =>
-							ctx.connectConn(encodeValue(connParams), request),
+							runtime.actorConnectConn(
+								ctx,
+								encodeValue(connParams),
+								request,
+							),
 						);
 						requestCtx = makeConnCtx(
 							ctx,
@@ -4095,7 +4402,7 @@ export function buildNativeFactory(
 								"onRequest handler must return a Response",
 							);
 						}
-						return await toJsHttpResponse(response);
+						return await toRuntimeHttpResponse(response);
 					} catch (error) {
 						const encodingHeader =
 							jsRequest.headers.get(HEADER_ENCODING);
@@ -4105,7 +4412,7 @@ export function buildNativeFactory(
 								? encodingHeader
 								: "json";
 						const path = new URL(jsRequest.url).pathname;
-						return await toJsHttpResponse(
+						return await toRuntimeHttpResponse(
 							buildNativeRequestErrorResponse(
 								encoding,
 								path,
@@ -4115,7 +4422,7 @@ export function buildNativeFactory(
 					} finally {
 						await requestCtx?.dispose();
 						if (conn) {
-							await conn.disconnect();
+							await runtime.connDisconnect(conn);
 						}
 					}
 				} catch (error) {
@@ -4133,36 +4440,29 @@ export function buildNativeFactory(
 						async (
 							error: unknown,
 							payload: {
-								ctx: NativeActorContext;
-								conn: NativeConnHandle;
-								ws: NativeWebSocket;
+								ctx: ActorContextHandle;
+								conn: ConnHandle;
+								ws: WebSocketHandle;
 								request?: {
 									method: string;
 									uri: string;
 									headers?: Record<string, string>;
-									body?: Buffer;
+									body?: RuntimeBytes;
 								};
 							},
 						) => {
 							const { ctx, conn, ws, request } =
-								unwrapTsfnPayload(
-									error,
-									payload,
-								);
+								unwrapTsfnPayload(error, payload);
 							const jsRequest = request
 								? buildRequest(request)
 								: undefined;
-							const actorCtx = makeConnCtx(
-								ctx,
-								conn,
-								jsRequest,
-							);
+							const actorCtx = makeConnCtx(ctx, conn, jsRequest);
 							try {
 								await config.onWebSocket(
 									actorCtx,
-									new TrackedNativeWebSocketAdapter(
+									new TrackedWebSocketHandleAdapter(
 										actorCtx,
-										new NativeWebSocketAdapter(ws),
+										new NativeWebSocketAdapter(runtime, ws),
 									),
 								);
 							} finally {
@@ -4180,10 +4480,10 @@ export function buildNativeFactory(
 			return wrapNativeCallback(
 				async (
 					error: unknown,
-					payload: { ctx: NativeActorContext },
+					payload: { ctx: ActorContextHandle },
 				) => {
 					const { ctx } = unwrapTsfnPayload(error, payload);
-					const actorId = callNativeSync(() => ctx.actorId());
+					const actorId = callNativeSync(() => runtime.actorId(ctx));
 					const actorCtx = makeActorCtx(ctx);
 					nativeRunHandlerActiveByActorId.set(actorId, true);
 					try {
@@ -4200,7 +4500,7 @@ export function buildNativeFactory(
 				? wrapNativeCallback(
 						async (
 							error: unknown,
-							payload: { ctx: NativeActorContext },
+							payload: { ctx: ActorContextHandle },
 						) => {
 							const { ctx } = unwrapTsfnPayload(error, payload);
 							const history =
@@ -4217,7 +4517,7 @@ export function buildNativeFactory(
 						async (
 							error: unknown,
 							payload: {
-								ctx: NativeActorContext;
+								ctx: ActorContextHandle;
 								entryId?: string;
 							},
 						) => {
@@ -4248,11 +4548,11 @@ export function buildNativeFactory(
 					async (
 						error: unknown,
 						payload: {
-							ctx: NativeActorContext;
-							conn: NativeConnHandle | null;
+							ctx: ActorContextHandle;
+							conn: ConnHandle | null;
 							name: string;
-							args: Buffer;
-							cancelToken?: NativeCancellationToken;
+							args: RuntimeBytes;
+							cancelToken?: CancellationTokenHandle;
 						},
 					) => {
 						const { ctx, conn, args, cancelToken } =
@@ -4283,19 +4583,19 @@ export function buildNativeFactory(
 			async (
 				error: unknown,
 				payload: {
-					ctx: NativeActorContext;
-					conn: NativeConnHandle;
+					ctx: ActorContextHandle;
+					conn: ConnHandle;
 					request: {
 						method: string;
 						uri: string;
 						headers?: Record<string, string>;
-						body?: Buffer;
+						body?: RuntimeBytes;
 					};
 					name: string;
-					body: Buffer;
+					body: RuntimeBytes;
 					wait: boolean;
 					timeoutMs?: bigint | number;
-					cancelToken?: NativeCancellationToken;
+					cancelToken?: CancellationTokenHandle;
 				},
 			) => {
 				const {
@@ -4310,7 +4610,7 @@ export function buildNativeFactory(
 				} = unwrapTsfnPayload(error, payload);
 				const jsRequest = buildRequest(request);
 				const actorCtx = withConnContext(
-					bindings,
+					runtime,
 					ctx,
 					conn,
 					createClient,
@@ -4383,7 +4683,7 @@ export function buildNativeFactory(
 			async (
 				error: unknown,
 				payload: {
-					ctx: NativeActorContext;
+					ctx: ActorContextHandle;
 					reason: SerializeStateReason;
 				},
 			) => {
@@ -4398,20 +4698,20 @@ export function buildNativeFactory(
 		),
 	};
 
-	return new bindings.NapiActorFactory(
+	return runtime.createActorFactory(
 		callbacks,
 		buildActorConfig(definition, registryConfig),
 	);
 }
 
-async function buildServeConfig(
+export async function buildServeConfig(
 	config: RegistryConfig,
-): Promise<JsServeConfig> {
+): Promise<RuntimeServeConfig> {
 	if (!config.endpoint) {
 		throw nativeEndpointNotConfiguredError();
 	}
 
-	const serveConfig: JsServeConfig = {
+	const serveConfig: RuntimeServeConfig = {
 		version: config.envoy.version,
 		endpoint: config.endpoint,
 		token: config.token,
@@ -4431,35 +4731,66 @@ async function buildServeConfig(
 		const { getEnginePath } = await loadEngineCli();
 		serveConfig.engineBinaryPath = getEnginePath();
 	}
+	if (config.test?.enabled) {
+		serveConfig.inspectorTestToken =
+			getEnvUniversal("_RIVET_TEST_INSPECTOR_TOKEN") ?? "token";
+	}
 
 	return serveConfig;
 }
 
-export async function buildNativeRegistry(config: RegistryConfig): Promise<{
-	bindings: NativeBindings;
-	registry: NativeCoreRegistry;
-	serveConfig: JsServeConfig;
+export async function buildRegistryWithRuntime(
+	config: RegistryConfig,
+	runtime: CoreRuntime,
+): Promise<{
+	runtime: CoreRuntime;
+	registry: RegistryHandle;
+	serveConfig: RuntimeServeConfig;
 }> {
 	if (
 		config.test?.enabled &&
-		process.env._RIVET_TEST_INSPECTOR_TOKEN === undefined
+		getEnvUniversal("_RIVET_TEST_INSPECTOR_TOKEN") === undefined
 	) {
-		process.env._RIVET_TEST_INSPECTOR_TOKEN = "token";
+		trySetProcessEnv("_RIVET_TEST_INSPECTOR_TOKEN", "token");
 	}
 
-	const bindings = await loadNativeBindings();
-	const registry = new bindings.CoreRegistry();
+	const registry = runtime.createRegistry();
 
 	for (const [name, definition] of Object.entries(config.use)) {
-		registry.register(
+		runtime.registerActor(
+			registry,
 			name,
-			buildNativeFactory(bindings, config, definition),
+			buildNativeFactory(runtime, config, definition),
 		);
 	}
 
 	return {
-		bindings,
+		runtime,
 		registry,
 		serveConfig: await buildServeConfig(config),
 	};
+}
+
+export async function buildNativeRegistry(config: RegistryConfig): Promise<{
+	runtime: CoreRuntime;
+	registry: RegistryHandle;
+	serveConfig: RuntimeServeConfig;
+}> {
+	const { runtime } = await loadNapiRuntime();
+	return buildRegistryWithRuntime(
+		normalizeRuntimeConfigForKind(config, "native"),
+		runtime,
+	);
+}
+
+export async function buildConfiguredRegistry(config: RegistryConfig): Promise<{
+	runtime: CoreRuntime;
+	registry: RegistryHandle;
+	serveConfig: RuntimeServeConfig;
+}> {
+	const runtime = await loadConfiguredRuntime(config);
+	return buildRegistryWithRuntime(
+		normalizeRuntimeConfig(config, runtime),
+		runtime,
+	);
 }

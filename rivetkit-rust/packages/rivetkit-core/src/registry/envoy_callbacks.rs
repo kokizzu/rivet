@@ -2,6 +2,7 @@ use tracing::Instrument;
 
 use super::*;
 use crate::error::ActorRuntime;
+use crate::runtime::RuntimeSpawner;
 
 impl EnvoyCallbacks for RegistryCallbacks {
 	fn on_actor_start(
@@ -62,7 +63,7 @@ impl EnvoyCallbacks for RegistryCallbacks {
 	) -> EnvoyBoxFuture<anyhow::Result<()>> {
 		let dispatcher = self.dispatcher.clone();
 		Box::pin(async move {
-			tokio::spawn(
+			RuntimeSpawner::spawn(
 				async move {
 					if let Err(error) = dispatcher.stop_actor(&actor_id, reason, stop_handle).await
 					{
@@ -163,13 +164,13 @@ impl ServeSettings {
 			serverless_base_path: None,
 			serverless_package_version: env!("CARGO_PKG_VERSION").to_owned(),
 			serverless_client_endpoint: None,
-			serverless_client_namespace: None,
-			serverless_client_token: None,
-			serverless_validate_endpoint: true,
-			serverless_max_start_payload_bytes: 1_048_576,
+				serverless_client_namespace: None,
+				serverless_client_token: None,
+				serverless_validate_endpoint: true,
+				serverless_max_start_payload_bytes: 1_048_576,
+			}
 		}
 	}
-}
 
 impl Default for ServeConfig {
 	fn default() -> Self {
@@ -191,13 +192,14 @@ impl ServeConfig {
 			serverless_base_path: settings.serverless_base_path,
 			serverless_package_version: settings.serverless_package_version,
 			serverless_client_endpoint: settings.serverless_client_endpoint,
-			serverless_client_namespace: settings.serverless_client_namespace,
-			serverless_client_token: settings.serverless_client_token,
-			serverless_validate_endpoint: settings.serverless_validate_endpoint,
-			serverless_max_start_payload_bytes: settings.serverless_max_start_payload_bytes,
+				serverless_client_namespace: settings.serverless_client_namespace,
+				serverless_client_token: settings.serverless_client_token,
+				serverless_validate_endpoint: settings.serverless_validate_endpoint,
+				serverless_max_start_payload_bytes: settings.serverless_max_start_payload_bytes,
+				serverless_cache_envoy: true,
+			}
 		}
 	}
-}
 
 fn actor_key_from_protocol(key: Option<String>) -> ActorKey {
 	key.as_deref()

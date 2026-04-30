@@ -523,6 +523,14 @@ export class ActorConnRaw {
 			return true;
 		}
 
+		if (
+			error instanceof errors.ActorError &&
+			error.group === "client" &&
+			error.code === "get_params_failed"
+		) {
+			return true;
+		}
+
 		return isRetryableLifecycleReconnectSignal(error);
 	}
 

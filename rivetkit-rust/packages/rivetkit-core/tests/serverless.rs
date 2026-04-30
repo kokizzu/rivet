@@ -2,6 +2,8 @@ use super::*;
 
 mod moved_tests {
 	use std::collections::HashMap;
+	#[cfg(not(feature = "native-runtime"))]
+	use std::path::PathBuf;
 
 	use tokio_util::sync::CancellationToken;
 
@@ -43,6 +45,18 @@ mod moved_tests {
 	fn invalid_urls_fall_back_to_string_comparison() {
 		assert!(endpoints_match("not a url", "not a url"));
 		assert!(!endpoints_match("not a url", "also not a url"));
+	}
+
+	#[test]
+	fn matches_combined_duplicate_endpoint_headers() {
+		assert!(endpoints_match(
+			"http://127.0.0.1:6420, http://127.0.0.1:8080",
+			"http://localhost:8080/"
+		));
+		assert!(!endpoints_match(
+			"http://127.0.0.1:6420, http://127.0.0.1:8080",
+			"http://localhost:9000/"
+		));
 	}
 
 	#[tokio::test]
@@ -133,28 +147,48 @@ mod moved_tests {
 		assert_eq!(parsed.token.as_deref(), Some("dev"));
 	}
 
+	#[cfg(not(feature = "native-runtime"))]
+	#[tokio::test]
+	async fn engine_process_spawn_requires_native_runtime() {
+		let mut config = test_config();
+		config.engine_binary_path = Some(PathBuf::from("rivet-engine"));
+
+		let error = match CoreServerlessRuntime::new(HashMap::new(), config).await {
+			Ok(_) => panic!("engine process spawning should fail without native runtime"),
+			Err(error) => error,
+		};
+
+		assert!(
+			error
+				.to_string()
+				.contains("engine process spawning requires the `native-runtime` feature")
+		);
+	}
+
 	async fn test_runtime() -> CoreServerlessRuntime {
-		CoreServerlessRuntime::new(
-			HashMap::new(),
-			ServeConfig {
-				version: 1,
-				endpoint: "http://127.0.0.1:6420".to_owned(),
-				token: Some("dev".to_owned()),
-				namespace: "default".to_owned(),
-				pool_name: "default".to_owned(),
-				engine_binary_path: None,
-				handle_inspector_http_in_runtime: true,
-				serverless_base_path: Some("/api/rivet".to_owned()),
-				serverless_package_version: "test-version".to_owned(),
-				serverless_client_endpoint: Some("http://client.example".to_owned()),
-				serverless_client_namespace: Some("default".to_owned()),
-				serverless_client_token: Some("client-token".to_owned()),
-				serverless_validate_endpoint: true,
-				serverless_max_start_payload_bytes: 1_048_576,
-			},
-		)
+		CoreServerlessRuntime::new(HashMap::new(), test_config())
 		.await
 		.expect("runtime should build")
+	}
+
+	fn test_config() -> ServeConfig {
+		ServeConfig {
+			version: 1,
+			endpoint: "http://127.0.0.1:6420".to_owned(),
+			token: Some("dev".to_owned()),
+			namespace: "default".to_owned(),
+			pool_name: "default".to_owned(),
+			engine_binary_path: None,
+			handle_inspector_http_in_runtime: true,
+			serverless_base_path: Some("/api/rivet".to_owned()),
+			serverless_package_version: "test-version".to_owned(),
+			serverless_client_endpoint: Some("http://client.example".to_owned()),
+			serverless_client_namespace: Some("default".to_owned()),
+			serverless_client_token: Some("client-token".to_owned()),
+			serverless_validate_endpoint: true,
+			serverless_max_start_payload_bytes: 1_048_576,
+			serverless_cache_envoy: true,
+		}
 	}
 
 	fn test_request(method: &str, path: &str) -> ServerlessRequest {

@@ -262,4 +262,4 @@ describeDriverMatrix("Actor Db Stress", (driverTestConfig) => {
 			KITCHEN_SINK_TEST_TIMEOUT_MS,
 		);
 	});
-}, { encodings: ["bare"] });
+});

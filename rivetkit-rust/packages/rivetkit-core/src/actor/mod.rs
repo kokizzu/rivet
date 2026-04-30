@@ -4,6 +4,7 @@ pub mod connection;
 pub mod context;
 pub(crate) mod diagnostics;
 pub mod factory;
+pub(crate) mod keys;
 pub mod kv;
 pub mod lifecycle_hooks;
 pub mod messages;
@@ -33,6 +34,7 @@ pub use queue::{
 };
 pub use sqlite::{
 	BindParam, ColumnValue, ExecResult, ExecuteResult, ExecuteRoute, QueryResult, SqliteDb,
+	SqliteBackend,
 };
 pub use state::RequestSaveOpts;
 pub use task::{

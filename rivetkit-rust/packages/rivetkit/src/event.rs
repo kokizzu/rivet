@@ -70,7 +70,12 @@ impl<A: Actor> Event<A> {
 				timeout_ms,
 				reply: Some(reply),
 			}),
-			ActorEvent::WebSocketOpen { ws, request, reply } => Self::WebSocketOpen(WsOpen {
+			ActorEvent::WebSocketOpen {
+				conn: _conn,
+				ws,
+				request,
+				reply,
+			} => Self::WebSocketOpen(WsOpen {
 				ws,
 				request,
 				reply: Some(reply),

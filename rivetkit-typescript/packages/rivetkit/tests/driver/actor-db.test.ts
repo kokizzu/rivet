@@ -1,7 +1,10 @@
 // @ts-nocheck
 
 import { describe, expect, test, vi } from "vitest";
-import { describeDriverMatrix } from "./shared-matrix";
+import {
+	describeDriverMatrix,
+	SQLITE_DRIVER_MATRIX_OPTIONS,
+} from "./shared-matrix";
 import { setupDriverTest, waitFor } from "./shared-utils";
 
 type DbVariant = "raw";
@@ -587,4 +590,4 @@ describeDriverMatrix("Actor Db", (driverTestConfig) => {
 			lifecycleTestTimeout,
 		);
 	});
-});
+}, SQLITE_DRIVER_MATRIX_OPTIONS);

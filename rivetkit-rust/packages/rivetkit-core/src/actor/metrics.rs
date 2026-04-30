@@ -38,53 +38,53 @@ struct ActorMetricsInner {
 	shutdown_timeout_total: CounterVec,
 	state_mutation_total: CounterVec,
 	direct_subsystem_shutdown_warning_total: CounterVec,
-	#[cfg(feature = "sqlite")]
+	#[cfg(feature = "sqlite-local")]
 	sqlite_vfs_resolve_pages_total: IntCounter,
-	#[cfg(feature = "sqlite")]
+	#[cfg(feature = "sqlite-local")]
 	sqlite_vfs_resolve_pages_requested_total: IntCounter,
-	#[cfg(feature = "sqlite")]
+	#[cfg(feature = "sqlite-local")]
 	sqlite_vfs_resolve_pages_cache_hits_total: IntCounter,
-	#[cfg(feature = "sqlite")]
+	#[cfg(feature = "sqlite-local")]
 	sqlite_vfs_resolve_pages_cache_misses_total: IntCounter,
-	#[cfg(feature = "sqlite")]
+	#[cfg(feature = "sqlite-local")]
 	sqlite_vfs_get_pages_total: IntCounter,
-	#[cfg(feature = "sqlite")]
+	#[cfg(feature = "sqlite-local")]
 	sqlite_vfs_pages_fetched_total: IntCounter,
-	#[cfg(feature = "sqlite")]
+	#[cfg(feature = "sqlite-local")]
 	sqlite_vfs_prefetch_pages_total: IntCounter,
-	#[cfg(feature = "sqlite")]
+	#[cfg(feature = "sqlite-local")]
 	sqlite_vfs_bytes_fetched_total: IntCounter,
-	#[cfg(feature = "sqlite")]
+	#[cfg(feature = "sqlite-local")]
 	sqlite_vfs_prefetch_bytes_total: IntCounter,
-	#[cfg(feature = "sqlite")]
+	#[cfg(feature = "sqlite-local")]
 	sqlite_vfs_get_pages_duration_seconds: Histogram,
-	#[cfg(feature = "sqlite")]
+	#[cfg(feature = "sqlite-local")]
 	sqlite_vfs_commit_total: IntCounter,
-	#[cfg(feature = "sqlite")]
+	#[cfg(feature = "sqlite-local")]
 	sqlite_vfs_commit_phase_duration_seconds_total: CounterVec,
-	#[cfg(feature = "sqlite")]
+	#[cfg(feature = "sqlite-local")]
 	sqlite_vfs_commit_duration_seconds_total: CounterVec,
-	#[cfg(feature = "sqlite")]
+	#[cfg(feature = "sqlite-local")]
 	sqlite_read_pool_active_readers: IntGauge,
-	#[cfg(feature = "sqlite")]
+	#[cfg(feature = "sqlite-local")]
 	sqlite_read_pool_idle_readers: IntGauge,
-	#[cfg(feature = "sqlite")]
+	#[cfg(feature = "sqlite-local")]
 	sqlite_read_pool_read_wait_duration_seconds: Histogram,
-	#[cfg(feature = "sqlite")]
+	#[cfg(feature = "sqlite-local")]
 	sqlite_read_pool_write_wait_duration_seconds: Histogram,
-	#[cfg(feature = "sqlite")]
+	#[cfg(feature = "sqlite-local")]
 	sqlite_read_pool_routed_read_queries_total: IntCounter,
-	#[cfg(feature = "sqlite")]
+	#[cfg(feature = "sqlite-local")]
 	sqlite_read_pool_write_fallback_queries_total: IntCounter,
-	#[cfg(feature = "sqlite")]
+	#[cfg(feature = "sqlite-local")]
 	sqlite_read_pool_manual_transaction_duration_seconds: Histogram,
-	#[cfg(feature = "sqlite")]
+	#[cfg(feature = "sqlite-local")]
 	sqlite_read_pool_reader_opens_total: IntCounter,
-	#[cfg(feature = "sqlite")]
+	#[cfg(feature = "sqlite-local")]
 	sqlite_read_pool_reader_closes_total: IntCounter,
-	#[cfg(feature = "sqlite")]
+	#[cfg(feature = "sqlite-local")]
 	sqlite_read_pool_rejected_reader_mutations_total: IntCounter,
-	#[cfg(feature = "sqlite")]
+	#[cfg(feature = "sqlite-local")]
 	sqlite_read_pool_mode_transitions_total: CounterVec,
 }
 
@@ -234,61 +234,61 @@ impl ActorMetrics {
 			&["subsystem", "operation"],
 		)
 		.context("create direct_subsystem_shutdown_warning_total counter")?;
-		#[cfg(feature = "sqlite")]
+		#[cfg(feature = "sqlite-local")]
 		let sqlite_vfs_resolve_pages_total = IntCounter::with_opts(Opts::new(
 			"sqlite_vfs_resolve_pages_total",
 			"total VFS page resolution attempts",
 		))
 		.context("create sqlite_vfs_resolve_pages_total counter")?;
-		#[cfg(feature = "sqlite")]
+		#[cfg(feature = "sqlite-local")]
 		let sqlite_vfs_resolve_pages_requested_total = IntCounter::with_opts(Opts::new(
 			"sqlite_vfs_resolve_pages_requested_total",
 			"total pages requested by VFS page resolution attempts",
 		))
 		.context("create sqlite_vfs_resolve_pages_requested_total counter")?;
-		#[cfg(feature = "sqlite")]
+		#[cfg(feature = "sqlite-local")]
 		let sqlite_vfs_resolve_pages_cache_hits_total = IntCounter::with_opts(Opts::new(
 			"sqlite_vfs_resolve_pages_cache_hits_total",
 			"total pages resolved from the VFS page cache or write buffer",
 		))
 		.context("create sqlite_vfs_resolve_pages_cache_hits_total counter")?;
-		#[cfg(feature = "sqlite")]
+		#[cfg(feature = "sqlite-local")]
 		let sqlite_vfs_resolve_pages_cache_misses_total = IntCounter::with_opts(Opts::new(
 			"sqlite_vfs_resolve_pages_cache_misses_total",
 			"total pages missing from the VFS page cache and write buffer",
 		))
 		.context("create sqlite_vfs_resolve_pages_cache_misses_total counter")?;
-		#[cfg(feature = "sqlite")]
+		#[cfg(feature = "sqlite-local")]
 		let sqlite_vfs_get_pages_total = IntCounter::with_opts(Opts::new(
 			"sqlite_vfs_get_pages_total",
 			"total VFS to engine get_pages requests",
 		))
 		.context("create sqlite_vfs_get_pages_total counter")?;
-		#[cfg(feature = "sqlite")]
+		#[cfg(feature = "sqlite-local")]
 		let sqlite_vfs_pages_fetched_total = IntCounter::with_opts(Opts::new(
 			"sqlite_vfs_pages_fetched_total",
 			"total pages requested from the engine by VFS get_pages calls",
 		))
 		.context("create sqlite_vfs_pages_fetched_total counter")?;
-		#[cfg(feature = "sqlite")]
+		#[cfg(feature = "sqlite-local")]
 		let sqlite_vfs_prefetch_pages_total = IntCounter::with_opts(Opts::new(
 			"sqlite_vfs_prefetch_pages_total",
 			"total pages requested speculatively by VFS prefetch",
 		))
 		.context("create sqlite_vfs_prefetch_pages_total counter")?;
-		#[cfg(feature = "sqlite")]
+		#[cfg(feature = "sqlite-local")]
 		let sqlite_vfs_bytes_fetched_total = IntCounter::with_opts(Opts::new(
 			"sqlite_vfs_bytes_fetched_total",
 			"total bytes requested from the engine by VFS get_pages calls",
 		))
 		.context("create sqlite_vfs_bytes_fetched_total counter")?;
-		#[cfg(feature = "sqlite")]
+		#[cfg(feature = "sqlite-local")]
 		let sqlite_vfs_prefetch_bytes_total = IntCounter::with_opts(Opts::new(
 			"sqlite_vfs_prefetch_bytes_total",
 			"total bytes requested speculatively by VFS prefetch",
 		))
 		.context("create sqlite_vfs_prefetch_bytes_total counter")?;
-		#[cfg(feature = "sqlite")]
+		#[cfg(feature = "sqlite-local")]
 		let sqlite_vfs_get_pages_duration_seconds = Histogram::with_opts(
 			HistogramOpts::new(
 				"sqlite_vfs_get_pages_duration_seconds",
@@ -299,13 +299,13 @@ impl ActorMetrics {
 			]),
 		)
 		.context("create sqlite_vfs_get_pages_duration_seconds histogram")?;
-		#[cfg(feature = "sqlite")]
+		#[cfg(feature = "sqlite-local")]
 		let sqlite_vfs_commit_total = IntCounter::with_opts(Opts::new(
 			"sqlite_vfs_commit_total",
 			"total successful VFS commits",
 		))
 		.context("create sqlite_vfs_commit_total counter")?;
-		#[cfg(feature = "sqlite")]
+		#[cfg(feature = "sqlite-local")]
 		let sqlite_vfs_commit_phase_duration_seconds_total = CounterVec::new(
 			Opts::new(
 				"sqlite_vfs_commit_phase_duration_seconds_total",
@@ -314,7 +314,7 @@ impl ActorMetrics {
 			&["phase"],
 		)
 		.context("create sqlite_vfs_commit_phase_duration_seconds_total counter")?;
-		#[cfg(feature = "sqlite")]
+		#[cfg(feature = "sqlite-local")]
 		let sqlite_vfs_commit_duration_seconds_total = CounterVec::new(
 			Opts::new(
 				"sqlite_vfs_commit_duration_seconds_total",
@@ -323,19 +323,19 @@ impl ActorMetrics {
 			&["phase"],
 		)
 		.context("create sqlite_vfs_commit_duration_seconds_total counter")?;
-		#[cfg(feature = "sqlite")]
+		#[cfg(feature = "sqlite-local")]
 		let sqlite_read_pool_active_readers = IntGauge::with_opts(Opts::new(
 			"sqlite_read_pool_active_readers",
 			"current active SQLite read-pool readers",
 		))
 		.context("create sqlite_read_pool_active_readers gauge")?;
-		#[cfg(feature = "sqlite")]
+		#[cfg(feature = "sqlite-local")]
 		let sqlite_read_pool_idle_readers = IntGauge::with_opts(Opts::new(
 			"sqlite_read_pool_idle_readers",
 			"current idle SQLite read-pool readers",
 		))
 		.context("create sqlite_read_pool_idle_readers gauge")?;
-		#[cfg(feature = "sqlite")]
+		#[cfg(feature = "sqlite-local")]
 		let sqlite_read_pool_read_wait_duration_seconds = Histogram::with_opts(
 			HistogramOpts::new(
 				"sqlite_read_pool_read_wait_duration_seconds",
@@ -344,7 +344,7 @@ impl ActorMetrics {
 			.buckets(sqlite_pool_wait_buckets()),
 		)
 		.context("create sqlite_read_pool_read_wait_duration_seconds histogram")?;
-		#[cfg(feature = "sqlite")]
+		#[cfg(feature = "sqlite-local")]
 		let sqlite_read_pool_write_wait_duration_seconds = Histogram::with_opts(
 			HistogramOpts::new(
 				"sqlite_read_pool_write_wait_duration_seconds",
@@ -353,19 +353,19 @@ impl ActorMetrics {
 			.buckets(sqlite_pool_wait_buckets()),
 		)
 		.context("create sqlite_read_pool_write_wait_duration_seconds histogram")?;
-		#[cfg(feature = "sqlite")]
+		#[cfg(feature = "sqlite-local")]
 		let sqlite_read_pool_routed_read_queries_total = IntCounter::with_opts(Opts::new(
 			"sqlite_read_pool_routed_read_queries_total",
 			"total SQLite statements routed to read-pool readers",
 		))
 		.context("create sqlite_read_pool_routed_read_queries_total counter")?;
-		#[cfg(feature = "sqlite")]
+		#[cfg(feature = "sqlite-local")]
 		let sqlite_read_pool_write_fallback_queries_total = IntCounter::with_opts(Opts::new(
 			"sqlite_read_pool_write_fallback_queries_total",
 			"total SQLite statements routed to write mode as read-pool fallbacks",
 		))
 		.context("create sqlite_read_pool_write_fallback_queries_total counter")?;
-		#[cfg(feature = "sqlite")]
+		#[cfg(feature = "sqlite-local")]
 		let sqlite_read_pool_manual_transaction_duration_seconds = Histogram::with_opts(
 			HistogramOpts::new(
 				"sqlite_read_pool_manual_transaction_duration_seconds",
@@ -374,25 +374,25 @@ impl ActorMetrics {
 			.buckets(sqlite_pool_wait_buckets()),
 		)
 		.context("create sqlite_read_pool_manual_transaction_duration_seconds histogram")?;
-		#[cfg(feature = "sqlite")]
+		#[cfg(feature = "sqlite-local")]
 		let sqlite_read_pool_reader_opens_total = IntCounter::with_opts(Opts::new(
 			"sqlite_read_pool_reader_opens_total",
 			"total SQLite read-pool reader connection opens",
 		))
 		.context("create sqlite_read_pool_reader_opens_total counter")?;
-		#[cfg(feature = "sqlite")]
+		#[cfg(feature = "sqlite-local")]
 		let sqlite_read_pool_reader_closes_total = IntCounter::with_opts(Opts::new(
 			"sqlite_read_pool_reader_closes_total",
 			"total SQLite read-pool reader connection closes",
 		))
 		.context("create sqlite_read_pool_reader_closes_total counter")?;
-		#[cfg(feature = "sqlite")]
+		#[cfg(feature = "sqlite-local")]
 		let sqlite_read_pool_rejected_reader_mutations_total = IntCounter::with_opts(Opts::new(
 			"sqlite_read_pool_rejected_reader_mutations_total",
 			"total SQLite reader mutation attempts rejected by read-pool safeguards",
 		))
 		.context("create sqlite_read_pool_rejected_reader_mutations_total counter")?;
-		#[cfg(feature = "sqlite")]
+		#[cfg(feature = "sqlite-local")]
 		let sqlite_read_pool_mode_transitions_total = CounterVec::new(
 			Opts::new(
 				"sqlite_read_pool_mode_transitions_total",
@@ -421,7 +421,7 @@ impl ActorMetrics {
 		register_metric(&registry, shutdown_timeout_total.clone());
 		register_metric(&registry, state_mutation_total.clone());
 		register_metric(&registry, direct_subsystem_shutdown_warning_total.clone());
-		#[cfg(feature = "sqlite")]
+		#[cfg(feature = "sqlite-local")]
 		{
 			register_metric(&registry, sqlite_vfs_resolve_pages_total.clone());
 			register_metric(&registry, sqlite_vfs_resolve_pages_requested_total.clone());
@@ -477,7 +477,7 @@ impl ActorMetrics {
 			shutdown_wait_seconds.with_label_values(&[reason.as_metric_label()]);
 			shutdown_timeout_total.with_label_values(&[reason.as_metric_label()]);
 		}
-		#[cfg(feature = "sqlite")]
+		#[cfg(feature = "sqlite-local")]
 		{
 			for phase in ["request_build", "serialize", "transport", "state_update"] {
 				sqlite_vfs_commit_phase_duration_seconds_total.with_label_values(&[phase]);
@@ -517,53 +517,53 @@ impl ActorMetrics {
 			shutdown_timeout_total,
 			state_mutation_total,
 			direct_subsystem_shutdown_warning_total,
-			#[cfg(feature = "sqlite")]
+			#[cfg(feature = "sqlite-local")]
 			sqlite_vfs_resolve_pages_total,
-			#[cfg(feature = "sqlite")]
+			#[cfg(feature = "sqlite-local")]
 			sqlite_vfs_resolve_pages_requested_total,
-			#[cfg(feature = "sqlite")]
+			#[cfg(feature = "sqlite-local")]
 			sqlite_vfs_resolve_pages_cache_hits_total,
-			#[cfg(feature = "sqlite")]
+			#[cfg(feature = "sqlite-local")]
 			sqlite_vfs_resolve_pages_cache_misses_total,
-			#[cfg(feature = "sqlite")]
+			#[cfg(feature = "sqlite-local")]
 			sqlite_vfs_get_pages_total,
-			#[cfg(feature = "sqlite")]
+			#[cfg(feature = "sqlite-local")]
 			sqlite_vfs_pages_fetched_total,
-			#[cfg(feature = "sqlite")]
+			#[cfg(feature = "sqlite-local")]
 			sqlite_vfs_prefetch_pages_total,
-			#[cfg(feature = "sqlite")]
+			#[cfg(feature = "sqlite-local")]
 			sqlite_vfs_bytes_fetched_total,
-			#[cfg(feature = "sqlite")]
+			#[cfg(feature = "sqlite-local")]
 			sqlite_vfs_prefetch_bytes_total,
-			#[cfg(feature = "sqlite")]
+			#[cfg(feature = "sqlite-local")]
 			sqlite_vfs_get_pages_duration_seconds,
-			#[cfg(feature = "sqlite")]
+			#[cfg(feature = "sqlite-local")]
 			sqlite_vfs_commit_total,
-			#[cfg(feature = "sqlite")]
+			#[cfg(feature = "sqlite-local")]
 			sqlite_vfs_commit_phase_duration_seconds_total,
-			#[cfg(feature = "sqlite")]
+			#[cfg(feature = "sqlite-local")]
 			sqlite_vfs_commit_duration_seconds_total,
-			#[cfg(feature = "sqlite")]
+			#[cfg(feature = "sqlite-local")]
 			sqlite_read_pool_active_readers,
-			#[cfg(feature = "sqlite")]
+			#[cfg(feature = "sqlite-local")]
 			sqlite_read_pool_idle_readers,
-			#[cfg(feature = "sqlite")]
+			#[cfg(feature = "sqlite-local")]
 			sqlite_read_pool_read_wait_duration_seconds,
-			#[cfg(feature = "sqlite")]
+			#[cfg(feature = "sqlite-local")]
 			sqlite_read_pool_write_wait_duration_seconds,
-			#[cfg(feature = "sqlite")]
+			#[cfg(feature = "sqlite-local")]
 			sqlite_read_pool_routed_read_queries_total,
-			#[cfg(feature = "sqlite")]
+			#[cfg(feature = "sqlite-local")]
 			sqlite_read_pool_write_fallback_queries_total,
-			#[cfg(feature = "sqlite")]
+			#[cfg(feature = "sqlite-local")]
 			sqlite_read_pool_manual_transaction_duration_seconds,
-			#[cfg(feature = "sqlite")]
+			#[cfg(feature = "sqlite-local")]
 			sqlite_read_pool_reader_opens_total,
-			#[cfg(feature = "sqlite")]
+			#[cfg(feature = "sqlite-local")]
 			sqlite_read_pool_reader_closes_total,
-			#[cfg(feature = "sqlite")]
+			#[cfg(feature = "sqlite-local")]
 			sqlite_read_pool_rejected_reader_mutations_total,
-			#[cfg(feature = "sqlite")]
+			#[cfg(feature = "sqlite-local")]
 			sqlite_read_pool_mode_transitions_total,
 		})
 	}
@@ -761,7 +761,7 @@ impl ActorMetrics {
 	}
 }
 
-#[cfg(feature = "sqlite")]
+#[cfg(feature = "sqlite-local")]
 impl rivetkit_sqlite::vfs::SqliteVfsMetrics for ActorMetrics {
 	fn record_resolve_pages(&self, requested_pages: u64) {
 		let Some(inner) = self.inner.as_ref().as_ref() else {
@@ -957,12 +957,12 @@ fn duration_ms(duration: Duration) -> f64 {
 	duration.as_secs_f64() * 1000.0
 }
 
-#[cfg(feature = "sqlite")]
+#[cfg(feature = "sqlite-local")]
 fn ns_to_seconds(duration_ns: u64) -> f64 {
 	Duration::from_nanos(duration_ns).as_secs_f64()
 }
 
-#[cfg(feature = "sqlite")]
+#[cfg(feature = "sqlite-local")]
 fn sqlite_pool_wait_buckets() -> Vec<f64> {
 	vec![
 		0.000_1, 0.000_5, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5,

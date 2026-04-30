@@ -269,16 +269,28 @@ pub fn stringify_to_rivet(message: &protocol::ToRivet) -> String {
 				val.request_id
 			)
 		}
-		protocol::ToRivet::ToRivetSqliteGetPageRangeRequest(val) => {
-			format!(
-				"ToRivetSqliteGetPageRangeRequest{{requestId: {}}}",
-				val.request_id
-			)
-		}
 		protocol::ToRivet::ToRivetSqliteCommitRequest(val) => {
 			format!(
 				"ToRivetSqliteCommitRequest{{requestId: {}}}",
 				val.request_id
+			)
+		}
+		protocol::ToRivet::ToRivetSqliteExecRequest(val) => {
+			format!(
+				"ToRivetSqliteExecRequest{{requestId: {}, actorId: \"{}\", generation: {}}}",
+				val.request_id, val.data.actor_id, val.data.generation
+			)
+		}
+		protocol::ToRivet::ToRivetSqliteExecuteRequest(val) => {
+			format!(
+				"ToRivetSqliteExecuteRequest{{requestId: {}, actorId: \"{}\", generation: {}}}",
+				val.request_id, val.data.actor_id, val.data.generation
+			)
+		}
+		protocol::ToRivet::ToRivetSqliteExecuteWriteRequest(val) => {
+			format!(
+				"ToRivetSqliteExecuteWriteRequest{{requestId: {}, actorId: \"{}\", generation: {}}}",
+				val.request_id, val.data.actor_id, val.data.generation
 			)
 		}
 		protocol::ToRivet::ToRivetTunnelMessage(val) => {
@@ -327,15 +339,24 @@ pub fn stringify_to_envoy(message: &protocol::ToEnvoy) -> String {
 				val.request_id
 			)
 		}
-		protocol::ToEnvoy::ToEnvoySqliteGetPageRangeResponse(val) => {
-			format!(
-				"ToEnvoySqliteGetPageRangeResponse{{requestId: {}}}",
-				val.request_id
-			)
-		}
 		protocol::ToEnvoy::ToEnvoySqliteCommitResponse(val) => {
 			format!(
 				"ToEnvoySqliteCommitResponse{{requestId: {}}}",
+				val.request_id
+			)
+		}
+		protocol::ToEnvoy::ToEnvoySqliteExecResponse(val) => {
+			format!("ToEnvoySqliteExecResponse{{requestId: {}}}", val.request_id)
+		}
+		protocol::ToEnvoy::ToEnvoySqliteExecuteResponse(val) => {
+			format!(
+				"ToEnvoySqliteExecuteResponse{{requestId: {}}}",
+				val.request_id
+			)
+		}
+		protocol::ToEnvoy::ToEnvoySqliteExecuteWriteResponse(val) => {
+			format!(
+				"ToEnvoySqliteExecuteWriteResponse{{requestId: {}}}",
 				val.request_id
 			)
 		}

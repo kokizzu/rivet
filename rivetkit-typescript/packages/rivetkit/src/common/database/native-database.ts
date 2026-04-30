@@ -5,13 +5,43 @@ import type {
 	SqliteExecuteResult,
 } from "./config";
 
-interface NativeBindParam {
-	kind: "null" | "int" | "float" | "text" | "blob";
-	intValue?: number;
-	floatValue?: number;
-	textValue?: string;
-	blobValue?: Buffer;
-}
+type NativeBindNoValues = {
+	intValue?: never;
+	floatValue?: never;
+	textValue?: never;
+	blobValue?: never;
+};
+
+type NativeBindParam =
+	| ({ kind: "null" } & NativeBindNoValues)
+	| {
+			kind: "int";
+			intValue: number;
+			floatValue?: never;
+			textValue?: never;
+			blobValue?: never;
+	  }
+	| {
+			kind: "float";
+			intValue?: never;
+			floatValue: number;
+			textValue?: never;
+			blobValue?: never;
+	  }
+	| {
+			kind: "text";
+			intValue?: never;
+			floatValue?: never;
+			textValue: string;
+			blobValue?: never;
+	  }
+	| {
+			kind: "blob";
+			intValue?: never;
+			floatValue?: never;
+			textValue?: never;
+			blobValue: Buffer;
+	  };
 
 interface NativeExecResult {
 	columns: string[];
@@ -230,11 +260,23 @@ export function wrapJsNativeDatabase(
 	const gate = new NativeCloseGate();
 	let closePromise: Promise<void> | undefined;
 	let writeModeDepth = 0;
+	let lastInsertRowId: number | null = null;
 
 	const executeNative = async (
 		sql: string,
 		params?: SqliteBindings,
 	): Promise<SqliteExecuteResult> => {
+		const lastInsertRowIdColumn = lastInsertRowIdColumnName(sql);
+		if (lastInsertRowIdColumn) {
+			return {
+				columns: [lastInsertRowIdColumn],
+				rows: [[lastInsertRowId ?? 0]],
+				changes: 0,
+				lastInsertRowId,
+				route: "writeFallback",
+			};
+		}
+
 		const release = gate.enter();
 		try {
 			const nativeParams = toNativeBindings(sql, params);
@@ -242,6 +284,9 @@ export function wrapJsNativeDatabase(
 				writeModeDepth > 0
 					? await database.executeWrite(sql, nativeParams)
 					: await database.execute(sql, nativeParams);
+			if (result.lastInsertRowId !== undefined) {
+				lastInsertRowId = result.lastInsertRowId;
+			}
 			return {
 				...result,
 				route: normalizeExecuteRoute(result.route),
@@ -300,4 +345,26 @@ export function wrapJsNativeDatabase(
 			await closePromise;
 		},
 	};
+}
+
+function lastInsertRowIdColumnName(sql: string): string | undefined {
+	const match = sql.match(
+		/^\s*SELECT\s+last_insert_rowid\s*\(\s*\)\s*(?:AS\s+("[^"]+"|`[^`]+`|\[[^\]]+\]|\w+))?\s*;?\s*$/i,
+	);
+	if (!match) {
+		return undefined;
+	}
+
+	const alias = match[1];
+	if (!alias) {
+		return "last_insert_rowid()";
+	}
+	if (
+		(alias.startsWith('"') && alias.endsWith('"')) ||
+		(alias.startsWith("`") && alias.endsWith("`")) ||
+		(alias.startsWith("[") && alias.endsWith("]"))
+	) {
+		return alias.slice(1, -1);
+	}
+	return alias;
 }

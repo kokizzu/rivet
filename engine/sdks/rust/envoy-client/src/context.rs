@@ -4,7 +4,7 @@ use std::sync::Mutex as StdMutex;
 use std::sync::atomic::AtomicBool;
 
 use rivet_envoy_protocol as protocol;
-use rivet_util::async_counter::AsyncCounter;
+use crate::async_counter::AsyncCounter;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 use tokio::sync::watch;

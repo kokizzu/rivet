@@ -22,6 +22,7 @@ COPY . .
 RUN if [ "$BUILD_TARGET" = "engine" ] && [ "$BUILD_FRONTEND" = "true" ]; then \
         export NODE_OPTIONS="--max-old-space-size=8192" && \
         export SKIP_NAPI_BUILD=1 && \
+        export SKIP_WASM_BUILD=1 && \
         pnpm install --ignore-scripts && \
         VITE_APP_API_URL="${VITE_APP_API_URL}" VITE_FEATURE_FLAGS="${VITE_FEATURE_FLAGS}" npx turbo build -F @rivetkit/engine-frontend; \
     fi
@@ -49,7 +50,7 @@ RUN --mount=type=cache,id=cargo-registry-linux-arm64-gnu,target=/usr/local/cargo
     fi && \
     mkdir -p /artifacts && \
     if [ "$BUILD_TARGET" = "engine" ]; then \
-        cargo build --bin rivet-engine $CARGO_FLAG --target aarch64-unknown-linux-gnu && \
+        cargo build -p rivet-engine --bin rivet-engine $CARGO_FLAG --target aarch64-unknown-linux-gnu && \
         cp target/aarch64-unknown-linux-gnu/$PROFILE_DIR/rivet-engine /artifacts/rivet-engine-aarch64-unknown-linux-gnu; \
     elif [ "$BUILD_TARGET" = "rivetkit-napi" ]; then \
         cd rivetkit-typescript/packages/rivetkit-napi && \

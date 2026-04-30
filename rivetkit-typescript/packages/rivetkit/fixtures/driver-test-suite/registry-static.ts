@@ -19,7 +19,7 @@ import {
 	promiseActor,
 	syncActionActor,
 } from "./action-types";
-import { dbActorRaw } from "./actor-db-raw";
+import { dbActorRaw, dbRemoteLifecycleProbe } from "./actor-db-raw";
 import { onStateChangeActor } from "./actor-onstatechange";
 import { connErrorSerializationActor } from "./conn-error-serialization";
 import {
@@ -319,6 +319,7 @@ export const registry = setup({
 		workflowSpawnParentActor,
 		// From actor-db-raw.ts
 		dbActorRaw,
+		dbRemoteLifecycleProbe,
 		// From db-lifecycle.ts
 		dbLifecycle,
 		dbLifecycleFailing,

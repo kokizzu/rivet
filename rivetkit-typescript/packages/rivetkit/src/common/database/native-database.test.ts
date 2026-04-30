@@ -132,6 +132,63 @@ describe("wrapJsNativeDatabase", () => {
 		});
 	});
 
+	test("normalizes supported sqlite bind values", async () => {
+		const native = new FakeNativeDatabase();
+		const db = wrapJsNativeDatabase(native);
+		const blob = new Uint8Array([1, 2, 3]);
+
+		const query = db.query("SELECT ?, ?, ?, ?, ?, ?, ?", [
+			1n,
+			true,
+			"text",
+			1.5,
+			null,
+			undefined,
+			blob,
+		]);
+
+		expect(native.executeCalls[0]?.params).toEqual([
+			{ kind: "int", intValue: 1 },
+			{ kind: "int", intValue: 1 },
+			{ kind: "text", textValue: "text" },
+			{ kind: "float", floatValue: 1.5 },
+			{ kind: "null" },
+			{ kind: "null" },
+			{ kind: "blob", blobValue: Buffer.from(blob) },
+		]);
+
+		native.resolveNext({ columns: ["value"], rows: [[1]] });
+
+		await expect(query).resolves.toEqual({
+			columns: ["value"],
+			rows: [[1]],
+		});
+	});
+
+	test("normalizes native execute routes and rejects unsupported routes", async () => {
+		const native = new FakeNativeDatabase();
+		const db = wrapJsNativeDatabase(native);
+
+		const read = db.execute("SELECT 1");
+		native.resolveNext({ route: "read" });
+		await expect(read).resolves.toMatchObject({ route: "read" });
+
+		const write = db.execute("INSERT INTO test VALUES (1)");
+		native.resolveNext({ route: "write" });
+		await expect(write).resolves.toMatchObject({ route: "write" });
+
+		const fallback = db.execute("SELECT last_insert_rowid()");
+		await expect(fallback).resolves.toMatchObject({
+			route: "writeFallback",
+		});
+
+		const unsupported = db.execute("SELECT 2");
+		native.resolveNext({ route: "custom" });
+		await expect(unsupported).rejects.toThrow(
+			"unsupported sqlite execute route: custom",
+		);
+	});
+
 	test("close waits for admitted native calls and rejects new work", async () => {
 		const native = new FakeNativeDatabase();
 		const db = wrapJsNativeDatabase(native);

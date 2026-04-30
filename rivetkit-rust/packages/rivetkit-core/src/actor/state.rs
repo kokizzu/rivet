@@ -1,9 +1,13 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::{Duration, Instant as StdInstant};
+use std::time::Duration;
+
+use crate::time::Instant as StdInstant;
+use crate::time::sleep;
 
 use anyhow::{Context, Result};
 use rivetkit_actor_persist::{generated::v4 as persist_v4, versioned as persist_versioned};
+#[cfg(not(feature = "wasm-runtime"))]
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -17,11 +21,13 @@ use crate::actor::messages::StateDelta;
 use crate::actor::persist::{
 	decode_latest_with_embedded_version, encode_latest_with_embedded_version,
 };
-use crate::actor::task::{
-	LIFECYCLE_EVENT_INBOX_CHANNEL, LifecycleEvent, actor_channel_overloaded_error,
-};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::actor::task::{LIFECYCLE_EVENT_INBOX_CHANNEL, actor_channel_overloaded_error};
+use crate::actor::task::LifecycleEvent;
 use crate::actor::task_types::StateMutationReason;
 use crate::error::ActorRuntime;
+#[cfg(feature = "wasm-runtime")]
+use crate::runtime::RuntimeSpawner;
 use crate::types::SaveStateOpts;
 
 const LAST_PUSHED_ALARM_VERSION: u16 = 1;
@@ -106,7 +112,7 @@ impl ActorContext {
 		} else {
 			let delay = self.compute_save_delay(None);
 			if !delay.is_zero() {
-				tokio::time::sleep(delay).await;
+				sleep(delay).await;
 			}
 			self.persist_if_dirty().await
 		};
@@ -129,8 +135,51 @@ impl ActorContext {
 	/// [`Self::request_save_and_wait`] when the caller must observe
 	/// save-request delivery failures.
 	pub fn request_save(&self, opts: RequestSaveOpts) {
+		#[cfg(target_arch = "wasm32")]
+		{
+			self.request_save_best_effort(opts);
+		}
+
+		#[cfg(not(target_arch = "wasm32"))]
 		if let Err(error) = self.request_save_with_revision(opts) {
 			tracing::warn!(?error, "failed to request actor state save");
+		}
+	}
+
+	#[cfg(target_arch = "wasm32")]
+	fn request_save_best_effort(&self, opts: RequestSaveOpts) {
+		let immediate = opts.immediate;
+		let _save_request_revision = self.0.save_request_revision.fetch_add(1, Ordering::SeqCst) + 1;
+		self.notify_request_save_hooks(opts);
+		let already_requested = self.0.save_requested.swap(true, Ordering::SeqCst);
+		let immediate_already_requested = if immediate {
+			self.0.save_requested_immediate.swap(true, Ordering::SeqCst)
+		} else {
+			self.0.save_requested_immediate.load(Ordering::SeqCst)
+		};
+
+		if let Some(max_wait_ms) = opts.max_wait_ms {
+			let deadline = StdInstant::now() + Duration::from_millis(u64::from(max_wait_ms));
+			let mut requested_deadline = self.0.save_requested_within_deadline.lock();
+			*requested_deadline = Some(match *requested_deadline {
+				Some(existing) => existing.min(deadline),
+				None => deadline,
+			});
+		}
+
+		let Some(sender) = self.lifecycle_event_sender() else {
+			return;
+		};
+
+		if opts.max_wait_ms.is_none()
+			&& already_requested
+			&& (!immediate || immediate_already_requested)
+		{
+			return;
+		}
+
+		if let Ok(permit) = sender.try_reserve() {
+			permit.send(LifecycleEvent::SaveRequested { immediate });
 		}
 	}
 
@@ -185,6 +234,9 @@ impl ActorContext {
 				permit.send(LifecycleEvent::SaveRequested { immediate });
 				Ok(save_request_revision)
 			}
+			#[cfg(target_arch = "wasm32")]
+			Err(_) => Ok(save_request_revision),
+			#[cfg(not(target_arch = "wasm32"))]
 			Err(_) => Err(actor_channel_overloaded_error(
 				LIFECYCLE_EVENT_INBOX_CHANNEL,
 				self.0.lifecycle_event_inbox_capacity,
@@ -212,8 +264,8 @@ impl ActorContext {
 		self.0.save_requested_immediate.load(Ordering::SeqCst)
 	}
 
-	pub(crate) fn save_deadline(&self, immediate: bool) -> tokio::time::Instant {
-		self.compute_save_deadline(immediate).into()
+	pub(crate) fn save_deadline(&self, immediate: bool) -> StdInstant {
+		self.compute_save_deadline(immediate)
 	}
 
 	pub(crate) fn compute_save_deadline(&self, immediate: bool) -> StdInstant {
@@ -546,10 +598,6 @@ impl ActorContext {
 			return;
 		}
 
-		let Ok(tokio_handle) = Handle::try_current() else {
-			return;
-		};
-
 		let delay = self.compute_save_delay(max_wait);
 		let scheduled_at = StdInstant::now() + delay;
 
@@ -567,20 +615,29 @@ impl ActorContext {
 		// Intentionally detached but abortable: pending delayed saves are
 		// retained in `pending_save`, replaced by newer saves, and awaited at
 		// shutdown through the state save guard.
-		let handle = tokio_handle.spawn(
-			async move {
-				if !delay.is_zero() {
-					tokio::time::sleep(delay).await;
-				}
-
-				state.take_pending_save();
-
-				if let Err(error) = state.persist_if_dirty().await {
-					tracing::error!(?error, "failed to persist actor state");
-				}
+		let task = async move {
+			if !delay.is_zero() {
+				sleep(delay).await;
 			}
-			.in_current_span(),
-		);
+
+			state.take_pending_save();
+
+			if let Err(error) = state.persist_if_dirty().await {
+				tracing::error!(?error, "failed to persist actor state");
+			}
+		}
+		.in_current_span();
+
+		#[cfg(not(feature = "wasm-runtime"))]
+		let handle = {
+			let Ok(tokio_handle) = Handle::try_current() else {
+				return;
+			};
+			tokio_handle.spawn(task)
+		};
+
+		#[cfg(feature = "wasm-runtime")]
+		let handle = RuntimeSpawner::spawn(task);
 
 		*pending_save = Some(PendingSave {
 			scheduled_at,
@@ -597,29 +654,35 @@ impl ActorContext {
 	pub(crate) fn persist_now_tracked(&self, description: &'static str) {
 		self.clear_pending_save();
 
-		let Ok(tokio_handle) = Handle::try_current() else {
-			tracing::warn!(
-				description,
-				"skipping tracked actor state persistence without runtime"
-			);
-			return;
-		};
-
 		let state = self.clone();
 		let mut tracked_persist = self.0.tracked_persist.lock();
 		let previous = tracked_persist.take();
-		let handle = tokio_handle.spawn(
-			async move {
-				if let Some(previous) = previous {
-					let _ = previous.await;
-				}
-
-				if let Err(error) = state.persist_state(SaveStateOpts { immediate: true }).await {
-					tracing::error!(?error, description, "failed to persist actor state");
-				}
+		let task = async move {
+			if let Some(previous) = previous {
+				let _ = previous.await;
 			}
-			.in_current_span(),
-		);
+
+			if let Err(error) = state.persist_state(SaveStateOpts { immediate: true }).await {
+				tracing::error!(?error, description, "failed to persist actor state");
+			}
+		}
+		.in_current_span();
+
+		#[cfg(not(feature = "wasm-runtime"))]
+		let handle = {
+			let Ok(tokio_handle) = Handle::try_current() else {
+				tracing::warn!(
+					description,
+					"skipping tracked actor state persistence without runtime"
+				);
+				return;
+			};
+			tokio_handle.spawn(task)
+		};
+
+		#[cfg(feature = "wasm-runtime")]
+		let handle = RuntimeSpawner::spawn(task);
+
 		*tracked_persist = Some(handle);
 	}
 

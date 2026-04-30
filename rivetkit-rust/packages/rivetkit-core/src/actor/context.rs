@@ -3,7 +3,9 @@ use std::future::Future;
 use std::sync::Weak;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
+
+use crate::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as AnyhowContext, Result};
 use futures::future::BoxFuture;
@@ -14,7 +16,6 @@ use scc::HashMap as SccHashMap;
 use tokio::runtime::Handle;
 use tokio::sync::{Mutex as AsyncMutex, Notify, OnceCell, broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
-use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::ActorConfig;
@@ -31,10 +32,12 @@ use crate::actor::queue::{QueueInspectorUpdateCallback, QueueMetadata, QueueWait
 use crate::actor::schedule::{InternalKeepAwakeCallback, LocalAlarmCallback};
 use crate::actor::sleep::{CanSleep, SleepState};
 use crate::actor::state::{PendingSave, PersistedActor, RequestSaveOpts};
-use crate::actor::task::{
-	LIFECYCLE_EVENT_INBOX_CHANNEL, LifecycleEvent, actor_channel_overloaded_error,
-};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::actor::task::{LIFECYCLE_EVENT_INBOX_CHANNEL, actor_channel_overloaded_error};
+use crate::actor::task::LifecycleEvent;
 use crate::actor::task_types::UserTaskKind;
+#[cfg(feature = "wasm-runtime")]
+use crate::actor::work_registry::CountGuard;
 use crate::actor::work_registry::RegionGuard;
 use crate::error::{ActorLifecycle as ActorLifecycleError, ActorRuntime};
 use crate::inspector::{Inspector, InspectorSnapshot};
@@ -69,8 +72,8 @@ pub(crate) struct ActorContextInner {
 	pub(super) save_requested: AtomicBool,
 	pub(super) save_requested_immediate: AtomicBool,
 	// Forced-sync: debounce bookkeeping is updated from sync save-request paths.
-	pub(super) save_requested_within_deadline: Mutex<Option<std::time::Instant>>,
-	pub(super) last_save_at: Mutex<Option<std::time::Instant>>,
+	pub(super) save_requested_within_deadline: Mutex<Option<crate::time::Instant>>,
+	pub(super) last_save_at: Mutex<Option<crate::time::Instant>>,
 	pub(super) pending_save: Mutex<Option<PendingSave>>,
 	pub(super) tracked_persist: Mutex<Option<JoinHandle<()>>>,
 	pub(super) save_guard: AsyncMutex<()>,
@@ -215,19 +218,21 @@ impl ActorContext {
 		)
 	}
 
-		pub(crate) fn build(
-			actor_id: String,
-			name: String,
-			key: ActorKey,
-			region: String,
-			config: ActorConfig,
-			kv: Kv,
-			mut sql: SqliteDb,
-		) -> Self {
-			let metrics = ActorMetrics::new(actor_id.clone(), name.clone());
-			#[cfg(feature = "sqlite")]
-			sql.set_vfs_metrics(Arc::new(metrics.clone()));
-			let diagnostics = ActorDiagnostics::new(actor_id.clone());
+	pub(crate) fn build(
+		actor_id: String,
+		name: String,
+		key: ActorKey,
+		region: String,
+		config: ActorConfig,
+		kv: Kv,
+		sql: SqliteDb,
+	) -> Self {
+		let metrics = ActorMetrics::new(actor_id.clone(), name.clone());
+		#[cfg(feature = "sqlite-local")]
+		let mut sql = sql;
+		#[cfg(feature = "sqlite-local")]
+		sql.set_vfs_metrics(Arc::new(metrics.clone()));
+		let diagnostics = ActorDiagnostics::new(actor_id.clone());
 		let lifecycle_event_inbox_capacity = config.lifecycle_event_inbox_capacity;
 		let state_save_interval = config.state_save_interval;
 		let abort_signal = CancellationToken::new();
@@ -445,11 +450,14 @@ impl ActorContext {
 			return Err(ActorLifecycleError::Stopping.build())
 				.context("destroy already requested for this generation");
 		}
-		// Reuse the shared teardown sequence used by the registry shutdown
-		// path so future changes to `mark_destroy_requested` cannot drift.
-		// `destroy_requested` is already true from the swap above; the redundant
+		// Reuse the shared teardown sequence used by the registry shutdown path
+		// so future changes to `mark_destroy_requested` cannot drift.
+		// `destroy_requested` is already true from the swap above. The redundant
 		// `store(true)` inside is harmless.
+		#[cfg(not(feature = "wasm-runtime"))]
 		self.mark_destroy_requested();
+		#[cfg(feature = "wasm-runtime")]
+		self.mark_destroy_requested_without_spawn();
 
 		let ctx = self.clone();
 		if Handle::try_current().is_ok() {
@@ -471,6 +479,14 @@ impl ActorContext {
 	pub fn mark_destroy_requested(&self) {
 		self.cancel_sleep_timer();
 		self.flush_on_shutdown();
+		self.0.destroy_requested.store(true, Ordering::SeqCst);
+		self.0.destroy_completed.store(false, Ordering::SeqCst);
+		self.0.abort_signal.cancel();
+	}
+
+	#[cfg(feature = "wasm-runtime")]
+	fn mark_destroy_requested_without_spawn(&self) {
+		self.cancel_sleep_timer();
 		self.0.destroy_requested.store(true, Ordering::SeqCst);
 		self.0.destroy_completed.store(false, Ordering::SeqCst);
 		self.0.abort_signal.cancel();
@@ -516,6 +532,7 @@ impl ActorContext {
 		false
 	}
 
+	#[cfg(not(feature = "wasm-runtime"))]
 	pub fn wait_until(&self, future: impl Future<Output = ()> + Send + 'static) {
 		if Handle::try_current().is_err() {
 			tracing::warn!("skipping wait_until without a tokio runtime");
@@ -531,6 +548,23 @@ impl ActorContext {
 			let started_at = Instant::now();
 			future.await;
 			ctx.record_user_task_finished(UserTaskKind::WaitUntil, started_at.elapsed());
+			ctx.reset_sleep_timer();
+		});
+	}
+
+	#[cfg(feature = "wasm-runtime")]
+	pub fn wait_until(&self, future: impl Future<Output = ()> + 'static) {
+		let counter = self.0.sleep.work.shutdown_counter.clone();
+		counter.increment();
+		let guard = CountGuard::from_incremented(counter);
+		let ctx = self.clone();
+		wasm_bindgen_futures::spawn_local(async move {
+			let _guard = guard;
+			ctx.record_user_task_started(UserTaskKind::WaitUntil);
+			let started_at = Instant::now();
+			future.await;
+			ctx.record_user_task_finished(UserTaskKind::WaitUntil, started_at.elapsed());
+			ctx.reset_sleep_timer();
 		});
 	}
 
@@ -653,8 +687,12 @@ impl ActorContext {
 	/// so overdue scheduled work enters the normal actor event loop.
 	pub async fn drain_overdue_scheduled_events(&self) -> Result<()> {
 		for event in self.due_scheduled_events(now_timestamp_ms()) {
-			self.dispatch_scheduled_action(&event.event_id, event.action, event.args)
-				.await;
+			self.dispatch_scheduled_action(
+				&event.event_id,
+				event.action,
+				event.args.unwrap_or_default(),
+			)
+			.await;
 		}
 
 		self.sync_alarm_logged();
@@ -816,6 +854,34 @@ impl ActorContext {
 	{
 		let conn = self
 			.connect_with_state(params, is_hibernatable, hibernation, request, create_state)
+			.await?;
+		self.record_connections_updated();
+		self.reset_sleep_timer();
+		Ok(conn)
+	}
+
+	pub(crate) async fn connect_conn_with_prepare<F, P>(
+		&self,
+		params: Vec<u8>,
+		is_hibernatable: bool,
+		hibernation: Option<HibernatableConnectionMetadata>,
+		request: Option<Request>,
+		create_state: F,
+		prepare_connection: P,
+	) -> Result<ConnHandle>
+	where
+		F: Future<Output = Result<Vec<u8>>> + Send,
+		P: FnOnce(&ConnHandle) -> Result<()>,
+	{
+		let conn = self
+			.connect_with_state_and_prepare(
+				params,
+				is_hibernatable,
+				hibernation,
+				request,
+				create_state,
+				prepare_connection,
+			)
 			.await?;
 		self.record_connections_updated();
 		self.reset_sleep_timer();
@@ -1184,6 +1250,10 @@ impl ActorContext {
 			return;
 		}
 
+		#[cfg(feature = "wasm-runtime")]
+		return;
+
+		#[cfg(not(feature = "wasm-runtime"))]
 		self.reset_sleep_timer_state();
 	}
 
@@ -1370,17 +1440,23 @@ impl ActorContext {
 	}
 
 	fn try_send_lifecycle_event(&self, event: LifecycleEvent, operation: &'static str) {
+		#[cfg(target_arch = "wasm32")]
+		let _ = operation;
+
 		let Some(sender) = self.0.lifecycle_events.read().clone() else {
 			return;
 		};
 
 		match sender.try_reserve() {
-			Ok(permit) => {
-				permit.send(event);
-			}
-			Err(_) => {
-				let _ = actor_channel_overloaded_error(
-					LIFECYCLE_EVENT_INBOX_CHANNEL,
+				Ok(permit) => {
+					permit.send(event);
+				}
+				#[cfg(target_arch = "wasm32")]
+				Err(_) => {}
+				#[cfg(not(target_arch = "wasm32"))]
+				Err(_) => {
+					let _ = actor_channel_overloaded_error(
+						LIFECYCLE_EVENT_INBOX_CHANNEL,
 					self.0.lifecycle_event_inbox_capacity,
 					operation,
 					Some(&self.0.metrics),

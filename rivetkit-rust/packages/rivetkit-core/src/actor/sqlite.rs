@@ -1,122 +1,97 @@
 use std::collections::HashSet;
 use std::io::Cursor;
-#[cfg(feature = "sqlite")]
+#[cfg(feature = "sqlite-local")]
 use std::sync::Arc;
-#[cfg(feature = "sqlite")]
+#[cfg(feature = "sqlite-local")]
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-#[cfg(feature = "sqlite")]
+#[cfg(feature = "sqlite-local")]
 use parking_lot::Mutex;
-use rivet_envoy_client::handle::EnvoyHandle;
 use rivet_envoy_client::protocol;
+use rivet_envoy_client::{
+	handle::EnvoyHandle, utils::RemoteSqliteIndeterminateResultError,
+};
+pub use rivetkit_sqlite_types::{
+	BindParam, ColumnValue, ExecResult, ExecuteResult, ExecuteRoute, QueryResult,
+};
 use serde::Serialize;
 use serde_json::{Map as JsonMap, Value as JsonValue};
-#[cfg(feature = "sqlite")]
-use tokio::task::JoinHandle;
-#[cfg(feature = "sqlite")]
+#[cfg(feature = "sqlite-local")]
 use tokio::sync::Mutex as AsyncMutex;
-#[cfg(feature = "sqlite")]
+#[cfg(feature = "sqlite-local")]
+use tokio::task::JoinHandle;
+#[cfg(feature = "sqlite-local")]
 use tokio::time::{interval, timeout};
-#[cfg(feature = "sqlite")]
+#[cfg(feature = "sqlite-local")]
 use tracing::Instrument;
 
 use crate::error::SqliteRuntimeError;
 
-#[cfg(feature = "sqlite")]
-pub use rivetkit_sqlite::query::{
-	BindParam, ColumnValue, ExecResult, ExecuteResult, ExecuteRoute, QueryResult,
-};
-#[cfg(feature = "sqlite")]
+#[cfg(feature = "sqlite-local")]
 use rivetkit_sqlite::{
 	database::{NativeDatabaseHandle, open_database_from_envoy},
 	optimization_flags::sqlite_optimization_flags,
-	vfs::{SqliteVfsMetrics, VfsPreloadHintSnapshot},
+	vfs::{SqliteVfsMetrics, SqliteVfsMetricsSnapshot, VfsPreloadHintSnapshot},
 };
 
-#[cfg(feature = "sqlite")]
+#[cfg(not(feature = "sqlite-local"))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SqliteVfsMetricsSnapshot {
+	pub request_build_ns: u64,
+	pub serialize_ns: u64,
+	pub transport_ns: u64,
+	pub state_update_ns: u64,
+	pub total_ns: u64,
+	pub commit_count: u64,
+}
+
+#[cfg(feature = "sqlite-local")]
 const PRELOAD_HINT_FLUSH_INTERVAL: Duration = Duration::from_secs(30);
-#[cfg(feature = "sqlite")]
+#[cfg(feature = "sqlite-local")]
 const PRELOAD_HINT_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
-
-#[cfg(not(feature = "sqlite"))]
-#[derive(Clone, Debug, PartialEq)]
-pub enum BindParam {
-	Null,
-	Integer(i64),
-	Float(f64),
-	Text(String),
-	Blob(Vec<u8>),
-}
-
-#[cfg(not(feature = "sqlite"))]
-#[derive(Clone, Debug, PartialEq)]
-pub struct ExecResult {
-	pub changes: i64,
-}
-
-#[cfg(not(feature = "sqlite"))]
-#[derive(Clone, Debug, PartialEq)]
-pub struct QueryResult {
-	pub columns: Vec<String>,
-	pub rows: Vec<Vec<ColumnValue>>,
-}
-
-#[cfg(not(feature = "sqlite"))]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ExecuteRoute {
-	Read,
-	Write,
-	WriteFallback,
-}
-
-#[cfg(not(feature = "sqlite"))]
-#[derive(Clone, Debug, PartialEq)]
-pub struct ExecuteResult {
-	pub columns: Vec<String>,
-	pub rows: Vec<Vec<ColumnValue>>,
-	pub changes: i64,
-	pub last_insert_row_id: Option<i64>,
-	pub route: ExecuteRoute,
-}
-
-#[cfg(not(feature = "sqlite"))]
-#[derive(Clone, Debug, PartialEq)]
-pub enum ColumnValue {
-	Null,
-	Integer(i64),
-	Float(f64),
-	Text(String),
-	Blob(Vec<u8>),
-}
 
 #[derive(Clone)]
 pub struct SqliteRuntimeConfig {
 	pub handle: EnvoyHandle,
 	pub actor_id: String,
-	pub startup_data: Option<protocol::SqliteStartupData>,
+	pub generation: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SqliteBackend {
+	LocalNative,
+	RemoteEnvoy,
+	Unavailable,
+}
+
+impl Default for SqliteBackend {
+	fn default() -> Self {
+		Self::Unavailable
+	}
 }
 
 #[derive(Clone, Default)]
 pub struct SqliteDb {
 	handle: Option<EnvoyHandle>,
 	actor_id: Option<String>,
-	startup_data: Option<protocol::SqliteStartupData>,
+	generation: Option<u64>,
+	backend: SqliteBackend,
 	/// Mirrors the user's actor-config `db({...})` declaration. The envoy
 	/// always sets up sqlite storage under the hood, so handle/actor_id are
 	/// not a reliable signal for whether the user opted in; this flag is.
 	enabled: bool,
-	#[cfg(feature = "sqlite")]
-	// Forced-sync: native SQLite handles are read from synchronous diagnostic
-	// accessors and closed from cleanup paths.
+	#[cfg(feature = "sqlite-local")]
+	// Forced-sync: native SQLite handles are used inside spawn_blocking and
+	// synchronous diagnostic accessors.
 	db: Arc<Mutex<Option<NativeDatabaseHandle>>>,
-	#[cfg(feature = "sqlite")]
+	#[cfg(feature = "sqlite-local")]
 	open_lock: Arc<AsyncMutex<()>>,
-	#[cfg(feature = "sqlite")]
+	#[cfg(feature = "sqlite-local")]
 	// Forced-sync: the background task is spawned and aborted from sync cleanup
 	// paths around the native database handle.
 	preload_hint_flush_task: Arc<Mutex<Option<JoinHandle<()>>>>,
-	#[cfg(feature = "sqlite")]
+	#[cfg(feature = "sqlite-local")]
 	vfs_metrics: Option<Arc<dyn SqliteVfsMetrics>>,
 }
 
@@ -124,32 +99,46 @@ impl SqliteDb {
 	pub fn new(
 		handle: EnvoyHandle,
 		actor_id: impl Into<String>,
-		startup_data: Option<protocol::SqliteStartupData>,
 		enabled: bool,
+	) -> Self {
+		Self::new_with_remote_sqlite(handle, actor_id, None, enabled, false)
+	}
+
+	pub fn new_with_remote_sqlite(
+		handle: EnvoyHandle,
+		actor_id: impl Into<String>,
+		generation: Option<u64>,
+		enabled: bool,
+		remote_sqlite: bool,
 	) -> Self {
 		Self {
 			handle: Some(handle),
 			actor_id: Some(actor_id.into()),
-			startup_data,
+			generation,
+			backend: select_sqlite_backend(enabled, remote_sqlite),
 			enabled,
-			#[cfg(feature = "sqlite")]
+			#[cfg(feature = "sqlite-local")]
 			db: Default::default(),
-			#[cfg(feature = "sqlite")]
+			#[cfg(feature = "sqlite-local")]
 			open_lock: Default::default(),
-			#[cfg(feature = "sqlite")]
+			#[cfg(feature = "sqlite-local")]
 			preload_hint_flush_task: Default::default(),
-			#[cfg(feature = "sqlite")]
+			#[cfg(feature = "sqlite-local")]
 			vfs_metrics: None,
 		}
 	}
 
-	#[cfg(feature = "sqlite")]
+	#[cfg(feature = "sqlite-local")]
 	pub(crate) fn set_vfs_metrics(&mut self, metrics: Arc<dyn SqliteVfsMetrics>) {
 		self.vfs_metrics = Some(metrics);
 	}
 
 	pub fn is_enabled(&self) -> bool {
 		self.enabled
+	}
+
+	pub fn backend(&self) -> SqliteBackend {
+		self.backend
 	}
 
 	pub async fn get_pages(
@@ -166,78 +155,130 @@ impl SqliteDb {
 		self.handle()?.sqlite_commit(request).await
 	}
 
-	pub async fn commit_stage_begin(
-		&self,
-		request: protocol::SqliteCommitStageBeginRequest,
-	) -> Result<protocol::SqliteCommitStageBeginResponse> {
-		self.handle()?.sqlite_commit_stage_begin(request).await
-	}
-
-	pub async fn commit_stage(
-		&self,
-		request: protocol::SqliteCommitStageRequest,
-	) -> Result<protocol::SqliteCommitStageResponse> {
-		self.handle()?.sqlite_commit_stage(request).await
-	}
-
-	pub fn commit_stage_fire_and_forget(
-		&self,
-		request: protocol::SqliteCommitStageRequest,
-	) -> Result<()> {
-		self.handle()?.sqlite_commit_stage_fire_and_forget(request)
-	}
-
-	pub async fn commit_finalize(
-		&self,
-		request: protocol::SqliteCommitFinalizeRequest,
-	) -> Result<protocol::SqliteCommitFinalizeResponse> {
-		self.handle()?.sqlite_commit_finalize(request).await
-	}
-
 	pub async fn open(&self) -> Result<()> {
-		#[cfg(feature = "sqlite")]
-		{
-			let _open_guard = self.open_lock.lock().await;
-			if self.db.lock().is_some() {
-				return Ok(());
+		match self.backend {
+			SqliteBackend::LocalNative => {
+				#[cfg(feature = "sqlite-local")]
+				{
+					let _open_guard = self.open_lock.lock().await;
+					if self.db.lock().is_some() {
+						return Ok(());
+					}
+
+					let config = self.runtime_config()?;
+					let vfs_metrics = self.vfs_metrics.clone();
+					let rt_handle = tokio::runtime::Handle::try_current()
+						.context("open sqlite database requires a tokio runtime")?;
+
+					let native_db = open_database_from_envoy(
+						config.handle,
+						config.actor_id,
+						config
+							.generation
+							.ok_or_else(|| sqlite_not_configured("generation"))?,
+						rt_handle,
+						vfs_metrics,
+					)
+					.await?;
+					*self.db.lock() = Some(native_db);
+					self.ensure_preload_hint_flush_task()?;
+					Ok(())
+				}
+
+				#[cfg(not(feature = "sqlite-local"))]
+				{
+					Err(SqliteRuntimeError::Unavailable.build())
+				}
 			}
-
-			let config = self.runtime_config()?;
-			let vfs_metrics = self.vfs_metrics.clone();
-			let rt_handle = tokio::runtime::Handle::try_current()
-				.context("open sqlite database requires a tokio runtime")?;
-
-			let native_db = open_database_from_envoy(
-				config.handle,
-				config.actor_id,
-				config.startup_data,
-				rt_handle,
-				vfs_metrics,
-			)
-			.await?;
-			*self.db.lock() = Some(native_db);
-			self.ensure_preload_hint_flush_task()?;
-			Ok(())
+			SqliteBackend::RemoteEnvoy => {
+				self.remote_config()?;
+				Ok(())
+			}
+			SqliteBackend::Unavailable => Err(SqliteRuntimeError::Unavailable.build()),
 		}
+	}
 
-		#[cfg(not(feature = "sqlite"))]
-		{
-			Err(SqliteRuntimeError::Unavailable.build())
-		}
+	#[cfg(feature = "sqlite-local")]
+	async fn local_exec(&self, sql: String) -> Result<QueryResult> {
+		self.open().await?;
+		self.native_db_handle()?.exec(sql).await
+	}
+
+	#[cfg(not(feature = "sqlite-local"))]
+	async fn local_exec(&self, _sql: String) -> Result<QueryResult> {
+		Err(SqliteRuntimeError::Unavailable.build())
+	}
+
+	#[cfg(feature = "sqlite-local")]
+	async fn local_query(&self, sql: String, params: Option<Vec<BindParam>>) -> Result<QueryResult> {
+		self.open().await?;
+		self.native_db_handle()?.query(sql, params).await
+	}
+
+	#[cfg(not(feature = "sqlite-local"))]
+	async fn local_query(
+		&self,
+		_sql: String,
+		_params: Option<Vec<BindParam>>,
+	) -> Result<QueryResult> {
+		Err(SqliteRuntimeError::Unavailable.build())
+	}
+
+	#[cfg(feature = "sqlite-local")]
+	async fn local_run(&self, sql: String, params: Option<Vec<BindParam>>) -> Result<ExecResult> {
+		self.open().await?;
+		self.native_db_handle()?.run(sql, params).await
+	}
+
+	#[cfg(not(feature = "sqlite-local"))]
+	async fn local_run(&self, _sql: String, _params: Option<Vec<BindParam>>) -> Result<ExecResult> {
+		Err(SqliteRuntimeError::Unavailable.build())
+	}
+
+	#[cfg(feature = "sqlite-local")]
+	async fn local_execute(
+		&self,
+		sql: String,
+		params: Option<Vec<BindParam>>,
+	) -> Result<ExecuteResult> {
+		self.open().await?;
+		self.native_db_handle()?.execute(sql, params).await
+	}
+
+	#[cfg(not(feature = "sqlite-local"))]
+	async fn local_execute(
+		&self,
+		_sql: String,
+		_params: Option<Vec<BindParam>>,
+	) -> Result<ExecuteResult> {
+		Err(SqliteRuntimeError::Unavailable.build())
+	}
+
+	#[cfg(feature = "sqlite-local")]
+	async fn local_execute_write(
+		&self,
+		sql: String,
+		params: Option<Vec<BindParam>>,
+	) -> Result<ExecuteResult> {
+		self.open().await?;
+		self.native_db_handle()?.execute_write(sql, params).await
+	}
+
+	#[cfg(not(feature = "sqlite-local"))]
+	async fn local_execute_write(
+		&self,
+		_sql: String,
+		_params: Option<Vec<BindParam>>,
+	) -> Result<ExecuteResult> {
+		Err(SqliteRuntimeError::Unavailable.build())
 	}
 
 	pub async fn exec(&self, sql: impl Into<String>) -> Result<QueryResult> {
-		#[cfg(feature = "sqlite")]
-		{
-			self.open().await?;
-			let sql = sql.into();
-			self.native_db_handle()?.exec(sql).await
-		}
-
-		#[cfg(not(feature = "sqlite"))]
-		{
-			let _ = sql;
-			Err(SqliteRuntimeError::Unavailable.build())
+		let sql = sql.into();
+		match self.backend {
+			SqliteBackend::LocalNative => self.local_exec(sql).await,
+			SqliteBackend::RemoteEnvoy => self.remote_exec(sql).await,
+			SqliteBackend::Unavailable => Err(SqliteRuntimeError::Unavailable.build()),
 		}
 	}
 
@@ -246,17 +287,13 @@ impl SqliteDb {
 		sql: impl Into<String>,
 		params: Option<Vec<BindParam>>,
 	) -> Result<QueryResult> {
-		#[cfg(feature = "sqlite")]
-		{
-			self.open().await?;
-			let sql = sql.into();
-			self.native_db_handle()?.query(sql, params).await
-		}
-
-		#[cfg(not(feature = "sqlite"))]
-		{
-			let _ = (sql, params);
-			Err(SqliteRuntimeError::Unavailable.build())
+		let sql = sql.into();
+		match self.backend {
+			SqliteBackend::LocalNative => self.local_query(sql, params).await,
+			SqliteBackend::RemoteEnvoy => {
+				Ok(self.remote_execute(sql, params).await?.into_query_result())
+			}
+			SqliteBackend::Unavailable => Err(SqliteRuntimeError::Unavailable.build()),
 		}
 	}
 
@@ -265,17 +302,13 @@ impl SqliteDb {
 		sql: impl Into<String>,
 		params: Option<Vec<BindParam>>,
 	) -> Result<ExecResult> {
-		#[cfg(feature = "sqlite")]
-		{
-			self.open().await?;
-			let sql = sql.into();
-			self.native_db_handle()?.run(sql, params).await
-		}
-
-		#[cfg(not(feature = "sqlite"))]
-		{
-			let _ = (sql, params);
-			Err(SqliteRuntimeError::Unavailable.build())
+		let sql = sql.into();
+		match self.backend {
+			SqliteBackend::LocalNative => self.local_run(sql, params).await,
+			SqliteBackend::RemoteEnvoy => {
+				Ok(self.remote_execute(sql, params).await?.into_exec_result())
+			}
+			SqliteBackend::Unavailable => Err(SqliteRuntimeError::Unavailable.build()),
 		}
 	}
 
@@ -284,17 +317,11 @@ impl SqliteDb {
 		sql: impl Into<String>,
 		params: Option<Vec<BindParam>>,
 	) -> Result<ExecuteResult> {
-		#[cfg(feature = "sqlite")]
-		{
-			self.open().await?;
-			let sql = sql.into();
-			self.native_db_handle()?.execute(sql, params).await
-		}
-
-		#[cfg(not(feature = "sqlite"))]
-		{
-			let _ = (sql, params);
-			Err(SqliteRuntimeError::Unavailable.build())
+		let sql = sql.into();
+		match self.backend {
+			SqliteBackend::LocalNative => self.local_execute(sql, params).await,
+			SqliteBackend::RemoteEnvoy => self.remote_execute(sql, params).await,
+			SqliteBackend::Unavailable => Err(SqliteRuntimeError::Unavailable.build()),
 		}
 	}
 
@@ -303,39 +330,33 @@ impl SqliteDb {
 		sql: impl Into<String>,
 		params: Option<Vec<BindParam>>,
 	) -> Result<ExecuteResult> {
-		#[cfg(feature = "sqlite")]
-		{
-			self.open().await?;
-			let sql = sql.into();
-			self.native_db_handle()?.execute_write(sql, params).await
-		}
-
-		#[cfg(not(feature = "sqlite"))]
-		{
-			let _ = (sql, params);
-			Err(SqliteRuntimeError::Unavailable.build())
+		let sql = sql.into();
+		match self.backend {
+			SqliteBackend::LocalNative => self.local_execute_write(sql, params).await,
+			SqliteBackend::RemoteEnvoy => self.remote_execute_write(sql, params).await,
+			SqliteBackend::Unavailable => Err(SqliteRuntimeError::Unavailable.build()),
 		}
 	}
 
 	pub async fn close(&self) -> Result<()> {
-		#[cfg(feature = "sqlite")]
-		{
-			self.stop_preload_hint_flush_task();
-			let native_db = self.db.lock().take();
-			if let Some(native_db) = native_db {
-				native_db.close().await?;
+		match self.backend {
+			SqliteBackend::LocalNative => {
+				#[cfg(feature = "sqlite-local")]
+				{
+					self.stop_preload_hint_flush_task();
+					let native_db = self.db.lock().take();
+					if let Some(native_db) = native_db {
+						native_db.close().await?;
+					}
+				}
+				Ok(())
 			}
-			Ok(())
-		}
-
-		#[cfg(not(feature = "sqlite"))]
-		{
-			Ok(())
+			SqliteBackend::RemoteEnvoy | SqliteBackend::Unavailable => Ok(()),
 		}
 	}
 
 	pub(crate) async fn cleanup(&self) -> Result<()> {
-		#[cfg(feature = "sqlite")]
+		#[cfg(feature = "sqlite-local")]
 		{
 			self.stop_preload_hint_flush_task();
 			self.flush_preload_hints_before_close().await;
@@ -343,14 +364,14 @@ impl SqliteDb {
 		self.close().await
 	}
 
-	#[cfg(feature = "sqlite")]
+	#[cfg(feature = "sqlite-local")]
 	fn ensure_preload_hint_flush_task(&self) -> Result<()> {
 		if !sqlite_optimization_flags().preload_hint_flush {
 			return Ok(());
 		}
 
 		let config = self.runtime_config()?;
-		let Some(generation) = config.startup_data.as_ref().map(|data| data.generation) else {
+		let Some(generation) = config.generation else {
 			return Ok(());
 		};
 		if self.db.lock().is_none() {
@@ -386,14 +407,14 @@ impl SqliteDb {
 		Ok(())
 	}
 
-	#[cfg(feature = "sqlite")]
+	#[cfg(feature = "sqlite-local")]
 	fn stop_preload_hint_flush_task(&self) {
 		if let Some(task) = self.preload_hint_flush_task.lock().take() {
 			task.abort();
 		}
 	}
 
-	#[cfg(feature = "sqlite")]
+	#[cfg(feature = "sqlite-local")]
 	async fn flush_preload_hints_before_close(&self) {
 		if !sqlite_optimization_flags().preload_hint_flush {
 			return;
@@ -402,7 +423,7 @@ impl SqliteDb {
 		let Ok(config) = self.runtime_config() else {
 			return;
 		};
-		let Some(generation) = config.startup_data.as_ref().map(|data| data.generation) else {
+		let Some(generation) = config.generation else {
 			return;
 		};
 
@@ -416,27 +437,45 @@ impl SqliteDb {
 	}
 
 	pub fn take_last_kv_error(&self) -> Option<String> {
-		#[cfg(feature = "sqlite")]
+		if self.backend != SqliteBackend::LocalNative {
+			return None;
+		}
+
+		#[cfg(feature = "sqlite-local")]
 		{
-			self.db
+			return self
+				.db
 				.lock()
 				.as_ref()
-				.and_then(NativeDatabaseHandle::take_last_kv_error)
+				.and_then(NativeDatabaseHandle::take_last_kv_error);
 		}
 
-		#[cfg(not(feature = "sqlite"))]
-		{
-			None
-		}
+		#[cfg(not(feature = "sqlite-local"))]
+		None
 	}
 
-	#[cfg(feature = "sqlite")]
+	#[cfg(feature = "sqlite-local")]
 	fn native_db_handle(&self) -> Result<NativeDatabaseHandle> {
 		self.db
 			.lock()
 			.as_ref()
 			.cloned()
 			.ok_or_else(|| SqliteRuntimeError::Closed.build())
+	}
+
+	pub fn metrics(&self) -> Option<SqliteVfsMetricsSnapshot> {
+		#[cfg(feature = "sqlite-local")]
+		{
+			self.db
+				.lock()
+				.as_ref()
+				.map(NativeDatabaseHandle::sqlite_vfs_metrics)
+		}
+
+		#[cfg(not(feature = "sqlite-local"))]
+		{
+			None
+		}
 	}
 
 	pub fn runtime_config(&self) -> Result<SqliteRuntimeConfig> {
@@ -446,8 +485,100 @@ impl SqliteDb {
 				.actor_id
 				.clone()
 				.ok_or_else(|| sqlite_not_configured("actor id"))?,
-			startup_data: self.startup_data.clone(),
+			generation: self.generation,
 		})
+	}
+
+	fn remote_config(&self) -> Result<RemoteSqliteConfig> {
+		let config = self.runtime_config()?;
+		let generation = config
+			.generation
+			.ok_or_else(|| sqlite_not_configured("generation"))?;
+		Ok(RemoteSqliteConfig {
+			namespace_id: config.handle.namespace().to_owned(),
+			handle: config.handle,
+			actor_id: config.actor_id,
+			generation,
+		})
+	}
+
+	async fn remote_exec(&self, sql: String) -> Result<QueryResult> {
+		let config = self.remote_config()?;
+		let response = config
+			.handle
+			.remote_sqlite_exec(protocol::SqliteExecRequest {
+				namespace_id: config.namespace_id,
+				actor_id: config.actor_id,
+				generation: config.generation,
+				sql,
+			})
+			.await
+			.map_err(remote_request_error)?;
+
+			match response {
+				protocol::SqliteExecResponse::SqliteExecOk(ok) => {
+					Ok(query_result_from_protocol(ok.result))
+				}
+				protocol::SqliteExecResponse::SqliteErrorResponse(error) => {
+					Err(remote_sqlite_error_response(error.message))
+				}
+		}
+	}
+
+	async fn remote_execute(
+		&self,
+		sql: String,
+		params: Option<Vec<BindParam>>,
+	) -> Result<ExecuteResult> {
+		let config = self.remote_config()?;
+		let response = config
+			.handle
+			.remote_sqlite_execute(protocol::SqliteExecuteRequest {
+				namespace_id: config.namespace_id,
+				actor_id: config.actor_id,
+				generation: config.generation,
+				sql,
+				params: params.map(protocol_bind_params),
+			})
+			.await
+			.map_err(remote_request_error)?;
+
+			match response {
+				protocol::SqliteExecuteResponse::SqliteExecuteOk(ok) => {
+					Ok(execute_result_from_protocol(ok.result))
+				}
+				protocol::SqliteExecuteResponse::SqliteErrorResponse(error) => {
+					Err(remote_sqlite_error_response(error.message))
+				}
+		}
+	}
+
+	async fn remote_execute_write(
+		&self,
+		sql: String,
+		params: Option<Vec<BindParam>>,
+	) -> Result<ExecuteResult> {
+		let config = self.remote_config()?;
+		let response = config
+			.handle
+			.remote_sqlite_execute_write(protocol::SqliteExecuteWriteRequest {
+				namespace_id: config.namespace_id,
+				actor_id: config.actor_id,
+				generation: config.generation,
+				sql,
+				params: params.map(protocol_bind_params),
+			})
+			.await
+			.map_err(remote_request_error)?;
+
+			match response {
+				protocol::SqliteExecuteWriteResponse::SqliteExecuteWriteOk(ok) => {
+					Ok(execute_result_from_protocol(ok.result))
+				}
+				protocol::SqliteExecuteWriteResponse::SqliteErrorResponse(error) => {
+					Err(remote_sqlite_error_response(error.message))
+				}
+		}
 	}
 
 	pub(crate) async fn query_rows_cbor(
@@ -490,7 +621,7 @@ impl SqliteDb {
 	}
 }
 
-#[cfg(feature = "sqlite")]
+#[cfg(feature = "sqlite-local")]
 async fn enqueue_preload_hint_flush_best_effort(
 	db: Arc<Mutex<Option<NativeDatabaseHandle>>>,
 	handle: EnvoyHandle,
@@ -543,7 +674,7 @@ async fn enqueue_preload_hint_flush_best_effort(
 	}
 }
 
-#[cfg(feature = "sqlite")]
+#[cfg(feature = "sqlite-local")]
 async fn flush_preload_hints_best_effort(
 	db: Arc<Mutex<Option<NativeDatabaseHandle>>>,
 	handle: EnvoyHandle,
@@ -632,7 +763,7 @@ async fn flush_preload_hints_best_effort(
 	}
 }
 
-#[cfg(feature = "sqlite")]
+#[cfg(feature = "sqlite-local")]
 async fn snapshot_preload_hints(
 	db: Arc<Mutex<Option<NativeDatabaseHandle>>>,
 ) -> Result<Option<VfsPreloadHintSnapshot>> {
@@ -644,7 +775,7 @@ async fn snapshot_preload_hints(
 	.context("join sqlite preload hint snapshot task")?
 }
 
-#[cfg(feature = "sqlite")]
+#[cfg(feature = "sqlite-local")]
 fn protocol_preload_hints(snapshot: VfsPreloadHintSnapshot) -> protocol::SqlitePreloadHints {
 	protocol::SqlitePreloadHints {
 		pgnos: snapshot.pgnos,
@@ -659,6 +790,131 @@ fn protocol_preload_hints(snapshot: VfsPreloadHintSnapshot) -> protocol::SqliteP
 	}
 }
 
+struct RemoteSqliteConfig {
+	handle: EnvoyHandle,
+	namespace_id: String,
+	actor_id: String,
+	generation: u64,
+}
+
+fn select_sqlite_backend(enabled: bool, remote_sqlite: bool) -> SqliteBackend {
+	if enabled && remote_sqlite {
+		return SqliteBackend::RemoteEnvoy;
+	}
+
+	#[cfg(feature = "sqlite-local")]
+	{
+		SqliteBackend::LocalNative
+	}
+
+	#[cfg(not(feature = "sqlite-local"))]
+	{
+		SqliteBackend::Unavailable
+	}
+}
+
+fn protocol_bind_params(params: Vec<BindParam>) -> Vec<protocol::SqliteBindParam> {
+	params.into_iter().map(protocol_bind_param).collect()
+}
+
+fn protocol_bind_param(param: BindParam) -> protocol::SqliteBindParam {
+	match param {
+		BindParam::Null => protocol::SqliteBindParam::SqliteValueNull,
+		BindParam::Integer(value) => {
+			protocol::SqliteBindParam::SqliteValueInteger(protocol::SqliteValueInteger { value })
+		}
+		BindParam::Float(value) => protocol::SqliteBindParam::SqliteValueFloat(
+			protocol::SqliteValueFloat {
+				value: value.to_bits().to_be_bytes(),
+			},
+		),
+		BindParam::Text(value) => {
+			protocol::SqliteBindParam::SqliteValueText(protocol::SqliteValueText { value })
+		}
+		BindParam::Blob(value) => {
+			protocol::SqliteBindParam::SqliteValueBlob(protocol::SqliteValueBlob { value })
+		}
+	}
+}
+
+fn query_result_from_protocol(result: protocol::SqliteQueryResult) -> QueryResult {
+	QueryResult {
+		columns: result.columns,
+		rows: result
+			.rows
+			.into_iter()
+			.map(|row| row.into_iter().map(column_value_from_protocol).collect())
+			.collect(),
+	}
+}
+
+fn execute_result_from_protocol(result: protocol::SqliteExecuteResult) -> ExecuteResult {
+	ExecuteResult {
+		columns: result.columns,
+		rows: result
+			.rows
+			.into_iter()
+			.map(|row| row.into_iter().map(column_value_from_protocol).collect())
+			.collect(),
+		changes: result.changes,
+		last_insert_row_id: result.last_insert_row_id,
+		route: execute_route_from_protocol(result.route),
+	}
+}
+
+fn column_value_from_protocol(value: protocol::SqliteColumnValue) -> ColumnValue {
+	match value {
+		protocol::SqliteColumnValue::SqliteValueNull => ColumnValue::Null,
+		protocol::SqliteColumnValue::SqliteValueInteger(value) => {
+			ColumnValue::Integer(value.value)
+		}
+		protocol::SqliteColumnValue::SqliteValueFloat(value) => {
+			ColumnValue::Float(f64::from_bits(u64::from_be_bytes(value.value)))
+		}
+		protocol::SqliteColumnValue::SqliteValueText(value) => ColumnValue::Text(value.value),
+		protocol::SqliteColumnValue::SqliteValueBlob(value) => ColumnValue::Blob(value.value),
+	}
+}
+
+fn execute_route_from_protocol(route: protocol::SqliteExecuteRoute) -> ExecuteRoute {
+	match route {
+		protocol::SqliteExecuteRoute::Read => ExecuteRoute::Read,
+		protocol::SqliteExecuteRoute::Write => ExecuteRoute::Write,
+		protocol::SqliteExecuteRoute::WriteFallback => ExecuteRoute::WriteFallback,
+	}
+}
+
+fn remote_request_error(error: anyhow::Error) -> anyhow::Error {
+	if let Some(indeterminate) = error.downcast_ref::<RemoteSqliteIndeterminateResultError>() {
+		return SqliteRuntimeError::RemoteIndeterminateResult {
+			operation: indeterminate.operation.to_owned(),
+		}
+		.build();
+	}
+
+	if let Some(compatibility) =
+		error.downcast_ref::<protocol::versioned::ProtocolCompatibilityError>()
+	{
+		if compatibility.feature
+			== protocol::versioned::ProtocolCompatibilityFeature::RemoteSqliteExecution
+		{
+			return SqliteRuntimeError::RemoteUnavailable {
+				reason: compatibility.to_string(),
+			}
+			.build();
+		}
+	}
+
+	error
+}
+
+fn remote_sqlite_error_response(message: String) -> anyhow::Error {
+	if message.contains("unavailable") || message.contains("unsupported") {
+		return SqliteRuntimeError::RemoteUnavailable { reason: message }.build();
+	}
+
+	SqliteRuntimeError::RemoteExecutionFailed { message }.build()
+}
 impl std::fmt::Debug for SqliteDb {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		f.debug_struct("SqliteDb")
@@ -867,3 +1123,7 @@ fn json_type_name(value: &JsonValue) -> &'static str {
 		JsonValue::Object(_) => "object",
 	}
 }
+
+#[cfg(test)]
+#[path = "../../tests/sqlite.rs"]
+mod tests;

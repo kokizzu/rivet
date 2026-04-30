@@ -51,6 +51,7 @@ export interface JsActorConfig {
   name?: string
   icon?: string
   hasDatabase?: boolean
+  remoteSqlite?: boolean
   hasState?: boolean
   canHibernateWebsocket?: boolean
   stateSaveIntervalMs?: number

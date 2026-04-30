@@ -141,6 +141,34 @@ pub(crate) enum SqliteRuntimeError {
 		"Invalid SQLite bind parameter {name}: {reason}"
 	)]
 	InvalidBindParameter { name: String, reason: String },
+
+	#[error(
+		"remote_unavailable",
+		"Remote SQLite is unavailable.",
+		"Remote SQLite is unavailable: {reason}"
+	)]
+	RemoteUnavailable { reason: String },
+
+	#[error(
+		"remote_execution_failed",
+		"Remote SQLite execution failed.",
+		"Remote SQLite execution failed: {message}"
+	)]
+	RemoteExecutionFailed { message: String },
+
+	#[error(
+		"remote_indeterminate_result",
+		"Remote SQLite result is indeterminate.",
+		"Remote SQLite {operation} may have completed, but the envoy disconnected before returning a result."
+	)]
+	RemoteIndeterminateResult { operation: String },
+
+	#[error(
+		"remote_fence_mismatch",
+		"Remote SQLite generation is stale.",
+		"Remote SQLite generation is stale: {reason}"
+	)]
+	RemoteFenceMismatch { reason: String },
 }
 
 #[derive(RivetError, Debug, Clone, Deserialize, Serialize)]

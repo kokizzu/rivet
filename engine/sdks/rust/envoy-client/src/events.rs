@@ -79,7 +79,7 @@ mod tests {
 	use std::sync::Arc;
 
 	use rivet_envoy_protocol as protocol;
-	use rivet_util::async_counter::AsyncCounter;
+	use crate::async_counter::AsyncCounter;
 	use tokio::sync::mpsc;
 
 	use super::handle_send_events;
@@ -187,6 +187,8 @@ mod tests {
 				next_kv_request_id: 0,
 				sqlite_requests: HashMap::new(),
 				next_sqlite_request_id: 0,
+				remote_sqlite_requests: HashMap::new(),
+				next_remote_sqlite_request_id: 0,
 				request_to_actor: crate::utils::BufferMap::new(),
 				buffered_messages: Vec::new(),
 				processed_command_idx: HashMap::new(),

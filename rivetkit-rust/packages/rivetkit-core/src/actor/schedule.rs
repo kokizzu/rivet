@@ -1,6 +1,8 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
+
+use crate::time::{SystemTime, UNIX_EPOCH, sleep};
 
 use anyhow::Result;
 use futures::future::BoxFuture;
@@ -13,6 +15,8 @@ use uuid::Uuid;
 use crate::actor::context::ActorContext;
 use crate::actor::state::PersistedScheduleEvent;
 use crate::error::ActorRuntime;
+#[cfg(feature = "wasm-runtime")]
+use crate::runtime::RuntimeSpawner;
 
 pub(super) type InternalKeepAwakeCallback =
 	Arc<dyn Fn(BoxFuture<'static, Result<()>>) -> BoxFuture<'static, Result<()>> + Send + Sync>;
@@ -345,8 +349,10 @@ impl ActorContext {
 			return;
 		}
 
-		let Ok(tokio_handle) = Handle::try_current() else {
-			return;
+		#[cfg(not(feature = "wasm-runtime"))]
+		let tokio_handle = match Handle::try_current() {
+			Ok(handle) => handle,
+			Err(_) => return,
 		};
 
 		let delay_ms = next_alarm.saturating_sub(now_timestamp_ms()).max(0) as u64;
@@ -361,9 +367,8 @@ impl ActorContext {
 		);
 		// Intentionally detached but abortable: the handle is stored in
 		// `local_alarm_task` and cancelled when alarms are resynced or stopped.
-		let handle = tokio_handle.spawn(
-			async move {
-				tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+		let task = async move {
+				sleep(Duration::from_millis(delay_ms)).await;
 				if schedule.0.schedule_local_alarm_epoch.load(Ordering::SeqCst) != local_alarm_epoch
 				{
 					return;
@@ -378,8 +383,13 @@ impl ActorContext {
 				};
 				callback().await;
 			}
-			.in_current_span(),
-		);
+			.in_current_span();
+
+		#[cfg(not(feature = "wasm-runtime"))]
+		let handle = tokio_handle.spawn(task);
+
+		#[cfg(feature = "wasm-runtime")]
+		let handle = RuntimeSpawner::spawn(task);
 
 		*self.0.schedule_local_alarm_task.lock() = Some(handle);
 	}

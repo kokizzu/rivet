@@ -6,7 +6,7 @@ mod moved_tests {
 	use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 	use std::sync::{Mutex, OnceLock};
 	use std::task::Poll;
-	use std::time::Duration;
+	use std::time::{Duration, Instant};
 
 	use futures::{FutureExt, poll};
 	use rivet_envoy_client::config::{
@@ -19,7 +19,7 @@ mod moved_tests {
 	use rivet_envoy_client::protocol;
 	use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot};
 	use tokio::task::yield_now;
-	use tokio::time::{Instant, advance, sleep, timeout};
+	use tokio::time::{advance, sleep, timeout};
 	use tracing::field::{Field, Visit};
 	use tracing::instrument::WithSubscriber;
 	use tracing::{Event, Subscriber};
@@ -761,7 +761,7 @@ mod moved_tests {
 		let debounce_deadline = task
 			.state_save_deadline
 			.expect("debounced save deadline should exist");
-		assert!(debounce_deadline > tokio::time::Instant::now());
+		assert!(debounce_deadline > Instant::now());
 		sleep(Duration::from_millis(20)).await;
 		assert_eq!(save_ticks.load(Ordering::SeqCst), 0);
 
@@ -779,7 +779,7 @@ mod moved_tests {
 		let immediate_deadline = task
 			.state_save_deadline
 			.expect("immediate save deadline should exist");
-		assert!(immediate_deadline <= tokio::time::Instant::now() + Duration::from_millis(5));
+		assert!(immediate_deadline <= Instant::now() + Duration::from_millis(5));
 		task.on_state_save_tick().await;
 		wait_for_count(&save_ticks, 2).await;
 		wait_for_state(&ctx, &[2]).await;

@@ -27,6 +27,7 @@ COPY . .
 RUN if [ "$BUILD_TARGET" = "engine" ] && [ "$BUILD_FRONTEND" = "true" ]; then \
         export NODE_OPTIONS="--max-old-space-size=8192" && \
         export SKIP_NAPI_BUILD=1 && \
+        export SKIP_WASM_BUILD=1 && \
         pnpm install --ignore-scripts && \
         VITE_APP_API_URL="${VITE_APP_API_URL}" VITE_FEATURE_FLAGS="${VITE_FEATURE_FLAGS}" npx turbo build -F @rivetkit/engine-frontend; \
     fi
@@ -55,7 +56,7 @@ RUN --mount=type=cache,id=cargo-registry-linux-x64-musl,target=/usr/local/cargo/
     mkdir -p /artifacts && \
     if [ "$BUILD_TARGET" = "engine" ]; then \
         RUSTFLAGS="--cfg tokio_unstable -C target-feature=+crt-static -C link-arg=-static-libgcc" \
-            cargo build --bin rivet-engine $CARGO_FLAG --target x86_64-unknown-linux-musl && \
+            cargo build -p rivet-engine --bin rivet-engine $CARGO_FLAG --target x86_64-unknown-linux-musl && \
         cp target/x86_64-unknown-linux-musl/$PROFILE_DIR/rivet-engine /artifacts/rivet-engine-x86_64-unknown-linux-musl; \
     elif [ "$BUILD_TARGET" = "rivetkit-napi" ]; then \
         cd rivetkit-typescript/packages/rivetkit-napi && \

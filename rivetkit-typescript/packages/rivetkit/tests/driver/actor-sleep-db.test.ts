@@ -5,7 +5,10 @@ import {
 	SLEEP_DB_TIMEOUT,
 	SLEEP_SCHEDULE_AFTER_ON_SLEEP_DELAY_MS,
 } from "../../fixtures/driver-test-suite/sleep-db";
-import { describeDriverMatrix } from "./shared-matrix";
+import {
+	describeDriverMatrix,
+	SQLITE_DRIVER_MATRIX_OPTIONS,
+} from "./shared-matrix";
 import { setupDriverTest, waitFor } from "./shared-utils";
 
 type LogEntry = { id: number; event: string; created_at: number };
@@ -1072,4 +1075,4 @@ describeDriverMatrix("Actor Sleep Db", (driverTestConfig) => {
 			{ timeout: 30_000 },
 		);
 	});
-});
+}, SQLITE_DRIVER_MATRIX_OPTIONS);

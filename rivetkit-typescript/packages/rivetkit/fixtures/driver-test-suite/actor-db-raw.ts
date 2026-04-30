@@ -370,9 +370,26 @@ export const dbActorRaw = actor({
 		triggerSleep: (c) => {
 			scheduleActorSleep(c);
 		},
+		destroy: (c) => {
+			c.destroy();
+		},
+		ping: () => "pong",
 	},
 	options: {
 		actionTimeout: 120_000,
+		sleepTimeout: 100,
+	},
+});
+
+export const dbRemoteLifecycleProbe = actor({
+	db: db(),
+	actions: {
+		ping: () => "pong",
+		triggerSleep: (c) => {
+			scheduleActorSleep(c);
+		},
+	},
+	options: {
 		sleepTimeout: 100,
 	},
 });

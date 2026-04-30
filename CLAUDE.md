@@ -22,6 +22,8 @@ Design constraints, invariants, and reference commands for the Rivet monorepo. F
 
 **Always use versioned BARE (`vbare`) instead of raw `serde_bare` for any persisted or wire-format encoding unless explicitly told otherwise.** Raw `serde_bare::to_vec` / `from_slice` has no version header, so any future schema change forces hand-rolled `LegacyXxx` fallback structs. `vbare::OwnedVersionedData` plus a versioned `*.bare` schema is the standard pattern. Acceptable raw-bare exceptions: ephemeral in-memory encodings that never cross a process boundary or hit disk, and wire formats whose protocol version is coordinated out-of-band (e.g. an HTTP path like `/v{PROTOCOL_VERSION}/...` or another channel that pins both peers to one schema per call).
 
+- Avoid raw `f64` fields in vbare protocol schemas that use hashable maps; generated Rust derives `Eq`/`Hash`, so encode floats as fixed bytes or an ordered wrapper.
+
 When talking about "Rivet Actors" make sure to capitalize "Rivet Actor" as a proper noun and lowercase "actor" as a generic noun.
 
 ## Commands
@@ -90,6 +92,13 @@ docker-compose up -d
 ## Dependency Management
 
 - Prefer the Tokio-shaped APIs from `antiox` (`antiox/sync/mpsc`, `antiox/task`, etc.) over ad hoc Promise queues, custom channel wrappers, or event-emitter coordination.
+- `rivet-envoy-client` transport features are mutually exclusive; native builds use the default `native-transport`, while wasm builds must set `default-features = false` and enable `wasm-transport`.
+- `rivet-envoy-client` wasm WebSocket code lives behind `target_arch = "wasm32"` with a native-host `wasm-transport` stub so feature checks do not compile browser APIs on developer machines.
+- `rivetkit-core` wasm builds use `--no-default-features --features wasm-runtime,sqlite-remote`; keep native process and runner-config HTTP code behind `native-runtime`.
+- Core-owned lifecycle tasks in `rivetkit-core` should spawn through `RuntimeSpawner` so native builds use Send-capable tasks and wasm builds use local tasks.
+- `rivet-envoy-client::async_counter::AsyncCounter` is the shared HTTP request counter type consumed by core sleep logic; do not pull `rivet-util` into core for that counter.
+- For `wasm32-unknown-unknown` Rust checks, use target-specific minimal Tokio plus `getrandom/js` and `uuid/js`; scan production dependencies with `cargo tree -e normal` so dev-dependencies do not create false native-dependency hits.
+- Use `scripts/cargo/check-rivetkit-core-wasm.sh` as the canonical wasm gate for `rivetkit-core`; it checks the wasm build, scans native dependency leaks, and verifies native transport/runtime features fail on wasm.
 - The high-level `rivetkit` crate stays a thin typed wrapper over `rivetkit-core` and re-exports shared transport/config types instead of redefining them.
 - When `rivetkit` needs ergonomic helpers on a `rivetkit-core` type it re-exports, prefer an extension trait plus `prelude` re-export instead of wrapping and replacing the core type.
 - `engine/sdks/*/api-*` are auto-generated SDK outputs; update the source API schema and regenerate them instead of editing them by hand.
@@ -98,6 +107,7 @@ docker-compose up -d
 
 - Core tests that touch the `_RIVET_TEST_INSPECTOR_TOKEN` env override must share a process-wide lock with startup tests that assert inspector-token initialization side effects; otherwise parallel `cargo test` runs can flip `init_inspector_token(...)` between the env-override no-op path and the KV-backed path.
 - For the fast static/http/bare driver verifier, pass only the files listed under `## Fast Tests` in `.agent/notes/driver-test-progress.md`; `tests/driver/*.test.ts` also pulls in slow-suite files and gives bogus gate failures.
+- Wasm host smoke tests can drive `buildNativeFactory` through `WasmCoreRuntime` fake bindings to cover actor callbacks, KV, state serialization, remote SQLite routing, and NAPI import boundaries without checked-in wasm-pack output.
 - When moving Rust inline tests out of `src/`, keep a tiny source-owned `#[cfg(test)] #[path = "..."] mod tests;` shim so the moved file still has private module access without widening runtime visibility. Prefer a dedicated moved-test file per source module; reusing stale shared `tests/modules/*.rs` files can silently rot against private APIs and explode once you wire them back in.
 - Tracing assertions on spawned Rust futures should bind an explicit `tracing::Dispatch` with `.with_subscriber(...)` on the spawned future; thread-local `set_default(...)` can miss the real logs in full async suite runs.
 
@@ -108,6 +118,9 @@ docker-compose up -d
 - Native SQLite VFS recent-page preload hints are actor-side Rust state surfaced by `NativeDatabase::snapshot_preload_hints()`; persist and consume them through runtime/envoy wiring, not JS APIs.
 - SQLite VFS file handles must enforce their reader or writer role; reader-owned handles fail closed on mutating callbacks.
 - Native SQLite single-statement work should route through the native execute path; keep `exec` as the multi-statement compatibility path.
+- Pegboard-envoy remote SQL execution should use `rivetkit-sqlite::database::open_database_from_engine` instead of direct `rusqlite` calls so native routing policy stays shared.
+- Pegboard-envoy remote SQL executor caches should use `Arc<OnceCell<NativeDatabaseHandle>>` values so first-use initialization stays lazy and single-flight per `(actor_id, sqlite_generation)`.
+- Sent remote SQL requests must fail with `sqlite.remote_indeterminate_result` on WebSocket disconnect; only unsent remote SQL may be sent after reconnect.
 - Native SQLite manual transactions keep an idle writer open until autocommit returns; route subsequent work through the writer instead of reader classification.
 - Native SQLite read mode may hold multiple read-only connections, while write mode must hold exactly one writable connection and no readers; TypeScript must not be the routing policy boundary.
 - For NAPI bridge wiring (TSF callback layout, cancellation tokens, `#[napi(object)]` rules), see `docs-internal/engine/napi-bridge.md`.
@@ -139,6 +152,7 @@ When the user asks to track something in a note, store it in `.agent/notes/` by 
 - rivetkit-napi must be pure bindings. If code would be duplicated by a future V8 runtime, it belongs in rivetkit-core instead.
 - rivetkit-napi serves through `CoreRegistry` + `NapiActorFactory`; do not reintroduce the deleted `BridgeCallbacks` JSON-envelope envoy path or `startEnvoy*Js` exports.
 - NAPI `ActorContext.sql()` returns `JsNativeDatabase` directly; do not reintroduce a standalone `SqliteDb` wrapper export.
+- TypeScript runtime adapters expose `CoreRuntime` from `rivetkit/src/registry/runtime.ts`; keep raw `@rivetkit/rivetkit-napi` and future `@rivetkit/rivetkit-wasm` imports inside `src/registry/*-runtime.ts`.
 - rivetkit (Rust) is a thin typed wrapper. If it does more than deserialize, delegate to core, and serialize, the logic should move to rivetkit-core.
 - rivetkit (TypeScript) owns only: workflow engine, agent-os, client library, Zod schema validation for user-defined types, and actor definition types.
 - Errors use universal `RivetError` (group/code/message/metadata) at all boundaries. No custom error classes in TS.
@@ -277,6 +291,7 @@ When the user asks to track something in a note, store it in `.agent/notes/` by 
 - Only add design constraints, invariants, and non-obvious rules that shape how new code should be written. Do not add general trivia, current implementation wiring, KV-key layouts, module organization, API signatures, ephemeral migration state, or anything a reader can learn by reading the code. That content belongs in module doc-comments, `docs-internal/`, or `.claude/reference/`.
 - When the user asks to update any `CLAUDE.md`, add one-line bullet points only, or add a new section containing one-line bullet points.
 - Architectural internals and runtime wiring belong in `docs-internal/engine/`. Agent-procedural guides (test-harness gotchas, build troubleshooting, docs-sync tables) belong in `.claude/reference/`. Link them from the [Reference Docs](#reference-docs) index below instead of inlining.
+- Every directory that has a `CLAUDE.md` must also have an `AGENTS.md` symlink pointing to it (`ln -s CLAUDE.md AGENTS.md` from the same directory). When creating a new `CLAUDE.md`, create the symlink in the same change.
 
 ## Reference Docs
 

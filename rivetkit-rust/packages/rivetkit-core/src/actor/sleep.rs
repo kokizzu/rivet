@@ -1,22 +1,25 @@
 use parking_lot::Mutex;
+use rivet_envoy_client::async_counter::AsyncCounter;
 use rivet_envoy_client::handle::EnvoyHandle;
-use rivet_util::async_counter::AsyncCounter;
 use std::future::Future;
 use std::sync::Arc;
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize as TestAtomicUsize;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+#[cfg(not(feature = "wasm-runtime"))]
 use tokio::runtime::Handle;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
-#[cfg(test)]
-use tokio::time::sleep_until;
-use tokio::time::{Instant, sleep};
 use tracing::Instrument;
 
 use crate::actor::config::ActorConfig;
 use crate::actor::context::ActorContext;
 use crate::actor::work_registry::{CountGuard, RegionGuard, WorkRegistry};
+#[cfg(feature = "wasm-runtime")]
+use crate::runtime::RuntimeSpawner;
+use crate::time::{Instant, sleep};
+#[cfg(test)]
+use crate::time::sleep_until;
 #[cfg(test)]
 use crate::types::ActorKey;
 
@@ -267,6 +270,7 @@ impl ActorContext {
 	pub(crate) fn reset_sleep_timer_state(&self) {
 		self.cancel_sleep_timer();
 
+		#[cfg(not(feature = "wasm-runtime"))]
 		let Ok(runtime) = Handle::try_current() else {
 			tracing::debug!(
 				actor_id = %self.actor_id(),
@@ -282,7 +286,7 @@ impl ActorContext {
 		);
 
 		let ctx = self.clone();
-		let task = runtime.spawn(async move {
+		let task_body = async move {
 			let can_sleep = ctx.can_sleep().await;
 			if can_sleep != CanSleep::Yes {
 				tracing::debug!(
@@ -317,7 +321,13 @@ impl ActorContext {
 					"sleep idle timer elapsed but actor stayed awake"
 				);
 			}
-		});
+		};
+
+		#[cfg(not(feature = "wasm-runtime"))]
+		let task = runtime.spawn(task_body);
+
+		#[cfg(feature = "wasm-runtime")]
+		let task = RuntimeSpawner::spawn(task_body);
 
 		*self.0.sleep.sleep_timer.lock() = Some(task);
 	}
@@ -441,6 +451,7 @@ impl ActorContext {
 		self.0.sleep.work.websocket_callback.load()
 	}
 
+	#[cfg(not(feature = "wasm-runtime"))]
 	pub(crate) fn track_shutdown_task<F>(&self, fut: F) -> bool
 	where
 		F: Future<Output = ()> + Send + 'static,
@@ -458,10 +469,36 @@ impl ActorContext {
 		let counter = self.0.sleep.work.shutdown_counter.clone();
 		counter.increment();
 		let guard = CountGuard::from_incremented(counter);
+		let ctx = self.clone();
 		shutdown_tasks.spawn(
 			async move {
 				let _guard = guard;
 				fut.await;
+				ctx.reset_sleep_timer();
+			}
+			.in_current_span(),
+		);
+		true
+	}
+
+	#[cfg(feature = "wasm-runtime")]
+	pub(crate) fn track_shutdown_task<F>(&self, fut: F) -> bool
+	where
+		F: Future<Output = ()> + 'static,
+	{
+		if self.0.sleep.work.teardown_started.load(Ordering::Acquire) {
+			tracing::warn!("shutdown task spawned after teardown; aborting immediately");
+			return false;
+		}
+		let counter = self.0.sleep.work.shutdown_counter.clone();
+		counter.increment();
+		let guard = CountGuard::from_incremented(counter);
+		let ctx = self.clone();
+		wasm_bindgen_futures::spawn_local(
+			async move {
+				let _guard = guard;
+				fut.await;
+				ctx.reset_sleep_timer();
 			}
 			.in_current_span(),
 		);

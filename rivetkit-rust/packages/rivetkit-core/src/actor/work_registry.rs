@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use parking_lot::Mutex;
-use rivet_util::async_counter::AsyncCounter;
+use rivet_envoy_client::async_counter::AsyncCounter;
 use tokio::sync::Notify;
 use tokio::task::JoinSet;
 

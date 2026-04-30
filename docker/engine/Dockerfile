@@ -21,12 +21,13 @@ COPY . .
 # Build frontend. Use --ignore-scripts because the root postinstall runs
 # `lefthook install`, which needs a .git directory (excluded by
 # .dockerignore). lefthook is a dev-only git hook manager and has no
-# place inside the Docker build. SKIP_NAPI_BUILD=1 tells
-# @rivetkit/rivetkit-napi to skip its napi build. The frontend only
-# consumes the TypeScript surface, not the runtime .node binary.
+# place inside the Docker build. SKIP_NAPI_BUILD=1 and SKIP_WASM_BUILD=1 tell
+# the runtime binding packages to skip native artifact builds. The frontend only
+# consumes their TypeScript surfaces, not the runtime binaries.
 RUN if [ "$BUILD_FRONTEND" = "true" ]; then \
         export NODE_OPTIONS="--max-old-space-size=8192" && \
         export SKIP_NAPI_BUILD=1 && \
+        export SKIP_WASM_BUILD=1 && \
         pnpm install --ignore-scripts && \
         VITE_APP_API_URL="${VITE_APP_API_URL}" VITE_FEATURE_FLAGS="${VITE_FEATURE_FLAGS}" VITE_APP_TURNSTILE_SITE_KEY="${VITE_APP_TURNSTILE_SITE_KEY}" npx turbo build -F @rivetkit/engine-frontend; \
     fi
@@ -40,9 +41,9 @@ RUN \
     --mount=type=cache,target=/app/target,id=univseral-target \
     --mount=type=cache,target=/root/.cache,id=universal-user-cache \
     if [ "$CARGO_BUILD_MODE" = "release" ]; then \
-        RUSTFLAGS="--cfg tokio_unstable" cargo build --bin rivet-engine --release; \
+        RUSTFLAGS="--cfg tokio_unstable" cargo build -p rivet-engine --bin rivet-engine --release; \
     else \
-        RUSTFLAGS="--cfg tokio_unstable" cargo build --bin rivet-engine; \
+        RUSTFLAGS="--cfg tokio_unstable" cargo build -p rivet-engine --bin rivet-engine; \
     fi && \
     # cargo install --locked tokio-console && \
     mkdir /app/dist/ && \

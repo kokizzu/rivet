@@ -26,6 +26,7 @@ rivet-guard-core.workspace = true
 rivet-metrics.workspace = true
 rivet-pools.workspace = true
 rivet-envoy-protocol.workspace = true
+rivetkit-sqlite.workspace = true
 rivet-runtime.workspace = true
 rivet-types.workspace = true
 scc.workspace = true

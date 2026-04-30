@@ -4,10 +4,12 @@ mod moved_tests {
 
 	use crate::actor::context::ActorContext;
 	use parking_lot::Mutex as DropMutex;
-	use rivet_util::async_counter::AsyncCounter;
+	use rivet_envoy_client::async_counter::AsyncCounter;
 	use tokio::sync::oneshot;
 	use tokio::task::yield_now;
-	use tokio::time::{Duration, Instant, advance};
+	use std::time::{Duration, Instant};
+
+	use tokio::time::advance;
 	use tracing::field::{Field, Visit};
 	use tracing::{Event, Subscriber};
 	use tracing_subscriber::layer::{Context as LayerContext, Layer};
