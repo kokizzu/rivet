@@ -1,6 +1,29 @@
 use rivet_error::*;
 use serde::{Deserialize, Serialize};
 
+pub fn public_error_status_code(group: &str, code: &str) -> Option<u16> {
+	match (group, code) {
+		("auth", "forbidden") => Some(403),
+		("actor", "action_not_found") => Some(404),
+		("actor", "action_timed_out") => Some(408),
+		("actor", "aborted") => Some(400),
+		("message", "incoming_too_long" | "outgoing_too_long") => Some(400),
+		(
+			"queue",
+			"full"
+			| "message_too_large"
+			| "message_invalid"
+			| "invalid_payload"
+			| "invalid_completion_payload"
+			| "already_completed"
+			| "previous_message_not_completed"
+			| "complete_not_configured"
+			| "timed_out",
+		) => Some(400),
+		_ => None,
+	}
+}
+
 #[derive(RivetError, Debug, Clone, Deserialize, Serialize)]
 #[error("actor")]
 pub enum ActorLifecycle {

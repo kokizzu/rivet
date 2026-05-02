@@ -1,8 +1,8 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
@@ -19,7 +19,9 @@ use rivetkit_core::{
 	SerializeStateReason, ServeConfig, ServerlessRequest, StateDelta, WebSocket,
 	WebSocketCallbackRegion, WsMessage,
 };
+use rivetkit_core::error::public_error_status_code;
 use rivetkit_core::inspector::InspectorAuth;
+use scc::HashMap as SccHashMap;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken as CoreCancellationToken;
 use wasm_bindgen::prelude::*;
@@ -27,6 +29,12 @@ use wasm_bindgen::{JsCast, UnwrapThrowExt};
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 
 const BRIDGE_RIVET_ERROR_PREFIX: &str = "__RIVET_ERROR_JSON__:";
+
+type BridgeRivetErrorSchemaKey = (String, String);
+
+static BRIDGE_RIVET_ERROR_SCHEMAS: LazyLock<
+	SccHashMap<BridgeRivetErrorSchemaKey, &'static RivetErrorSchema>,
+> = LazyLock::new(SccHashMap::new);
 
 #[derive(rivet_error::RivetError, serde::Serialize)]
 #[error(
@@ -37,6 +45,18 @@ const BRIDGE_RIVET_ERROR_PREFIX: &str = "__RIVET_ERROR_JSON__:";
 )]
 struct WasmInvalidState {
 	state: String,
+	reason: String,
+}
+
+#[derive(rivet_error::RivetError, serde::Serialize)]
+#[error(
+	"wasm",
+	"invalid_config",
+	"Invalid wasm configuration.",
+	"Invalid wasm configuration field '{field}': {reason}"
+)]
+struct WasmInvalidConfig {
+	field: String,
 	reason: String,
 }
 
@@ -93,7 +113,7 @@ pub fn start() {
 	console_error_panic_hook::set_once();
 }
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WasmServeConfig {
 	pub version: u32,
@@ -113,6 +133,17 @@ pub struct WasmServeConfig {
 	pub serverless_max_start_payload_bytes: u32,
 }
 
+fn validate_wasm_serve_config(config: &WasmServeConfig) -> Result<()> {
+	if config.engine_binary_path.is_some() {
+		return Err(WasmInvalidConfig {
+			field: "engine_binary_path".to_owned(),
+			reason: "wasm runtimes cannot spawn an engine binary; omit this field and connect to an existing engine endpoint".to_owned(),
+		}
+		.build());
+	}
+	Ok(())
+}
+
 impl From<WasmServeConfig> for ServeConfig {
 	fn from(config: WasmServeConfig) -> Self {
 		Self {
@@ -122,20 +153,20 @@ impl From<WasmServeConfig> for ServeConfig {
 			namespace: config.namespace,
 			pool_name: config.pool_name,
 			engine_binary_path: config.engine_binary_path.map(PathBuf::from),
-				handle_inspector_http_in_runtime: config
-					.handle_inspector_http_in_runtime
-					.unwrap_or(false),
-				serverless_base_path: config.serverless_base_path,
-				serverless_package_version: config.serverless_package_version,
-				serverless_client_endpoint: config.serverless_client_endpoint,
-				serverless_client_namespace: config.serverless_client_namespace,
-				serverless_client_token: config.serverless_client_token,
-				serverless_validate_endpoint: config.serverless_validate_endpoint,
-				serverless_max_start_payload_bytes: config.serverless_max_start_payload_bytes as usize,
-				serverless_cache_envoy: false,
-			}
+			handle_inspector_http_in_runtime: config
+				.handle_inspector_http_in_runtime
+				.unwrap_or(false),
+			serverless_base_path: config.serverless_base_path,
+			serverless_package_version: config.serverless_package_version,
+			serverless_client_endpoint: config.serverless_client_endpoint,
+			serverless_client_namespace: config.serverless_client_namespace,
+			serverless_client_token: config.serverless_client_token,
+			serverless_validate_endpoint: config.serverless_validate_endpoint,
+			serverless_max_start_payload_bytes: config.serverless_max_start_payload_bytes as usize,
+			serverless_cache_envoy: false,
 		}
 	}
+}
 
 #[derive(Clone, Default, serde::Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -279,6 +310,7 @@ impl WasmCoreRegistry {
 	#[wasm_bindgen]
 	pub async fn serve(&self, config: JsValue) -> Result<(), JsValue> {
 		let config: WasmServeConfig = serde_wasm_bindgen::from_value(config)?;
+		validate_wasm_serve_config(&config).map_err(anyhow_to_js_error)?;
 		rivetkit_core::inspector::set_test_inspector_token_override(
 			config.inspector_test_token.clone(),
 		);
@@ -354,6 +386,7 @@ impl WasmCoreRegistry {
 
 	async fn serverless_runtime(&self, config: JsValue) -> Result<WasmServerlessRuntime, JsValue> {
 		let config: WasmServeConfig = serde_wasm_bindgen::from_value(config)?;
+		validate_wasm_serve_config(&config).map_err(anyhow_to_js_error)?;
 		rivetkit_core::inspector::set_test_inspector_token_override(
 			config.inspector_test_token.clone(),
 		);
@@ -1029,7 +1062,8 @@ pub struct WasmActorContext {
 	inner: rivetkit_core::ActorContext,
 	callbacks: WasmCallbacks,
 	runtime_state: JsValue,
-	websocket_callback_regions: Rc<RefCell<Vec<Option<WebSocketCallbackRegion>>>>,
+	websocket_callback_regions: Rc<RefCell<HashMap<u32, WebSocketCallbackRegion>>>,
+	next_websocket_callback_region_id: Rc<Cell<u32>>,
 }
 
 impl WasmActorContext {
@@ -1038,8 +1072,30 @@ impl WasmActorContext {
 			inner,
 			callbacks,
 			runtime_state: Object::new().into(),
-			websocket_callback_regions: Rc::new(RefCell::new(Vec::new())),
+			websocket_callback_regions: Rc::new(RefCell::new(HashMap::new())),
+			next_websocket_callback_region_id: Rc::new(Cell::new(0)),
 		}
+	}
+
+	fn allocate_websocket_callback_region_id(
+		&self,
+		regions: &HashMap<u32, WebSocketCallbackRegion>,
+	) -> Option<u32> {
+		let start_id = self.next_websocket_callback_region_id.get();
+		let mut region_id = start_id;
+
+		for _ in 0..u32::MAX {
+			region_id = region_id.wrapping_add(1);
+			if region_id == 0 {
+				region_id = 1;
+			}
+			if !regions.contains_key(&region_id) {
+				self.next_websocket_callback_region_id.set(region_id);
+				return Some(region_id);
+			}
+		}
+
+		None
 	}
 }
 
@@ -1143,11 +1199,13 @@ impl WasmActorContext {
 		} else {
 			serde_wasm_bindgen::from_value(opts)?
 		};
-		self.inner.request_save(RequestSaveOpts {
-			immediate: opts.immediate.unwrap_or(false),
-			max_wait_ms: opts.max_wait_ms,
-		});
-		Ok(())
+		self.inner
+			.request_save_and_wait(RequestSaveOpts {
+				immediate: opts.immediate.unwrap_or(false),
+				max_wait_ms: opts.max_wait_ms,
+			})
+			.await
+			.map_err(anyhow_to_js_error)
 	}
 
 	#[wasm_bindgen(js_name = saveState)]
@@ -1308,7 +1366,15 @@ impl WasmActorContext {
 
 	#[wasm_bindgen(js_name = registerTask)]
 	pub fn register_task(&self, promise: Promise) {
-		self.wait_until(promise);
+		let actor_id = self.inner.actor_id().to_owned();
+		self.inner.register_task(async move {
+			if let Err(error) = JsFuture::from(promise).await {
+				console_error(&format!(
+					"actor registered task promise rejected for actor {actor_id}: {}",
+					js_value_to_anyhow(error)
+				));
+			}
+		});
 	}
 
 	#[wasm_bindgen(js_name = restartRunHandler)]
@@ -1319,8 +1385,12 @@ impl WasmActorContext {
 	#[wasm_bindgen(js_name = beginWebsocketCallback)]
 	pub fn begin_websocket_callback(&self) -> u32 {
 		let mut regions = self.websocket_callback_regions.borrow_mut();
-		regions.push(Some(self.inner.websocket_callback_region()));
-		regions.len() as u32
+		let Some(region_id) = self.allocate_websocket_callback_region_id(&regions) else {
+			console_error("failed to begin websocket callback region: no region ids available");
+			return 0;
+		};
+		regions.insert(region_id, self.inner.websocket_callback_region());
+		region_id
 	}
 
 	#[wasm_bindgen(js_name = endWebsocketCallback)]
@@ -1328,13 +1398,7 @@ impl WasmActorContext {
 		if region_id == 0 {
 			return;
 		}
-		if let Some(region) = self
-			.websocket_callback_regions
-			.borrow_mut()
-			.get_mut(region_id as usize - 1)
-		{
-			region.take();
-		}
+		self.websocket_callback_regions.borrow_mut().remove(&region_id);
 	}
 
 	#[wasm_bindgen]
@@ -2559,13 +2623,21 @@ fn leak_str(value: String) -> &'static str {
 }
 
 fn bridge_rivet_error_schema(payload: &BridgeRivetErrorPayload) -> &'static RivetErrorSchema {
-	Box::leak(Box::new(RivetErrorSchema {
-		group: leak_str(payload.group.clone()),
-		code: leak_str(payload.code.clone()),
-		default_message: leak_str(payload.message.clone()),
-		meta_type: None,
-		_macro_marker: MacroMarker { _private: () },
-	}))
+	let key = (payload.group.clone(), payload.code.clone());
+	match BRIDGE_RIVET_ERROR_SCHEMAS.entry_sync(key) {
+		scc::hash_map::Entry::Occupied(entry) => *entry.get(),
+		scc::hash_map::Entry::Vacant(entry) => {
+			let schema = Box::leak(Box::new(RivetErrorSchema {
+				group: leak_str(payload.group.clone()),
+				code: leak_str(payload.code.clone()),
+				default_message: leak_str(payload.message.clone()),
+				meta_type: None,
+				_macro_marker: MacroMarker { _private: () },
+			}));
+			entry.insert_entry(schema);
+			schema
+		}
+	}
 }
 
 fn parse_bridge_rivet_error(reason: &str) -> Option<anyhow::Error> {
@@ -2643,19 +2715,319 @@ fn registry_shut_down_error() -> JsValue {
 }
 
 fn anyhow_to_js_error(error: anyhow::Error) -> JsValue {
+	let payload = anyhow_to_bridge_rivet_error_payload(error);
+	js_sys::Error::new(&format!("{BRIDGE_RIVET_ERROR_PREFIX}{payload}")).into()
+}
+
+fn anyhow_to_bridge_rivet_error_payload(error: anyhow::Error) -> serde_json::Value {
 	let bridge_context = error
 		.chain()
 		.find_map(|cause| cause.downcast_ref::<BridgeRivetErrorContext>());
 	let error = RivetTransportError::extract(&error);
-	let public_ = bridge_context.and_then(|context| context.public_);
-	let status_code = bridge_context.and_then(|context| context.status_code);
-	let payload = serde_json::json!({
+	let promoted_status_code = public_error_status_code(error.group(), error.code());
+	let should_promote = promoted_status_code.is_some_and(|_| match bridge_context {
+		Some(context) => {
+			context.public_ != Some(true)
+				|| context.status_code.is_none()
+				|| context.status_code == Some(500)
+		},
+		None => true,
+	});
+	let status_code = if should_promote {
+		promoted_status_code
+	} else {
+		bridge_context.and_then(|context| context.status_code)
+	};
+	let public_ = if should_promote {
+		Some(true)
+	} else {
+		bridge_context.and_then(|context| context.public_)
+	};
+	serde_json::json!({
 		"group": error.group(),
 		"code": error.code(),
 		"message": error.message(),
 		"metadata": error.metadata(),
 		"public": public_,
 		"statusCode": status_code,
-	});
-	js_sys::Error::new(&format!("{BRIDGE_RIVET_ERROR_PREFIX}{payload}")).into()
+	})
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn test_serve_config(engine_binary_path: Option<String>) -> WasmServeConfig {
+		WasmServeConfig {
+			version: 1,
+			endpoint: "http://127.0.0.1:6420".to_owned(),
+			token: None,
+			namespace: "default".to_owned(),
+			pool_name: "default".to_owned(),
+			engine_binary_path,
+			handle_inspector_http_in_runtime: None,
+			inspector_test_token: None,
+			serverless_base_path: None,
+			serverless_package_version: "0.0.0-test".to_owned(),
+			serverless_client_endpoint: None,
+			serverless_client_namespace: None,
+			serverless_client_token: None,
+			serverless_validate_endpoint: true,
+			serverless_max_start_payload_bytes: 1024,
+		}
+	}
+
+	fn bridge_reason(group: &str, code: &str, message: &str) -> String {
+		let payload = serde_json::json!({
+			"group": group,
+			"code": code,
+			"message": message,
+			"metadata": { "case": "schema-cache" },
+			"public": true,
+			"statusCode": 418,
+		});
+		format!("{BRIDGE_RIVET_ERROR_PREFIX}{payload}")
+	}
+
+	static AUTH_FORBIDDEN_SCHEMA: RivetErrorSchema = RivetErrorSchema {
+		group: "auth",
+		code: "forbidden",
+		default_message: "Forbidden",
+		meta_type: None,
+		_macro_marker: MacroMarker { _private: () },
+	};
+
+	fn transport_schema(error: &anyhow::Error) -> &'static RivetErrorSchema {
+		error
+			.chain()
+			.find_map(|cause| cause.downcast_ref::<RivetTransportError>())
+			.expect("bridge error should carry RivetTransportError")
+			.schema
+	}
+
+	fn transport_message(error: &anyhow::Error) -> String {
+		error
+			.chain()
+			.find_map(|cause| cause.downcast_ref::<RivetTransportError>())
+			.expect("bridge error should carry RivetTransportError")
+			.message()
+			.to_owned()
+	}
+
+	#[test]
+	fn parse_bridge_rivet_error_reuses_interned_schema() {
+		// This test owns the `(wasm_schema_cache_test, same_payload)` cache key so
+		// concurrent tests do not perturb the global schema-count delta.
+		let initial_count = BRIDGE_RIVET_ERROR_SCHEMAS.len();
+		let reason = bridge_reason(
+			"wasm_schema_cache_test",
+			"same_payload",
+			"same payload message",
+		);
+		let first = parse_bridge_rivet_error(&reason).expect("bridge error should decode");
+		let first_schema = transport_schema(&first) as *const RivetErrorSchema;
+
+		for _ in 0..100 {
+			let error = parse_bridge_rivet_error(&reason).expect("bridge error should decode");
+			let schema = transport_schema(&error) as *const RivetErrorSchema;
+			assert_eq!(schema, first_schema);
+		}
+
+		assert_eq!(BRIDGE_RIVET_ERROR_SCHEMAS.len(), initial_count + 1);
+
+		let different_message = bridge_reason(
+			"wasm_schema_cache_test",
+			"same_payload",
+			"different default message",
+		);
+		let error =
+			parse_bridge_rivet_error(&different_message).expect("bridge error should decode");
+		let schema = transport_schema(&error) as *const RivetErrorSchema;
+
+		assert_eq!(schema, first_schema);
+		assert_eq!(transport_message(&error), "different default message");
+		assert_eq!(BRIDGE_RIVET_ERROR_SCHEMAS.len(), initial_count + 1);
+
+		let different_code = bridge_reason(
+			"wasm_schema_cache_test",
+			"different_code",
+			"different code message",
+		);
+		let error = parse_bridge_rivet_error(&different_code).expect("bridge error should decode");
+		let schema = transport_schema(&error) as *const RivetErrorSchema;
+
+		assert_ne!(schema, first_schema);
+		assert_eq!(BRIDGE_RIVET_ERROR_SCHEMAS.len(), initial_count + 2);
+	}
+
+	#[test]
+	fn wasm_bridge_payload_promotes_known_core_error_status() {
+		let payload = anyhow_to_bridge_rivet_error_payload(anyhow::Error::new(
+			RivetTransportError {
+				schema: &AUTH_FORBIDDEN_SCHEMA,
+				meta: None,
+				message: None,
+			},
+		));
+
+		assert_eq!(payload.get("group").and_then(|value| value.as_str()), Some("auth"));
+		assert_eq!(
+			payload.get("code").and_then(|value| value.as_str()),
+			Some("forbidden")
+		);
+		assert_eq!(
+			payload.get("public").and_then(|value| value.as_bool()),
+			Some(true)
+		);
+		assert_eq!(
+			payload.get("statusCode").and_then(|value| value.as_u64()),
+			Some(403)
+		);
+	}
+
+	#[cfg(target_arch = "wasm32")]
+	#[test]
+	fn websocket_callback_regions_are_removed_after_end() {
+		let context = WasmActorContext::from_core(
+			rivetkit_core::ActorContext::new(
+				"websocket-region-test",
+				"websocket-region-test",
+				Vec::new(),
+				"local",
+			),
+			WasmCallbacks::new(Object::new().into()),
+		);
+		let mut previous_id = 0;
+
+		for _ in 0..1000 {
+			let region_id = context.begin_websocket_callback();
+			assert!(region_id > previous_id);
+			assert_eq!(context.websocket_callback_regions.borrow().len(), 1);
+
+			context.end_websocket_callback(region_id);
+			assert!(context.websocket_callback_regions.borrow().is_empty());
+
+			previous_id = region_id;
+		}
+	}
+
+	#[cfg(target_arch = "wasm32")]
+	#[test]
+	fn websocket_callback_region_ids_wrap_without_collision() {
+		let context = WasmActorContext::from_core(
+			rivetkit_core::ActorContext::new(
+				"websocket-region-wrap-test",
+				"websocket-region-wrap-test",
+				Vec::new(),
+				"local",
+			),
+			WasmCallbacks::new(Object::new().into()),
+		);
+
+		let first_id = context.begin_websocket_callback();
+		context
+			.next_websocket_callback_region_id
+			.set(u32::MAX - 1);
+		let max_id = context.begin_websocket_callback();
+		let wrapped_id = context.begin_websocket_callback();
+
+		assert_eq!(first_id, 1);
+		assert_eq!(max_id, u32::MAX);
+		assert_eq!(wrapped_id, 2);
+		assert_eq!(context.websocket_callback_regions.borrow().len(), 3);
+		assert!(
+			context
+				.websocket_callback_regions
+				.borrow()
+				.contains_key(&first_id)
+		);
+		assert!(
+			context
+				.websocket_callback_regions
+				.borrow()
+				.contains_key(&max_id)
+		);
+		assert!(
+			context
+				.websocket_callback_regions
+				.borrow()
+				.contains_key(&wrapped_id)
+		);
+
+		context.end_websocket_callback(first_id);
+		context.end_websocket_callback(max_id);
+		context.end_websocket_callback(wrapped_id);
+		assert!(context.websocket_callback_regions.borrow().is_empty());
+	}
+
+	#[test]
+	fn engine_binary_path_error_is_typed_with_field_metadata() {
+		let error = validate_wasm_serve_config(&test_serve_config(Some(
+			"/usr/local/bin/rivet-engine".to_owned(),
+		)))
+		.expect_err("engine_binary_path should be rejected");
+		let error = RivetTransportError::extract(&error);
+
+		assert_eq!(error.group(), "wasm");
+		assert_eq!(error.code(), "invalid_config");
+		assert_eq!(error.message(), "Invalid wasm configuration.");
+		assert_eq!(
+			error
+				.metadata()
+				.as_ref()
+				.and_then(|metadata| metadata.get("field"))
+				.and_then(|field| field.as_str()),
+			Some("engine_binary_path")
+		);
+	}
+
+	#[cfg(target_arch = "wasm32")]
+	#[test]
+	fn serve_rejects_engine_binary_path_before_core_setup() {
+		use std::future::Future;
+		use std::pin::pin;
+		use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
+		fn raw_waker() -> RawWaker {
+			fn clone(_: *const ()) -> RawWaker {
+				raw_waker()
+			}
+			fn wake(_: *const ()) {}
+			fn wake_by_ref(_: *const ()) {}
+			fn drop(_: *const ()) {}
+			RawWaker::new(
+				std::ptr::null(),
+				&RawWakerVTable::new(clone, wake, wake_by_ref, drop),
+			)
+		}
+
+		let registry = WasmCoreRegistry::new();
+		let config = serde_wasm_bindgen::to_value(&test_serve_config(Some(
+			"/usr/local/bin/rivet-engine".to_owned(),
+		)))
+		.expect("serve config should encode");
+		let future = registry.serve(config);
+		let mut future = pin!(future);
+		let waker = unsafe { Waker::from_raw(raw_waker()) };
+		let mut cx = Context::from_waker(&waker);
+
+		match Future::poll(future.as_mut(), &mut cx) {
+			Poll::Ready(Err(error)) => {
+				let error = js_value_to_anyhow(error);
+				let error = RivetTransportError::extract(&error);
+				assert_eq!(error.group(), "wasm");
+				assert_eq!(error.code(), "invalid_config");
+				assert_eq!(
+					error
+						.metadata()
+						.as_ref()
+						.and_then(|metadata| metadata.get("field"))
+						.and_then(|field| field.as_str()),
+					Some("engine_binary_path")
+				);
+			}
+			Poll::Ready(Ok(())) => panic!("serve should reject engine_binary_path"),
+			Poll::Pending => panic!("serve should reject before awaiting core setup"),
+		}
+	}
 }

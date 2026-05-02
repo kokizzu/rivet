@@ -1,11 +1,27 @@
 #!/usr/bin/env node
 import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
+import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const packageDir = dirname(dirname(fileURLToPath(import.meta.url)));
 const pkgDir = join(packageDir, "pkg");
+const require = createRequire(import.meta.url);
+
+function resolveWasmPackBin() {
+	try {
+		const packageJsonPath = require.resolve("wasm-pack/package.json", {
+			paths: [packageDir],
+		});
+		return join(dirname(packageJsonPath), "run.js");
+	} catch (err) {
+		throw new Error(
+			"Missing pinned wasm-pack dependency. Run pnpm install before building @rivetkit/rivetkit-wasm.",
+			{ cause: err },
+		);
+	}
+}
 
 if (["1", "true"].includes(process.env.SKIP_WASM_BUILD ?? "")) {
 	const hasPkg = existsSync(join(pkgDir, "rivetkit_wasm.js"));
@@ -33,7 +49,6 @@ if (!outDir) {
 }
 
 const cmd = [
-	"wasm-pack",
 	"build",
 	"--target",
 	target,
@@ -43,5 +58,7 @@ const cmd = [
 	"rivetkit_wasm",
 ];
 
-console.log(`[rivetkit-wasm/build] running: ${cmd.join(" ")}`);
-execFileSync("npx", ["-y", ...cmd], { stdio: "inherit" });
+const wasmPackBin = resolveWasmPackBin();
+
+console.log(`[rivetkit-wasm/build] running: wasm-pack ${cmd.join(" ")}`);
+execFileSync(process.execPath, [wasmPackBin, ...cmd], { stdio: "inherit" });

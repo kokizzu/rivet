@@ -6,11 +6,7 @@ import type {
 	CoreRegistry as WasmCoreRegistry,
 	WebSocketHandle as WasmWebSocketHandle,
 } from "@rivetkit/rivetkit-wasm";
-import {
-	decodeBridgeRivetError,
-	isRivetErrorLike,
-	RivetError,
-} from "@/actor/errors";
+import { decodeBridgeRivetError, RivetError } from "@/actor/errors";
 import type {
 	WasmRuntimeBindings,
 	WasmRuntimeConfig,
@@ -140,112 +136,15 @@ function normalizeQueueMessage(
 	};
 }
 
-function promoteKnownBridgeError(value: unknown): unknown {
-	if (!isRivetErrorLike(value)) {
-		return value;
-	}
-
-	if (
-		value.group === "auth" &&
-		value.code === "forbidden" &&
-		(!value.public || value.statusCode === 500)
-	) {
-		return new RivetError(value.group, value.code, value.message, {
-			public: true,
-			statusCode: 403,
-			metadata: value.metadata,
-			cause: value instanceof Error ? value.cause : undefined,
-		});
-	}
-
-	if (
-		value.group === "actor" &&
-		value.code === "action_not_found" &&
-		(!value.public || value.statusCode === 500)
-	) {
-		return new RivetError(value.group, value.code, value.message, {
-			public: true,
-			statusCode: 404,
-			metadata: value.metadata,
-			cause: value instanceof Error ? value.cause : undefined,
-		});
-	}
-
-	if (
-		value.group === "actor" &&
-		value.code === "action_timed_out" &&
-		(!value.public || value.statusCode === 500)
-	) {
-		return new RivetError(value.group, value.code, value.message, {
-			public: true,
-			statusCode: 408,
-			metadata: value.metadata,
-			cause: value instanceof Error ? value.cause : undefined,
-		});
-	}
-
-	if (
-		value.group === "actor" &&
-		value.code === "aborted" &&
-		(!value.public || value.statusCode === 500)
-	) {
-		return new RivetError(value.group, value.code, value.message, {
-			public: true,
-			statusCode: 400,
-			metadata: value.metadata,
-			cause: value instanceof Error ? value.cause : undefined,
-		});
-	}
-
-	if (
-		value.group === "message" &&
-		(value.code === "incoming_too_long" ||
-			value.code === "outgoing_too_long") &&
-		(!value.public || value.statusCode === 500)
-	) {
-		return new RivetError(value.group, value.code, value.message, {
-			public: true,
-			statusCode: 400,
-			metadata: value.metadata,
-			cause: value instanceof Error ? value.cause : undefined,
-		});
-	}
-
-	if (
-		value.group === "queue" &&
-		[
-			"full",
-			"message_too_large",
-			"message_invalid",
-			"invalid_payload",
-			"invalid_completion_payload",
-			"already_completed",
-			"previous_message_not_completed",
-			"complete_not_configured",
-			"timed_out",
-		].includes(value.code) &&
-		(!value.public || value.statusCode === 500)
-	) {
-		return new RivetError(value.group, value.code, value.message, {
-			public: true,
-			statusCode: 400,
-			metadata: value.metadata,
-			cause: value instanceof Error ? value.cause : undefined,
-		});
-	}
-
-	return value;
-}
-
 function normalizeWasmBridgeError(error: unknown): unknown {
 	if (typeof error === "string") {
-		return promoteKnownBridgeError(decodeBridgeRivetError(error) ?? error);
+		return decodeBridgeRivetError(error) ?? error;
 	}
 
 	if (error instanceof Error) {
 		const bridged = decodeBridgeRivetError(error.message);
 		if (bridged) {
-			return promoteKnownBridgeError(bridged);
+			return bridged;
 		}
 	}
 
@@ -257,11 +156,11 @@ function normalizeWasmBridgeError(error: unknown): unknown {
 	) {
 		const bridged = decodeBridgeRivetError(error.reason);
 		if (bridged) {
-			return promoteKnownBridgeError(bridged);
+			return bridged;
 		}
 	}
 
-	return promoteKnownBridgeError(error);
+	return error;
 }
 
 async function callWasm<T>(invoke: () => Promise<T>): Promise<T> {

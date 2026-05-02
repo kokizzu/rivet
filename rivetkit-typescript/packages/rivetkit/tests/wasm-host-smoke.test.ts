@@ -51,6 +51,9 @@ class SmokeGate {
 class SmokeScenario {
 	readonly actionReconnect = new SmokeGate();
 	readonly remoteWriteReconnect = new SmokeGate();
+	readonly save = new SmokeGate();
+	readonly registerTask = new SmokeGate();
+	registerTaskCompleted = false;
 }
 
 class SmokeHost {
@@ -217,11 +220,15 @@ class SmokeKv {
 class SmokeActorContext {
 	stateBytes = Buffer.alloc(0);
 	readonly runtimeBag = {};
+	readonly registeredTasks: Array<Promise<void>> = [];
 	readonly kvHandle: SmokeKv;
 	readonly sqlHandle: SmokeSql;
 	readonly abortController = new AbortController();
 
-	constructor(private readonly host: SmokeHost) {
+	constructor(
+		private readonly host: SmokeHost,
+		private readonly scenario: SmokeScenario,
+	) {
 		this.kvHandle = new SmokeKv(host);
 		this.sqlHandle = new SmokeSql(host);
 	}
@@ -240,6 +247,19 @@ class SmokeActorContext {
 
 	async requestSaveAndWait(opts?: unknown): Promise<void> {
 		this.host.saves.push(opts);
+		this.scenario.save.markStarted();
+		await this.scenario.save.released;
+	}
+
+	registerTask(promise: Promise<unknown>): void {
+		this.registeredTasks.push(Promise.resolve(promise).then(() => {}));
+	}
+
+	async drainRegisteredTasks(): Promise<void> {
+		while (this.registeredTasks.length > 0) {
+			const tasks = this.registeredTasks.splice(0);
+			await Promise.all(tasks);
+		}
 	}
 
 	takePendingHibernationChanges(): string[] {
@@ -320,6 +340,7 @@ function fakeWasmBindings(
 ): WasmBindings {
 	class FakeCoreRegistry {
 		registered = new Map<string, FakeActorFactory>();
+		activeCtx?: SmokeActorContext;
 
 		register(name: string, factory: FakeActorFactory): void {
 			this.registered.set(name, factory);
@@ -337,13 +358,15 @@ function fakeWasmBindings(
 				remoteSqlite: true,
 			});
 
-			const ctx = new SmokeActorContext(host);
+			const ctx = new SmokeActorContext(host, scenario);
+			this.activeCtx = ctx;
 			const initialState = await factory.callbacks.createState(null, {
 				ctx,
 				input: encodeValue({ host: host.kind }),
 			});
 			ctx.stateBytes = Buffer.from(initialState);
 
+			let actionSettled = false;
 			const actionPromise = factory.callbacks.actions.smoke(null, {
 				ctx,
 				conn: null,
@@ -351,6 +374,14 @@ function fakeWasmBindings(
 				args: encodeValue([host.kind]),
 				cancelToken: new FakeCancellationToken(),
 			});
+			void actionPromise.then(
+				() => {
+					actionSettled = true;
+				},
+				() => {
+					actionSettled = true;
+				},
+			);
 
 			await scenario.actionReconnect.started;
 			host.reconnect(config, "during-action");
@@ -359,6 +390,11 @@ function fakeWasmBindings(
 			await scenario.remoteWriteReconnect.started;
 			host.reconnect(config, "during-remote-write-sql");
 			scenario.remoteWriteReconnect.release();
+
+			await scenario.save.started;
+			await Promise.resolve();
+			expect(actionSettled).toBe(false);
+			scenario.save.release();
 
 			const output = decodeValue<{
 				stateCount: number;
@@ -380,7 +416,9 @@ function fakeWasmBindings(
 			});
 		}
 
-		async shutdown(): Promise<void> {}
+		async shutdown(): Promise<void> {
+			await this.activeCtx?.drainRegisteredTasks();
+		}
 	}
 
 	return {
@@ -457,6 +495,15 @@ async function runHostSmoke(kind: HostKind): Promise<SmokeHost> {
 					[label],
 				);
 				await c.saveState({ immediate: true });
+				void (
+					c as unknown as {
+						internalKeepAwake<T>(run: () => Promise<T>): Promise<T>;
+					}
+				).internalKeepAwake(async () => {
+					scenario.registerTask.markStarted();
+					await scenario.registerTask.released;
+					scenario.registerTaskCompleted = true;
+				});
 
 				return {
 					stateCount: c.state.count,
@@ -474,6 +521,20 @@ async function runHostSmoke(kind: HostKind): Promise<SmokeHost> {
 		buildNativeFactory(runtime, config, definition),
 	);
 	await runtime.serveRegistry(registry, serveConfig);
+	await scenario.registerTask.started;
+
+	let shutdownSettled = false;
+	const shutdownPromise = runtime.shutdownRegistry(registry).then(() => {
+		shutdownSettled = true;
+	});
+	await Promise.resolve();
+	expect(shutdownSettled).toBe(false);
+	expect(scenario.registerTaskCompleted).toBe(false);
+
+	scenario.registerTask.release();
+	await shutdownPromise;
+	expect(shutdownSettled).toBe(true);
+	expect(scenario.registerTaskCompleted).toBe(true);
 
 	return host;
 }

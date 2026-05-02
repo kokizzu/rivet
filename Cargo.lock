@@ -6093,6 +6093,7 @@ dependencies = [
  "js-sys",
  "rivet-error",
  "rivetkit-core",
+ "scc",
  "serde",
  "serde-wasm-bindgen",
  "serde_json",

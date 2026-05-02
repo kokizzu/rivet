@@ -1,17 +1,17 @@
 {
-  "project": "RivetKit Runtime Boundary Cleanup",
-  "branchName": "04-29-chore_rivetkit_wasm_support",
-  "description": "Clean up the RivetKit TypeScript runtime boundary so NAPI and WebAssembly use the same portable CoreRuntime contract, wasm initialization is explicit, invalid SQLite/runtime combinations fail clearly, and Cloudflare Workers, Supabase Functions, and Deno are covered by first-class platform smoke tests.",
+  "project": "RivetKit Wasm Support Review Fixes",
+  "branchName": "05-02-fix_rivetkit-wasm_fix_mem_leaks",
+  "description": "Address correctness, durability, parity, and build robustness issues identified in code review of PR #4860 (chore(rivetkit): wasm support). Each story targets one concrete defect or divergence between the wasm and NAPI runtimes so the wasm path matches the NAPI contract that the rest of rivetkit-core relies on.",
   "userStories": [
     {
       "id": "US-001",
-      "title": "Extract shared engine test harness",
-      "description": "As a test maintainer, I need the driver suite and platform tests to share one engine startup mechanism so that platform smoke tests do not duplicate process and port management.",
+      "title": "Make WasmActorContext.requestSaveAndWait actually wait",
+      "description": "As an actor author running on wasm, I want `ctx.requestSaveAndWait({ immediate: true })` to resolve only after the save has completed so durability promises hold on Cloudflare Workers and Supabase Functions.",
       "acceptanceCriteria": [
-        "Extract the engine start, health check, ref-count, and release logic from `rivetkit-typescript/packages/rivetkit/tests/driver/shared-harness.ts` into a shared test utility if it cannot be reused directly",
-        "Update driver tests to keep using the same engine behavior through the shared utility or existing exported helper",
-        "Expose a helper that platform tests can use to start and release a local `rivet-engine`",
-        "Do not introduce a second independent engine launcher for platform tests",
+        "`WasmActorContext::request_save_and_wait` in `rivetkit-typescript/packages/rivetkit-wasm/src/lib.rs` calls `self.inner.request_save_and_wait(opts).await` instead of `self.inner.request_save(opts)`",
+        "Errors from core `request_save_and_wait` propagate to JS via `anyhow_to_js_error` so the bridged RivetError is preserved",
+        "NAPI and wasm both expose the same `requestSaveAndWait` semantics (resolves after save completes, rejects on save failure)",
+        "Add or extend a wasm host smoke test in `rivetkit-typescript/packages/rivetkit/tests/wasm-host-smoke.test.ts` that verifies `requestSaveAndWait` does not resolve before the save completes",
         "Typecheck passes",
         "Tests pass"
       ],
@@ -21,13 +21,13 @@
     },
     {
       "id": "US-002",
-      "title": "Use runtime.kind for runtime normalization",
-      "description": "As a maintainer, I want runtime selection to depend on the `CoreRuntime` contract rather than concrete adapter classes so that duplicate modules and future adapters remain compatible.",
+      "title": "Cache bridged RivetErrorSchema to stop per-error memory leak",
+      "description": "As an operator running a long-lived wasm worker, I want bridged JS error decoding to stop leaking unbounded `String`s and `RivetErrorSchema` boxes so memory does not grow with bridged-error volume.",
       "acceptanceCriteria": [
-        "`loadedRuntimeKind` switches on `runtime.kind`",
-        "No production runtime selection logic depends on `instanceof NapiCoreRuntime` or `instanceof WasmCoreRuntime`",
-        "Tests can use plain object `CoreRuntime` fakes with `kind: \"napi\"` or `kind: \"wasm\"`",
-        "Config resolution order remains setup config, then `RIVETKIT_RUNTIME`, then `auto`",
+        "`bridge_rivet_error_schema` in `rivetkit-typescript/packages/rivetkit-wasm/src/lib.rs` deduplicates schema entries by `(group, code, default_message)` so each unique tuple is leaked at most once for the process lifetime",
+        "Use a process-global cache (for example `OnceCell<scc::HashMap<...>>` or equivalent allowed concurrent map) instead of `Box::leak` on every call",
+        "`parse_bridge_rivet_error` continues to return an `anyhow::Error` carrying a `RivetTransportError` plus `BridgeRivetErrorContext`",
+        "Add a wasm crate test that decodes the same bridge error payload many times and asserts only one schema instance is interned",
         "Typecheck passes",
         "Tests pass"
       ],
@@ -37,15 +37,14 @@
     },
     {
       "id": "US-003",
-      "title": "Define portable SQL runtime types",
-      "description": "As a runtime adapter author, I need SQL params and results to use shared plain TypeScript structs so that NAPI and wasm do not depend on NAPI-specific database types.",
+      "title": "Reject engine_binary_path on wasm runtimes",
+      "description": "As a wasm user, I want a clear error if I pass `engine_binary_path` so I do not get an obscure failure deep in core when wasm cannot spawn an engine binary anyway.",
       "acceptanceCriteria": [
-        "`rivetkit-typescript/packages/rivetkit/src/registry/runtime.ts` no longer imports `JsNativeDatabaseLike`",
-        "Define explicit runtime SQL bind param, query result, execute result, and run result types using portable values and `Uint8Array` for blobs",
-        "NAPI and wasm SQL adapters both implement the same explicit SQL result types",
-        "Existing `wrapJsNativeDatabase` behavior remains unchanged for user-facing database APIs",
-        "Bigint, boolean, string, number, null, undefined, and `Uint8Array` SQL parameter normalization still works",
-        "User-facing SQL integer result behavior remains unchanged from the current TypeScript API",
+        "`From<WasmServeConfig> for ServeConfig` in `rivetkit-typescript/packages/rivetkit-wasm/src/lib.rs` returns or surfaces a typed error when `engine_binary_path` is set",
+        "Or the wasm `serve` and `serverless_runtime` entrypoints validate `engine_binary_path.is_none()` up front and return a `RivetError` with group `wasm` and an actionable message",
+        "Error metadata includes the rejected field name so users can find it",
+        "Add a wasm crate test that calls `serve` with `engine_binary_path: Some(...)` and expects the typed configuration error",
+        "Indentation inside the `From<WasmServeConfig> for ServeConfig` struct literal is corrected to single tabs",
         "Typecheck passes",
         "Tests pass"
       ],
@@ -55,13 +54,13 @@
     },
     {
       "id": "US-004",
-      "title": "Replace CoreRuntime Buffer fields with Uint8Array",
-      "description": "As an edge runtime user, I want the shared CoreRuntime byte boundary to use portable byte types so that wasm hosts do not need Node `Buffer` globals.",
+      "title": "Wire wasm registerTask to core register_task",
+      "description": "As an actor on wasm, I want `ctx.registerTask(promise)` to behave the same as on NAPI so sleep counters and shutdown semantics stay consistent between runtimes.",
       "acceptanceCriteria": [
-        "`rivetkit-typescript/packages/rivetkit/src/registry/runtime.ts` no longer references `Buffer` in the `CoreRuntime` boundary",
-        "HTTP bodies, state deltas, KV keys and values, queue payloads, SQL blobs, websocket binary messages, connection bytes, and inspector bytes use `Uint8Array` or a portable alias",
-        "NAPI-only `Buffer` conversion remains inside `NapiCoreRuntime` where native bindings require it",
-        "Wasm runtime boundary normalization does not require `Buffer.from`, `Buffer.alloc`, or `Buffer.isBuffer`",
+        "`WasmActorContext::register_task` in `rivetkit-typescript/packages/rivetkit-wasm/src/lib.rs` calls the dedicated `register_task` path on `rivetkit_core::ActorContext` instead of forwarding to `wait_until`",
+        "If core does not yet expose a wasm-friendly `register_task`, expose one in `rivetkit-rust/packages/rivetkit-core/src/actor/context.rs` behind the existing `wasm-runtime` feature flag",
+        "Sleep counter and shutdown drain semantics for `registerTask` match between NAPI and wasm",
+        "Add a wasm host smoke test that exercises `registerTask` and asserts the registered task is awaited during shutdown drain",
         "Typecheck passes",
         "Tests pass"
       ],
@@ -71,14 +70,13 @@
     },
     {
       "id": "US-005",
-      "title": "Add explicit wasm bindings loader config",
-      "description": "As an edge runtime integrator, I want wasm bindings passed through configuration so that Cloudflare, Supabase, and Deno do not depend on hidden global mutation.",
+      "title": "Move bridge error status promotion into rivetkit-core",
+      "description": "As a maintainer, I want HTTP status promotion for known RivetError codes to live in core so NAPI and wasm return identical statusCodes for the same underlying error, per the single-source-of-truth rule in CLAUDE.md.",
       "acceptanceCriteria": [
-        "Add a typed `wasm.bindings?: typeof import(\"@rivetkit/rivetkit-wasm\")` field to RivetKit TypeScript registry config",
-        "`loadWasmRuntime` uses configured `wasm.bindings` before falling back to importing `@rivetkit/rivetkit-wasm`",
-        "`wasm.initInput` continues to accept Worker-friendly and Deno-friendly wasm module, bytes, URL, or response inputs",
-        "`loadWasmRuntime` does not read `globalThis.__rivetkitWasmBindings`",
-        "Add tests proving configured bindings are used instead of hidden globals",
+        "Identify the canonical promotion list currently in `promoteKnownBridgeError` in `rivetkit-typescript/packages/rivetkit/src/registry/wasm-runtime.ts`",
+        "Move the `(group, code) -> statusCode` mapping into `rivetkit-rust/packages/rivetkit-core/src/error.rs` or the existing RivetError build path so core sets `statusCode` correctly on extract",
+        "Remove `promoteKnownBridgeError` from `wasm-runtime.ts` (and any `callWasm` wrapping that exists only to call it)",
+        "Add a unit test (Rust or TS) that decodes a bridged `auth.forbidden` and asserts statusCode 403 from both NAPI and wasm paths",
         "Typecheck passes",
         "Tests pass"
       ],
@@ -88,16 +86,15 @@
     },
     {
       "id": "US-006",
-      "title": "Publish one public wasm package import path",
-      "description": "As an application developer, I want `@rivetkit/rivetkit-wasm` to expose a supported public import path so that platform apps do not import repo-relative generated files.",
+      "title": "Pin wasm-pack instead of fetching via npx -y",
+      "description": "As a release engineer, I want the wasm publish job to not depend on a live npm registry fetch on every build so a flaky network does not block publishes.",
       "acceptanceCriteria": [
-        "`@rivetkit/rivetkit-wasm` exposes one default public import path that can be passed as `wasm.bindings`",
-        "`package.json` exports and files include the JavaScript, declaration, and wasm artifacts needed by the public import path",
-        "Do not add `@rivetkit/rivetkit-wasm/cloudflare` or `@rivetkit/rivetkit-wasm/deno` exports unless platform tests prove the single export cannot work",
-        "If a specialized export becomes necessary, document the packaging failure that requires it",
-        "No platform app imports repo-relative `pkg`, `pkg-deno`, or `dist/tsup` paths",
-        "Typecheck passes",
-        "Tests pass"
+        "`rivetkit-typescript/packages/rivetkit-wasm/scripts/build.mjs` no longer relies on `npx -y wasm-pack`",
+        "Add `wasm-pack` as a pinned `devDependency` in `rivetkit-typescript/packages/rivetkit-wasm/package.json` or invoke a vendored binary",
+        "Build script resolves the pinned `wasm-pack` binary path locally and falls back with an explicit error message if missing, rather than silently re-fetching",
+        "`pnpm --filter @rivetkit/rivetkit-wasm build` succeeds offline once dependencies are installed",
+        "`pnpm --filter @rivetkit/rivetkit-wasm run check:package` still passes",
+        "Typecheck passes"
       ],
       "priority": 6,
       "passes": true,
@@ -105,14 +102,13 @@
     },
     {
       "id": "US-007",
-      "title": "Make wasm serverless startup concurrency-safe",
-      "description": "As a serverless runtime maintainer, I want concurrent first requests to share wasm serverless startup so that edge hosts do not fail during cold-start races.",
+      "title": "Add wasm-runtime parity tests for save, registerTask, status promotion",
+      "description": "As a maintainer, I want a parity test that runs the same actor scenarios under NAPI and wasm so future regressions in either adapter are caught.",
       "acceptanceCriteria": [
-        "Wasm registry implements a `BuildingServerless` equivalent to match the NAPI serverless state pattern",
-        "Concurrent first serverless requests share one build or wait for the build to finish instead of returning an already-serving or wrong-mode error",
-        "Shutdown during wasm serverless build leaves the registry in a terminal state and does not orphan a newly built runtime",
-        "NAPI and wasm return equivalent wrong-mode or shutdown errors for serve/serverless mode conflicts",
-        "Add focused tests for concurrent first serverless requests and shutdown during build using deterministic ordering where needed",
+        "Add a parity test file under `rivetkit-typescript/packages/rivetkit/tests/` that runs the same scenario through `NapiCoreRuntime` and `WasmCoreRuntime` (using the existing wasm host smoke harness)",
+        "Cover: durable save via `requestSaveAndWait`, `registerTask` shutdown drain, and HTTP statusCode promotion for at least `auth.forbidden`, `actor.action_not_found`, `actor.action_timed_out`",
+        "Each scenario asserts the same observable result on both runtimes",
+        "Tests skip gracefully if the wasm package artifact is absent rather than failing CI on environments without `wasm-pack`",
         "Typecheck passes",
         "Tests pass"
       ],
@@ -122,12 +118,12 @@
     },
     {
       "id": "US-008",
-      "title": "Restore wasm queue API parity",
-      "description": "As a Rivet Actor developer, I want queue APIs to return the same values through NAPI and wasm so that runtime selection does not change behavior.",
+      "title": "Fix per-call schema leaks in napi_actor_events",
+      "description": "As an operator running a long-lived NAPI process, I want unknown bridged error decoding to stop allocating and leaking a fresh `RivetErrorSchema` per call so memory is bounded under high error volume.",
       "acceptanceCriteria": [
-        "`WasmQueue.maxSize()` returns the real core queue max size instead of `0`",
-        "Add parity coverage for queue max size through both NAPI and wasm adapters",
-        "Unsupported wasm runtime methods fail with an explicit structured unsupported-runtime error",
+        "`action_not_found` in `rivetkit-typescript/packages/rivetkit-napi/src/napi_actor_events.rs` uses a `static`/`const` `RivetErrorSchema` instead of `Box::leak(Box::new(...))` since all fields are compile-time constants",
+        "`structured_timeout_schema` fallback path in the same file routes through the existing `BRIDGE_RIVET_ERROR_SCHEMAS` intern map (or an equivalent shared dedup map keyed by `(group, code)`) instead of leaking on every unknown timeout",
+        "Add a NAPI-side test that triggers `action_not_found` many times and asserts the schema pointer is reused (e.g., compare addresses)",
         "Typecheck passes",
         "Tests pass"
       ],
@@ -137,13 +133,13 @@
     },
     {
       "id": "US-009",
-      "title": "Fail fast for explicit wasm local SQLite",
-      "description": "As a test runner user, I want impossible wasm/local SQLite selections to fail clearly so that requested coverage is not silently dropped.",
+      "title": "Stop wasm websocket_callback_regions Vec from growing unboundedly",
+      "description": "As an actor author running on wasm with frequent websocket callbacks, I want region tracking to release slots when callbacks end so memory does not grow with callback churn for the actor lifetime.",
       "acceptanceCriteria": [
-        "Default driver matrix excludes `runtime=wasm` with `sqlite=local`",
-        "`RIVETKIT_DRIVER_TEST_RUNTIME=wasm` with `RIVETKIT_DRIVER_TEST_SQLITE=local` fails fast with a clear configuration error",
-        "Valid matrix cells remain native/local/all encodings, native/remote/all encodings, and wasm/remote/all encodings",
-        "`shared-matrix.test.ts` asserts the fail-fast behavior for explicit wasm/local selection",
+        "Replace `Rc<RefCell<Vec<Option<WebSocketCallbackRegion>>>>` in `WasmActorContext` (`rivetkit-typescript/packages/rivetkit-wasm/src/lib.rs`) with a `HashMap<u32, WebSocketCallbackRegion>` (or equivalent map) keyed by region_id, mirroring the NAPI `BTreeMap` pattern in `actor_context.rs`",
+        "`end_websocket_callback` removes the entry rather than leaving a `None` slot",
+        "Region IDs are still monotonically increasing and never reused while in flight",
+        "Add a wasm crate test that calls begin/end websocket callbacks many times and asserts the underlying map is empty afterward",
         "Typecheck passes",
         "Tests pass"
       ],
@@ -153,185 +149,86 @@
     },
     {
       "id": "US-010",
-      "title": "Enforce wasm SQLite config invariants in setup",
-      "description": "As a RivetKit user, I want `setup()` to reject local SQLite for wasm so that the unsupported configuration fails before runtime work begins.",
+      "title": "Investigate napi runtime_state mem::forget bounded leak",
+      "description": "As a maintainer, I want a path to drop the napi `runtime_state` JsObject ref via an Env-bearing thread so the documented per-actor-wake leak goes away.",
       "acceptanceCriteria": [
-        "`setup({ runtime: \"wasm\" })` defaults SQLite to remote when SQLite config is unset",
-        "`setup({ runtime: \"wasm\", sqlite: remote })` is allowed",
-        "`setup({ runtime: \"wasm\", sqlite: local })` fails with a clear configuration error",
-        "Native runtime keeps its current SQLite default and allows both local and remote SQLite",
-        "Add tests for wasm default remote SQLite, wasm remote allowed, wasm local rejected, and native behavior unchanged",
+        "Investigate `reset_runtime_state` and `Drop for ActorContextShared` in `rivetkit-typescript/packages/rivetkit-napi/src/actor_context.rs:720-749`",
+        "Document or implement an Env-bearing drop path (for example post a TSF call on the main thread that drops the napi `Ref` with an Env in scope)",
+        "If implementation is deferred, write up the constraints in `docs-internal/engine/napi-bridge.md` so the rationale survives the comment",
+        "If implemented: add a NAPI test that creates and destroys many actors and asserts the JsObject ref count returns to zero after process tear-down",
         "Typecheck passes",
         "Tests pass"
       ],
       "priority": 10,
       "passes": true,
-      "notes": ""
+      "notes": "Investigated and documented the Env-bearing cleanup path plus constraints in docs-internal/engine/napi-bridge.md. Implementation deferred until a NAPI integration test can verify TSF drain and reference counts."
     },
     {
       "id": "US-011",
-      "title": "Add shared platform SQLite counter registry",
-      "description": "As a platform test maintainer, I need one tiny shared registry so that Cloudflare, Supabase, and Deno tests verify the same public wasm API without duplicating actor code.",
+      "title": "Drop message from wasm BRIDGE_RIVET_ERROR_SCHEMAS cache key",
+      "description": "As an operator running a long-lived wasm worker, I want bridged JS error decoding to intern at most one schema per `(group, code)` so callers whose error messages vary per call (timestamps, request IDs, dynamic context) cannot grow the schema map and `Box::leak` arena unboundedly. The current US-002 fix keys on `(group, code, message)`, which still leaks one schema per unique message and re-introduces the same class of leak the PR is trying to close. The NAPI-side `STRUCTURED_TIMEOUT_SCHEMAS` already keys only on `(&'static str, &'static str)` (`rivetkit-typescript/packages/rivetkit-napi/src/napi_actor_events.rs:96-98`); wasm must match.",
       "acceptanceCriteria": [
-        "Create `rivetkit-typescript/packages/rivetkit/tests/platforms/shared-registry.ts`",
-        "Define a SQLite-backed counter actor with `increment` and `getCount` actions",
-        "The actor uses raw SQL rather than Drizzle",
-        "The registry factory uses public `setup({ runtime: \"wasm\", wasm: { bindings, initInput }, use })` shape",
-        "The registry uses remote SQLite and does not allow local SQLite",
+        "`BridgeRivetErrorSchemaKey` in `rivetkit-typescript/packages/rivetkit-wasm/src/lib.rs:2596` becomes `(String, String)` (or equivalent two-tuple) keyed only on `(group, code)`",
+        "`bridge_rivet_error_schema` (`lib.rs:2599-2618`) inserts the first-seen `default_message` for a given `(group, code)` and reuses that schema for subsequent decodes regardless of payload message",
+        "The actual per-error `message` field continues to flow through `RivetTransportError.message: Some(payload.message)` so callers still see the live message",
+        "Update `parse_bridge_rivet_error_reuses_interned_schema` to assert that varying only the message for the same `(group, code)` reuses the schema (and therefore does NOT increment `BRIDGE_RIVET_ERROR_SCHEMAS.len()`)",
+        "Add a second test (or extend the existing one) that varying `(group, code)` does still allocate a new schema",
+        "`pnpm --filter @rivetkit/rivetkit-wasm run check:package` passes; `cargo test -p rivetkit-wasm` passes",
         "Typecheck passes",
         "Tests pass"
       ],
       "priority": 11,
       "passes": true,
-      "notes": ""
+      "notes": "Wasm bridged RivetError schemas now intern by `(group, code)` only while preserving each payload's live message on the transport error. Native `cargo test -p rivetkit-wasm` still hits the pre-existing host-target `wasm_bindgen_futures` compile issue; wasm-target cargo test compilation and package checks pass."
     },
     {
       "id": "US-012",
-      "title": "Add shared platform test harness",
-      "description": "As a platform test maintainer, I need common process and client helpers so each platform smoke test can focus on its host runtime.",
+      "title": "Bound register_task shutdown drain against shutdown deadline",
+      "description": "As an operator, I want `ctx.registerTask(promise)` not to block actor shutdown indefinitely when the user-supplied JS promise never resolves. `WasmActorContext::register_task` (`rivetkit-typescript/packages/rivetkit-wasm/src/lib.rs:1345-1356`) and the analogous NAPI path route through `ActorContext::register_task` -> `track_shutdown_task`, so a never-resolving promise hangs shutdown drain. This contradicts the new CLAUDE.md rule added in this PR (\"Spawned futures that capture JS callbacks or other heavy resources must have a guaranteed completion path (e.g. a `CancellationToken` whose clones are guaranteed to drop)\").",
       "acceptanceCriteria": [
-        "Create `rivetkit-typescript/packages/rivetkit/tests/platforms/shared-platform-harness.ts`",
-        "The harness can create a namespace and serverless runner config against the shared test engine",
-        "The harness can create a RivetKit client for the shared SQLite counter registry",
-        "The harness provides helpers for temporary app directories, child process logging, health checks, and cleanup",
-        "Platform CLI commands are launched through pinned `pnpm dlx` versions where a CLI is needed",
-        "Platform tests are exposed through an explicit script such as `test:platforms` and are not included in the default test command",
+        "`ActorContext::register_task` in `rivetkit-rust/packages/rivetkit-core/src/actor/context.rs:552-587` races the user future against `ctx.shutdown_deadline_token().cancelled()` (or equivalent) so registered tasks unblock shutdown when the grace deadline elapses",
+        "Cancellation cause is logged at `tracing::warn!` with `actor_id` and a stable `reason` field so operators can find hanging registered tasks",
+        "Behavior is identical for the `wasm-runtime` and native `cfg(not(feature = \"wasm-runtime\"))` variants of `register_task`",
+        "Wasm `WasmActorContext::register_task` does not need a separate cancel path because core handles it",
+        "Add a Rust integration test in `rivetkit-rust/packages/rivetkit-core/tests/` that registers a never-completing future, triggers shutdown, and asserts shutdown completes within a bounded deadline rather than hanging",
         "Typecheck passes",
         "Tests pass"
       ],
       "priority": 12,
       "passes": true,
-      "notes": ""
+      "notes": "Core register_task now races registered futures against the shutdown deadline token for both native and wasm cfgs. A focused core test verifies a never-completing task drains after deadline cancellation and logs the stable reason."
     },
     {
       "id": "US-013",
-      "title": "Add Cloudflare Workers wasm platform smoke test",
-      "description": "As a release owner, I want a real local Cloudflare Workers smoke test so that wasm runtime packaging works in workerd.",
+      "title": "Avoid panic on websocket_callback_regions ID overflow",
+      "description": "As an operator running a long-lived wasm actor with frequent websocket callbacks, I do not want my actor to crash after ~4B handshakes because `next_websocket_callback_region_id` overflows `u32`. The current code (`rivetkit-typescript/packages/rivetkit-wasm/src/lib.rs:1351-1355`) uses `checked_add(1).expect(\"websocket callback region id overflow\")`, which crashes the actor process instead of degrading.",
       "acceptanceCriteria": [
-        "Create `rivetkit-typescript/packages/rivetkit/tests/platforms/cloudflare-workers.test.ts`",
-        "The test runs real local workerd through pinned `pnpm dlx wrangler@... dev --local`",
-        "The test imports only public `rivetkit` and `@rivetkit/rivetkit-wasm` package exports from platform app code",
-        "The test performs multiple requests to the same SQLite counter actor and verifies persisted readback",
-        "The test verifies actor sleep and wake for the SQLite counter actor",
-        "The test runs multiple separate actor IDs in parallel on the same platform instance",
-        "The test does not cover raw HTTP, raw WebSocket, workflows, queues, or the full driver suite",
+        "Either bump `next_websocket_callback_region_id` to `Cell<u64>` (and update the `begin_websocket_callback` return type plus any wasm-bindgen surface that exposes it) so overflow becomes operationally unreachable",
+        "Or implement wraparound that skips IDs already present in `websocket_callback_regions` so reuse is safe while regions are in flight",
+        "Either approach must keep IDs strictly monotonic for IDs currently in the map so no two live regions ever share an ID",
+        "Add a wasm crate test that exercises the wraparound (or large-counter) path to confirm no panic and no ID collision with live regions",
+        "If u32 is preserved, the test seeds `next_websocket_callback_region_id` near `u32::MAX` and verifies wraparound",
         "Typecheck passes",
         "Tests pass"
       ],
       "priority": 13,
       "passes": true,
-      "notes": ""
+      "notes": "Wasm websocket callback region IDs now wrap across the u32 boundary, skip ID 0, and skip live region IDs instead of panicking. Added wasm-target regression coverage for wraparound with live regions."
     },
     {
       "id": "US-014",
-      "title": "Add Deno wasm platform smoke test",
-      "description": "As a release owner, I want a plain Deno smoke test so that wasm runtime packaging works without the Supabase CLI wrapper.",
+      "title": "Document global cache delta in parse_bridge_rivet_error test",
+      "description": "As a future contributor adding tests under `rivetkit-typescript/packages/rivetkit-wasm/src/lib.rs`, I want a comment on `parse_bridge_rivet_error_reuses_interned_schema` (`lib.rs:2715-2737`) explaining that its `BRIDGE_RIVET_ERROR_SCHEMAS.len()` delta assertions only hold because the test owns a unique `(group, code)` namespace (`wasm_schema_cache_test`/`same_payload`). Without the comment, a future test that shares the global cache namespace will silently flip this assertion under parallel `cargo test`.",
       "acceptanceCriteria": [
-        "Create `rivetkit-typescript/packages/rivetkit/tests/platforms/deno.test.ts`",
-        "The test runs the platform app with real local Deno and does not use the Supabase CLI wrapper",
-        "The test imports only public `rivetkit` and `@rivetkit/rivetkit-wasm` package exports from platform app code",
-        "The test performs multiple requests to the same SQLite counter actor and verifies persisted readback",
-        "The test verifies actor sleep and wake for the SQLite counter actor",
-        "The test runs multiple separate actor IDs in parallel on the same platform instance",
-        "The test does not cover raw HTTP, raw WebSocket, workflows, queues, or the full driver suite",
+        "Add a one or two line comment immediately above `parse_bridge_rivet_error_reuses_interned_schema` (or above the `initial_count` capture) noting that the test relies on a dedicated `(group, code)` namespace so concurrent tests do not perturb the global `BRIDGE_RIVET_ERROR_SCHEMAS.len()` delta",
+        "Comment names the namespace strings (`wasm_schema_cache_test`, `same_payload`) so future contributors know what to avoid",
+        "If US-011 lands first and changes the cache key shape, update the comment to reflect the new key",
         "Typecheck passes",
         "Tests pass"
       ],
       "priority": 14,
       "passes": true,
-      "notes": ""
-    },
-    {
-      "id": "US-015",
-      "title": "Add Supabase Functions wasm platform smoke test",
-      "description": "As a release owner, I want a real local Supabase Functions smoke test so that wasm runtime packaging works through `supabase functions serve`.",
-      "acceptanceCriteria": [
-        "Create `rivetkit-typescript/packages/rivetkit/tests/platforms/supabase-functions.test.ts`",
-        "The test runs real local Supabase Functions through pinned `pnpm dlx supabase@... functions serve`",
-        "The test imports only public `rivetkit` and `@rivetkit/rivetkit-wasm` package exports from function app code",
-        "The test performs multiple requests to the same SQLite counter actor and verifies persisted readback",
-        "The test verifies actor sleep and wake for the SQLite counter actor",
-        "The test runs multiple separate actor IDs in parallel on the same platform instance",
-        "The test does not cover raw HTTP, raw WebSocket, workflows, queues, or the full driver suite",
-        "Typecheck passes",
-        "Tests pass"
-      ],
-      "priority": 15,
-      "passes": true,
-      "notes": ""
-    },
-    {
-      "id": "US-016",
-      "title": "Document wasm runtime setup for Cloudflare and Supabase",
-      "description": "As an application developer, I want public docs for wasm runtime setup on Cloudflare Workers and Supabase Functions so that I can copy the same API used by the tests.",
-      "acceptanceCriteria": [
-        "Update quickstart docs to point users at edge and serverless wasm setup",
-        "Add or update `website/src/content/docs/connect/cloudflare.mdx` for Cloudflare Workers",
-        "Replace the placeholder in `website/src/content/docs/connect/supabase.mdx` with Supabase Edge Functions setup",
-        "Update the sidebar source used by `website/src/sitemap/mod.ts` if a new Connect page is added",
-        "Docs show `setup({ runtime: \"wasm\", wasm: { bindings, initInput }, use })`",
-        "Docs explain that wasm cannot use local SQLite and defaults to remote SQLite when SQLite config is unset",
-        "Docs mention `runtime: \"wasm\"` and `RIVETKIT_RUNTIME=wasm`",
-        "Docs do not mention hidden globals, private generated paths, or lower-level registry builders",
-        "Quickstart and Connect pages link to each other where appropriate",
-        "Typecheck passes"
-      ],
-      "priority": 16,
-      "passes": true,
-      "notes": ""
-    },
-    {
-      "id": "US-017",
-      "title": "Remove Buffer from shared actor runtime glue",
-      "description": "As an edge runtime maintainer, I want the shared TypeScript actor glue to use portable bytes so that wasm hosts do not rely on Node `Buffer` outside the NAPI adapter.",
-      "acceptanceCriteria": [
-        "Audit `rivetkit-typescript/packages/rivetkit/src/registry/native.ts` for `Buffer` usage that is part of shared actor glue rather than NAPI-only adapter conversion",
-        "Replace shared actor glue byte construction and decoding with `Uint8Array`, `ArrayBuffer`, `TextEncoder`, `TextDecoder`, or portable helper functions",
-        "Keep required Node `Buffer` conversion inside `rivetkit-typescript/packages/rivetkit/src/registry/napi-runtime.ts` or clearly NAPI-only code paths",
-        "`WasmCoreRuntime` and wasm platform registry paths do not require `globalThis.Buffer`",
-        "Add or update tests that exercise wasm runtime behavior without installing a `Buffer` global",
-        "Typecheck passes",
-        "Tests pass"
-      ],
-      "priority": 17,
-      "passes": true,
-      "notes": ""
-    },
-    {
-      "id": "US-018",
-      "title": "Tighten runtime SQL boundary types",
-      "description": "As a runtime adapter author, I want SQL boundary types to be exact discriminated unions so that NAPI and wasm cannot accidentally pass malformed SQL params or route strings.",
-      "acceptanceCriteria": [
-        "Change `RuntimeSqlBindParam` to a discriminated union with exactly one value field per kind",
-        "Use `RuntimeBytes` or `Uint8Array` consistently for SQL blob params and results",
-        "Change `RuntimeSqlExecuteResult.route` to the exact union `\"read\" | \"write\" | \"writeFallback\"`",
-        "Update NAPI and wasm SQL adapters to satisfy the stricter runtime SQL types without casts that hide invalid shapes",
-        "Add type or unit coverage for null, int, float, text, blob, and route result normalization",
-        "User-facing SQL integer result behavior remains unchanged from the current TypeScript API",
-        "Typecheck passes",
-        "Tests pass"
-      ],
-      "priority": 18,
-      "passes": true,
-      "notes": ""
-    },
-    {
-      "id": "US-019",
-      "title": "Make platform fixtures match public docs code",
-      "description": "As an application developer, I want platform smoke fixtures to use the same user-friendly code shown in docs so that tests validate the copy-paste Cloudflare, Supabase, and Deno setup.",
-      "acceptanceCriteria": [
-        "Platform app code does not import helper names like `createPlatformSqliteCounterRegistry` from test-only modules",
-        "Each generated platform app includes a docs-shaped registry file that imports `actor`, `setup`, and `@rivetkit/rivetkit-wasm` directly through public package exports",
-        "Each generated platform app calls `setup({ runtime: \"wasm\", wasm: { bindings, initInput }, sqlite: \"remote\", use })` or the documented equivalent inline",
-        "Shared test utilities may generate or copy the docs-shaped registry source, but the app code itself must look like user documentation rather than a test harness API",
-        "Cloudflare Workers, Supabase Functions, and Deno platform tests all use the same docs-shaped SQLite counter actor source with only platform bootstrapping differences",
-        "No platform app uses hidden globals, lower-level registry builders, private generated wasm paths, or test-only registry wrappers",
-        "Typecheck passes",
-        "Tests pass"
-      ],
-      "priority": 19,
-      "passes": true,
-      "notes": ""
+      "notes": "Added a comment documenting the dedicated `(wasm_schema_cache_test, same_payload)` cache namespace used by the global schema-count delta assertion."
     }
   ]
 }

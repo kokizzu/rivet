@@ -7,6 +7,7 @@ mod moved_tests {
 
 	use rivet_error::RivetError as RivetTransportError;
 	use rivetkit_actor_persist::versioned as persist_versioned;
+	use rivet_error::{RivetError as RivetTransportError, RivetErrorSchema};
 	use rivetkit_core::Kv;
 	use rivetkit_core::actor::state::PERSIST_DATA_KEY;
 	use tokio::sync::oneshot;
@@ -61,6 +62,14 @@ mod moved_tests {
 	fn assert_error_code(error: anyhow::Error, code: &str) {
 		let error = RivetTransportError::extract(&error);
 		assert_eq!(error.code(), code);
+	}
+
+	fn schema_ptr(error: &anyhow::Error) -> *const RivetErrorSchema {
+		error
+			.chain()
+			.find_map(|cause| cause.downcast_ref::<RivetTransportError>())
+			.map(|error| error.schema as *const RivetErrorSchema)
+			.expect("expected rivet error")
 	}
 
 	#[tokio::test(flavor = "current_thread")]
@@ -167,6 +176,17 @@ mod moved_tests {
 			.expect_err("missing action should error");
 		let error = RivetTransportError::extract(&error);
 		assert_eq!(error.code(), "action_not_found");
+	}
+
+	#[test]
+	fn action_not_found_reuses_static_schema() {
+		let first = action_not_found("missing-first".to_owned());
+		let first_schema = schema_ptr(&first);
+
+		for i in 0..100 {
+			let error = action_not_found(format!("missing-{i}"));
+			assert_eq!(schema_ptr(&error), first_schema);
+		}
 	}
 
 	#[tokio::test]
@@ -369,6 +389,16 @@ mod moved_tests {
 		assert_eq!(error.group(), "actor");
 		assert_eq!(error.code(), "action_timed_out");
 		assert_eq!(error.message(), "Action timed out");
+	}
+
+	#[test]
+	fn unknown_structured_timeout_schema_is_interned_by_group_and_code() {
+		let first = structured_timeout_schema("test", "slow_callback", "first message");
+
+		for i in 0..100 {
+			let schema = structured_timeout_schema("test", "slow_callback", &format!("message {i}"));
+			assert!(std::ptr::eq(schema, first));
+		}
 	}
 
 	#[tokio::test]

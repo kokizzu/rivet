@@ -1,266 +1,163 @@
 # Ralph Progress Log
-
 ## Codebase Patterns
-- Current branch: `04-29-chore_rivetkit_wasm_support`.
 - The NAPI and wasm TypeScript adapters implement the shared `CoreRuntime` contract in `rivetkit-typescript/packages/rivetkit/src/registry/`.
-- Keep raw `@rivetkit/rivetkit-napi` and `@rivetkit/rivetkit-wasm` imports inside runtime adapter modules or explicit edge entrypoints.
+- Keep raw `@rivetkit/rivetkit-napi` and `@rivetkit/rivetkit-wasm` imports inside runtime adapter modules (`napi-runtime.ts`, `wasm-runtime.ts`); enforced by `tests/runtime-import-guard.test.ts`.
 - Wasm cannot use local SQLite. Valid SQLite runtime cells are native/local, native/remote, and wasm/remote.
-- Edge smoke coverage should eventually validate public package exports, not only repo-relative generated wasm-pack output.
-- Reuse `rivetkit-typescript/packages/rivetkit/tests/shared-engine.ts` for TypeScript tests that need a local `rivet-engine`; do not add separate engine launchers in driver or platform tests.
-- Runtime normalization should use `CoreRuntime.kind`, not adapter `instanceof` checks. Map `kind: "napi"` to native and `kind: "wasm"` to wasm.
-- `CoreRuntime` SQL methods use the portable `RuntimeSql*` structs from `src/registry/runtime.ts`; keep NAPI `Buffer` conversion inside `NapiCoreRuntime`.
-- Keep runtime SQL bind params as exact discriminated unions and normalize adapter execute routes to `read`, `write`, or `writeFallback`.
-- `CoreRuntime` byte payloads use `RuntimeBytes`/`Uint8Array`; keep Node `Buffer` conversion inside `NapiCoreRuntime` and out of `wasm-runtime.ts`.
-- Shared actor glue in `src/registry/native.ts` should construct `RuntimeBytes`/`Uint8Array`; leave Node `Buffer` creation to `NapiCoreRuntime`.
-- Pass wasm bindings through `setup({ wasm: { bindings, initInput } })`; do not rely on hidden `globalThis` wasm binding hooks.
-- Use `pnpm --filter @rivetkit/rivetkit-wasm run check:package` after wasm package export/files changes; wasm-pack's generated `.gitignore` can otherwise hide required `pkg` artifacts from npm tarballs.
-- Wasm `CoreRegistry` serverless startup uses a `BuildingServerless` waiter state; shutdown during build must wake waiters and drain any newly built runtime.
-- Wasm bindings should forward supported parity APIs to `rivetkit-core`; do not leave placeholder returns for NAPI-supported APIs.
-- Driver matrix env overrides that explicitly request `runtime=wasm` with `sqlite=local` should fail fast in `tests/driver/shared-matrix.ts`.
-- Use public `setup({ sqlite: "local" | "remote" })` for runtime SQLite backend selection; wasm defaults unset SQLite to remote and rejects local during config parsing.
-- Platform wasm smoke clients can use `tests/platforms/shared-registry.ts` for registry typing, while generated platform apps should use docs-shaped local registry source.
-- Platform smoke tests should use `tests/platforms/shared-platform-harness.ts` for shared engine namespaces, serverless runner configs, clients, temp app dirs, health checks, child logs, and pinned `pnpm dlx` launches.
-- Use `buildPlatformSqliteCounterRegistrySource(...)` to generate the shared docs-shaped platform SQLite counter registry source for Cloudflare, Deno, and Supabase apps.
-- Platform tests that import public package exports must build `rivetkit` first because package exports point at `dist/tsup`.
-- Raw `ctx.sql` platform fixtures still need a `db` provider so runtime SQLite is enabled.
-- Cloudflare Workers platform fixtures need a fetch-upgrade `WebSocket` shim for wasm envoy connections.
-- Do not duplicate engine-owned serverless start headers in platform runner config; Cloudflare may combine duplicate headers into comma-separated values.
-- Avoid `sqlite_` table prefixes in platform SQLite fixtures because SQLite reserves them.
-- Deno platform fixtures need `--allow-sys` because public `rivetkit` imports `pino`, which reads `os.hostname()`.
-- Deno platform fixtures can pass wasm bytes from the public `@rivetkit/rivetkit-wasm/rivetkit_wasm_bg.wasm` export using `import.meta.resolve` plus `Deno.readFile`.
-- Supabase Functions platform fixtures run inside Docker; advertise local engines through the Docker bridge IP when `docker0` exists and fall back to `host.docker.internal`.
-- Supabase Functions Edge Runtime needs function-local package metadata and copied package trees for public bare package imports.
-- Supabase Functions fixtures should use Edge Runtime `per_worker` policy and avoid serverless runner prewarm settings so long-lived `/start` streams coexist with metadata and wake requests.
-- Connect docs cards and sidebar entries are generated from `frontend/packages/shared-data/src/deploy.ts`.
-- Website docs code-block typechecking runs during `pnpm --filter rivet-website build`; `c.kv.listRange` and `c.kv.deleteRange` range bounds must be `Uint8Array`.
+- Cross-boundary error sanitization belongs in `rivetkit-core`. The TS bridge passes raw errors through; status code promotion should not live in `wasm-runtime.ts`.
+- Use `rivetkit-typescript/packages/rivetkit/tests/shared-engine.ts` for any TS test that needs a local `rivet-engine`.
+- The wasm crate uses `RuntimeSpawner::spawn` which maps to `tokio::task::spawn_local` under `wasm-runtime` and `tokio::spawn` otherwise.
+- Bridged JS errors round-trip via `__RIVET_ERROR_JSON__:` prefix in the message string; decoded with `parse_bridge_rivet_error` and re-encoded with `anyhow_to_js_error`.
+- Wasm `JsValue` callbacks are not Send/Sync; `WasmFunction` uses an unsafe Send/Sync impl because the wasm runtime is single-threaded.
+- Wasm host smoke tests use fake `WasmBindings` in `rivetkit-typescript/packages/rivetkit/tests/wasm-host-smoke.test.ts` to exercise the TypeScript `WasmCoreRuntime` adapter without requiring a built wasm artifact.
+- Wasm bindings that return `Result<_, JsValue>` should map core `anyhow::Error` values with `anyhow_to_js_error`.
+- Wasm bridged RivetError schemas are process-interned with `scc::HashMap` by `(group, code)` only; live per-error messages stay on `RivetError.message`.
+- Validate wasm-only `ServeConfig` constraints at wasm entrypoints before converting to core `ServeConfig` or starting registry side effects.
+- Runtime-owned promises that must drain during shutdown use core `ActorContext::register_task(...)`, not public `wait_until(...)`, so NAPI and wasm can keep `registerTask` intent distinct.
+- Public HTTP status promotion for bridged errors lives in `rivetkit-core::error::public_error_status_code`; TS native/wasm adapters should not duplicate promotion tables.
+- `@rivetkit/rivetkit-wasm` builds must use the package-local pinned `wasm-pack` dependency; do not shell through `npx -y wasm-pack`.
+- Runtime parity tests can instantiate `NapiCoreRuntime` and `WasmCoreRuntime` with fake binding classes, then drive shared actor glue through `buildNativeFactory(...)` without requiring generated NAPI or wasm artifacts.
+- NAPI actor-event synthetic `RivetErrorSchema` values should be `static` when fields are compile-time constants, or process-interned by `(group, code)` with `scc::HashMap` when the default message is dynamic.
+- Wasm websocket callback regions should be tracked in a map keyed by active region IDs and removed on end so callback churn does not retain empty slots.
+- Wasm websocket callback region ID `0` is the untracked sentinel; `u32` allocation wraps by skipping live IDs instead of panicking.
+- NAPI `Ref::unref` needs an `Env`; cleanup from worker or `Drop` paths should be routed through an Env-bearing TSF and must tolerate addon shutdown by falling back to a bounded leak.
+- Core `ActorContext::register_task(...)` must race registered runtime promises against `shutdown_deadline_token()` so shutdown drain cannot hang forever.
 
-Started: Fri May 01 2026
+Started: Sat May  2 02:13:32 AM PDT 2026
 ---
-
-## 2026-05-01 21:56 PDT - US-013
-- Added a real Cloudflare Workers wasm platform smoke test that launches pinned local `wrangler dev --local`.
-- The generated Worker app imports only public `rivetkit` and `@rivetkit/rivetkit-wasm` exports, wires wasm through public `setup`, and exercises SQLite counter persistence, cold wake, and parallel actor IDs.
-- Added the Cloudflare fetch-upgrade `WebSocket` shim, public wasm asset export, serverless header cleanup, and SQLite fixture adjustments needed for the workerd runtime.
-- Files changed: `rivetkit-typescript/packages/rivetkit/tests/platforms/cloudflare-workers.test.ts`, `rivetkit-typescript/packages/rivetkit/tests/platforms/shared-platform-harness.ts`, `rivetkit-typescript/packages/rivetkit/tests/platforms/shared-registry.ts`, `rivetkit-typescript/packages/rivetkit/tests/platforms/CLAUDE.md`, `rivetkit-typescript/packages/rivetkit/tests/platforms/AGENTS.md`, `rivetkit-typescript/packages/rivetkit/package.json`, `rivetkit-typescript/packages/rivetkit-wasm/package.json`, `rivetkit-typescript/packages/rivetkit/tests/shared-engine.ts`, `rivetkit-rust/packages/rivetkit-core/src/serverless.rs`, `rivetkit-rust/packages/rivetkit-core/tests/serverless.rs`, `rivetkit-rust/packages/rivetkit-core/tests/context.rs`, `rivetkit-rust/packages/rivetkit-core/tests/sleep.rs`, `rivetkit-rust/packages/rivetkit-core/tests/task.rs`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
-- Checks: `pnpm --filter rivetkit run test:platforms` passed; `pnpm --filter rivetkit run check-types` passed; `pnpm --filter @rivetkit/rivetkit-wasm run check:package` passed; `pnpm --filter @rivetkit/rivetkit-wasm run check-types` passed; `cargo test -p rivetkit-core matches_combined_duplicate_endpoint_headers` passed.
+## 2026-05-02 02:15:18 PDT - US-001
+- Implemented wasm `ActorContext.requestSaveAndWait` by awaiting `rivetkit_core::ActorContext::request_save_and_wait`.
+- Extended the wasm host smoke harness so `saveState({ immediate: true })` cannot resolve until the host save gate completes.
+- Files changed: `rivetkit-typescript/packages/rivetkit-wasm/src/lib.rs`, `rivetkit-typescript/packages/rivetkit/tests/wasm-host-smoke.test.ts`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+- Checks: `pnpm --filter rivetkit exec vitest run tests/wasm-host-smoke.test.ts`, `pnpm --filter @rivetkit/rivetkit-wasm run check:wasm`, `pnpm --filter rivetkit run check-types`, `pnpm --filter @rivetkit/rivetkit-wasm run check-types`, `pnpm --filter rivetkit exec biome check tests/wasm-host-smoke.test.ts`.
+- Full `pnpm --filter rivetkit run lint` currently fails on pre-existing diagnostics in `fixtures/driver-test-suite/*`.
 - **Learnings for future iterations:**
-  - Cloudflare workerd does not provide a browser-compatible `new WebSocket("ws://...")` path, so the fixture must bridge wasm envoy connections through `fetch(..., { headers: { Upgrade: "websocket" } })`.
-  - Platform app code that uses `ctx.sql` must still declare `db` so the actor config enables runtime SQLite.
-  - The platform test command should build first because generated apps resolve public package exports to `dist/tsup`.
-  - Serverless start headers should be owned by the engine and harness, not duplicated in platform runner config.
+  - `ctx.saveState(...)` routes through `WasmCoreRuntime.actorRequestSaveAndWait`, so host smoke tests can model durability waits by blocking fake `requestSaveAndWait`.
+  - The wasm crate check may emit existing `rivetkit-core` warnings while still passing.
 ---
-
-## 2026-05-01 19:50 PDT - US-001
-- Extracted the shared local `rivet-engine` lifecycle from the driver harness into `rivetkit-typescript/packages/rivetkit/tests/shared-engine.ts`.
-- Kept driver runtime setup on the existing `shared-harness.ts` API by delegating `getOrStartSharedEngine` and `releaseSharedEngine` to the shared utility.
-- Added a reusable harness note to `rivetkit-typescript/AGENTS.md` and marked US-001 passing in `prd.json`.
-- Files changed: `rivetkit-typescript/packages/rivetkit/tests/shared-engine.ts`, `rivetkit-typescript/packages/rivetkit/tests/driver/shared-harness.ts`, `rivetkit-typescript/AGENTS.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
-- Checks: targeted Biome passed for touched files; `pnpm run check-types` passed in `rivetkit-typescript/packages/rivetkit`; `pnpm exec vitest run tests/driver/shared-matrix.test.ts` passed. Full `pnpm run lint` is blocked by existing fixture lint failures outside this story.
+## 2026-05-02 02:24:00 PDT - US-002
+- Implemented process-global interning for wasm bridged `RivetErrorSchema` values keyed by `(group, code, default_message)`.
+- Added a wasm crate unit test that decodes the same bridged payload repeatedly, checks schema pointer reuse, and verifies a different default message interns separately.
+- Files changed: `rivetkit-typescript/packages/rivetkit-wasm/src/lib.rs`, `rivetkit-typescript/packages/rivetkit-wasm/Cargo.toml`, `Cargo.lock`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+- Checks: `cargo test -p rivetkit-wasm --target wasm32-unknown-unknown --no-run parse_bridge_rivet_error_reuses_interned_schema`, `pnpm --filter @rivetkit/rivetkit-wasm run check:wasm`, `pnpm --filter @rivetkit/rivetkit-wasm run check-types`.
+- Native `cargo test -p rivetkit-wasm` currently fails before this crate compiles because `rivetkit-core`'s `wasm-runtime` feature references `wasm_bindgen_futures` on the host target.
 - **Learnings for future iterations:**
-  - Use `tests/shared-engine.ts` for any TypeScript test that needs a shared local `rivet-engine`.
-  - `driver/shared-harness.ts` should stay focused on namespace, runner config, and driver runtime process setup.
-  - Package-wide lint currently reports many pre-existing issues under `tests/fixtures/driver-test-suite`.
+  - `rivetkit-wasm` has `autotests = false`, so private Rust leak guards are currently easiest as crate unit tests compiled for `wasm32-unknown-unknown`.
+  - The wasm-target test harness can be compiled with `cargo test --target wasm32-unknown-unknown --no-run` even when native host tests cannot run.
 ---
-
-## 2026-05-01 19:53 PDT - US-002
-- Updated runtime normalization to switch on the portable `CoreRuntime.kind` field instead of concrete NAPI/wasm adapter classes.
-- Added runtime-selection coverage for plain object `CoreRuntime` fakes with `kind: "napi"` and `kind: "wasm"`.
-- Kept config precedence behavior covered by the existing setup config, `RIVETKIT_RUNTIME`, and auto-selection tests.
-- Files changed: `rivetkit-typescript/packages/rivetkit/src/registry/native.ts`, `rivetkit-typescript/packages/rivetkit/tests/runtime-selection.test.ts`, `rivetkit-typescript/CLAUDE.md` via the `AGENTS.md` symlink, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
-- Checks: `pnpm exec biome check src/registry/native.ts tests/runtime-selection.test.ts` passed; `pnpm exec vitest run tests/runtime-selection.test.ts` passed; `pnpm run check-types` passed.
+## 2026-05-02 02:26:54 PDT - US-003
+- Implemented wasm `engine_binary_path` rejection with a typed `wasm.invalid_config` error before registry serve/serverless startup reaches core.
+- Added wasm crate regression coverage for the typed metadata and the `serve` entrypoint fast-rejection path.
+- Files changed: `rivetkit-typescript/packages/rivetkit-wasm/src/lib.rs`, `engine/artifacts/errors/wasm.invalid_config.json`, `rivetkit-typescript/AGENTS.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+- Checks: `cargo test -p rivetkit-wasm --target wasm32-unknown-unknown --no-run engine_binary_path_error_is_typed_with_field_metadata`, `cargo test -p rivetkit-wasm --target wasm32-unknown-unknown --no-run serve_rejects_engine_binary_path_before_core_setup`, `pnpm --filter @rivetkit/rivetkit-wasm run check:wasm`, `pnpm --filter @rivetkit/rivetkit-wasm run check-types`.
 - **Learnings for future iterations:**
-  - `CoreRuntime.kind` is the stable adapter boundary for runtime-specific behavior; avoid class identity checks so duplicate modules and future adapters still work.
-  - The public config still calls the NAPI runtime `native`, while the portable runtime contract uses `kind: "napi"`.
-  - `native.ts` may contain older lint-sensitive code, so touched-file Biome checks can surface nearby cleanup needs.
+  - Wasm runtime config errors should use typed RivetError values and cross the JS boundary through `anyhow_to_js_error`.
+  - Validate wasm-only serve constraints before setting inspector overrides or moving the registry out of `Registering`.
 ---
-
-## 2026-05-01 19:57 PDT - US-003
-- Defined explicit portable SQL bind, query, execute, exec, run, and database types in `rivetkit-typescript/packages/rivetkit/src/registry/runtime.ts`.
-- Updated NAPI and wasm SQL adapters to implement the shared runtime SQL shape, with NAPI converting `Uint8Array` blob params to `Buffer` only at the native binding call.
-- Added bind normalization coverage for bigint, boolean, string, number, null, undefined, and `Uint8Array`.
-- Files changed: `rivetkit-typescript/packages/rivetkit/src/registry/runtime.ts`, `rivetkit-typescript/packages/rivetkit/src/registry/napi-runtime.ts`, `rivetkit-typescript/packages/rivetkit/src/registry/wasm-runtime.ts`, `rivetkit-typescript/packages/rivetkit/src/common/database/native-database.test.ts`, `rivetkit-typescript/CLAUDE.md` via the `AGENTS.md` symlink, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
-- Checks: `pnpm exec biome check src/registry/runtime.ts src/registry/napi-runtime.ts src/registry/wasm-runtime.ts src/common/database/native-database.test.ts` passed; `pnpm run check-types` passed; `pnpm exec vitest run src/common/database/native-database.test.ts` passed; `pnpm exec vitest run tests/wasm-host-smoke.test.ts` passed.
+## 2026-05-02 02:31:24 PDT - US-004
+- Implemented core `ActorContext::register_task(...)` for native and wasm cfgs, backed by the existing shutdown task counter and a distinct `registered_task` user-task metric.
+- Updated wasm `ActorContext.registerTask` to call core `register_task` instead of forwarding to `waitUntil`.
+- Extended the wasm host smoke harness so a registered task remains pending when shutdown starts and shutdown does not resolve until that task finishes.
+- Files changed: `rivetkit-rust/packages/rivetkit-core/src/actor/context.rs`, `rivetkit-rust/packages/rivetkit-core/src/actor/task_types.rs`, `rivetkit-rust/packages/rivetkit-core/AGENTS.md`, `rivetkit-typescript/packages/rivetkit-wasm/src/lib.rs`, `rivetkit-typescript/packages/rivetkit/tests/wasm-host-smoke.test.ts`, `rivetkit-typescript/AGENTS.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+- Checks: `pnpm --filter rivetkit exec vitest run tests/wasm-host-smoke.test.ts`, `pnpm --filter @rivetkit/rivetkit-wasm run check:wasm`, `pnpm --filter @rivetkit/rivetkit-wasm run check-types`, `pnpm --filter rivetkit run check-types`, `pnpm --filter rivetkit exec biome check tests/wasm-host-smoke.test.ts`, `cargo check -p rivetkit-core`, `cargo test -p rivetkit-wasm --target wasm32-unknown-unknown --no-run`.
 - **Learnings for future iterations:**
-  - The shared runtime SQL boundary should stay independent of `JsNativeDatabaseLike`.
-  - NAPI generated bindings still use `Buffer` for SQL blobs, so adapt at the NAPI runtime edge instead of changing `CoreRuntime`.
-  - `wrapJsNativeDatabase` remains the user-facing SQL behavior boundary and is the right place to guard bind normalization.
+  - `ActorContextHandleAdapter.internalKeepAwake(...)` routes to runtime `actorRegisterTask`, so wasm host smoke tests can exercise it by adding `registerTask(...)` and shutdown-drain behavior to the fake wasm context.
+  - Core `register_task(...)` should use shutdown task tracking directly while keeping a separate `UserTaskKind::RegisteredTask` label from public `wait_until(...)`.
 ---
-
-## 2026-05-01 20:01 PDT - US-004
-- Replaced the shared `CoreRuntime` byte boundary with `RuntimeBytes`/`Uint8Array` for HTTP bodies, state deltas, KV keys and values, queue payloads, websocket bytes, connection bytes, and inspector bytes.
-- Kept NAPI `Buffer` coercion inside `NapiCoreRuntime`, including serverless requests, HTTP requests, state deltas, KV batches, queue completions, schedules, connections, websockets, and SQL blob params.
-- Removed Node `Buffer` normalization from `wasm-runtime.ts` so wasm byte handling stays portable.
-- Files changed: `rivetkit-typescript/packages/rivetkit/src/registry/runtime.ts`, `rivetkit-typescript/packages/rivetkit/src/registry/napi-runtime.ts`, `rivetkit-typescript/packages/rivetkit/src/registry/wasm-runtime.ts`, `rivetkit-typescript/packages/rivetkit/src/registry/index.ts`, `rivetkit-typescript/CLAUDE.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
-- Checks: `pnpm exec biome check src/registry/runtime.ts src/registry/napi-runtime.ts src/registry/wasm-runtime.ts src/registry/index.ts` passed; `pnpm run check-types` passed; `pnpm exec vitest run tests/wasm-host-smoke.test.ts tests/runtime-selection.test.ts` passed.
+## 2026-05-02 02:37:23 PDT - US-005
+- Moved bridged RivetError HTTP status promotion into `rivetkit-core::error::public_error_status_code`.
+- Updated NAPI and wasm bridge encoders to include promoted `public` and `statusCode` values from core, and removed the TS native/wasm adapter promotion tables.
+- Removed the decoder-side TS fallback promotion so bridge payload status now comes from the encoded core payload.
+- Added NAPI and wasm bridge tests for `auth.forbidden` producing statusCode 403.
+- Files changed: `rivetkit-rust/packages/rivetkit-core/src/error.rs`, `rivetkit-rust/packages/rivetkit-core/AGENTS.md`, `rivetkit-typescript/packages/rivetkit-napi/src/lib.rs`, `rivetkit-typescript/packages/rivetkit-napi/tests/actor_factory.rs`, `rivetkit-typescript/packages/rivetkit-wasm/src/lib.rs`, `rivetkit-typescript/packages/rivetkit/src/actor/errors.ts`, `rivetkit-typescript/packages/rivetkit/src/registry/native.ts`, `rivetkit-typescript/packages/rivetkit/src/registry/wasm-runtime.ts`, `rivetkit-typescript/AGENTS.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+- Checks: `cargo check -p rivetkit-core`, `cargo check -p rivetkit-napi --tests`, `cargo test -p rivetkit-wasm --target wasm32-unknown-unknown --no-run wasm_bridge_payload_promotes_known_core_error_status`, `pnpm --filter rivetkit exec vitest run tests/rivet-error.test.ts`, `pnpm --filter rivetkit exec biome check src/actor/errors.ts src/registry/native.ts src/registry/wasm-runtime.ts`, `pnpm --filter rivetkit run check-types`, `pnpm --filter @rivetkit/rivetkit-wasm run check-types`, `pnpm --filter @rivetkit/rivetkit-wasm run check:wasm`.
+- Direct `cargo test -p rivetkit-napi napi_bridge_payload_promotes_known_core_error_status` currently fails at the existing standalone N-API linker step with unresolved `napi_*` symbols; `cargo check -p rivetkit-napi --tests` compiles the added test.
 - **Learnings for future iterations:**
-  - Use `RuntimeBytes` from `src/registry/runtime.ts` for shared runtime byte payloads.
-  - NAPI generated bindings still require `Buffer`, so convert at the `NapiCoreRuntime` call boundary rather than widening the shared contract.
-  - Wasm runtime code should avoid Node byte helpers such as `Buffer.from`, `Buffer.alloc`, and `Buffer.isBuffer`.
+  - Test-only `#[derive(RivetError)]` structs can generate `engine/artifacts/errors/*.json`; use static `RivetErrorSchema` values in private bridge tests when no artifact should be committed.
+  - Keep bridge status promotion at the Rust encoding boundary so old/private/default 500 bridge contexts are normalized before TypeScript decodes them.
 ---
-
-## 2026-05-01 20:04 PDT - US-005
-- Added typed `wasm.bindings` runtime config alongside `wasm.initInput`.
-- Updated runtime loading so explicit and auto wasm selection pass the full wasm config object into `loadWasmRuntime`.
-- Removed production `globalThis.__rivetkitWasmBindings` lookup; configured bindings are used before falling back to the public `@rivetkit/rivetkit-wasm` import.
-- Files changed: `rivetkit-typescript/packages/rivetkit/src/registry/config/index.ts`, `rivetkit-typescript/packages/rivetkit/src/registry/native.ts`, `rivetkit-typescript/packages/rivetkit/src/registry/wasm-runtime.ts`, `rivetkit-typescript/packages/rivetkit/tests/runtime-selection.test.ts`, `rivetkit-typescript/packages/rivetkit/tests/wasm-runtime.test.ts`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
-- Checks: `pnpm exec biome check src/registry/config/index.ts src/registry/native.ts src/registry/wasm-runtime.ts tests/runtime-selection.test.ts tests/wasm-runtime.test.ts` passed; `pnpm exec vitest run tests/runtime-selection.test.ts tests/wasm-runtime.test.ts` passed; `pnpm run check-types` passed.
+## 2026-05-02 02:40:27 PDT - US-006
+- Added pinned `wasm-pack@0.14.0` as a dev dependency of `@rivetkit/rivetkit-wasm`.
+- Updated the wasm build script to resolve and execute the local `wasm-pack` binary through Node instead of using `npx -y`.
+- Files changed: `rivetkit-typescript/packages/rivetkit-wasm/package.json`, `rivetkit-typescript/packages/rivetkit-wasm/scripts/build.mjs`, `pnpm-lock.yaml`, `rivetkit-typescript/AGENTS.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+- Checks: `pnpm --filter @rivetkit/rivetkit-wasm build`, `pnpm install --lockfile-only --frozen-lockfile`, `pnpm --filter @rivetkit/rivetkit-wasm run check:package`, `pnpm --filter @rivetkit/rivetkit-wasm run check-types`, `pnpm --filter @rivetkit/rivetkit-wasm run check:wasm`, `node --check rivetkit-typescript/packages/rivetkit-wasm/scripts/build.mjs`.
+- Biome ignored the touched wasm package files by repository configuration, so no Biome lint signal was available for this package path.
 - **Learnings for future iterations:**
-  - `RegistryConfigSchema` owns the typed wasm binding config.
-  - `loadWasmRuntime` accepts the full wasm config object so bindings and `initInput` stay paired.
-  - Keep platform-provided wasm bindings explicit in registry config instead of smuggling them through globals.
+  - The `wasm-pack` npm package exposes a `wasm-pack` bin through `run.js`; resolve it from `wasm-pack/package.json` and execute it with `process.execPath`.
+  - Keep the wasm package build offline-friendly after dependencies are installed. Missing `wasm-pack` should fail with an explicit install/dependency error, not a registry fetch.
 ---
-
-## 2026-05-01 20:09 PDT - US-006
-- Published the wasm package through one root public import path by keeping `@rivetkit/rivetkit-wasm` as the only package export and forwarding root declarations to the generated wasm-pack declarations.
-- Fixed package contents so npm tarballs include the root JS/types, generated JS/types, and `.wasm` artifact despite wasm-pack's generated ignored `pkg/` directory.
-- Added a `check:package` script to assert the published file list and a `prepack` build hook so clean package publishing regenerates wasm artifacts before packing.
-- Files changed: `rivetkit-typescript/packages/rivetkit-wasm/.npmignore`, `rivetkit-typescript/packages/rivetkit-wasm/index.d.ts`, `rivetkit-typescript/packages/rivetkit-wasm/package.json`, `rivetkit-typescript/packages/rivetkit-wasm/scripts/check-package.mjs`, `rivetkit-typescript/CLAUDE.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
-- Checks: `pnpm --filter @rivetkit/rivetkit-wasm run check:package` passed; `pnpm --filter @rivetkit/rivetkit-wasm run check-types` passed; `pnpm --filter @rivetkit/rivetkit-wasm run check:wasm` passed with existing warnings in `rivetkit-core`; `pnpm --filter rivetkit run check-types` passed; `pnpm --filter rivetkit exec vitest run tests/wasm-runtime.test.ts tests/runtime-selection.test.ts` passed; public root import smoke via Node passed; `SKIP_WASM_BUILD=1 npm pack --dry-run` passed.
+## 2026-05-02 02:46:37 PDT - US-007
+- Added `runtime-parity.test.ts` to run the same save, registered-task drain, and promoted bridge-error status scenarios through `NapiCoreRuntime` and `WasmCoreRuntime`.
+- Used fake NAPI/wasm binding classes plus `buildNativeFactory(...)` so the parity coverage does not require generated wasm package artifacts.
+- Files changed: `rivetkit-typescript/packages/rivetkit/tests/runtime-parity.test.ts`, `rivetkit-typescript/AGENTS.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+- Checks: `pnpm --filter rivetkit exec vitest run tests/runtime-parity.test.ts`, `pnpm --filter rivetkit exec biome check tests/runtime-parity.test.ts`, `pnpm --filter rivetkit run check-types`.
 - **Learnings for future iterations:**
-  - `@rivetkit/rivetkit-wasm` should expose only the root export; do not add platform-specific or generated subpath exports unless a platform test proves the root path cannot work.
-  - wasm-pack writes `pkg/.gitignore` with `*`, so npm package contents need an explicit `.npmignore` override plus a tarball check.
-  - Root package declarations can forward to `./pkg/rivetkit_wasm.js` when the tarball includes the generated `.d.ts` files.
+  - `ActorContextHandleAdapter.saveState({ immediate: true })` is a useful shared path for parity tests because it exercises NAPI direct calls and wasm `callHandleAsync` while preserving bridged `RivetError` status fields.
+  - Fake runtime bindings should keep byte payloads as `Uint8Array`/`Buffer` at the adapter boundary and let `NapiCoreRuntime`/`WasmCoreRuntime` normalize them.
 ---
-
-## 2026-05-01 20:15 PDT - US-007
-- Implemented wasm `CoreRegistry` serverless startup concurrency with a `BuildingServerless` state, waiters, structured invalid-state errors, and shutdown cleanup for runtimes built after cancellation.
-- Added focused wasm runtime tests for concurrent first serverless requests, shutdown during serverless build, and structured wrong-mode errors.
-- Added the generated `wasm.invalid_state` error artifact and a reusable wasm binding note in `rivetkit-typescript/AGENTS.md`.
-- Files changed: `rivetkit-typescript/packages/rivetkit-wasm/src/lib.rs`, `rivetkit-typescript/packages/rivetkit/tests/wasm-runtime.test.ts`, `rivetkit-typescript/CLAUDE.md`, `engine/artifacts/errors/wasm.invalid_state.json`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
-- Checks: `pnpm --filter @rivetkit/rivetkit-wasm run check:wasm` passed with existing `rivetkit-core` warnings; `pnpm --filter @rivetkit/rivetkit-wasm run check-types` passed; `pnpm --filter rivetkit run check-types` passed; `pnpm --filter rivetkit exec biome check tests/wasm-runtime.test.ts` passed; `pnpm --filter rivetkit exec vitest run tests/wasm-runtime.test.ts` passed.
+## 2026-05-02 02:50:11 PDT - US-008
+- Replaced the per-call `action_not_found` schema leak with a compile-time static schema.
+- Interned unknown structured timeout schemas by `(group, code)` so dynamic default messages are leaked at most once per unique timeout error.
+- Added NAPI moved tests that compare schema pointers across repeated `action_not_found` and unknown structured timeout calls.
+- Files changed: `rivetkit-typescript/packages/rivetkit-napi/src/napi_actor_events.rs`, `rivetkit-typescript/packages/rivetkit-napi/tests/napi_actor_events.rs`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`, `CLAUDE.md`.
+- Checks: `cargo check -p rivetkit-napi --tests`, `cargo check -p rivetkit-napi`.
+- Direct `cargo test -p rivetkit-napi action_not_found_reuses_static_schema --no-run` still fails at the existing standalone N-API linker step with unresolved `napi_*` symbols.
 - **Learnings for future iterations:**
-  - Use a waiter state rather than a temporary `Serving` state during wasm serverless runtime construction.
-  - Build failures and shutdown during wasm serverless startup must transition the registry to a terminal state and wake all waiters.
-  - New `RivetError` derives create `engine/artifacts/errors/*.json` files that should be committed with the source change.
+  - The moved NAPI actor event tests have private-module access through the source-owned `#[path = "../tests/napi_actor_events.rs"]` shim, so pointer-level helpers can test private schema constructors directly.
+  - `cargo check -p rivetkit-napi --tests` is the practical compile gate for these Rust tests until the standalone N-API test linker setup is fixed.
 ---
-
-## 2026-05-01 20:17 PDT - US-008
-- Restored wasm queue max-size parity by forwarding `WasmQueue.maxSize()` to the core queue config instead of returning `0`.
-- Added adapter parity coverage proving NAPI and wasm both read queue max size through the shared runtime boundary.
-- Made missing wasm runtime methods throw a structured `runtime.unsupported` `RivetError` with runtime and method metadata.
-- Files changed: `rivetkit-typescript/packages/rivetkit-wasm/src/lib.rs`, `rivetkit-typescript/packages/rivetkit/src/registry/wasm-runtime.ts`, `rivetkit-typescript/packages/rivetkit/tests/wasm-runtime.test.ts`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
-- Checks: `pnpm --filter @rivetkit/rivetkit-wasm run check:wasm` passed with existing `rivetkit-core` warnings; `pnpm --filter rivetkit exec biome check src/registry/wasm-runtime.ts tests/wasm-runtime.test.ts` passed; `pnpm --filter rivetkit run check-types` passed; `pnpm --filter rivetkit exec vitest run tests/wasm-runtime.test.ts` passed.
+## 2026-05-02 02:53:12 PDT - US-009
+- Replaced wasm websocket callback region tracking with a `HashMap<u32, WebSocketCallbackRegion>` plus a shared monotonic region ID counter.
+- Updated `endWebsocketCallback` to remove completed regions instead of leaving `None` slots behind.
+- Added a wasm crate regression test that churns callback begin/end calls and asserts the underlying map is empty afterward.
+- Files changed: `rivetkit-typescript/packages/rivetkit-wasm/src/lib.rs`, `rivetkit-typescript/CLAUDE.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+- Checks: `cargo test -p rivetkit-wasm --target wasm32-unknown-unknown --no-run websocket_callback_regions_are_removed_after_end`, `pnpm --filter @rivetkit/rivetkit-wasm run check:wasm`, `pnpm --filter @rivetkit/rivetkit-wasm run check-types`.
 - **Learnings for future iterations:**
-  - `WasmQueue` should expose the same supported queue surface as NAPI by forwarding to `rivetkit-core::ActorContext`.
-  - Use focused adapter tests with fake actor contexts when parity behavior lives in the TypeScript runtime boundary.
-  - Missing wasm binding methods should fail as structured `runtime.unsupported` errors with the missing method name in metadata.
+  - Wasm `ActorContext` clones must share both active websocket callback regions and the next region ID so interleaved callbacks remain uniquely tracked across cloned handles.
+  - `endWebsocketCallback` should drop the stored `WebSocketCallbackRegion` by removing the map entry; that releases the core guard and keeps memory bounded under repeated callbacks.
 ---
-
-## 2026-05-01 20:20 PDT - US-009
-- Implemented fail-fast validation for explicit `RIVETKIT_DRIVER_TEST_RUNTIME=wasm` plus `RIVETKIT_DRIVER_TEST_SQLITE=local` driver matrix overrides.
-- Added shared matrix tests covering the exact valid SQLite matrix cells and the explicit wasm/local configuration error.
-- Marked US-009 passing in `prd.json`.
-- Files changed: `rivetkit-typescript/packages/rivetkit/tests/driver/shared-matrix.ts`, `rivetkit-typescript/packages/rivetkit/tests/driver/shared-matrix.test.ts`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
-- Checks: `pnpm --filter rivetkit exec biome check tests/driver/shared-matrix.ts tests/driver/shared-matrix.test.ts` passed; `pnpm --filter rivetkit exec vitest run tests/driver/shared-matrix.test.ts` passed; `pnpm --filter rivetkit run check-types` passed.
+## 2026-05-02 02:55:33 PDT - US-010
+- Investigated the `ActorContextShared::runtime_state` `mem::forget` fallback in NAPI.
+- Documented the Env-bearing cleanup design using a cleanup `ThreadsafeFunction`, plus the shutdown edge cases that require preserving a bounded leak fallback.
+- Files changed: `docs-internal/engine/napi-bridge.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+- Checks: `jq empty scripts/ralph/prd.json`, `cargo check -p rivetkit-napi`.
+- `cargo check -p rivetkit-napi` still emits existing warnings from `rivetkit-sqlite` and `rivetkit-core`.
 - **Learnings for future iterations:**
-  - The normal SQLite driver matrix still filters unsupported wasm/local cells so native/local, native/remote, and wasm/remote coverage remains.
-  - Treat env matrix overrides as requested coverage. If they name an unsupported cell, throw instead of silently filtering it out.
-  - Keep driver matrix behavior covered in `tests/driver/shared-matrix.test.ts` because it is fast and does not need the shared engine.
+  - `napi::Ref::unref(env)` cannot be called from receive-loop worker reset paths or arbitrary `Drop` paths because both can lack a valid `Env`.
+  - A future implementation should wrap stale refs in a TSF payload that forgets the reference on failed delivery, then unrefs only inside the TSF callback while an `Env` is in scope.
 ---
-
-## 2026-05-01 20:23 PDT - US-010
-- Added public `sqlite` registry config for selecting the runtime SQLite backend.
-- Made explicit wasm/local SQLite fail during config parsing, while unset wasm SQLite defaults to remote and native keeps its previous default.
-- Preserved the internal `test.sqliteBackend` path for existing driver coverage while routing runtime backend decisions through one helper.
-- Files changed: `rivetkit-typescript/packages/rivetkit/src/registry/config/index.ts`, `rivetkit-typescript/packages/rivetkit/src/registry/native.ts`, `rivetkit-typescript/packages/rivetkit/tests/runtime-selection.test.ts`, `rivetkit-typescript/CLAUDE.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
-- Checks: `pnpm exec biome check src/registry/config/index.ts src/registry/native.ts tests/runtime-selection.test.ts` passed; `pnpm exec vitest run tests/runtime-selection.test.ts` passed; `pnpm run check-types` passed.
+## 2026-05-02 03:21:47 PDT - US-011
+- Changed wasm bridged `RivetErrorSchema` interning to key by `(group, code)` only, reusing the first schema default message even when later payload messages vary.
+- Extended the wasm crate cache test so same `(group, code)` with a different live message reuses the schema pointer and does not grow the cache, while a different code still allocates one new schema.
+- Files changed: `rivetkit-typescript/packages/rivetkit-wasm/src/lib.rs`, `rivetkit-typescript/CLAUDE.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+- Checks: `cargo test -p rivetkit-wasm --target wasm32-unknown-unknown --no-run parse_bridge_rivet_error_reuses_interned_schema`, `pnpm --filter @rivetkit/rivetkit-wasm run check:package`, `pnpm --filter @rivetkit/rivetkit-wasm run check:wasm`, `pnpm --filter @rivetkit/rivetkit-wasm run check-types`.
+- Plain `cargo test -p rivetkit-wasm` still fails on the pre-existing host-target `rivetkit-core` `wasm_bindgen_futures` dependency issue recorded in earlier progress.
 - **Learnings for future iterations:**
-  - Public setup config should use `sqlite: "local" | "remote"` for backend selection; the schema also normalizes object form to `{ backend }`.
-  - Keep `test.sqliteBackend` as a driver/test hook, but production runtime decisions should prefer public `sqlite.backend`.
-  - Explicit `runtime: "wasm"` is validated at config parse time; auto-selected wasm is guarded again during runtime normalization.
+  - Use unique `(group, code)` namespaces when asserting `BRIDGE_RIVET_ERROR_SCHEMAS.len()` deltas because the intern map is process-global.
+  - Schema defaults are only the first-seen fallback for a `(group, code)`; callers should assert live bridged messages through `RivetTransportError.message()`.
 ---
-
-## 2026-05-01 20:26 PDT - US-011
-- Added `rivetkit-typescript/packages/rivetkit/tests/platforms/shared-registry.ts` with a raw-SQL SQLite counter actor exposing `increment` and `getCount`.
-- Added a public-shape registry factory that requires explicit wasm bindings/init input, hardcodes `runtime: "wasm"`, and hardcodes remote SQLite with no local SQLite option.
-- Files changed: `rivetkit-typescript/packages/rivetkit/tests/platforms/shared-registry.ts`, `rivetkit-typescript/CLAUDE.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
-- Checks: `pnpm exec biome check tests/platforms/shared-registry.ts` passed; `pnpm run check-types` passed; `pnpm exec tsx -e "import('./tests/platforms/shared-registry.ts').then(() => undefined)"` passed.
+## 2026-05-02 03:30:40 PDT - US-012
+- Implemented bounded shutdown drain for core `ActorContext::register_task(...)` by racing registered futures against `shutdown_deadline_token()` in one shared native/wasm helper.
+- Added a core sleep regression test that registers a never-completing future, cancels the shutdown deadline, verifies the shutdown counter drains, and checks the warning includes `actor_id` plus `reason = "shutdown_deadline_elapsed"`.
+- Files changed: `rivetkit-rust/packages/rivetkit-core/src/actor/context.rs`, `rivetkit-rust/packages/rivetkit-core/tests/sleep.rs`, `rivetkit-rust/packages/rivetkit-core/AGENTS.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+- Checks: `cargo test -p rivetkit-core register_task_exits_when_shutdown_deadline_cancels`, `cargo check -p rivetkit-core`, `scripts/cargo/check-rivetkit-core-wasm.sh`, `cargo test -p rivetkit-core actor_task_logs_lifecycle_dispatch_and_actor_event_flow`.
+- Full `cargo test -p rivetkit-core` was stopped after it hung in the existing `save_tick_cancels_pending_inspector_deadline_and_broadcasts_overlay` test; that test also hung when run in isolation.
 - **Learnings for future iterations:**
-  - Platform smoke tests should share the `sqliteCounter` actor from `tests/platforms/shared-registry.ts` instead of duplicating counter actor code per host.
-  - The shared platform registry intentionally omits `sqlite`, `runtime`, `test`, `use`, and `wasm` from caller options so tests cannot accidentally enable local SQLite or private test config.
-  - Use `ctx.sql` for this platform counter because it keeps the app import surface to public `rivetkit` plus explicit wasm bindings and avoids the Drizzle/database-provider subpaths.
+  - Keep native and wasm `register_task(...)` behavior in a shared helper where possible so the two cfg-specific public signatures cannot diverge.
+  - The package-wide core test suite currently has an unrelated hanging inspector debounce test, so use focused tests plus `check-rivetkit-core-wasm.sh` for this shutdown path.
 ---
-
-## 2026-05-01 20:37 PDT - US-012
-- Added `rivetkit-typescript/packages/rivetkit/tests/platforms/shared-platform-harness.ts` with helpers for shared engine reuse, namespace creation, serverless runner config, SQLite counter clients, temp app dirs, logged child processes, health checks, and pinned `pnpm dlx` CLI launches.
-- Added fast harness coverage in `tests/platforms/shared-platform-harness.test.ts`.
-- Added `pnpm run test:platforms` and excluded `tests/platforms/**/*.test.ts` from default Vitest unless `RIVETKIT_INCLUDE_PLATFORM_TESTS=1` is set.
-- Files changed: `rivetkit-typescript/packages/rivetkit/tests/platforms/shared-platform-harness.ts`, `rivetkit-typescript/packages/rivetkit/tests/platforms/shared-platform-harness.test.ts`, `rivetkit-typescript/packages/rivetkit/tests/platforms/shared-registry.ts`, `rivetkit-typescript/packages/rivetkit/package.json`, `rivetkit-typescript/packages/rivetkit/vitest.config.ts`, `rivetkit-typescript/CLAUDE.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
-- Checks: `pnpm exec biome check tests/platforms/shared-platform-harness.ts tests/platforms/shared-platform-harness.test.ts tests/platforms/shared-registry.ts package.json vitest.config.ts` passed; `pnpm run check-types` passed; `pnpm run test:platforms` passed; `pnpm exec tsx -e "import('./tests/platforms/shared-platform-harness.ts').then(() => undefined)"` passed; `pnpm exec vitest run tests/platforms --passWithNoTests` confirmed platform tests are excluded by default. A broader `pnpm exec vitest run --passWithNoTests` was stopped after several minutes in unrelated driver coverage.
+## 2026-05-02 03:33:22 PDT - US-013
+- Implemented wraparound allocation for wasm websocket callback region IDs, skipping ID `0` and any IDs still live in the active region map instead of panicking at `u32::MAX`.
+- Added a wasm-target regression test that seeds the allocator near `u32::MAX`, keeps a low ID live, and verifies wraparound does not collide.
+- Files changed: `rivetkit-typescript/packages/rivetkit-wasm/src/lib.rs`, `rivetkit-typescript/CLAUDE.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+- Checks: `cargo test -p rivetkit-wasm --target wasm32-unknown-unknown --no-run websocket_callback_region_ids_wrap_without_collision`, `pnpm --filter @rivetkit/rivetkit-wasm run check:wasm`, `pnpm --filter @rivetkit/rivetkit-wasm run check-types`, `pnpm --filter @rivetkit/rivetkit-wasm run check:package`.
 - **Learnings for future iterations:**
-  - Use `createPlatformServerlessRunner(...)` to create a namespace and serverless runner config against the shared local engine.
-  - Use `createPlatformSqliteCounterClient(...)` with the returned runner when platform smoke tests need the shared counter registry.
-  - Launch platform CLIs through `spawnPinnedPnpmDlx(...)` so test code has to name a concrete package version.
+  - Wasm websocket callback region allocation preserves the existing `u32` JS surface and uses `0` as the untracked sentinel for the impossible exhausted-ID case.
+  - Tests that assert wraparound should keep an existing low region ID live so the allocator proves it skips active IDs after wrapping.
 ---
-
-## 2026-05-01 22:05 PDT - US-014
-- Added a real local Deno wasm platform smoke test in `rivetkit-typescript/packages/rivetkit/tests/platforms/deno.test.ts`.
-- The generated Deno app imports only public `rivetkit` and `@rivetkit/rivetkit-wasm` exports, passes wasm bytes through public setup config, and exercises SQLite counter persistence, sleep/wake, and parallel actor IDs.
-- Marked US-014 passing in `scripts/ralph/prd.json`.
-- Files changed: `rivetkit-typescript/packages/rivetkit/tests/platforms/deno.test.ts`, `rivetkit-typescript/packages/rivetkit/tests/platforms/CLAUDE.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
-- Checks: `pnpm exec biome check tests/platforms/deno.test.ts` passed; `RIVETKIT_INCLUDE_PLATFORM_TESTS=1 pnpm exec vitest run tests/platforms/deno.test.ts` passed; `pnpm run check-types` passed; `pnpm run test:platforms` passed.
+## 2026-05-02 03:34:47 PDT - US-014
+- Documented that `parse_bridge_rivet_error_reuses_interned_schema` owns the `(wasm_schema_cache_test, same_payload)` cache key so global schema-count delta assertions remain stable under concurrent tests.
+- Files changed: `rivetkit-typescript/packages/rivetkit-wasm/src/lib.rs`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+- Checks: `cargo test -p rivetkit-wasm --target wasm32-unknown-unknown --no-run parse_bridge_rivet_error_reuses_interned_schema`, `pnpm --filter @rivetkit/rivetkit-wasm run check:package`, `pnpm --filter @rivetkit/rivetkit-wasm run check-types`, `pnpm --filter @rivetkit/rivetkit-wasm run check:wasm`.
 - **Learnings for future iterations:**
-  - Deno can resolve the local workspace packages through symlinked `node_modules` with `--node-modules-dir=manual`.
-  - The Deno app needs `--allow-sys` because `pino` reads the host name during public `rivetkit` import.
-  - Use the public wasm asset export with `import.meta.resolve("@rivetkit/rivetkit-wasm/rivetkit_wasm_bg.wasm")` and `Deno.readFile(...)` instead of importing generated `pkg` paths.
----
-
-## 2026-05-01 23:11 PDT - US-015
-- Added a real local Supabase Functions wasm platform smoke test driven by pinned `pnpm dlx supabase@2.95.4 functions serve`.
-- The generated function app imports only public `rivetkit` and `@rivetkit/rivetkit-wasm` exports, wires wasm bytes through public setup config, and exercises SQLite counter persistence, idle sleep/wake, and parallel actor IDs.
-- Added Supabase-specific engine/network/package handling for Dockerized Edge Runtime and marked US-015 passing in `prd.json`.
-- Files changed: `rivetkit-typescript/packages/rivetkit/tests/platforms/supabase-functions.test.ts`, `rivetkit-typescript/packages/rivetkit/tests/platforms/CLAUDE.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
-- Checks: `pnpm exec biome check tests/platforms/supabase-functions.test.ts tests/platforms/CLAUDE.md` passed; `RIVETKIT_INCLUDE_PLATFORM_TESTS=1 pnpm exec vitest run tests/platforms/supabase-functions.test.ts` passed; `pnpm run check-types` passed; `pnpm run test:platforms` passed.
-- **Learnings for future iterations:**
-  - Supabase Edge Runtime runs in Docker, so local engine URLs must be reachable from containers; prefer the Docker bridge IP from `docker0` and fall back to `host.docker.internal`.
-  - Supabase Edge Runtime bare import resolution needs package metadata and real package trees next to the function entrypoint.
-  - Avoid serverless runner prewarm for Supabase Functions and use `per_worker`; prewarm/`oneshot` caused `/start` BOOT_ERRORs around long-lived serverless streams.
----
-
-## 2026-05-01 23:21 PDT - US-016
-- Added Cloudflare Workers wasm runtime setup docs with public `rivetkit` and `@rivetkit/rivetkit-wasm` imports, explicit `setup({ runtime: "wasm", wasm: { bindings, initInput }, sqlite: "remote", use })`, and remote SQLite/runtime notes.
-- Replaced the Supabase placeholder with Supabase Edge Functions wasm setup docs, including Deno wasm loading and serverless runner URL guidance.
-- Added Cloudflare Workers and Supabase Functions to the Connect deploy metadata and quickstart cards, and fixed the KV range docs snippet that was blocking docs typechecking.
-- Files changed: `website/src/content/docs/connect/cloudflare.mdx`, `website/src/content/docs/connect/supabase.mdx`, `website/src/content/docs/quickstart/index.mdx`, `website/src/content/docs/actors/quickstart/index.mdx`, `website/src/content/docs/actors/kv.mdx`, `frontend/packages/shared-data/src/deploy.ts`, `website/CLAUDE.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
-- Checks: `pnpm --filter rivet-website build` passed; `git diff --check` passed. `pnpm --filter rivet-website lint` is blocked because the website package has ESLint 9 but no `eslint.config.*` flat config.
-- **Learnings for future iterations:**
-  - Connect docs navigation is driven by `frontend/packages/shared-data/src/deploy.ts`, so new Connect pages need a deploy option entry to appear in cards/sidebar.
-  - The website build is the useful docs gate because it typechecks TypeScript code blocks before building Astro pages.
-  - Avoid running Prettier blindly on MDX docs with nested code examples; it can rewrite code fences and example indentation in surprising ways.
----
-
-## 2026-05-01 23:32 PDT - US-017
-- Removed Node `Buffer` construction from shared actor runtime glue in `registry/native.ts`; shared KV, HTTP, websocket, state, queue, and callback payloads now use `RuntimeBytes`/`Uint8Array` helpers.
-- Kept NAPI `Buffer` conversion isolated to the NAPI adapter boundary and made callback error stack logging resilient when `Buffer` is unavailable.
-- Added wasm runtime coverage that invokes shared actor callbacks after clearing `globalThis.Buffer`.
-- Files changed: `rivetkit-typescript/packages/rivetkit/src/registry/native.ts`, `rivetkit-typescript/packages/rivetkit/src/common/utils.ts`, `rivetkit-typescript/packages/rivetkit/tests/wasm-runtime.test.ts`, `rivetkit-typescript/CLAUDE.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
-- Checks: `pnpm --filter rivetkit exec biome check src/registry/native.ts src/common/utils.ts tests/wasm-runtime.test.ts` passed; `pnpm --filter rivetkit exec vitest run tests/wasm-runtime.test.ts` passed; `pnpm --filter rivetkit run check-types` passed.
-- **Learnings for future iterations:**
-  - Shared actor glue in `registry/native.ts` is used by both NAPI and wasm, so byte creation there should stay on `RuntimeBytes`/`Uint8Array` even when NAPI currently accepts Node `Buffer`.
-  - Tests can exercise wasm actor callback glue with a fake wasm context that implements `actorId()` and `runtimeState()`.
-  - Accessing `error.stack` can throw in Node source-map paths when `globalThis.Buffer` is unavailable, so stack logging should be best-effort.
----
-
-## 2026-05-01 23:39 PDT - US-018
-- Tightened `RuntimeSqlBindParam` into exact discriminated union variants and limited `RuntimeSqlExecuteResult.route` to `read`, `write`, or `writeFallback`.
-- Updated NAPI and wasm runtime adapters to normalize execute results before returning the shared runtime type, and tightened the local native database bind type so runtime forwarding remains type-safe.
-- Added runtime SQL boundary tests for null, int, float, text, blob, and route normalization, and strengthened native database tests for exact bind shapes and unsupported route rejection.
-- Files changed: `rivetkit-typescript/packages/rivetkit/src/registry/runtime.ts`, `rivetkit-typescript/packages/rivetkit/src/registry/napi-runtime.ts`, `rivetkit-typescript/packages/rivetkit/src/registry/wasm-runtime.ts`, `rivetkit-typescript/packages/rivetkit/src/registry/runtime.test.ts`, `rivetkit-typescript/packages/rivetkit/src/common/database/native-database.ts`, `rivetkit-typescript/packages/rivetkit/src/common/database/native-database.test.ts`, `rivetkit-typescript/CLAUDE.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
-- Checks: `pnpm --filter rivetkit exec biome check src/registry/runtime.ts src/registry/napi-runtime.ts src/registry/wasm-runtime.ts src/registry/runtime.test.ts src/common/database/native-database.ts src/common/database/native-database.test.ts` passed; `pnpm --filter rivetkit run check-types` passed; `pnpm --filter rivetkit exec vitest run src/registry/runtime.test.ts src/common/database/native-database.test.ts tests/wasm-host-smoke.test.ts` passed; `pnpm --filter rivetkit exec vitest run tests/wasm-runtime.test.ts` passed as part of an adapter run. `tests/napi-runtime-integration.test.ts` failed outside this story with `actor.validation_error: Invalid connection params`; an earlier retry was also blocked by an orphaned local engine holding the RocksDB lock.
-- **Learnings for future iterations:**
-  - Runtime SQL bind params should be switched by `kind` at adapter edges so impossible extra value fields are compile-time errors.
-  - Generated NAPI SQL execute results expose route as a loose string, so normalize to the shared runtime route union before returning from `NapiCoreRuntime`.
-  - The NAPI integration test can leave an orphaned local `rivet-engine` holding `/home/nathan/.rivetkit/var/engine/db/LOCK` when startup fails; clean that process before rerunning engine-backed tests.
----
-
-## 2026-05-01 23:48 PDT - US-019
-- Generated one shared docs-shaped SQLite counter registry source for platform apps via `buildPlatformSqliteCounterRegistrySource(...)`.
-- Updated Cloudflare Workers, Deno, and Supabase Functions fixtures to write local `registry.ts` files that import public `rivetkit` and `@rivetkit/rivetkit-wasm` exports, then keep only platform bootstrapping in each app entrypoint.
-- Marked US-019 passing in `prd.json` and preserved the reusable helper pattern in the platform AGENTS/CLAUDE notes.
-- Files changed: `rivetkit-typescript/packages/rivetkit/tests/platforms/shared-platform-harness.ts`, `rivetkit-typescript/packages/rivetkit/tests/platforms/cloudflare-workers.test.ts`, `rivetkit-typescript/packages/rivetkit/tests/platforms/deno.test.ts`, `rivetkit-typescript/packages/rivetkit/tests/platforms/supabase-functions.test.ts`, `rivetkit-typescript/packages/rivetkit/tests/platforms/CLAUDE.md`, `rivetkit-typescript/packages/rivetkit/tests/platforms/AGENTS.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
-- Checks: `pnpm --filter rivetkit exec biome check tests/platforms/shared-platform-harness.ts tests/platforms/cloudflare-workers.test.ts tests/platforms/deno.test.ts tests/platforms/supabase-functions.test.ts` passed; `pnpm --filter rivetkit run check-types` passed; `pnpm --filter rivetkit run test:platforms` passed.
-- **Learnings for future iterations:**
-  - Keep generated platform app registry code in a local app file so it can look like docs copy-paste code while still sharing one test utility source.
-  - Cloudflare uses the same registry source with a wasm module import; Deno and Supabase use the same source with `Deno.readFile(import.meta.resolve(...))`.
-  - The platform smoke suite can emit transient `actor_ready_timeout` logs during wake retries and still pass once the cold-start retry helper observes the new start request.
+  - Existing Codebase Patterns already cover unique `(group, code)` namespaces for global wasm schema-cache length assertions.
 ---

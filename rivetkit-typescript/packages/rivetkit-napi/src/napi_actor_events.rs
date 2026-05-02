@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -9,6 +9,7 @@ use rivetkit_core::{
 	ActorContext as CoreActorContext, ActorEvent, ActorEvents, ActorLifecycle, ActorStart,
 	QueueSendResult, QueueSendStatus, Reply, SerializeStateReason, StateDelta,
 };
+use scc::HashMap as SccHashMap;
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 use tokio::task::JoinHandle;
 use tokio::task::JoinSet;
@@ -85,6 +86,18 @@ static CALLBACK_TIMED_OUT_SCHEMA: RivetErrorSchema = RivetErrorSchema {
 	meta_type: None,
 	_macro_marker: MacroMarker { _private: () },
 };
+
+static ACTION_NOT_FOUND_SCHEMA: RivetErrorSchema = RivetErrorSchema {
+	group: "actor",
+	code: "action_not_found",
+	default_message: "Action not found",
+	meta_type: None,
+	_macro_marker: MacroMarker { _private: () },
+};
+
+static STRUCTURED_TIMEOUT_SCHEMAS: LazyLock<
+	SccHashMap<(&'static str, &'static str), &'static RivetErrorSchema>,
+> = LazyLock::new(SccHashMap::new);
 
 pub(crate) async fn run_adapter_loop(
 	bindings: Arc<CallbackBindings>,
@@ -858,13 +871,20 @@ fn structured_timeout_schema(
 	match (group, code) {
 		("actor", "action_timed_out") => &ACTION_TIMED_OUT_SCHEMA,
 		("actor", "callback_timed_out") => &CALLBACK_TIMED_OUT_SCHEMA,
-		_ => Box::leak(Box::new(RivetErrorSchema {
-			group,
-			code,
-			default_message: Box::leak(message.to_owned().into_boxed_str()),
-			meta_type: None,
-			_macro_marker: MacroMarker { _private: () },
-		})),
+		_ => match STRUCTURED_TIMEOUT_SCHEMAS.entry_sync((group, code)) {
+			scc::hash_map::Entry::Occupied(entry) => *entry.get(),
+			scc::hash_map::Entry::Vacant(entry) => {
+				let schema = Box::leak(Box::new(RivetErrorSchema {
+					group,
+					code,
+					default_message: Box::leak(message.to_owned().into_boxed_str()),
+					meta_type: None,
+					_macro_marker: MacroMarker { _private: () },
+				}));
+				entry.insert_entry(schema);
+				schema
+			}
+		},
 	}
 }
 
@@ -1266,16 +1286,8 @@ async fn call_on_disconnect_final(
 }
 
 fn action_not_found(name: String) -> anyhow::Error {
-	let schema = Box::leak(Box::new(RivetErrorSchema {
-		group: "actor",
-		code: "action_not_found",
-		default_message: "Action not found",
-		meta_type: None,
-		_macro_marker: MacroMarker { _private: () },
-	}));
-
 	anyhow::Error::new(RivetTransportError {
-		schema,
+		schema: &ACTION_NOT_FOUND_SCHEMA,
 		meta: None,
 		message: Some(format!("Action `{name}` was not found.")),
 	})

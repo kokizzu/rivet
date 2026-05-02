@@ -14,6 +14,7 @@ pub mod websocket;
 use std::sync::Once;
 
 use rivet_error::RivetError as RivetTransportError;
+use rivetkit_core::error::public_error_status_code;
 
 static INIT_TRACING: Once = Once::new();
 pub(crate) const BRIDGE_RIVET_ERROR_PREFIX: &str = "__RIVET_ERROR_JSON__:";
@@ -43,13 +44,35 @@ pub(crate) struct NapiInvalidState {
 }
 
 pub(crate) fn napi_anyhow_error(error: anyhow::Error) -> napi::Error {
+	let payload = anyhow_to_bridge_rivet_error_payload(error);
+	napi::Error::from_reason(format!("{BRIDGE_RIVET_ERROR_PREFIX}{}", payload))
+}
+
+fn anyhow_to_bridge_rivet_error_payload(error: anyhow::Error) -> serde_json::Value {
 	let error_chain = error.chain().map(ToString::to_string).collect::<Vec<_>>();
 	let bridge_context = error
 		.chain()
 		.find_map(|cause| cause.downcast_ref::<crate::actor_factory::BridgeRivetErrorContext>());
 	let error = RivetTransportError::extract(&error);
-	let public_ = bridge_context.and_then(|context| context.public_);
-	let status_code = bridge_context.and_then(|context| context.status_code);
+	let promoted_status_code = public_error_status_code(error.group(), error.code());
+	let should_promote = promoted_status_code.is_some_and(|_| match bridge_context {
+		Some(context) => {
+			context.public_ != Some(true)
+				|| context.status_code.is_none()
+				|| context.status_code == Some(500)
+		},
+		None => true,
+	});
+	let status_code = if should_promote {
+		promoted_status_code
+	} else {
+		bridge_context.and_then(|context| context.status_code)
+	};
+	let public_ = if should_promote {
+		Some(true)
+	} else {
+		bridge_context.and_then(|context| context.public_)
+	};
 	let payload = serde_json::json!({
 		"group": error.group(),
 		"code": error.code(),
@@ -69,7 +92,7 @@ pub(crate) fn napi_anyhow_error(error: anyhow::Error) -> napi::Error {
 		?status_code,
 		"encoded structured bridge error"
 	);
-	napi::Error::from_reason(format!("{BRIDGE_RIVET_ERROR_PREFIX}{}", payload))
+	payload
 }
 
 pub(crate) fn init_tracing(log_level: Option<&str>) {

@@ -552,6 +552,14 @@ impl ActorContext {
 		});
 	}
 
+	#[cfg(not(feature = "wasm-runtime"))]
+	pub fn register_task(&self, future: impl Future<Output = ()> + Send + 'static) {
+		let ctx = self.clone();
+		self.track_shutdown_task(async move {
+			Self::run_registered_task(ctx, future).await;
+		});
+	}
+
 	#[cfg(feature = "wasm-runtime")]
 	pub fn wait_until(&self, future: impl Future<Output = ()> + 'static) {
 		let counter = self.0.sleep.work.shutdown_counter.clone();
@@ -566,6 +574,34 @@ impl ActorContext {
 			ctx.record_user_task_finished(UserTaskKind::WaitUntil, started_at.elapsed());
 			ctx.reset_sleep_timer();
 		});
+	}
+
+	#[cfg(feature = "wasm-runtime")]
+	pub fn register_task(&self, future: impl Future<Output = ()> + 'static) {
+		let ctx = self.clone();
+		self.track_shutdown_task(async move {
+			Self::run_registered_task(ctx, future).await;
+		});
+	}
+
+	async fn run_registered_task<F>(ctx: ActorContext, future: F)
+	where
+		F: Future<Output = ()>,
+	{
+		let shutdown_deadline = ctx.shutdown_deadline_token();
+		ctx.record_user_task_started(UserTaskKind::RegisteredTask);
+		let started_at = Instant::now();
+		tokio::select! {
+			_ = future => {}
+			_ = shutdown_deadline.cancelled() => {
+				tracing::warn!(
+					actor_id = %ctx.actor_id(),
+					reason = "shutdown_deadline_elapsed",
+					"registered task cancelled by shutdown deadline"
+				);
+			}
+		}
+		ctx.record_user_task_finished(UserTaskKind::RegisteredTask, started_at.elapsed());
 	}
 
 	pub async fn keep_awake<F>(&self, future: F) -> F::Output
