@@ -14,6 +14,8 @@ use tokio::sync::RwLock;
 use universaldb::Database;
 
 use crate::{cold_tier::ColdTier, workflows::compaction::DeltasAvailable};
+#[cfg(feature = "test-faults")]
+use crate::fault::DepotFaultController;
 
 use super::{
 	branch,
@@ -122,6 +124,8 @@ pub struct Db {
 	pub(super) last_deltas_available_at_ms: RwLock<Option<i64>>,
 	pub(super) compaction_signaler: Option<CompactionSignaler>,
 	pub(super) shard_cache_fill: ShardCacheFillQueue,
+	#[cfg(feature = "test-faults")]
+	pub(super) fault_controller: Option<DepotFaultController>,
 }
 
 impl Db {
@@ -177,6 +181,72 @@ impl Db {
 			Some(compaction_signaler),
 			ShardCacheFillOptions::default(),
 		)
+	}
+
+	#[cfg(feature = "test-faults")]
+	pub fn new_with_fault_controller_for_test(
+		udb: Arc<Database>,
+		bucket_id: Id,
+		database_id: String,
+		node_id: NodeId,
+		fault_controller: DepotFaultController,
+	) -> Self {
+		let mut db = Self::new_inner(
+			udb,
+			bucket_id,
+			database_id,
+			node_id,
+			None,
+			None,
+			ShardCacheFillOptions::default(),
+		);
+		db.fault_controller = Some(fault_controller);
+		db
+	}
+
+	#[cfg(feature = "test-faults")]
+	pub fn new_with_cold_tier_and_fault_controller_for_test(
+		udb: Arc<Database>,
+		bucket_id: Id,
+		database_id: String,
+		node_id: NodeId,
+		cold_tier: Arc<dyn ColdTier>,
+		fault_controller: DepotFaultController,
+	) -> Self {
+		let mut db = Self::new_inner(
+			udb,
+			bucket_id,
+			database_id,
+			node_id,
+			Some(cold_tier),
+			None,
+			ShardCacheFillOptions::default(),
+		);
+		db.fault_controller = Some(fault_controller);
+		db
+	}
+
+	#[cfg(feature = "test-faults")]
+	pub fn new_with_compaction_signaler_and_fault_controller_for_test(
+		udb: Arc<Database>,
+		bucket_id: Id,
+		database_id: String,
+		node_id: NodeId,
+		cold_tier: Option<Arc<dyn ColdTier>>,
+		compaction_signaler: CompactionSignaler,
+		fault_controller: DepotFaultController,
+	) -> Self {
+		let mut db = Self::new_inner(
+			udb,
+			bucket_id,
+			database_id,
+			node_id,
+			cold_tier,
+			Some(compaction_signaler),
+			ShardCacheFillOptions::default(),
+		);
+		db.fault_controller = Some(fault_controller);
+		db
 	}
 
 	#[cfg(debug_assertions)]
@@ -236,6 +306,8 @@ impl Db {
 			last_deltas_available_at_ms: RwLock::new(None),
 			compaction_signaler,
 			shard_cache_fill,
+			#[cfg(feature = "test-faults")]
+			fault_controller: None,
 		}
 	}
 

@@ -174,10 +174,7 @@ fn companion_workflow_ids() -> CompanionWorkflowIds {
 }
 
 fn manager_input(database_branch_id: DatabaseBranchId) -> DbManagerInput {
-	DbManagerInput {
-		database_branch_id,
-		actor_id: Some("actor-for-test".to_string()),
-	}
+	DbManagerInput::new(database_branch_id, Some("actor-for-test".to_string()))
 }
 
 fn reclaim_range() -> ReclaimJobInputRange {

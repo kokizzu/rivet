@@ -1700,27 +1700,66 @@ pub(crate) fn hex_lower(bytes: &[u8]) -> String {
 	out
 }
 
-pub(crate) fn workflow_cold_storage_enabled(config: &rivet_config::Config) -> bool {
-	#[cfg(test)]
-	if WORKFLOW_TEST_COLD_TIER.lock().is_some() {
+pub(crate) fn workflow_cold_storage_enabled(
+	config: &rivet_config::Config,
+	database_branch_id: DatabaseBranchId,
+) -> bool {
+	#[cfg(not(feature = "test-faults"))]
+	let _ = database_branch_id;
+
+	#[cfg(feature = "test-faults")]
+	if WORKFLOW_TEST_COLD_TIERS
+		.lock()
+		.iter()
+		.any(|(branch_id, _)| *branch_id == database_branch_id)
+	{
 		return true;
 	}
 
 	config.sqlite().workflow_cold_storage().is_some()
 }
 
-pub(crate) async fn workflow_cold_tier(config: &rivet_config::Config) -> Result<Option<Arc<dyn ColdTier>>> {
-	#[cfg(test)]
-	if let Some(cold_tier) = WORKFLOW_TEST_COLD_TIER.lock().clone() {
+pub(crate) async fn workflow_cold_tier(
+	config: &rivet_config::Config,
+	database_branch_id: DatabaseBranchId,
+) -> Result<Option<Arc<dyn ColdTier>>> {
+	#[cfg(not(feature = "test-faults"))]
+	let _ = database_branch_id;
+
+	#[cfg(feature = "test-faults")]
+	if let Some(cold_tier) = WORKFLOW_TEST_COLD_TIERS
+		.lock()
+		.iter()
+		.find(|(branch_id, _)| *branch_id == database_branch_id)
+		.map(|(_, cold_tier)| Arc::clone(cold_tier))
+	{
 		return Ok(Some(cold_tier));
 	}
 
 	cold_tier_from_config(config).await
 }
 
-#[cfg(test)]
-pub fn set_workflow_test_cold_tier_for_test(cold_tier: Option<Arc<dyn ColdTier>>) {
-	*WORKFLOW_TEST_COLD_TIER.lock() = cold_tier;
+#[cfg(feature = "test-faults")]
+pub(crate) fn install_workflow_test_cold_tier_for_test(
+	database_branch_id: DatabaseBranchId,
+	cold_tier: Arc<dyn ColdTier>,
+) {
+	let mut cold_tiers = WORKFLOW_TEST_COLD_TIERS.lock();
+	if let Some((_, existing)) = cold_tiers
+		.iter_mut()
+		.find(|(branch_id, _)| *branch_id == database_branch_id)
+	{
+		*existing = cold_tier;
+	} else {
+		cold_tiers.push((database_branch_id, cold_tier));
+	}
+}
+
+#[cfg(feature = "test-faults")]
+pub(crate) fn clear_workflow_test_cold_tier_for_test(database_branch_id: DatabaseBranchId) {
+	WORKFLOW_TEST_COLD_TIERS
+		.lock()
+		.retain(|(branch_id, _)| *branch_id != database_branch_id);
 }
 
 pub(crate) fn decode_branch_shard_version_key(

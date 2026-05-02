@@ -105,8 +105,6 @@ enum SqliteTransportInner {
 	Envoy(EnvoyHandle),
 	#[cfg(test)]
 	Direct(Arc<tests::DirectStorage>),
-	#[cfg(test)]
-	Test(Arc<tests::MockProtocol>),
 }
 
 impl SqliteTransport {
@@ -124,17 +122,10 @@ impl SqliteTransport {
 	}
 
 	#[cfg(test)]
-	fn from_mock(protocol: Arc<tests::MockProtocol>) -> Self {
-		Self {
-			inner: Arc::new(SqliteTransportInner::Test(protocol)),
-		}
-	}
-
-	#[cfg(test)]
 	fn direct_hooks(&self) -> Option<Arc<tests::DirectTransportHooks>> {
 		match &*self.inner {
 			SqliteTransportInner::Direct(storage) => Some(Arc::clone(&storage.hooks)),
-			_ => None,
+			SqliteTransportInner::Envoy(_) => None,
 		}
 	}
 
@@ -158,8 +149,6 @@ impl SqliteTransport {
 					)),
 				}
 			}
-			#[cfg(test)]
-			SqliteTransportInner::Test(protocol) => protocol.get_pages(req).await,
 		}
 	}
 
@@ -171,6 +160,10 @@ impl SqliteTransport {
 			SqliteTransportInner::Envoy(handle) => handle.sqlite_commit(req).await,
 			#[cfg(test)]
 			SqliteTransportInner::Direct(storage) => {
+				storage.hooks.record_commit_request(req.clone());
+				if storage.hooks.take_commit_hang() {
+					std::future::pending().await
+				}
 				if let Some(message) = storage.hooks.take_commit_error() {
 					return Err(anyhow::anyhow!(message));
 				}
@@ -192,9 +185,16 @@ impl SqliteTransport {
 					.await
 				{
 					Ok(_) => {
-						storage
-							.apply_commit(&actor_id, dirty_pages, req.db_size_pages)
-							.await;
+						if !storage.is_strict_mode() {
+							if let Err(err) = storage
+								.apply_commit(&actor_id, dirty_pages, req.db_size_pages)
+								.await
+							{
+								return Ok(protocol::SqliteCommitResponse::SqliteErrorResponse(
+									tests::sqlite_error_response(&err),
+								));
+							}
+						}
 						Ok(protocol::SqliteCommitResponse::SqliteCommitOk)
 					}
 					Err(err) => {
@@ -204,8 +204,6 @@ impl SqliteTransport {
 					}
 				}
 			}
-			#[cfg(test)]
-			SqliteTransportInner::Test(protocol) => protocol.commit(req).await,
 		}
 	}
 }
@@ -225,6 +223,8 @@ pub struct VfsConfig {
 	pub prefetch_depth: usize,
 	pub max_prefetch_bytes: usize,
 	pub max_pages_per_stage: usize,
+	#[cfg(test)]
+	pub assert_batch_atomic: bool,
 }
 
 impl Default for VfsConfig {
@@ -234,6 +234,8 @@ impl Default for VfsConfig {
 			prefetch_depth: DEFAULT_PREFETCH_DEPTH,
 			max_prefetch_bytes: DEFAULT_MAX_PREFETCH_BYTES,
 			max_pages_per_stage: DEFAULT_MAX_PAGES_PER_STAGE,
+			#[cfg(test)]
+			assert_batch_atomic: true,
 		}
 	}
 }
@@ -498,25 +500,31 @@ impl VfsContext {
 		transport: SqliteTransport,
 		config: VfsConfig,
 		io_methods: sqlite3_io_methods,
-	) -> Self {
+	) -> std::result::Result<Self, String> {
 		let mut state = VfsState::new(&config);
 		#[cfg(test)]
 		if let SqliteTransportInner::Direct(storage) = &*transport.inner {
-			let snapshot = runtime.block_on(storage.snapshot_pages(&actor_id));
-			if snapshot.db_size_pages > 0 {
-				state.db_size_pages = snapshot.db_size_pages;
-				state.page_cache.invalidate_all();
-				for (pgno, bytes) in snapshot.pages {
-					state.page_cache.insert(pgno, bytes);
+			if storage.is_strict_mode() {
+				if let Some(page) = fetch_initial_main_page(&transport, &runtime, &actor_id)? {
+					state.seed_main_page(page);
+				}
+			} else {
+				let snapshot = runtime.block_on(storage.snapshot_pages(&actor_id));
+				if snapshot.db_size_pages > 0 {
+					state.db_size_pages = snapshot.db_size_pages;
+					state.page_cache.invalidate_all();
+					for (pgno, bytes) in snapshot.pages {
+						state.page_cache.insert(pgno, bytes);
+					}
 				}
 			}
 		}
 		#[cfg(not(test))]
-		if let Some(page) = fetch_initial_main_page(&transport, &runtime, &actor_id) {
+		if let Some(page) = fetch_initial_main_page(&transport, &runtime, &actor_id)? {
 			state.seed_main_page(page);
 		}
 
-		Self {
+		Ok(Self {
 			actor_id,
 			runtime,
 			transport,
@@ -541,7 +549,7 @@ impl VfsContext {
 			commit_transport_ns: AtomicU64::new(0),
 			commit_state_update_ns: AtomicU64::new(0),
 			commit_duration_ns_total: AtomicU64::new(0),
-		}
+		})
 	}
 
 	fn clear_last_error(&self) {
@@ -1024,7 +1032,7 @@ fn fetch_initial_main_page(
 	transport: &SqliteTransport,
 	runtime: &Handle,
 	actor_id: &str,
-) -> Option<Vec<u8>> {
+) -> std::result::Result<Option<Vec<u8>>, String> {
 	let response = runtime.block_on(transport.get_pages(protocol::SqliteGetPagesRequest {
 		actor_id: actor_id.to_string(),
 		pgnos: vec![1],
@@ -1033,28 +1041,33 @@ fn fetch_initial_main_page(
 	}));
 
 	match response {
-		Ok(protocol::SqliteGetPagesResponse::SqliteGetPagesOk(ok)) => ok
+		Ok(protocol::SqliteGetPagesResponse::SqliteGetPagesOk(ok)) => Ok(ok
 			.pages
 			.into_iter()
 			.find(|page| page.pgno == 1)
-			.and_then(|page| page.bytes),
+			.and_then(|page| page.bytes)),
 		Ok(protocol::SqliteGetPagesResponse::SqliteErrorResponse(error)) => {
+			if !is_initial_main_page_missing(&error.message) {
+				return Err(format!(
+					"sqlite initial page fetch failed: {}",
+					error.message
+				));
+			}
 			tracing::debug!(
 				actor_id,
 				error = %error.message,
 				"sqlite initial page fetch did not find persisted data"
 			);
-			None
+			Ok(None)
 		}
-		Err(err) => {
-			tracing::debug!(
-				actor_id,
-				error = %err,
-				"sqlite initial page fetch failed"
-			);
-			None
-		}
+		Err(err) => Err(format!("sqlite initial page fetch failed: {err}")),
 	}
+}
+
+fn is_initial_main_page_missing(message: &str) -> bool {
+	message.contains("sqlite database was not found in this bucket branch")
+		|| message.contains("sqlite meta missing for get_pages")
+		|| message.contains("strict DirectStorage forbids mirror fallback for missing depot metadata")
 }
 
 fn next_temp_aux_path() -> String {
@@ -1963,7 +1976,7 @@ impl SqliteVfs {
 
 		let mut ctx = Box::new(VfsContext::new(
 			actor_id, runtime, transport, config, io_methods,
-		));
+		)?);
 		let ctx_ptr = (&mut *ctx) as *mut VfsContext;
 		let name_cstring = CString::new(name).map_err(|err| err.to_string())?;
 
@@ -2137,11 +2150,17 @@ pub fn open_database(
 		}
 	}
 
-	if let Err(err) = assert_batch_atomic_probe(db, &vfs) {
-		unsafe {
-			sqlite3_close(db);
+	#[cfg(test)]
+	let assert_batch_atomic = vfs.ctx.config.assert_batch_atomic;
+	#[cfg(not(test))]
+	let assert_batch_atomic = true;
+	if assert_batch_atomic {
+		if let Err(err) = assert_batch_atomic_probe(db, &vfs) {
+			unsafe {
+				sqlite3_close(db);
+			}
+			return Err(err);
 		}
-		return Err(err);
 	}
 
 	Ok(NativeDatabase { db, _vfs: vfs })

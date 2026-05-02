@@ -4,6 +4,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
+#[cfg(feature = "test-faults")]
+use crate::fault::{
+	ColdTierFaultPoint, DepotFaultAction, DepotFaultContext, DepotFaultController,
+	DepotFaultPoint,
+};
 use crate::metrics;
 
 use super::{ColdTier, ColdTierObjectMetadata};
@@ -21,6 +26,8 @@ pub struct FaultyColdTier<T> {
 	inner: T,
 	node_id: String,
 	state: Arc<FaultyColdTierState>,
+	#[cfg(feature = "test-faults")]
+	fault_controller: Option<DepotFaultController>,
 }
 
 #[derive(Debug, Default)]
@@ -39,6 +46,22 @@ impl<T> FaultyColdTier<T> {
 			inner,
 			node_id: node_id.into(),
 			state: Arc::new(FaultyColdTierState::default()),
+			#[cfg(feature = "test-faults")]
+			fault_controller: None,
+		}
+	}
+
+	#[cfg(feature = "test-faults")]
+	pub fn new_with_fault_controller_for_test(
+		inner: T,
+		node_id: impl Into<String>,
+		fault_controller: DepotFaultController,
+	) -> Self {
+		FaultyColdTier {
+			inner,
+			node_id: node_id.into(),
+			state: Arc::new(FaultyColdTierState::default()),
+			fault_controller: Some(fault_controller),
 		}
 	}
 
@@ -94,6 +117,27 @@ impl<T> FaultyColdTier<T> {
 
 		Ok(())
 	}
+
+	#[cfg(feature = "test-faults")]
+	async fn maybe_fire_controller_fault(
+		&self,
+		point: ColdTierFaultPoint,
+	) -> Result<Option<DepotFaultAction>> {
+		let Some(controller) = &self.fault_controller else {
+			return Ok(None);
+		};
+		let Some(fired) = controller
+			.maybe_fire(
+				DepotFaultPoint::ColdTier(point),
+				DepotFaultContext::new(),
+			)
+			.await?
+		else {
+			return Ok(None);
+		};
+
+		Ok(Some(fired.action))
+	}
 }
 
 impl ColdTierOperation {
@@ -116,6 +160,8 @@ where
 			inner: self.inner.clone(),
 			node_id: self.node_id.clone(),
 			state: self.state.clone(),
+			#[cfg(feature = "test-faults")]
+			fault_controller: self.fault_controller.clone(),
 		}
 	}
 }
@@ -127,21 +173,59 @@ where
 {
 	async fn put_object(&self, key: &str, bytes: &[u8]) -> Result<()> {
 		self.maybe_fail(ColdTierOperation::Put).await?;
+		#[cfg(feature = "test-faults")]
+		let drop_ack = matches!(
+			self.maybe_fire_controller_fault(ColdTierFaultPoint::PutObject)
+				.await?,
+			Some(DepotFaultAction::DropArtifact)
+		);
 		self.inner.put_object(key, bytes).await
+			.and_then(|()| {
+				#[cfg(feature = "test-faults")]
+				if drop_ack {
+					anyhow::bail!("injected cold-tier put acknowledgement drop for {key}");
+				}
+
+				Ok(())
+			})
 	}
 
 	async fn get_object(&self, key: &str) -> Result<Option<Vec<u8>>> {
 		self.maybe_fail(ColdTierOperation::Get).await?;
+		#[cfg(feature = "test-faults")]
+		if matches!(
+			self.maybe_fire_controller_fault(ColdTierFaultPoint::GetObject)
+				.await?,
+			Some(DepotFaultAction::DropArtifact)
+		) {
+			return Ok(None);
+		}
 		self.inner.get_object(key).await
 	}
 
 	async fn delete_objects(&self, keys: &[String]) -> Result<()> {
 		self.maybe_fail(ColdTierOperation::Delete).await?;
+		#[cfg(feature = "test-faults")]
+		if matches!(
+			self.maybe_fire_controller_fault(ColdTierFaultPoint::DeleteObjects)
+				.await?,
+			Some(DepotFaultAction::DropArtifact)
+		) {
+			anyhow::bail!("cold-tier DropArtifact is not supported for delete_objects");
+		}
 		self.inner.delete_objects(keys).await
 	}
 
 	async fn list_prefix(&self, prefix: &str) -> Result<Vec<ColdTierObjectMetadata>> {
 		self.maybe_fail(ColdTierOperation::List).await?;
+		#[cfg(feature = "test-faults")]
+		if matches!(
+			self.maybe_fire_controller_fault(ColdTierFaultPoint::ListPrefix)
+				.await?,
+			Some(DepotFaultAction::DropArtifact)
+		) {
+			anyhow::bail!("cold-tier DropArtifact is not supported for list_prefix");
+		}
 		self.inner.list_prefix(prefix).await
 	}
 }

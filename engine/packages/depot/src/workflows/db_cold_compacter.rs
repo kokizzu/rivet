@@ -5,6 +5,11 @@ use crate::compaction::{
 };
 use crate::workflows::db_manager::branch_record_is_live_at_generation;
 
+#[cfg(feature = "test-faults")]
+use crate::compaction::test_hooks;
+#[cfg(feature = "test-faults")]
+use crate::fault::ColdCompactionFaultPoint;
+
 #[workflow(DbColdCompacterWorkflow)]
 pub async fn db_cold_compacter(ctx: &mut WorkflowCtx, input: &DbColdCompacterInput) -> Result<()> {
 	run_companion_loop(ctx, input.database_branch_id, CompanionKind::Cold).await
@@ -37,7 +42,7 @@ pub async fn upload_cold_job(
 		});
 	}
 
-	let Some(cold_tier) = workflow_cold_tier(ctx.config()).await? else {
+	let Some(cold_tier) = workflow_cold_tier(ctx.config(), input.database_branch_id).await? else {
 		return Ok(UploadColdJobOutput {
 			status: CompactionJobStatus::Rejected {
 				reason: "cold storage is disabled".to_string(),
@@ -46,6 +51,15 @@ pub async fn upload_cold_job(
 		});
 	};
 	for object in objects {
+		#[cfg(feature = "test-faults")]
+		if let Some(output) = cold_upload_fault_output(
+			input.database_branch_id,
+			ColdCompactionFaultPoint::UploadBeforePutObject,
+		)
+		.await?
+		{
+			return Ok(output);
+		}
 		if let Err(err) = cold_tier.put_object(&object.object_key, &object.bytes).await {
 			tracing::warn!(
 				?input.database_branch_id,
@@ -60,6 +74,15 @@ pub async fn upload_cold_job(
 				},
 				output_refs: Vec::new(),
 			});
+		}
+		#[cfg(feature = "test-faults")]
+		if let Some(output) = cold_upload_fault_output(
+			input.database_branch_id,
+			ColdCompactionFaultPoint::UploadAfterPutObject,
+		)
+		.await?
+		{
+			return Ok(output);
 		}
 	}
 
@@ -88,6 +111,15 @@ async fn prepare_cold_upload_tx(
 ) -> Result<PreparedColdUpload> {
 	if input.job_kind != CompactionJobKind::Cold {
 		return Ok(rejected_cold_upload("cold compacter received a non-cold job"));
+	}
+	#[cfg(feature = "test-faults")]
+	if let Some(output) = cold_prepare_upload_fault_output(
+		input.database_branch_id,
+		ColdCompactionFaultPoint::UploadBeforeInputRead,
+	)
+	.await?
+	{
+		return Ok(output);
 	}
 
 	let branch_record = tx_get_value(
@@ -143,6 +175,15 @@ async fn prepare_cold_upload_tx(
 	if input_fingerprint != input.input_fingerprint {
 		return Ok(rejected_cold_upload("cold compaction input fingerprint changed"));
 	}
+	#[cfg(feature = "test-faults")]
+	if let Some(output) = cold_prepare_upload_fault_output(
+		input.database_branch_id,
+		ColdCompactionFaultPoint::UploadAfterInputRead,
+	)
+	.await?
+	{
+		return Ok(output);
+	}
 
 	let mut output_refs = Vec::with_capacity(cold_inputs.shard_blobs.len());
 	let mut objects = Vec::with_capacity(cold_inputs.shard_blobs.len());
@@ -195,6 +236,44 @@ fn rejected_cold_upload(reason: impl Into<String>) -> PreparedColdUpload {
 	}
 }
 
+#[cfg(feature = "test-faults")]
+async fn cold_prepare_upload_fault_output(
+	database_branch_id: DatabaseBranchId,
+	point: ColdCompactionFaultPoint,
+) -> Result<Option<PreparedColdUpload>> {
+	match test_hooks::maybe_fire_cold_compaction_fault(database_branch_id, point).await {
+		Ok(Some(_)) | Ok(None) => Ok(None),
+		Err(err) => Ok(Some(failed_prepared_cold_upload(err))),
+	}
+}
+
+#[cfg(feature = "test-faults")]
+async fn cold_upload_fault_output(
+	database_branch_id: DatabaseBranchId,
+	point: ColdCompactionFaultPoint,
+) -> Result<Option<UploadColdJobOutput>> {
+	match test_hooks::maybe_fire_cold_compaction_fault(database_branch_id, point).await {
+		Ok(Some(_)) | Ok(None) => Ok(None),
+		Err(err) => Ok(Some(UploadColdJobOutput {
+			status: CompactionJobStatus::Failed {
+				error: err.to_string(),
+			},
+			output_refs: Vec::new(),
+		})),
+	}
+}
+
+#[cfg(feature = "test-faults")]
+fn failed_prepared_cold_upload(err: anyhow::Error) -> PreparedColdUpload {
+	PreparedColdUpload {
+		status: CompactionJobStatus::Failed {
+			error: err.to_string(),
+		},
+		output_refs: Vec::new(),
+		objects: Vec::new(),
+	}
+}
+
 #[activity(PublishColdJob)]
 pub async fn publish_cold_job(
 	ctx: &ActivityCtx,
@@ -216,6 +295,15 @@ async fn publish_cold_job_tx(
 ) -> Result<PublishColdJobOutput> {
 	if input.job_kind != CompactionJobKind::Cold {
 		return Ok(rejected_cold_publish("manager received a non-cold job"));
+	}
+	#[cfg(feature = "test-faults")]
+	if let Some(output) = cold_publish_fault_output(
+		input.database_branch_id,
+		ColdCompactionFaultPoint::PublishBeforeInputRead,
+	)
+	.await?
+	{
+		return Ok(output);
 	}
 
 	let branch_record = tx_get_value(
@@ -283,6 +371,15 @@ async fn publish_cold_job_tx(
 	if expected_outputs != input.output_refs {
 		return Ok(rejected_cold_publish("cold output refs do not match planned inputs"));
 	}
+	#[cfg(feature = "test-faults")]
+	if let Some(output) = cold_publish_fault_output(
+		input.database_branch_id,
+		ColdCompactionFaultPoint::PublishAfterInputRead,
+	)
+	.await?
+	{
+		return Ok(output);
+	}
 
 	let mut seen_outputs = BTreeSet::new();
 	for output_ref in &input.output_refs {
@@ -304,6 +401,15 @@ async fn publish_cold_job_tx(
 		}
 	}
 
+	#[cfg(feature = "test-faults")]
+	if let Some(output) = cold_publish_fault_output(
+		input.database_branch_id,
+		ColdCompactionFaultPoint::PublishBeforeColdRefWrite,
+	)
+	.await?
+	{
+		return Ok(output);
+	}
 	for output_ref in &input.output_refs {
 		tx.informal().set(
 			&keys::branch_compaction_cold_shard_key(
@@ -316,6 +422,15 @@ async fn publish_cold_job_tx(
 		);
 	}
 
+	#[cfg(feature = "test-faults")]
+	if let Some(output) = cold_publish_fault_output(
+		input.database_branch_id,
+		ColdCompactionFaultPoint::PublishAfterColdRefWriteBeforeRootUpdate,
+	)
+	.await?
+	{
+		return Ok(output);
+	}
 	let next_root = CompactionRoot {
 		schema_version: root.schema_version,
 		manifest_generation: publish_generation,
@@ -332,6 +447,15 @@ async fn publish_cold_job_tx(
 		&encode_compaction_root(next_root)
 			.context("encode sqlite compaction root for cold publish")?,
 	);
+	#[cfg(feature = "test-faults")]
+	if let Some(output) = cold_publish_fault_output(
+		input.database_branch_id,
+		ColdCompactionFaultPoint::PublishAfterRootUpdate,
+	)
+	.await?
+	{
+		return Ok(output);
+	}
 
 	Ok(PublishColdJobOutput {
 		status: CompactionJobStatus::Succeeded,
@@ -345,5 +469,21 @@ fn rejected_cold_publish(reason: impl Into<String>) -> PublishColdJobOutput {
 			reason: reason.into(),
 		},
 		output_refs: Vec::new(),
+	}
+}
+
+#[cfg(feature = "test-faults")]
+async fn cold_publish_fault_output(
+	database_branch_id: DatabaseBranchId,
+	point: ColdCompactionFaultPoint,
+) -> Result<Option<PublishColdJobOutput>> {
+	match test_hooks::maybe_fire_cold_compaction_fault(database_branch_id, point).await {
+		Ok(Some(_)) | Ok(None) => Ok(None),
+		Err(err) => Ok(Some(PublishColdJobOutput {
+			status: CompactionJobStatus::Failed {
+				error: err.to_string(),
+			},
+			output_refs: Vec::new(),
+		})),
 	}
 }

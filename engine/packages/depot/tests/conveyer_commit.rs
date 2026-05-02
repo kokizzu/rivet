@@ -34,6 +34,10 @@ use depot::{
 	},
 	workflows::compaction::DeltasAvailable,
 };
+#[cfg(feature = "test-faults")]
+use depot::fault::{
+	CommitFaultPoint, DepotFaultController, DepotFaultPoint, FaultBoundary,
+};
 use universaldb::utils::IsolationLevel::Snapshot;
 
 const TEST_DATABASE: &str = "test-database";
@@ -210,6 +214,26 @@ async fn assert_commit_rejected(
 	Ok(())
 }
 
+#[cfg(feature = "test-faults")]
+fn error_chain_contains(err: &anyhow::Error, expected: &str) -> bool {
+	err.chain()
+		.any(|cause| cause.to_string().contains(expected))
+}
+
+#[cfg(feature = "test-faults")]
+fn faulting_db(
+	db: Arc<universaldb::Database>,
+	controller: DepotFaultController,
+) -> Db {
+	Db::new_with_fault_controller_for_test(
+		db,
+		test_bucket(),
+		TEST_DATABASE.to_string(),
+		NodeId::new(),
+		controller,
+	)
+}
+
 #[tokio::test]
 async fn commit_lazily_initializes_meta_on_first_write() -> Result<()> {
 	commit_matrix!("depot-commit-init", |ctx, db, database_db| {
@@ -282,6 +306,82 @@ async fn commit_rejects_invalid_dirty_pages_before_storage_writes() -> Result<()
 		assert_eq!(
 			read_value(&db, bucket_pointer_cur_key(BucketId::from_gas_id(test_bucket()))).await?,
 			None
+		);
+
+		Ok(())
+	})
+}
+
+#[cfg(feature = "test-faults")]
+#[tokio::test]
+async fn commit_pre_durable_fault_leaves_old_state() -> Result<()> {
+	commit_matrix!("depot-commit-fault-pre-durable", |ctx, db, database_db| {
+		database_db.commit(vec![page(1, 0x11)], 2, 1_000).await?;
+		let branch_id = read_branch_id(&db).await?;
+
+		let controller = DepotFaultController::new();
+		controller
+			.at(DepotFaultPoint::Commit(CommitFaultPoint::BeforeHeadWrite))
+			.database_id(TEST_DATABASE)
+			.once()
+			.fail("stop before head write")?;
+		let faulting_db = faulting_db(db.clone(), controller.clone());
+		let err = faulting_db
+			.commit(vec![page(2, 0x22)], 3, 2_000)
+			.await
+			.expect_err("pre-durable fault should fail the commit");
+
+		assert!(
+			error_chain_contains(&err, "stop before head write"),
+			"expected injected fault error, got {err:?}"
+		);
+		controller.assert_expected_fired()?;
+		assert_eq!(controller.replay_log()[0].boundary, FaultBoundary::PreDurableCommit);
+		assert_eq!(read_head(&db).await?, head_with_branch(branch_id, 1, 2));
+		assert!(
+			read_value(&db, branch_delta_chunk_key(branch_id, 2, 0))
+				.await?
+				.is_none()
+		);
+		assert!(read_value(&db, branch_pidx_key(branch_id, 2)).await?.is_none());
+
+		Ok(())
+	})
+}
+
+#[cfg(feature = "test-faults")]
+#[tokio::test]
+async fn commit_after_udb_fault_reports_ambiguous_committed_state() -> Result<()> {
+	commit_matrix!("depot-commit-fault-after-udb", |ctx, db, database_db| {
+		database_db.commit(vec![page(1, 0x11)], 2, 1_000).await?;
+		let branch_id = read_branch_id(&db).await?;
+
+		let controller = DepotFaultController::new();
+		controller
+			.at(DepotFaultPoint::Commit(CommitFaultPoint::AfterUdbCommit))
+			.database_id(TEST_DATABASE)
+			.once()
+			.fail("stop after durable commit")?;
+		let faulting_db = faulting_db(db.clone(), controller.clone());
+		let err = faulting_db
+			.commit(vec![page(2, 0x22)], 3, 2_000)
+			.await
+			.expect_err("post-durable fault should return an ambiguous error");
+
+		assert!(
+			error_chain_contains(&err, "stop after durable commit"),
+			"expected injected fault error, got {err:?}"
+		);
+		controller.assert_expected_fired()?;
+		assert_eq!(
+			controller.replay_log()[0].boundary,
+			FaultBoundary::AmbiguousAfterDurableCommit
+		);
+		assert_eq!(read_head(&db).await?, head_with_branch(branch_id, 2, 3));
+		let reader = ctx.make_db(test_bucket(), TEST_DATABASE);
+		assert_eq!(
+			reader.get_pages(vec![1, 2]).await?,
+			vec![fetched_page(1, 0x11), fetched_page(2, 0x22)]
 		);
 
 		Ok(())

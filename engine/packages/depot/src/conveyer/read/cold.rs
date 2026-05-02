@@ -1,6 +1,10 @@
 use std::collections::BTreeMap;
 
 use anyhow::{Context, Result};
+#[cfg(feature = "test-faults")]
+use crate::fault::{
+	DepotFaultAction, DepotFaultFired, ReadFaultPoint,
+};
 use futures_util::TryStreamExt;
 use universaldb::{
 	RangeOption,
@@ -25,6 +29,8 @@ use crate::conveyer::{
 	},
 };
 
+#[cfg(feature = "test-faults")]
+use super::maybe_fire_read_fault;
 use super::{
 	cache_fill::{ShardCacheFillJob, ShardCacheFillKey},
 	plan::{ReadSource, StorageScope},
@@ -181,11 +187,31 @@ impl Db {
 				return Ok(ColdObjectPageLoad::ObjectMissing);
 			};
 			let _timer = metrics::SQLITE_SHARD_CACHE_COLD_READ_DURATION.start_timer();
-			let Some(bytes) = cold_tier
+			let bytes = cold_tier
 				.get_object(object_key)
 				.await
-				.with_context(|| format!("get sqlite cold layer {object_key}"))?
-			else {
+				.with_context(|| format!("get sqlite cold layer {object_key}"))?;
+			#[cfg(feature = "test-faults")]
+			let mut bytes = bytes;
+			#[cfg(feature = "test-faults")]
+			if matches!(
+				maybe_fire_read_fault(
+					&self.fault_controller,
+					ReadFaultPoint::ColdObjectMissing,
+					&self.database_id,
+					None,
+					Some(pgno),
+					Some(pgno / keys::SHARD_SIZE),
+				)
+				.await?,
+				Some(DepotFaultFired {
+					action: DepotFaultAction::DropArtifact,
+					..
+				})
+			) {
+				bytes = None;
+			}
+			let Some(bytes) = bytes else {
 				return Ok(ColdObjectPageLoad::ObjectMissing);
 			};
 			loaded_objects.insert(object_key.to_string(), bytes);

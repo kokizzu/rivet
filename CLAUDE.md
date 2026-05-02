@@ -106,6 +106,7 @@ docker-compose up -d
 
 - RivetKit SQLite is native-only: VFS and query execution live in `rivetkit-rust/packages/rivetkit-sqlite/`, core owns lifecycle, and NAPI only marshals JS types.
 - SQLite VFS direct tests should record workflow compaction wakes through `CompactionSignaler`, not call legacy `compact_default_batch`.
+- SQLite VFS correctness tests should use `DirectStorage`; do not reintroduce mock or envoy transport variants for those tests.
 - SQLite VFS `xSync` durability depends on depot's `sqlite_commit` reply waiting for the FDB transaction commit.
 - SQLite VFS process-global registrations must be owned by a Drop guard so panics unwind through `sqlite3_vfs_unregister`.
 - `NativeDatabase::Drop` must bound dirty-page flushes with a short timeout and return after logging if the commit future never resolves.

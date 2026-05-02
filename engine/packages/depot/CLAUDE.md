@@ -44,6 +44,7 @@ These come from `r2-prior-art/.agent/research/sqlite/requirements.md` and supers
 - **Workflow compaction read fallback preserves hot-tier order.** PIDX/DELTA wins, branch SHARD fallback is next, and `CMP/cold_shard` refs are considered only before legacy cold manifest layers.
 - **Conveyer read domains live behind the `conveyer/read.rs` facade.** Keep read planning, PIDX/cache helpers, SHARD fallback, cold-tier reads, and transaction scan helpers under `conveyer/read/*.rs`.
 - **Sparse in-range reads zero-fill only when no source exists.** Corrupted or broken source blobs must return an explicit read error, not a zero page.
+- **PIDX-owned DELTA gaps are broken source coverage.** Missing delta chunks may fall back only to valid SHARD or cold coverage; otherwise return `ShardCoverageMissing` or a decode error.
 - **Compaction cold-shard reads must revalidate live refs.** After fetching cold bytes, re-read the `CMP/cold_shard` ref under `Serializable`; missing or changed refs return `ShardCoverageMissing`, not sparse zero-fill.
 - **Read-path tests should seed branch-owned storage.** Use `Db::commit` or `BR/{branch}` keys, not pre-PITR database-scoped `META`/`PIDX`/`DELTA`/`SHARD` keys.
 - **Conveyer branch domains live behind the `conveyer/branch.rs` facade.** Keep branch resolution, bucket catalog/list/delete, fork/derive, lifecycle rollback, and shared branch helpers under `conveyer/branch/*.rs`.
@@ -55,6 +56,7 @@ These come from `r2-prior-art/.agent/research/sqlite/requirements.md` and supers
 - **Shard-cache fill idle waits pre-arm `Notify` before checking `outstanding`.** `notify_waiters()` does not store permits.
 - **Shard-cache metrics use fixed outcome labels only.** Keep branch, database, shard, object, restore point, and bucket identifiers out of metric labels.
 - **Workflow compaction integration tests configure filesystem cold storage through `TestCtx`.** Do not use runtime global cold-tier overrides for integration coverage.
+- **Fault scenarios install workflow cold-tier test overrides by branch id.** Use `test_hooks::install_workflow_cold_tier_for_test` only when the workflow must share a fault-controller-backed tier with VFS reads.
 - **Truncate cleanup prunes the boundary SHARD instead of blindly deleting it.** `shard_id = pgno / SHARD_SIZE`, so page 64 and page 65 both map to shard 1.
 - **Debug historical reads cannot trust PIDX.** PIDX is the current owner map, so `debug::read_at` scans DELTA history up to the target txid before falling through to SHARD/cold layers.
 - **Fresh fork branches use `/META/head_at_fork` until first commit.** The first local commit treats it as the previous `DBHead`, writes `/META/head`, and clears `/META/head_at_fork` in the same transaction.
@@ -78,7 +80,8 @@ These come from `r2-prior-art/.agent/research/sqlite/requirements.md` and supers
 - **Workflow compaction joined signals expose `database_branch_id()`.** Manager and companion loops should filter unrelated branch signals once before variant-specific handling.
 - **Workflow companion signal handlers are kind-specific.** Hot, cold, and reclaim loops choose typed signal handlers first; storage work stays inside activities.
 - **Workflow force-compaction state lives in `ForceCompactionTracker`.** Manager code should use tracker methods for request, result, attempted-job, and completed-job bookkeeping.
-- **Workflow force-compaction tests use the manager `ForceCompaction` signal.** Wait on durable `force_compactions.recent_results`, not planner deadlines or arbitrary timing thresholds.
+- **Workflow force-compaction tests use `DepotCompactionTestDriver` under `depot/test-faults`.** Wait on durable `force_compactions.recent_results`, not planner deadlines or arbitrary timing thresholds.
+- **Workflow fault-hook tests should assert durable forced results.** Manager retries can surface a terminal error and still settle later state in the same forced cycle.
 - **Workflow hot compaction writes only staged LTX blobs under `CMP/stage/{job_id}/hot_shard`.** Successful staged results stay as the manager's active hot job until the manager install path publishes or rejects them.
 - **Workflow hot install runs in the DB manager.** It accepts only the active job fingerprint, copies staged hot shards to reader-visible `SHARD`, advances `CMP/root`, and clears matching PIDX rows with `COMPARE_AND_CLEAR`.
 - **Workflow hot planning treats `DB_PIN` records as exact coverage targets.** Preserve pinned txids in `HotJobInputRange.coverage_txids`; do not round them up to the latest head.
@@ -132,6 +135,7 @@ These come from `r2-prior-art/.agent/research/sqlite/requirements.md` and supers
 - **ColdTier object keys are relative S3-style keys.** Reject empty object keys, absolute paths, and `..`; use `FilesystemColdTier` for local tests and `FaultyColdTier` for injected latency or failures.
 - **ColdTier implementations live under `src/cold_tier/`.** Keep `mod.rs` as the trait/shared-type facade and put disabled, filesystem, S3, config, and fault-injection behavior in focused files.
 - **FaultyColdTier requires an explicit node id.** Use a real node id or test-specific label so injected-failure metrics never fall back to `unknown`.
+- **FaultyColdTier controller faults are test-only.** `DropArtifact` on GET returns a missing object; on PUT it writes first and then drops the acknowledgement with an error.
 - **S3 missing-object handling uses typed SDK service errors.** Check `GetObjectError::is_no_such_key`; do not match `Display` strings.
 - **Cold read fall-through keeps ColdTier GETs outside UDB transactions.** `Db::new_with_cold_tier` supplies the backend and read-side manifests are cached per connection.
 
@@ -201,6 +205,11 @@ We explicitly do **not** import:
 - Lease-expiry and time-window tests use `tokio::time::pause()` + `advance()` for determinism.
 - Use a nil bucket `Db` to exercise branch-scoped hot compaction through public `compact_default_batch`.
 - Latency tests that depend on `UDB_SIMULATED_LATENCY_MS` must live in a dedicated integration test binary because UDB caches the env var once per process via `OnceLock`.
+- SQLite VFS integration and fault-injection tests live in `rivetkit-rust/packages/rivetkit-sqlite/` so they exercise the full VFS.
+- Depot fault-injection APIs live only behind `depot/test-faults`; enable the feature from dev/test dependencies only.
+- Production fault-leak checks run through `engine/packages/depot/scripts/check-production-fault-leaks.sh`.
+- Depot fault-controller tests live in `tests/fault_controller.rs` and run with `cargo test -p depot --features test-faults --test fault_controller`.
+- Commit fault-hook tests should search the `anyhow` error chain because UDB transaction failures wrap injected fault errors.
 
 ## Metrics
 

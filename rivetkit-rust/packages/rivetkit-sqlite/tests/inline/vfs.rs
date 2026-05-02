@@ -1,7 +1,8 @@
 	mod vfs_support;
+	mod fault;
 
 	pub(super) use vfs_support::{
-		DirectStorage, DirectTransportHooks, MockProtocol, protocol_fetched_page,
+		DirectStorage, DirectStorageStats, DirectTransportHooks, protocol_fetched_page,
 		sqlite_error_response, storage_dirty_page,
 	};
 
@@ -10,6 +11,7 @@
 	use std::thread;
 	use std::time::Duration;
 
+	use depot::cold_tier::FilesystemColdTier;
 	use parking_lot::Mutex as SyncMutex;
 	use tempfile::TempDir;
 	use tokio::runtime::Builder;
@@ -19,15 +21,6 @@
 
 	static TEST_ID: AtomicU64 = AtomicU64::new(1);
 
-	fn dirty_pages(page_count: u32, fill: u8) -> Vec<protocol::SqliteDirtyPage> {
-		(0..page_count)
-			.map(|offset| protocol::SqliteDirtyPage {
-				pgno: offset + 1,
-				bytes: vec![fill; 4096],
-			})
-			.collect()
-	}
-
 	fn next_test_name(prefix: &str) -> String {
 		let id = TEST_ID.fetch_add(1, Ordering::Relaxed);
 		format!("{prefix}-{id}")
@@ -36,6 +29,7 @@
 	struct DirectEngineHarness {
 		actor_id: String,
 		db_dir: TempDir,
+		cold_dir: Option<TempDir>,
 		storage: OnceCell<Arc<DirectStorage>>,
 	}
 
@@ -44,6 +38,16 @@
 			Self {
 				actor_id: next_test_name("sqlite-direct-actor"),
 				db_dir: tempfile::tempdir().expect("temp dir should build"),
+				cold_dir: None,
+				storage: OnceCell::new(),
+			}
+		}
+
+		fn new_with_cold_tier() -> Self {
+			Self {
+				actor_id: next_test_name("sqlite-direct-actor"),
+				db_dir: tempfile::tempdir().expect("temp dir should build"),
+				cold_dir: Some(tempfile::tempdir().expect("cold temp dir should build")),
 				storage: OnceCell::new(),
 			}
 		}
@@ -60,7 +64,14 @@
 					.expect("rocksdb driver should build");
 					let db = universaldb::Database::new(Arc::new(driver));
 
-					Arc::new(DirectStorage::new(db))
+					Arc::new(if let Some(cold_dir) = &self.cold_dir {
+						DirectStorage::new_with_cold_tier(
+							db,
+							Arc::new(FilesystemColdTier::new(cold_dir.path())),
+						)
+					} else {
+						DirectStorage::new(db)
+					})
 				})
 				.await;
 			Arc::clone(storage)
@@ -88,6 +99,18 @@
 		fn open_db(&self, runtime: &tokio::runtime::Runtime) -> NativeDatabase {
 			let engine = runtime.block_on(self.open_engine());
 			self.open_db_on_engine(runtime, engine, &self.actor_id, VfsConfig::default())
+		}
+
+		fn open_context(&self, runtime: &tokio::runtime::Runtime) -> VfsContext {
+			let engine = runtime.block_on(self.open_engine());
+			VfsContext::new(
+				self.actor_id.clone(),
+				runtime.handle().clone(),
+				SqliteTransport::from_direct(engine),
+				VfsConfig::default(),
+				unsafe { std::mem::zeroed() },
+			)
+			.expect("vfs context should build")
 		}
 	}
 
@@ -352,6 +375,199 @@
 				.expect("user_version after reopen should succeed"),
 			7
 		);
+	}
+
+	#[test]
+	fn strict_direct_reopen_ignores_poisoned_mirror_and_reads_depot() {
+		let runtime = direct_runtime();
+		let harness = DirectEngineHarness::new();
+		let page_count;
+
+		{
+			let db = harness.open_db(&runtime);
+			sqlite_exec(db.as_ptr(), "PRAGMA user_version = 2718;")
+				.expect("user_version write should succeed");
+			page_count = sqlite_query_i64(db.as_ptr(), "PRAGMA page_count;")
+				.expect("page count should succeed") as u32;
+		}
+
+		let engine = runtime.block_on(harness.open_engine());
+		runtime.block_on(engine.poison_mirror_page(
+			&harness.actor_id,
+			1,
+			vec![0xdb; 4096],
+			page_count,
+		));
+		engine.enable_strict_mode();
+		runtime.block_on(engine.evict_actor_db(&harness.actor_id));
+
+		let before = engine.stats();
+		let reopened = harness.open_db(&runtime);
+		assert_eq!(
+			sqlite_query_i64(reopened.as_ptr(), "PRAGMA user_version;")
+				.expect("strict reopen should read depot state"),
+			2718
+		);
+		let after = engine.stats();
+		assert!(after.depot_get_pages > before.depot_get_pages);
+		assert_eq!(after.mirror_reads, before.mirror_reads);
+		assert_eq!(after.mirror_fills, before.mirror_fills);
+		assert_eq!(after.mirror_seeds, before.mirror_seeds);
+	}
+
+	#[test]
+	fn strict_direct_mode_rejects_mirror_fallback_and_seed_paths() {
+		let runtime = direct_runtime();
+		let harness = DirectEngineHarness::new();
+		let engine = runtime.block_on(harness.open_engine());
+
+		runtime
+			.block_on(engine.apply_commit(
+				&harness.actor_id,
+				vec![storage_dirty_page(protocol::SqliteDirtyPage {
+					pgno: 1,
+					bytes: empty_db_page(),
+				})],
+				1,
+			))
+			.expect("non-strict mirror seed should succeed");
+
+		engine.enable_strict_mode();
+		runtime.block_on(engine.evict_actor_db(&harness.actor_id));
+		let before = engine.stats();
+		let err = runtime
+			.block_on(engine.get_pages(&harness.actor_id, &[1]))
+			.expect_err("strict mode should not read from the mirror");
+		assert!(!err.to_string().is_empty());
+		let after = engine.stats();
+		assert_eq!(after.mirror_reads, before.mirror_reads);
+		assert_eq!(after.mirror_fills, before.mirror_fills);
+
+		let err = runtime
+			.block_on(engine.apply_commit(
+				&harness.actor_id,
+				vec![storage_dirty_page(protocol::SqliteDirtyPage {
+					pgno: 1,
+					bytes: empty_db_page(),
+				})],
+				1,
+			))
+			.expect_err("strict mode should reject mirror seed");
+		assert!(err.to_string().contains("forbids mirror-backed cache seeding"));
+	}
+
+	#[test]
+	fn strict_direct_reopen_counts_cold_tier_get_for_cold_covered_page() {
+		let runtime = direct_runtime();
+		let harness = DirectEngineHarness::new_with_cold_tier();
+		let page_count;
+
+		{
+			let db = harness.open_db(&runtime);
+			sqlite_exec(db.as_ptr(), "PRAGMA user_version = 808;")
+				.expect("user_version write should succeed");
+			page_count = sqlite_query_i64(db.as_ptr(), "PRAGMA page_count;")
+				.expect("page count should succeed") as u32;
+		}
+
+		let engine = runtime.block_on(harness.open_engine());
+		let page = runtime
+			.block_on(engine.snapshot_pages(&harness.actor_id))
+			.pages
+			.get(&1)
+			.cloned()
+			.expect("page 1 should be present");
+		assert_eq!(&page[..16], b"SQLite format 3\0");
+		runtime
+			.block_on(engine.seed_page_as_cold_ref(&harness.actor_id, 1, page))
+			.expect("cold ref should seed");
+		runtime.block_on(engine.poison_mirror_page(
+			&harness.actor_id,
+			1,
+			vec![0xcd; 4096],
+			page_count,
+		));
+		engine.enable_strict_mode();
+		runtime.block_on(engine.evict_actor_db(&harness.actor_id));
+
+		let before = engine.stats();
+		let reopened = harness.open_db(&runtime);
+		assert_eq!(
+			sqlite_query_i64(reopened.as_ptr(), "PRAGMA user_version;")
+				.expect("strict reopen should read cold-backed state"),
+			808
+		);
+		let after = engine.stats();
+		assert!(after.depot_get_pages > before.depot_get_pages);
+		assert!(after.cold_gets > before.cold_gets);
+		assert_eq!(after.mirror_reads, before.mirror_reads);
+		assert_eq!(after.mirror_fills, before.mirror_fills);
+		assert_eq!(after.mirror_seeds, before.mirror_seeds);
+	}
+
+	#[test]
+	fn strict_direct_warmed_shard_cache_does_not_count_as_cold_tier_evidence() {
+		let runtime = direct_runtime();
+		let harness = DirectEngineHarness::new_with_cold_tier();
+		let page_count;
+
+		{
+			let db = harness.open_db(&runtime);
+			sqlite_exec(db.as_ptr(), "PRAGMA user_version = 909;")
+				.expect("user_version write should succeed");
+			page_count = sqlite_query_i64(db.as_ptr(), "PRAGMA page_count;")
+				.expect("page count should succeed") as u32;
+		}
+
+		let engine = runtime.block_on(harness.open_engine());
+		let page = runtime
+			.block_on(engine.snapshot_pages(&harness.actor_id))
+			.pages
+			.get(&1)
+			.cloned()
+			.expect("page 1 should be present");
+		assert_eq!(&page[..16], b"SQLite format 3\0");
+		runtime
+			.block_on(engine.seed_page_as_cold_ref(&harness.actor_id, 1, page))
+			.expect("cold ref should seed");
+		runtime.block_on(engine.poison_mirror_page(
+			&harness.actor_id,
+			1,
+			vec![0xcd; 4096],
+			page_count,
+		));
+		engine.enable_strict_mode();
+		runtime.block_on(engine.evict_actor_db(&harness.actor_id));
+
+		let before_warm = engine.stats();
+		let cold_page = runtime
+			.block_on(engine.get_pages(&harness.actor_id, &[1]))
+			.expect("strict direct read should hit cold tier")
+			.into_iter()
+			.find(|page| page.pgno == 1)
+			.and_then(|page| page.bytes)
+			.expect("cold-backed page should be present");
+		assert_eq!(&cold_page[..16], b"SQLite format 3\0");
+		let after_warm = engine.stats();
+		assert!(after_warm.cold_gets > before_warm.cold_gets);
+
+		let actor_db = runtime.block_on(engine.actor_db(harness.actor_id.clone()));
+		runtime.block_on(actor_db.wait_for_shard_cache_fill_idle_for_test());
+		runtime.block_on(engine.evict_actor_db(&harness.actor_id));
+
+		let before = engine.stats();
+		let reopened = harness.open_db(&runtime);
+		assert_eq!(
+			sqlite_query_i64(reopened.as_ptr(), "PRAGMA user_version;")
+				.expect("strict reopen should read shard-cache-backed state"),
+			909
+		);
+		let after = engine.stats();
+		assert!(after.depot_get_pages > before.depot_get_pages);
+		assert_eq!(after.cold_gets, before.cold_gets);
+		assert_eq!(after.mirror_reads, before.mirror_reads);
+		assert_eq!(after.mirror_fills, before.mirror_fills);
+		assert_eq!(after.mirror_seeds, before.mirror_seeds);
 	}
 
 	#[test]
@@ -1645,7 +1861,8 @@
 			transport,
 			VfsConfig::default(),
 			unsafe { std::mem::zeroed() },
-		);
+		)
+		.expect("vfs context should build");
 
 		let before_page_1 = vec![0x11; 4096];
 		let before_page_2 = vec![0x22; 4096];
@@ -2330,29 +2547,30 @@
 
 	#[test]
 	fn native_database_drop_times_out_pending_commit() {
-		let runtime = Builder::new_multi_thread()
-			.worker_threads(2)
-			.enable_all()
-			.build()
-			.expect("runtime should build");
-		let protocol = Arc::new(MockProtocol::new(protocol::SqliteCommitResponse::SqliteCommitOk));
+		let runtime = direct_runtime();
+		let harness = DirectEngineHarness::new();
+		let engine = runtime.block_on(harness.open_engine());
+		let transport = SqliteTransport::from_direct(engine);
+		let hooks = transport
+			.direct_hooks()
+			.expect("direct transport should expose test hooks");
 		let vfs = SqliteVfs::register_with_transport(
-			"test-v2-drop-pending-commit",
-			SqliteTransport::from_mock(protocol.clone()),
-			"actor".to_string(),
+			&next_test_name("sqlite-direct-vfs"),
+			transport,
+			harness.actor_id.clone(),
 			runtime.handle().clone(),
 			VfsConfig::default(),
 		)
 		.expect("vfs should register");
-		let db = open_database(vfs, "actor").expect("db should open");
-		let commit_count_before_drop = protocol.commit_requests().len();
+		let db = open_database(vfs, &harness.actor_id).expect("db should open");
+		let commit_count_before_drop = hooks.commit_requests().len();
 		{
 			let ctx = db._vfs.ctx();
 			let mut state = ctx.state.write();
 			state.db_size_pages = 1;
 			state.write_buffer.dirty.insert(1, empty_db_page());
 		}
-		protocol.hang_commits();
+		hooks.hang_next_commit();
 
 		let (finished_tx, finished_rx) = mpsc::channel();
 		let drop_thread = thread::spawn(move || {
@@ -2366,25 +2584,14 @@
 			.recv_timeout(Duration::from_secs(2))
 			.expect("drop should not block forever on a pending commit");
 		drop_thread.join().expect("drop thread should finish");
-		assert_eq!(protocol.commit_requests().len(), commit_count_before_drop + 1);
+		assert_eq!(hooks.commit_requests().len(), commit_count_before_drop + 1);
 	}
 
 	#[test]
 	fn open_database_supports_empty_db_schema_setup() {
-		let runtime = Builder::new_current_thread()
-			.enable_all()
-			.build()
-			.expect("runtime should build");
-		let protocol = Arc::new(MockProtocol::new(protocol::SqliteCommitResponse::SqliteCommitOk));
-		let vfs = SqliteVfs::register_with_transport(
-			"test-v2-empty-db",
-			SqliteTransport::from_mock(protocol.clone()),
-			"actor".to_string(),
-			runtime.handle().clone(),
-			VfsConfig::default(),
-		)
-		.expect("vfs should register");
-		let db = open_database(vfs, "actor").expect("db should open");
+		let runtime = direct_runtime();
+		let harness = DirectEngineHarness::new();
+		let db = harness.open_db(&runtime);
 
 		sqlite_exec(
 			db.as_ptr(),
@@ -2395,21 +2602,9 @@
 
 	#[test]
 	fn open_database_supports_insert_after_pragma_migration() {
-		let runtime = Builder::new_current_thread()
-			.enable_all()
-			.build()
-			.expect("runtime should build");
-		let protocol = Arc::new(MockProtocol::new(protocol::SqliteCommitResponse::SqliteCommitOk));
-
-		let vfs = SqliteVfs::register_with_transport(
-			"test-v2-pragma-migration",
-			SqliteTransport::from_mock(protocol.clone()),
-			"actor".to_string(),
-			runtime.handle().clone(),
-			VfsConfig::default(),
-		)
-		.expect("vfs should register");
-		let db = open_database(vfs, "actor").expect("db should open");
+		let runtime = direct_runtime();
+		let harness = DirectEngineHarness::new();
+		let db = harness.open_db(&runtime);
 
 		sqlite_exec(
 			db.as_ptr(),
@@ -2431,20 +2626,9 @@
 
 	#[test]
 	fn open_database_supports_explicit_status_insert_after_pragma_migration() {
-		let runtime = Builder::new_current_thread()
-			.enable_all()
-			.build()
-			.expect("runtime should build");
-		let protocol = Arc::new(MockProtocol::new(protocol::SqliteCommitResponse::SqliteCommitOk));
-		let vfs = SqliteVfs::register_with_transport(
-			"test-v2-pragma-explicit",
-			SqliteTransport::from_mock(protocol),
-			"actor".to_string(),
-			runtime.handle().clone(),
-			VfsConfig::default(),
-		)
-		.expect("vfs should register");
-		let db = open_database(vfs, "actor").expect("db should open");
+		let runtime = direct_runtime();
+		let harness = DirectEngineHarness::new();
+		let db = harness.open_db(&runtime);
 
 		sqlite_exec(
 			db.as_ptr(),
@@ -2466,20 +2650,9 @@
 
 	#[test]
 	fn open_database_supports_hot_row_update_churn() {
-		let runtime = Builder::new_current_thread()
-			.enable_all()
-			.build()
-			.expect("runtime should build");
-		let protocol = Arc::new(MockProtocol::new(protocol::SqliteCommitResponse::SqliteCommitOk));
-		let vfs = SqliteVfs::register_with_transport(
-			"test-v2-hot-row-updates",
-			SqliteTransport::from_mock(protocol),
-			"actor".to_string(),
-			runtime.handle().clone(),
-			VfsConfig::default(),
-		)
-		.expect("vfs should register");
-		let db = open_database(vfs, "actor").expect("db should open");
+		let runtime = direct_runtime();
+		let harness = DirectEngineHarness::new();
+		let db = harness.open_db(&runtime);
 
 		sqlite_exec(
 			db.as_ptr(),
@@ -2507,23 +2680,10 @@
 
 	#[test]
 	fn open_database_supports_cross_thread_exec_sequence() {
-		let runtime = Builder::new_current_thread()
-			.enable_all()
-			.build()
-			.expect("runtime should build");
-		let protocol = Arc::new(MockProtocol::new(protocol::SqliteCommitResponse::SqliteCommitOk));
-		let vfs = SqliteVfs::register_with_transport(
-			"test-v2-cross-thread",
-			SqliteTransport::from_mock(protocol),
-			"actor".to_string(),
-			runtime.handle().clone(),
-			VfsConfig::default(),
-		)
-		.expect("vfs should register");
+		let runtime = direct_runtime();
+		let harness = DirectEngineHarness::new();
 		// Forced-sync: this test moves one SQLite handle between std::thread workers.
-		let db = Arc::new(SyncMutex::new(
-			open_database(vfs, "actor").expect("db should open"),
-		));
+		let db = Arc::new(SyncMutex::new(harness.open_db(&runtime)));
 
 		{
 			let db = db.clone();
@@ -2560,18 +2720,9 @@
 
 	#[test]
 	fn aux_files_are_shared_by_path_until_deleted() {
-		let runtime = Builder::new_current_thread()
-			.enable_all()
-			.build()
-			.expect("runtime should build");
-		let protocol = Arc::new(MockProtocol::new(protocol::SqliteCommitResponse::SqliteCommitOk));
-		let ctx = VfsContext::new(
-			"actor".to_string(),
-			runtime.handle().clone(),
-			SqliteTransport::from_mock(protocol),
-			VfsConfig::default(),
-			unsafe { std::mem::zeroed() },
-		);
+		let runtime = direct_runtime();
+		let harness = DirectEngineHarness::new();
+		let ctx = harness.open_context(&runtime);
 
 		let first = ctx.open_aux_file("actor-journal");
 		first.bytes.lock().extend_from_slice(&[1, 2, 3, 4]);
@@ -2586,18 +2737,9 @@
 
 	#[test]
 	fn concurrent_aux_file_opens_share_single_state() {
-		let runtime = Builder::new_current_thread()
-			.enable_all()
-			.build()
-			.expect("runtime should build");
-		let protocol = Arc::new(MockProtocol::new(protocol::SqliteCommitResponse::SqliteCommitOk));
-		let ctx = Arc::new(VfsContext::new(
-			"actor".to_string(),
-			runtime.handle().clone(),
-			SqliteTransport::from_mock(protocol),
-			VfsConfig::default(),
-			unsafe { std::mem::zeroed() },
-		));
+		let runtime = direct_runtime();
+		let harness = DirectEngineHarness::new();
+		let ctx = Arc::new(harness.open_context(&runtime));
 		let barrier = Arc::new(Barrier::new(2));
 
 		let first = {
@@ -2625,18 +2767,9 @@
 
 	#[test]
 	fn truncate_main_file_discards_pages_beyond_eof() {
-		let runtime = Builder::new_current_thread()
-			.enable_all()
-			.build()
-			.expect("runtime should build");
-		let protocol = Arc::new(MockProtocol::new(protocol::SqliteCommitResponse::SqliteCommitOk));
-		let ctx = VfsContext::new(
-			"actor".to_string(),
-			runtime.handle().clone(),
-			SqliteTransport::from_mock(protocol),
-			VfsConfig::default(),
-			unsafe { std::mem::zeroed() },
-		);
+		let runtime = direct_runtime();
+		let harness = DirectEngineHarness::new();
+		let ctx = harness.open_context(&runtime);
 		{
 			let mut state = ctx.state.write();
 			state.write_buffer.dirty.insert(3, vec![3; 4096]);
@@ -2654,22 +2787,13 @@
 
 	#[test]
 	fn resolve_pages_surfaces_read_path_error_response() {
-		let runtime = Builder::new_current_thread()
-			.enable_all()
-			.build()
-			.expect("runtime should build");
-		let mut protocol = MockProtocol::new(protocol::SqliteCommitResponse::SqliteCommitOk);
-		protocol.get_pages_response =
-			protocol::SqliteGetPagesResponse::SqliteErrorResponse(protocol::SqliteErrorResponse {
-				message: "InjectedGetPagesError: read path dropped".to_string(),
-			});
-		let ctx = VfsContext::new(
-			"actor".to_string(),
-			runtime.handle().clone(),
-			SqliteTransport::from_mock(Arc::new(protocol)),
-			VfsConfig::default(),
-			unsafe { std::mem::zeroed() },
-		);
+		let runtime = direct_runtime();
+		let harness = DirectEngineHarness::new();
+		let ctx = harness.open_context(&runtime);
+		ctx.transport
+			.direct_hooks()
+			.expect("direct transport should expose test hooks")
+			.fail_next_get_pages("InjectedGetPagesError: read path dropped");
 
 		let err = ctx
 			.resolve_pages(&[2], false)
@@ -2683,19 +2807,24 @@
 
 	#[test]
 	fn commit_buffered_pages_uses_fast_path() {
-		let runtime = Builder::new_current_thread()
-			.enable_all()
-			.build()
-			.expect("runtime should build");
-		let protocol = Arc::new(MockProtocol::new(protocol::SqliteCommitResponse::SqliteCommitOk));
+		let runtime = direct_runtime();
+		let harness = DirectEngineHarness::new();
+		let engine = runtime.block_on(harness.open_engine());
+		let transport = SqliteTransport::from_direct(engine);
+		let hooks = transport
+			.direct_hooks()
+			.expect("direct transport should expose test hooks");
 
 		let outcome = runtime
 			.block_on(commit_buffered_pages(
-				&SqliteTransport::from_mock(protocol.clone()),
+				&transport,
 				BufferedCommitRequest {
-					actor_id: "actor".to_string(),
+					actor_id: harness.actor_id.clone(),
 					new_db_size_pages: 1,
-					dirty_pages: dirty_pages(1, 9),
+					dirty_pages: vec![protocol::SqliteDirtyPage {
+						pgno: 1,
+						bytes: empty_db_page(),
+					}],
 				},
 			))
 			.expect("fast-path commit should succeed");
@@ -2705,7 +2834,7 @@
 		assert_eq!(outcome.db_size_pages, 1);
 		assert!(metrics.serialize_ns > 0);
 		assert!(metrics.transport_ns > 0);
-		assert_eq!(protocol.commit_requests().len(), 1);
+		assert_eq!(hooks.commit_requests().len(), 1);
 	}
 
 	#[test]

@@ -3,10 +3,14 @@ use crate::{
 		*,
 		companion::{CompanionKind, run_companion_loop},
 		shared::*,
+		test_hooks,
 	},
 	conveyer::metrics,
 	workflows::db_manager::branch_record_is_live_at_generation,
 };
+
+#[cfg(feature = "test-faults")]
+use crate::fault::ReclaimFaultPoint;
 
 #[workflow(DbReclaimerWorkflow)]
 pub async fn db_reclaimer(ctx: &mut WorkflowCtx, input: &DbReclaimerInput) -> Result<()> {
@@ -20,7 +24,7 @@ pub async fn reclaim_fdb_job(
 ) -> Result<ReclaimFdbJobOutput> {
 	let input = input.clone();
 	let input_for_tx = input.clone();
-	let cold_storage_enabled = workflow_cold_storage_enabled(ctx.config());
+	let cold_storage_enabled = workflow_cold_storage_enabled(ctx.config(), input.database_branch_id);
 	let now_ms = ctx.ts();
 
 	let output = ctx.udb()?
@@ -65,6 +69,13 @@ async fn reclaim_fdb_job_tx(
 ) -> Result<ReclaimFdbJobOutput> {
 	if input.job_kind != CompactionJobKind::Reclaim {
 		return Ok(rejected_reclaim_job("reclaimer received a non-reclaim job"));
+	}
+	#[cfg(feature = "test-faults")]
+	if let Some(output) =
+		reclaim_fdb_fault_output(input.database_branch_id, ReclaimFaultPoint::PlanBeforeSnapshot)
+			.await?
+	{
+		return Ok(output);
 	}
 	if input.input_range.txid_refs.is_empty()
 		&& input.input_range.cold_objects.is_empty()
@@ -159,6 +170,13 @@ async fn reclaim_fdb_job_tx(
 	if input_fingerprint != input.input_fingerprint {
 		return Ok(rejected_reclaim_job("reclaim input fingerprint changed"));
 	}
+	#[cfg(feature = "test-faults")]
+	if let Some(output) =
+		reclaim_fdb_fault_output(input.database_branch_id, ReclaimFaultPoint::PlanAfterSnapshot)
+			.await?
+	{
+		return Ok(output);
+	}
 
 	let selected_reclaim_txids = input
 		.input_range
@@ -168,6 +186,13 @@ async fn reclaim_fdb_job_tx(
 		.collect::<BTreeSet<_>>();
 	let mut key_count = 0_u32;
 	let mut byte_count = 0_u64;
+	#[cfg(feature = "test-faults")]
+	if let Some(output) =
+		reclaim_fdb_fault_output(input.database_branch_id, ReclaimFaultPoint::BeforeHotDelete)
+			.await?
+	{
+		return Ok(output);
+	}
 	for (txid, key, value, commit) in &snapshot.commits {
 		if !selected_reclaim_txids.contains(txid) {
 			continue;
@@ -214,6 +239,13 @@ async fn reclaim_fdb_job_tx(
 		key_count = key_count.saturating_add(1);
 		byte_count = byte_count
 			.saturating_add(u64::try_from(candidate.shard_bytes.len()).unwrap_or(u64::MAX));
+	}
+	#[cfg(feature = "test-faults")]
+	if let Some(output) =
+		reclaim_fdb_fault_output(input.database_branch_id, ReclaimFaultPoint::AfterHotDelete)
+			.await?
+	{
+		return Ok(output);
 	}
 
 	Ok(ReclaimFdbJobOutput {
@@ -331,6 +363,22 @@ fn rejected_reclaim_job(reason: impl Into<String>) -> ReclaimFdbJobOutput {
 	}
 }
 
+#[cfg(feature = "test-faults")]
+async fn reclaim_fdb_fault_output(
+	database_branch_id: DatabaseBranchId,
+	point: ReclaimFaultPoint,
+) -> Result<Option<ReclaimFdbJobOutput>> {
+	match test_hooks::maybe_fire_reclaim_fault(database_branch_id, point).await {
+		Ok(Some(_)) | Ok(None) => Ok(None),
+		Err(err) => Ok(Some(ReclaimFdbJobOutput {
+			status: CompactionJobStatus::Failed {
+				error: err.to_string(),
+			},
+			output_refs: Vec::new(),
+		})),
+	}
+}
+
 #[activity(RetireColdObjects)]
 pub async fn retire_cold_objects(
 	ctx: &ActivityCtx,
@@ -360,6 +408,13 @@ async fn retire_cold_objects_tx(
 			retired_objects: Vec::new(),
 			delete_after_ms: None,
 		});
+	}
+	#[cfg(feature = "test-faults")]
+	if let Some(output) =
+		retire_cold_fault_output(input.database_branch_id, ReclaimFaultPoint::BeforeColdRetire)
+			.await?
+	{
+		return Ok(output);
 	}
 
 	let branch_record = tx_get_value(
@@ -402,7 +457,7 @@ async fn retire_cold_objects_tx(
 
 	let delete_after_ms = input
 		.retired_at_ms
-		.saturating_add(CMP_COLD_OBJECT_DELETE_GRACE_MS);
+		.saturating_add(test_hooks::cold_object_delete_grace_ms(input.database_branch_id));
 	let retired_manifest_generation = root.manifest_generation.saturating_add(1);
 	let mut retired_objects = Vec::with_capacity(input.cold_objects.len());
 
@@ -458,6 +513,13 @@ async fn retire_cold_objects_tx(
 		&keys::branch_compaction_root_key(input.database_branch_id),
 		&encode_compaction_root(next_root).context("encode sqlite compaction root for cold retire")?,
 	);
+	#[cfg(feature = "test-faults")]
+	if let Some(output) =
+		retire_cold_fault_output(input.database_branch_id, ReclaimFaultPoint::AfterColdRetire)
+			.await?
+	{
+		return Ok(output);
+	}
 
 	Ok(RetireColdObjectsOutput {
 		status: CompactionJobStatus::Succeeded,
@@ -476,13 +538,30 @@ fn rejected_cold_object_retire(reason: impl Into<String>) -> RetireColdObjectsOu
 	}
 }
 
+#[cfg(feature = "test-faults")]
+async fn retire_cold_fault_output(
+	database_branch_id: DatabaseBranchId,
+	point: ReclaimFaultPoint,
+) -> Result<Option<RetireColdObjectsOutput>> {
+	match test_hooks::maybe_fire_reclaim_fault(database_branch_id, point).await {
+		Ok(Some(_)) | Ok(None) => Ok(None),
+		Err(err) => Ok(Some(RetireColdObjectsOutput {
+			status: CompactionJobStatus::Failed {
+				error: err.to_string(),
+			},
+			retired_objects: Vec::new(),
+			delete_after_ms: None,
+		})),
+	}
+}
+
 #[activity(DeleteRetiredColdObjects)]
 pub async fn delete_retired_cold_objects(
 	ctx: &ActivityCtx,
 	input: &DeleteRetiredColdObjectsInput,
 ) -> Result<DeleteRetiredColdObjectsOutput> {
 	let input = input.clone();
-	let Some(cold_tier) = workflow_cold_tier(ctx.config()).await? else {
+	let Some(cold_tier) = workflow_cold_tier(ctx.config(), input.database_branch_id).await? else {
 		return Ok(rejected_cold_object_delete("cold storage is disabled"));
 	};
 
@@ -500,10 +579,30 @@ pub async fn delete_retired_cold_objects(
 		return Ok(marked);
 	}
 
+	#[cfg(feature = "test-faults")]
+	if let Some(output) = delete_cold_fault_output(
+		input.database_branch_id,
+		ReclaimFaultPoint::BeforeColdDelete,
+		marked.deleted_object_keys.clone(),
+	)
+	.await?
+	{
+		return Ok(output);
+	}
 	cold_tier
 		.delete_objects(&marked.deleted_object_keys)
 		.await
 		.context("delete retired sqlite cold objects")?;
+	#[cfg(feature = "test-faults")]
+	if let Some(output) = delete_cold_fault_output(
+		input.database_branch_id,
+		ReclaimFaultPoint::AfterColdDelete,
+		marked.deleted_object_keys.clone(),
+	)
+	.await?
+	{
+		return Ok(output);
+	}
 
 	Ok(marked)
 }
@@ -572,6 +671,23 @@ fn rejected_cold_object_delete(reason: impl Into<String>) -> DeleteRetiredColdOb
 	}
 }
 
+#[cfg(feature = "test-faults")]
+async fn delete_cold_fault_output(
+	database_branch_id: DatabaseBranchId,
+	point: ReclaimFaultPoint,
+	deleted_object_keys: Vec<String>,
+) -> Result<Option<DeleteRetiredColdObjectsOutput>> {
+	match test_hooks::maybe_fire_reclaim_fault(database_branch_id, point).await {
+		Ok(Some(_)) | Ok(None) => Ok(None),
+		Err(err) => Ok(Some(DeleteRetiredColdObjectsOutput {
+			status: CompactionJobStatus::Failed {
+				error: err.to_string(),
+			},
+			deleted_object_keys,
+		})),
+	}
+}
+
 #[activity(CleanupRetiredColdObjects)]
 pub async fn cleanup_retired_cold_objects(
 	ctx: &ActivityCtx,
@@ -592,6 +708,13 @@ async fn cleanup_retired_cold_objects_tx(
 	input: &CleanupRetiredColdObjectsInput,
 ) -> Result<CleanupRetiredColdObjectsOutput> {
 	let mut cleaned = Vec::with_capacity(input.cold_objects.len());
+	#[cfg(feature = "test-faults")]
+	if let Some(output) =
+		cleanup_cold_fault_output(input.database_branch_id, ReclaimFaultPoint::BeforeCleanupRows)
+			.await?
+	{
+		return Ok(output);
+	}
 
 	for cold_object in &input.cold_objects {
 		let live_key = keys::branch_compaction_cold_shard_key(
@@ -654,6 +777,22 @@ fn rejected_cold_object_cleanup(reason: impl Into<String>) -> CleanupRetiredCold
 	}
 }
 
+#[cfg(feature = "test-faults")]
+async fn cleanup_cold_fault_output(
+	database_branch_id: DatabaseBranchId,
+	point: ReclaimFaultPoint,
+) -> Result<Option<CleanupRetiredColdObjectsOutput>> {
+	match test_hooks::maybe_fire_reclaim_fault(database_branch_id, point).await {
+		Ok(Some(_)) | Ok(None) => Ok(None),
+		Err(err) => Ok(Some(CleanupRetiredColdObjectsOutput {
+			status: CompactionJobStatus::Failed {
+				error: err.to_string(),
+			},
+			cleaned_object_keys: Vec::new(),
+		})),
+	}
+}
+
 #[activity(ValidateReclaimColdObjects)]
 pub async fn validate_reclaim_cold_objects(
 	ctx: &ActivityCtx,
@@ -680,7 +819,7 @@ pub async fn validate_reclaim_cold_objects(
 		return Ok(validated);
 	}
 
-	let Some(cold_tier) = workflow_cold_tier(ctx.config()).await? else {
+	let Some(cold_tier) = workflow_cold_tier(ctx.config(), input.database_branch_id).await? else {
 		return Ok(rejected_validate_reclaim_cold_objects(
 			"cold storage is disabled",
 		));
@@ -801,13 +940,33 @@ pub async fn delete_orphan_cold_objects(
 		return Ok(planned);
 	}
 
-	let Some(cold_tier) = workflow_cold_tier(ctx.config()).await? else {
+	let Some(cold_tier) = workflow_cold_tier(ctx.config(), input.database_branch_id).await? else {
 		return Ok(rejected_orphan_cold_object_delete("cold storage is disabled"));
 	};
+	#[cfg(feature = "test-faults")]
+	if let Some(output) = delete_orphan_cold_fault_output(
+		input.database_branch_id,
+		ReclaimFaultPoint::BeforeColdDelete,
+		planned.deleted_object_keys.clone(),
+	)
+	.await?
+	{
+		return Ok(output);
+	}
 	cold_tier
 		.delete_objects(&planned.deleted_object_keys)
 		.await
 		.context("delete orphan sqlite workflow cold objects")?;
+	#[cfg(feature = "test-faults")]
+	if let Some(output) = delete_orphan_cold_fault_output(
+		input.database_branch_id,
+		ReclaimFaultPoint::AfterColdDelete,
+		planned.deleted_object_keys.clone(),
+	)
+	.await?
+	{
+		return Ok(output);
+	}
 
 	Ok(planned)
 }
@@ -923,5 +1082,22 @@ fn rejected_orphan_cold_object_delete(
 			reason: reason.into(),
 		},
 		deleted_object_keys: Vec::new(),
+	}
+}
+
+#[cfg(feature = "test-faults")]
+async fn delete_orphan_cold_fault_output(
+	database_branch_id: DatabaseBranchId,
+	point: ReclaimFaultPoint,
+	deleted_object_keys: Vec<String>,
+) -> Result<Option<DeleteOrphanColdObjectsOutput>> {
+	match test_hooks::maybe_fire_reclaim_fault(database_branch_id, point).await {
+		Ok(Some(_)) | Ok(None) => Ok(None),
+		Err(err) => Ok(Some(DeleteOrphanColdObjectsOutput {
+			status: CompactionJobStatus::Failed {
+				error: err.to_string(),
+			},
+			deleted_object_keys,
+		})),
 	}
 }

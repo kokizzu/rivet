@@ -1,376 +1,304 @@
 # Ralph Progress Log
 ## Codebase Patterns
-- VFS success paths should call `clear_last_error()`; use `set_last_error(...)` only for real failure paths and keep diagnostics in structured tracing fields.
-- SQLite bound TEXT values may contain embedded NUL bytes, but SQL statement strings are rejected at `CString::new(sql)` before SQLite prepare.
-- VFS `xDelete` on the main database path should fail loudly with `SQLITE_IOERR_DELETE`; it cannot delete persisted depot state by clearing local memory.
-- SQLite VFS production opens fetch page 1 and seed `page_size` from the header via `fetch_initial_main_page` -> `seed_main_page`; test builds use the direct-storage snapshot path instead.
-- Depot burst-mode cold lag should derive from workflow `CMP/root.cold_watermark_txid`; `branch_manifest_cold_drained_txid_key` is legacy and should be ignored by production paths.
-- PITR interval expiry is owned by the compaction reclaimer's `expired_pitr_interval_rows` lane; use `udb::compare_and_clear`, not helper-level raw clears.
-- Legacy database-scoped depot key helpers (`meta_head_key`, `delta_prefix`, `pidx_delta_prefix`, `shard_prefix`) are v1 pegboard compatibility only; do not use them for current Depot invariant scans.
-- Workflow test matrix macros that wrap caller blocks in async futures should use `async move $body` so per-run locals are created inside each generated future.
-- SQLite VFS `xSync` durability depends on depot's `sqlite_commit` reply waiting for the FDB transaction commit.
-- SQLite VFS page-cache fills should use the internally synchronized `moka::Cache` handle directly; do not hold a VFS state write guard only to call `page_cache.insert(...)`.
-- Path-shimmed Rust unit tests can keep private module access while moving bulky fixtures into sibling `tests/inline/*_support.rs` modules re-exported from the shim.
-- Depot compaction workflows use one module per workflow under `src/workflows/`; shared contracts, companion-loop helpers, and test hooks live under `src/compaction/`, with `depot::workflows::compaction::*` kept as the compatibility facade.
-- VFS crash-recovery tests can inject dirty pages through `direct_vfs_ctx`, force unacked close-time commits with `DirectTransportHooks::fail_next_commit`, and reopen against the same `DirectStorage` to assert only committed state is durable.
-- VFS commit-concurrency tests can pause direct commit transport with `DirectTransportHooks::pause_next_commit`, issue `io_read` through the xRead callback, then release the commit to assert snapshot behavior deterministically.
-- Depot capped ancestor reads cannot trust latest PIDX alone after the parent branch advances; scan capped DELTA history for requested pages before falling through to SHARD/cold.
-- Fork/reopen isolation tests should use fresh `Db` handles for the fork before and after parent writes so assertions prove durable branch state, not a warmed per-handle cache.
-- Direct VFS harnesses should lazy-initialize RocksDB-backed `DirectStorage` with `tokio::sync::OnceCell::get_or_init`; a `OnceLock` get-then-set race can open the same RocksDB path twice and trip the per-path `LOCK`.
-- SQLite VFS process-global registration should live in a dedicated Drop guard so panics after `sqlite3_vfs_register` still call `sqlite3_vfs_unregister`.
-- `NativeDatabase::Drop` dirty-page flushes should use a short `tokio::time::timeout`; if the commit future times out, log and return without calling `sqlite3_close_v2`.
-- Depot shard-cache fill workers should use cloned `async-channel` receivers for multi-consumer dispatch; do not wrap one `mpsc::Receiver` in a mutex.
-- Shard-cache fill idle waiters must create and enable `Notify::notified()` before loading `outstanding`; `notify_waiters()` does not store permits.
-- Db branch read cache state belongs in one `CacheSnapshot`; publish branch id, ancestry, access bucket, and PIDX index under one write lock.
-- Use `tokio::sync::Barrier` for concurrent test start guns; `Notify::notify_waiters()` can lose a start signal before waiters arm.
-- Compaction cold-shard reads must distinguish missing cold objects from sparse pages and re-read the live `CMP/cold_shard` ref under `Serializable` before returning fetched bytes.
-- Debug-only Depot takeover reconcile launched from `Db::new*` must be scheduled in the background; do not join it on the constructor's Tokio worker.
-- Timing-sensitive WebSocket driver tests should use test-issued permit messages and actor acks to advance exact work counts; avoid real-clock delays plus magnitude ranges.
-- TS actor connections expose `connection.ready`; await it instead of polling `isConnected` or retrying startup actions.
-- Driver tests that wait for a target actor to sleep should poll a separate observer actor for lifecycle events; target actions and normal target connections can keep resetting or blocking sleep.
-- Depot `get_pages` sparse semantics are split: in-range pages with no source return a zero page, but corrupted source blobs must return an explicit error.
-- Restore-point creation must re-read the resolved `COMMITS/{txid}` row inside the pin-write transaction; abort with `RestoreTargetExpired` instead of writing a Ready pin for reclaimed history.
-- Restore database rollback and undo restore-point pinning must commit in one UDB transaction; never swap DBPTR before the undo pin is durable.
-- Future DB pins can rely on older cold-backed SHARD coverage; tests should evict the FDB SHARD, clear hot PIDX for the page, and assert reads still resolve through `CMP/cold_shard`.
-- Gasoline workflow-row waiters can subscribe to `BumpSubSubject::WorkflowCreated { tag }`; workflow creation publishes the bump after the UDB commit for each created tag value.
-- Depot inspect decode and pagination logic lives in `depot::inspect`; `api-peer` should only mount thin internal `/depot/inspect/...` handlers and must not expose this surface through public SDKs.
+- VFS correctness tests should use `DirectEngineHarness`/`DirectStorage` rather than mock transports; direct-only failure behavior belongs in `DirectTransportHooks`.
+- Strict `DirectStorage` reload tests should call `evict_actor_db` and initialize through real `get_pages`; do not hydrate strict VFS state from the diagnostic page mirror.
+- Depot fault-injection APIs must stay behind `depot/test-faults`, with the feature enabled only from dev/test dependencies.
+- Depot fault rules should use `DepotFaultController::at(...).once()/nth(...).fail()/pause()/delay()/drop_artifact()` and call `assert_expected_fired()` so expected-but-unfired rules fail tests.
+- Forced compaction tests should use `DepotCompactionTestDriver` under `depot/test-faults`; timer-disabled managers must be started with the driver and observed through durable `ForceCompactionResult` records.
+- SQLite fault scenario helpers must run SQLite calls through `tokio::task::block_in_place` because the VFS uses `Handle::block_on` internally.
+- Fault scenarios mirror successful `ctx.sql` and `ctx.exec` calls into `NativeSqliteOracle`; use explicit `OracleCommitSemantics` for pre-commit failures and ambiguous post-commit results.
+- Depot invariant verification should scan UDB depot rows directly through `DepotInvariantScanner`; do not verify durability by reading back through the VFS under test.
+- Commit fault-hook tests should inspect the `anyhow` error chain because UDB wraps injected transaction failures.
+- Read fault hooks should keep fault controller calls behind `depot/test-faults`; use page/shard context for scoped read rules.
+- PIDX-owned missing DELTA chunks are broken source coverage: fall back only to valid SHARD/cold coverage, otherwise return a loud read error.
+- Workflow compaction fault tests should assert durable forced results because manager retries can record a terminal error and still settle later state in the same forced cycle.
+- SQLite fault scenarios that force cold-ref reads should seed a whole cold shard from the DirectStorage mirror before clearing hot/delta rows; single-page cold refs can make reloads look corrupt.
+- FaultScenario strict workloads start after setup by closing the DB, enabling strict DirectStorage, evicting the depot `Db`, and reopening; during the workload, mirror read/fill/seed counters must not change.
+- Forced compaction no-op tests should first settle hot/cold/reclaim work, then issue a second forced request and assert skipped noop reasons.
+- `FaultScenarioCtx` is not `Send`; scenario tests should avoid `tokio::spawn` with it and keep pause/release coordination inside the same scenario task.
+- Production fault-leak checks run through `engine/packages/depot/scripts/check-production-fault-leaks.sh`; the script verifies no-feature release builds, no fault-only IR symbols, hidden fault APIs, hidden `disable_planning_timers`, and dev-only `depot/test-faults` dependencies.
+- Strict VFS initial page fetch may seed an empty page only for known missing/uninitialized depot state; real read faults must fail open/reload before SQLite sees an empty schema.
+- SQLite fault scenarios should install workflow cold-tier test overrides by branch id so `DbColdCompacterWorkflow` uses the same fault-controller-backed tier as DirectStorage.
+- Fault scenarios must assert expected workload faults before verification, and depot invariant verification must use a non-faulting cold-tier view so verifier reads cannot satisfy workload coverage.
+- End-to-end cold compaction/reclaim fault tests should create cold refs through forced depot workflows; keep handcrafted cold refs in clearly named harness-only regression tests.
+- Depot invariant scans should treat hot shard rows below the compaction root as stale cache rows: validate LTX shape and shard ownership, but do not require compacted-away commit rows.
+- Ambiguous post-commit scenario tests should leave the committed oracle at the old state, compute a separate new-state oracle dump, then classify replay as old/new/invalid after reload.
+- Depot invariant scans should require cold-backed PIDX pages to exist in the decoded cold object; cold ref shard and txid range alone are not enough backing evidence.
+- Strict cold-tier read evidence must capture baseline counters before any strict read can enqueue shard-cache fill; a warmed SHARD cache should increase depot reads without increasing cold-tier GETs.
+- Fault scenario VFS opens should disable the internal batch-atomic probe so startup validation cannot consume semantic depot fault rules before the workload does.
+- Heavy SQLite pager workloads should use large pseudorandom blobs when proving depot delta chunking or shard-boundary page coverage; patterned blobs can compress below the intended thresholds.
+- Fault scenario overlap tests should use same-task future joining around depot pause handles because `FaultScenarioCtx` is not `Send`.
+- Register broad read faults immediately before the target read or reload so earlier strict workload reads cannot consume them.
 
-Started: Fri May  1 03:05:26 PM PDT 2026
+Started: Fri May  1 08:41:41 PM PDT 2026
 ---
-## 2026-05-01 15:11:12 PDT - US-001
-- Replaced the `commit_atomic_write` success-path `set_last_error("post-commit atomic write succeeded: ...")` call with `clear_last_error()`.
-- Preserved the requested DB size diagnostic as a structured `tracing::debug!` field instead of encoding it in `last_error`.
-- Files changed: `rivetkit-rust/packages/rivetkit-sqlite/src/vfs.rs`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
-- Verification: pre-fix `cargo test -p rivetkit-sqlite commit_atomic_write_clears_last_error_on_success` failed with the success string in `take_last_kv_error()`; after the fix, that test passed and `cargo check -p rivetkit-sqlite` passed.
-- **Learnings for future iterations:**
-  - VFS success paths should call `clear_last_error()`; reserve `set_last_error(...)` for real failure paths.
-  - Size and timing diagnostics in VFS commit paths belong in structured tracing fields, not SQLite last-error state.
----
-## 2026-05-01 15:13:51 PDT - US-002
-- Implemented the loud-failure contract for main database `xDelete`: `vfs_delete` now sets `last_error` and returns `SQLITE_IOERR_DELETE` when `path == ctx.actor_id`.
-- Tightened the regression test to assert the chosen `SQLITE_IOERR_DELETE` contract and the explicit last-error message.
-- Files changed: `rivetkit-rust/packages/rivetkit-sqlite/src/vfs.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/vfs.rs`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
-- Verification: pre-fix `cargo test -p rivetkit-sqlite vfs_delete_main_db_resets_in_memory_state` failed because main-db xDelete returned `SQLITE_OK` with `db_size_pages=2`; after the fix, that test passed and `cargo check -p rivetkit-sqlite` passed.
-- **Learnings for future iterations:**
-  - Do not make main DB `xDelete` pretend success by only mutating local VFS state; it cannot delete persisted depot state.
-  - Aux-file deletes remain separate from main DB deletes and still use `delete_aux_file`.
----
-## 2026-05-01 15:15:20 PDT - US-003
-- Renamed the depot restore-point metric Rust identifier from `SQLITE_RESTORE_POINT_COUNT_PER_NAMESPACE` to `SQLITE_RESTORE_POINT_COUNT_PER_BUCKET`.
-- Kept the Prometheus metric name `sqlite_restore_point_count_per_bucket` unchanged.
-- Files changed: `engine/packages/depot/src/conveyer/metrics.rs`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
-- Verification: `rg -n "SQLITE_RESTORE_POINT_COUNT_PER_NAMESPACE|SQLITE_RESTORE_POINT_COUNT_PER_BUCKET" /home/nathan/r2/engine/packages/depot/src /home/nathan/r2/scripts/ralph/prd.json` and `cargo check -p depot` passed.
-- **Learnings for future iterations:**
-  - Depot metric Rust identifiers should match renamed Prometheus concepts when the metric string has already moved to the new terminology.
----
-## 2026-05-01 15:19:42 PDT - US-004
-- Removed the legacy `branch_manifest_cold_drained_txid_key` production reads from depot burst-mode and dirty-marker cleanup paths.
-- Changed burst-mode lag to use workflow `CMP/root.cold_watermark_txid`, reusing the already-read compaction root during commit.
-- Updated depot burst/quota tests to seed `branch_compaction_root_key` and keep legacy key writes only as an ignored-key regression.
-- Files changed: `engine/packages/depot/CLAUDE.md` (via `AGENTS.md` symlink), `engine/packages/depot/src/burst_mode.rs`, `engine/packages/depot/src/conveyer/commit/apply.rs`, `engine/packages/depot/src/conveyer/commit/dirty.rs`, `engine/packages/depot/src/conveyer/commit/helpers.rs`, `engine/packages/depot/tests/burst_mode.rs`, `engine/packages/depot/tests/conveyer_commit.rs`, `.agent/notes/sqlite-review-issues.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
-- Verification: `rg -n "branch_manifest_cold_drained_txid_key|set.*cold_drained|atomic.*cold_drained" /home/nathan/r2/engine/packages/depot --glob '!target/**'`, `cargo check -p depot`, and `cargo test -p depot` passed.
-- **Learnings for future iterations:**
-  - Depot burst-mode cold lag comes from workflow `CMP/root.cold_watermark_txid`; do not reintroduce the legacy cold-drained manifest key in production paths.
-  - Tests that need cold-lag recovery should seed `branch_compaction_root_key`, not `branch_manifest_cold_drained_txid_key`.
----
-## 2026-05-01 15:23:53 PDT - US-005
-- Deleted the dead `delete_expired_pitr_interval_coverage` helper from depot PITR interval utilities.
-- Removed the helper-only regression test/import; PITR expiry is covered by the live compaction reclaimer tests that clear `expired_pitr_interval_rows` with `udb::compare_and_clear`.
-- Files changed: `engine/packages/depot/src/conveyer/pitr_interval.rs`, `engine/packages/depot/tests/conveyer_pitr_interval.rs`, `.agent/notes/sqlite-review-issues.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
-- Verification: `rg -n "delete_expired_pitr_interval_coverage" /home/nathan/r2/engine/packages/depot/src /home/nathan/r2/engine/packages/depot/tests --glob '!target/**'` now returns no matches; `cargo test -p depot pitr_interval`, `cargo check -p depot`, and `cargo test -p depot` passed.
-- **Learnings for future iterations:**
-  - PITR interval expiry should flow through the compaction reclaimer, where stale rows are cleared with `udb::compare_and_clear`.
-  - Keep `pitr_interval` helper tests focused on read/write/scan selection; deletion semantics belong in reclaimer workflow coverage.
----
-## 2026-05-01 15:29:34 PDT - US-006
-- Removed the debug takeover scan of legacy database-scoped `META`/`DELTA`/`PIDX`/`SHARD` keys and left `reconcile_inner` as an explicit no-op until a branch-scoped invariant check exists.
-- Kept the legacy key helpers for v1 pegboard actor compatibility and documented that contract in `conveyer/keys.rs` plus depot `AGENTS.md`.
-- Updated `tests/takeover.rs` to prove malformed legacy database-scoped rows are ignored.
-- Carried forward the pre-existing depot tier-matrix test changes already present in the worktree; the workflow matrix macro needed `async move $body` for the full depot suite to compile.
-- Files changed: `engine/packages/depot/AGENTS.md` (via `CLAUDE.md` symlink), `engine/packages/depot/src/conveyer/keys.rs`, `engine/packages/depot/src/takeover.rs`, `engine/packages/depot/tests/takeover.rs`, `engine/packages/depot/tests/conveyer_branch.rs`, `engine/packages/depot/tests/conveyer_restore_point.rs`, `engine/packages/depot/tests/workflow_compaction_skeletons.rs`, `.agent/notes/depot-tier-test-matrix-results.md`, `.agent/notes/sqlite-review-issues.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
-- Verification: `rg -n "depot_keys::(meta_head_key|delta_prefix|pidx_delta_prefix|shard_prefix)|\\b(meta_head_key|delta_prefix|pidx_delta_prefix|shard_prefix)\\(" engine/packages --glob '!target/**'`, `cargo test -p depot --test takeover legacy_database_scoped_rows_are_ignored`, `cargo test -p depot`, and `cargo check -p depot -p pegboard` passed.
-- **Learnings for future iterations:**
-  - Legacy database-scoped depot key helpers are still load-bearing for v1 pegboard actor cleanup and migration fallback.
-  - Current Depot invariant checks must target branch-scoped storage; scanning legacy database-scoped keys is only checking compatibility debris.
-  - Use `async move $body` in the workflow matrix macro so per-run locals inside the macro body are created inside each generated future.
----
-## 2026-05-01 15:33:34 PDT - US-007
-- Documented the SQLite VFS `io_sync` durability contract directly above the callback.
-- Added the same reusable invariant to the repo-level `AGENTS.md` via the `CLAUDE.md` symlink.
-- Files changed: `rivetkit-rust/packages/rivetkit-sqlite/src/vfs.rs`, `CLAUDE.md`, `.agent/notes/sqlite-review-issues.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
-- Verification: `cargo check -p rivetkit-sqlite` passed with existing Rust 2024 unsafe-operation warnings.
-- **Learnings for future iterations:**
-  - SQLite VFS `xSync` returns after `ctx.flush_dirty_pages()` resolves, so byte durability depends on depot's `sqlite_commit` reply waiting for the FDB transaction commit.
-  - If pegboard-envoy ever pre-acks before the FDB tx commit, the VFS `xSync` durability contract is broken.
----
-## 2026-05-01 15:35:33 PDT - US-008
-- Added `query_sql_with_embedded_nul_is_rejected` to pin that SQL strings with embedded NUL bytes are rejected before SQLite prepare.
-- The new test inspects the `anyhow::Error` chain and confirms the `CString::new(sql)` NUL-byte error is surfaced.
-- Files changed: `rivetkit-rust/packages/rivetkit-sqlite/tests/query_text_nul.rs`, `.agent/notes/sqlite-review-issues.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
-- Verification: `cargo test -p rivetkit-sqlite query_sql_with_embedded_nul_is_rejected`, `cargo check -p rivetkit-sqlite`, and `cargo test -p rivetkit-sqlite` passed with existing `vfs.rs` Rust 2024 unsafe-operation warnings.
-- **Learnings for future iterations:**
-  - Keep SQL-string NUL rejection separate from bound TEXT NUL support: `BindParam::Text("a\0b")` round-trips, but SQL text containing `\0` is rejected at `CString::new(sql)`.
-  - For query helper error tests, inspect `anyhow::Error::chain()` so wrapper changes do not hide the underlying CString failure.
----
-## 2026-05-01 15:42:01 PDT - US-009
-- Re-verified S7 and closed it as `wontfix` instead of changing code.
-- Grep showed `VfsContext::new` calls `fetch_initial_main_page`, and the fetched page flows into `VfsState::seed_main_page`; `cargo check -p rivetkit-sqlite` passed without dead-code warnings for either helper.
-- Files changed: `.agent/notes/sqlite-review-issues.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
-- Verification: `rg -n "seed_main_page|fetch_initial_main_page" /home/nathan/r2/rivetkit-rust/packages/rivetkit-sqlite /home/nathan/r2/.agent/notes/sqlite-review-issues.md /home/nathan/r2/scripts/ralph --glob '!target/**'`; `cargo check -p rivetkit-sqlite`.
-- **Learnings for future iterations:**
-  - `fetch_initial_main_page` and `seed_main_page` are live on production opens and refresh `page_size` from page 1's SQLite header.
-  - The test-only direct transport path seeds from `snapshot_pages`, so it bypasses the production initial-page fetch under `#[cfg(test)]`.
----
-## 2026-05-01 15:43:41 PDT - US-010
-- Removed the unnecessary post-fetch `state.write()` guard in `resolve_pages`.
-- Cloned the internally synchronized `moka::Cache` handle under a short read and used that handle for fetched-page inserts.
-- Cleaned up the shifted `match` and cache-fill loop indentation.
-- Files changed: `rivetkit-rust/packages/rivetkit-sqlite/src/vfs.rs`, `.agent/notes/sqlite-review-issues.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
-- Verification: `cargo check -p rivetkit-sqlite`; `cargo test -p rivetkit-sqlite`.
-- **Learnings for future iterations:**
-  - `moka::Cache` is internally synchronized; VFS code should not hold a broad state write guard only to insert into `page_cache`.
-  - For cache-fill paths, clone the cache handle under a short read when the loop does not need other mutable VFS state.
----
-## 2026-05-01 15:48:55 PDT - US-011
-- Moved the VFS direct-storage and mock-protocol test fixtures from `src/vfs.rs` into `tests/inline/vfs_support.rs`.
-- Re-exported those support items from the existing path-shimmed `tests/inline/vfs.rs` module and updated test-only transport references in `src/vfs.rs` to use `tests::...`.
+## 2026-05-01 20:47:11 PDT - US-001
+- Removed the mock SQLite VFS transport path from `SqliteTransport` and deleted `MockProtocol`.
+- Rewrote the former mock-backed VFS tests to run through `DirectStorage`, adding direct test hooks for commit hangs, commit request inspection, and injected read-path errors.
 - Files changed: `rivetkit-rust/packages/rivetkit-sqlite/src/vfs.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/vfs.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/vfs_support.rs`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
-- Verification: `cargo check -p rivetkit-sqlite`; `cargo test -p rivetkit-sqlite`.
+- Verification: `cargo check -p rivetkit-sqlite`; `cargo test -p rivetkit-sqlite native_database_drop_times_out_pending_commit`; `cargo test -p rivetkit-sqlite open_database_supports`; `cargo test -p rivetkit-sqlite aux_files_are_shared_by_path_until_deleted`; focused tests for concurrent aux open, truncate, read-path error, and commit_buffered_pages. Commands pass with pre-existing Rust 2024 unsafe-operation warnings in `vfs.rs`.
 - **Learnings for future iterations:**
-  - A path-shimmed Rust test module can own a sibling support module and `pub(super) use` its fixtures back to the production module for `#[cfg(test)]` transport wiring.
-  - Fixture fields that tests mutate directly, such as `MockProtocol::get_pages_response`, need crate-visible access after being moved into a child support module.
+  - `DirectStorage` is the single VFS correctness test transport; production envoy remains available but is not a test matrix variant.
+  - Use `DirectTransportHooks` for direct-path test faults instead of reintroducing protocol mocks.
+  - The direct harness owns a `OnceCell<Arc<DirectStorage>>` because RocksDB permits only one open handle per test path.
 ---
-## 2026-05-01 15:54:29 PDT - US-012
-- Restructured Depot compaction workflows so the concrete workflow entry modules are `src/workflows/db_manager.rs`, `db_hot_compacter.rs`, `db_cold_compacter.rs`, and `db_reclaimer.rs`.
-- Moved shared compaction contracts, helper logic, companion-loop orchestration, and debug test hooks into `src/compaction/`.
-- Preserved the existing public `depot::workflows::compaction::*` facade while deleting the old `src/workflows/compaction.rs` umbrella and `src/workflows/compaction/` directory.
-- Files changed: `engine/packages/depot/src/workflows/mod.rs`, `engine/packages/depot/src/workflows/{db_manager,db_hot_compacter,db_cold_compacter,db_reclaimer}.rs`, `engine/packages/depot/src/compaction/{mod,types,shared,companion,test_hooks}.rs`, `engine/packages/depot/src/lib.rs`, `engine/packages/depot/CLAUDE.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
-- Verification: `cargo test -p depot`; `cargo check -p depot`.
+## 2026-05-01 20:56:39 PDT - US-002
+- Added strict DirectStorage mode with counters for depot reads, mirror reads/fills/seeds, and cold-tier GETs.
+- Made strict VFS initialization use the real `get_pages` path instead of diagnostic mirror snapshots, and added actor Db eviction for reload checks.
+- Added strict tests for poisoned mirrors, mirror fallback/seed rejection, and cold-covered reads through a counting filesystem cold tier.
+- Files changed: `rivetkit-rust/packages/rivetkit-sqlite/Cargo.toml`, `rivetkit-rust/packages/rivetkit-sqlite/src/vfs.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/vfs.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/vfs_support.rs`, `Cargo.lock`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+- Verification: `cargo check -p rivetkit-sqlite`; `cargo test -p rivetkit-sqlite strict_direct`; `cargo test -p rivetkit-sqlite direct_engine`. Commands pass with pre-existing Rust 2024 unsafe-operation warnings in `vfs.rs`.
 - **Learnings for future iterations:**
-  - The actual compaction workflow names are `DbManagerWorkflow`, `DbHotCompacterWorkflow`, `DbColdCompacterWorkflow`, and `DbReclaimerWorkflow`; `companion` is shared loop logic.
-  - Public callers should keep importing workflow contracts from `depot::workflows::compaction::*`; internal workflow files can use `crate::compaction::*` and `crate::compaction::shared::*`.
-  - Moving modules out from an old parent may require widening formerly sibling-only `pub(super)` helpers to `pub(crate)`.
+  - Strict DirectStorage should be enabled after setup writes; strict VFS commits skip mirror updates while direct `apply_commit` still fails if called as a mirror seed sentinel.
+  - Cold-ref read tests need a `CMP/root` row whose `manifest_generation` admits the seeded `CMP/cold_shard` ref.
+  - Use `evict_actor_db` before reload assertions so depot `Db` read caches cannot satisfy the check.
 ---
-## 2026-05-01 15:58:02 PDT - US-013
-- Added `direct_engine_crash_with_dirty_buffer_recovers_last_commit` to cover the VFS crash window where dirty pages are buffered locally but the commit never acks.
-- The test seeds a durable row, injects an `empty_db_page()` into the VFS dirty buffer, forces the close-time commit to fail via `DirectTransportHooks::fail_next_commit`, and verifies reopen sees the last successful commit.
-- Files changed: `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/vfs.rs`, `.agent/notes/sqlite-review-issues.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
-- Verification: `cargo test -p rivetkit-sqlite direct_engine_crash_with_dirty_buffer_recovers_last_commit`, `cargo check -p rivetkit-sqlite`, and `cargo test -p rivetkit-sqlite` passed with existing Rust 2024 unsafe-operation warnings.
+## 2026-05-01 21:02:47 PDT - US-003
+- Added the `depot/test-faults` feature and feature-gated the new `depot::fault` shell.
+- Added fault shell files for controller, points, actions, and checkpoints.
+- Enabled `depot/test-faults` only through the `rivetkit-sqlite` dev dependency and recorded the production-gating rule in `engine/packages/depot/AGENTS.md`.
+- Files changed: `engine/packages/depot/Cargo.toml`, `engine/packages/depot/src/lib.rs`, `engine/packages/depot/src/fault/*`, `engine/packages/depot/AGENTS.md`, `rivetkit-rust/packages/rivetkit-sqlite/Cargo.toml`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+- Verification: `cargo check -p depot --release`; `cargo check -p depot --features test-faults`; `cargo check -p rivetkit-sqlite --tests`. The SQLite check passes with pre-existing Rust 2024 unsafe-operation warnings in `vfs.rs`.
 - **Learnings for future iterations:**
-  - Use `DirectTransportHooks::fail_next_commit` to simulate a commit request that never becomes durable in the direct VFS test harness.
-  - Reopening against the same `DirectStorage` is the clean way to verify crash-recovery state, because the new VFS context seeds from the committed storage snapshot instead of the dead handle's local dirty buffer.
+  - Keep the `depot::fault` module itself behind `#[cfg(feature = "test-faults")]` so normal release builds do not expose or compile fault-controller symbols.
+  - `rivetkit-sqlite` is the current dev-only crate that needs `depot/test-faults` for future VFS fault tests.
 ---
-## 2026-05-01 16:02:03 PDT - US-014
-- Added `concurrent_reader_during_commit_atomic_observes_consistent_snapshot` to cover a reader issuing xRead while a writer is held mid-`commit_atomic_write`.
-- Extended `DirectTransportHooks` with `pause_next_commit`, a deterministic commit gate used only by the direct VFS test transport.
-- Updated the S9 issue note to remove concurrent-reader coverage from the remaining missing list; PITR-restore-then-write and fork-and-immediately-reopen remain open.
-- Files changed: `rivetkit-rust/packages/rivetkit-sqlite/src/vfs.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/vfs.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/vfs_support.rs`, `.agent/notes/sqlite-review-issues.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
-- Verification: `cargo test -p rivetkit-sqlite concurrent_reader_during_commit_atomic_observes_consistent_snapshot`, `cargo check -p rivetkit-sqlite`, and `cargo test -p rivetkit-sqlite` passed with existing Rust 2024 unsafe-operation warnings.
+## 2026-05-01 21:09:19 PDT - US-004
+- Implemented the depot fault controller rule API with matching by fault point, actor/database/branch scope, checkpoint, page/shard, seed, and invocation count.
+- Added explicit fault point enums and `FaultBoundary` classification for commit, read, hot/cold compaction, reclaim, cold tier, and shard-cache-fill points.
+- Added replay records for fired and expected-but-unfired faults plus pause/release and bounded-delay behavior.
+- Files changed: `engine/packages/depot/src/fault/actions.rs`, `engine/packages/depot/src/fault/controller.rs`, `engine/packages/depot/src/fault/mod.rs`, `engine/packages/depot/src/fault/points.rs`, `engine/packages/depot/tests/fault_controller.rs`, `engine/packages/depot/AGENTS.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+- Verification: `cargo check -p depot --features test-faults`; `cargo test -p depot --features test-faults --test fault_controller`; `cargo check -p depot --release`.
 - **Learnings for future iterations:**
-  - Use `DirectTransportHooks::pause_next_commit` when a VFS test needs to pause after the commit request enters direct transport but before the commit ack returns.
-  - For raw xRead coverage, construct a `VfsFile` with the target `VfsContext` and call `io_read` directly from a scoped reader thread.
+  - Fault-controller integration tests live in `engine/packages/depot/tests/fault_controller.rs` and are compiled with `--features test-faults`.
+  - Use `pause_handle(checkpoint).wait_reached()` plus `release()` for deterministic race tests instead of sleeping.
+  - `replay_log_with_unfired()` is the source for final scenario replay records because it includes expected rules that never fired.
 ---
-## 2026-05-01 16:09:20 PDT - US-015
-- Added Depot integration coverage for PITR-restore-then-write via `write_after_pitr_restore_lands_on_restored_branch`.
-- Fixed capped ancestor reads so `get_pages` scans historical DELTA rows up to the ancestor cap when latest PIDX points past the fork/restore point.
-- Files changed: `engine/packages/depot/src/conveyer/read.rs`, `engine/packages/depot/src/conveyer/read/plan.rs`, `engine/packages/depot/tests/conveyer_restore_point.rs`, `engine/packages/depot/CLAUDE.md`, `.agent/notes/sqlite-review-issues.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
-- Verification: `cargo test -p depot write_after_pitr_restore_lands_on_restored_branch`, `cargo check -p depot`, and `cargo test -p depot`.
+## 2026-05-01 21:18:17 PDT - US-005
+- Added a `depot/test-faults` gated `disable_planning_timers` field to `DbManagerInput` and kept normal builds free of the serialized field.
+- Added `DepotCompactionTestDriver` for manager dispatch and forced compaction requests through the existing `ForceCompaction` signal path.
+- Added forced-compaction driver tests covering timer-disabled no-op results and timer-disabled hot compaction result fields.
+- Files changed: `engine/packages/depot/src/compaction/types.rs`, `engine/packages/depot/src/workflows/db_manager.rs`, `engine/packages/depot/src/compaction/mod.rs`, `engine/packages/depot/src/compaction/test_driver.rs`, `engine/packages/depot/src/workflows/mod.rs`, `engine/packages/depot/tests/forced_compaction_test_driver.rs`, `engine/packages/depot/tests/workflow_compaction_skeletons.rs`, `engine/packages/depot/tests/inline/workflows_compaction.rs`, `engine/packages/depot/AGENTS.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+- Verification: `cargo check -p depot --features test-faults`; `cargo check -p depot --tests --features test-faults`; `cargo test -p depot --features test-faults --test forced_compaction_test_driver`; `cargo check -p depot --release`.
 - **Learnings for future iterations:**
-  - Latest PIDX is a current-owner map, so capped ancestor reads must scan capped DELTA history when parent commits after the cap have moved PIDX forward.
-  - Depot returns zero-filled bytes for missing in-range pages; only pages above `db_size_pages` return `None`.
-  - A fresh `Db` handle is useful after restore/write tests to prove durable branch state instead of a local cache result.
+  - Use `DbManagerInput::new(...)` for normal manager dispatch so `test-faults` gated fields do not break struct literals.
+  - `DepotCompactionTestDriver::force_compaction(...)` sends `ForceCompaction`, waits for signal ack, then reads durable manager loop state for the matching `ForceCompactionResult`.
+  - Timer-disabled managers should keep `ManagerPlanningDeadlines::default()` after refresh so no `listen_n_until(...)` path can schedule autonomous refreshes.
 ---
-## 2026-05-01 16:12:16 PDT - US-016
-- Added Depot integration coverage for fork-and-immediately-reopen via `fork_database_immediate_reopen_isolated_from_parent_later_writes`.
-- The test forks at a known source commit, immediately opens a fresh fork `Db`, verifies pre-fork pages plus sparse-page/EOF behavior, advances the parent, and verifies another fresh fork `Db` still excludes the parent's later writes.
-- Files changed: `engine/packages/depot/tests/fork_database.rs`, `.agent/notes/sqlite-review-issues.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
-- Verification: `cargo test -p depot fork_database_immediate_reopen_isolated_from_parent_later_writes`, `cargo check -p depot`, and `cargo test -p depot`.
+## 2026-05-01 21:26:55 PDT - US-006
+- Added the SQLite fault scenario module shell with `FaultScenario`, `FaultScenarioCtx`, logical workload ops, a deterministic simple test, and an ignored chaos shell.
+- Wired scenarios through strict DirectStorage, clean reload by dropping/reopening the VFS and evicting the depot `Db`, and forced compaction through `DepotCompactionTestDriver`.
+- Files changed: `rivetkit-rust/packages/rivetkit-sqlite/Cargo.toml`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/vfs.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/vfs_support.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/fault/*`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/fault/CLAUDE.md`, `Cargo.lock`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+- Verification: `cargo check -p rivetkit-sqlite --tests`; `cargo test -p rivetkit-sqlite fault -- --nocapture`. Commands pass with pre-existing Rust 2024 unsafe-operation warnings in `vfs.rs`.
 - **Learnings for future iterations:**
-  - Fork isolation tests should reopen with a fresh `Db` handle after parent writes to prove branch metadata and storage reads are correct without relying on a warmed cache.
-  - Depot returns zero-filled bytes for missing pages within `db_size_pages`, while pages above the fork head's `db_size_pages` return `None`.
+  - Scenario SQLite helpers need `tokio::task::block_in_place` because the VFS direct path calls `Handle::block_on` internally.
+  - Use the gasoline `TestCtx` UDB pool for fault scenarios so DirectStorage and the depot compaction test driver observe the same database state.
+  - `FaultScenario::run` should always shut down its gasoline `TestCtx`, even when a stage returns an error.
 ---
-## 2026-05-01 16:15:30 PDT - US-017
-- Added `direct_engine_open_engine_is_concurrency_safe` to reproduce concurrent `DirectEngineHarness::open_engine()` calls racing on the same RocksDB tempdir.
-- Replaced the harness's non-atomic `std::sync::OnceLock` get-then-set storage initialization and 50 x 10ms retry loop with `tokio::sync::OnceCell::get_or_init`.
-- Files changed: `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/vfs.rs`, `.agent/notes/sqlite-review-issues.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
-- Verification: pre-fix `cargo test -p rivetkit-sqlite direct_engine_open_engine_is_concurrency_safe -- --nocapture` failed with RocksDB `LOCK` errors; after the fix, that test passed, `cargo test -p rivetkit-sqlite` passed, and `cargo check -p rivetkit-sqlite` passed with existing Rust 2024 unsafe-operation warnings.
+## 2026-05-01 21:32:42 PDT - US-007
+- Added the native SQLite oracle module with a separate in-memory SQLite connection, canonical schema/table/value dump comparison, blob hex rendering, and integrity helpers for quick_check, integrity_check, and foreign_key_check.
+- Wired `FaultScenarioCtx` so successful scenario SQL and logical operations are mirrored into the oracle, and added explicit oracle semantics for pre-commit failure, success, and ambiguous post-commit cases.
+- Files changed: `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/fault/oracle.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/fault/scenario.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/fault/mod.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/fault/workload.rs`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+- Verification: `cargo check -p rivetkit-sqlite --tests`; `cargo test -p rivetkit-sqlite oracle -- --nocapture`; `cargo test -p rivetkit-sqlite fault_scenario_runs_setup_workload_reload_and_verify -- --nocapture`. Commands pass with pre-existing Rust 2024 unsafe-operation warnings in `vfs.rs`.
 - **Learnings for future iterations:**
-  - The flake was not shared tempdirs across tests; it was concurrent lazy initialization inside one harness instance.
-  - RocksDB allows only one open handle per path, so test helpers that cache a RocksDB-backed engine must make initialization atomic instead of retrying failed opens.
+  - Keep the oracle as a native SQLite connection opened with `sqlite3_open(":memory:")`; do not route oracle verification through the Rivet VFS.
+  - Scenario helpers should mirror only successful default operations into the oracle, then use `OracleCommitSemantics` when a future fault test needs failed or ambiguous commit behavior.
+  - Canonical oracle comparison should include user schema entries plus ordered user-table rows rendered with typed values and blob hex.
 ---
-## 2026-05-01 16:18:51 PDT - US-018
-- Added `vfs_registration_is_removed_after_registration_panic` to prove a uniquely named SQLite VFS is gone from `sqlite3_vfs_find(...)` after a panic unwind.
-- Split SQLite VFS registration into `SqliteVfsRegistration`, a Drop guard that owns `sqlite3_vfs_register`/`sqlite3_vfs_unregister`; `SqliteVfs` now keeps the VFS name and boxed context alive while that guard unregisters.
-- Files changed: `rivetkit-rust/packages/rivetkit-sqlite/src/vfs.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/vfs.rs`, `CLAUDE.md` via `AGENTS.md`, `.agent/notes/sqlite-review-issues.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
-- Verification: `cargo test -p rivetkit-sqlite vfs_registration_is_removed_after_registration_panic`, `cargo check -p rivetkit-sqlite`, and `cargo test -p rivetkit-sqlite` passed with existing Rust 2024 unsafe-operation warnings.
+## 2026-05-01 21:45:56 PDT - US-008
+- Added `DepotInvariantScanner` for direct UDB row validation of database pointers, live branch heads, commit continuity, PIDX backing, DELTA/SHARD/CMP rows, dirty markers, retired cold objects, restore points, PITR intervals, and history pins.
+- Wired `FaultScenarioCtx::verify_depot_invariants()` to use the scanner and added corruption regression tests for missing head commits and broken PIDX backing.
+- Files changed: `rivetkit-rust/packages/rivetkit-sqlite/Cargo.toml`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/vfs_support.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/fault/mod.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/fault/scenario.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/fault/verify.rs`, `Cargo.lock`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+- Verification: `cargo check -p rivetkit-sqlite --tests`; `cargo test -p rivetkit-sqlite depot_invariant_scanner -- --nocapture`; `cargo test -p rivetkit-sqlite fault_scenario_runs_setup_workload_reload_and_verify -- --nocapture`; `cargo test -p rivetkit-sqlite fault -- --nocapture`. Commands pass with pre-existing Rust 2024 unsafe-operation warnings in `vfs.rs`.
 - **Learnings for future iterations:**
-  - Keep SQLite VFS process-global registration ownership in a dedicated guard; code between `sqlite3_vfs_register` and final `SqliteVfs` construction can panic.
-  - Store the VFS context in a `Box<VfsContext>` and pass its stable heap pointer to SQLite instead of manually pairing `Box::into_raw` with `Drop for SqliteVfs`.
+  - `DepotInvariantScanner` verifies depot durability by scanning UDB rows directly, not by routing reads through SQLite or the VFS.
+  - `DirectStorage::depot_database()` and `DirectStorage::cold_tier()` are the test-only handles for invariant scanners that need raw depot rows and cold-object validation.
+  - Scanner regression tests can corrupt depot rows inside a `FaultScenario` verify stage, then assert `ctx.verify_depot_invariants()` reports the expected violation.
 ---
-## 2026-05-01 16:25:05 PDT - US-019
-- Added `native_database_drop_times_out_pending_commit` to prove `NativeDatabase::Drop` returns when the commit future never resolves.
-- Added a pending-commit mode to `MockProtocol`, then bounded drop-time dirty-page flushes with `tokio::time::timeout`; on timeout, Drop logs `tracing::error!`, nulls the DB pointer, and returns without calling `sqlite3_close_v2`.
-- Files changed: `rivetkit-rust/packages/rivetkit-sqlite/src/vfs.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/vfs.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/vfs_support.rs`, `CLAUDE.md` via `AGENTS.md`, `.agent/notes/sqlite-review-issues.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
-- Verification: `cargo test -p rivetkit-sqlite native_database_drop_times_out_pending_commit` failed before the close-path adjustment by timing out at 2s; after the fix, it passed. `cargo check -p rivetkit-sqlite` and `cargo test -p rivetkit-sqlite` passed with existing Rust 2024 unsafe-operation warnings.
+## 2026-05-01 21:52:39 PDT - US-009
+- Added feature-gated depot commit hooks for all spec-listed `CommitFaultPoint`s in `engine/packages/depot/src/conveyer/commit/apply.rs`.
+- Added a test-only `Db::new_with_fault_controller_for_test` constructor and focused commit fault tests for pre-durable failure and ambiguous after-UDB-commit failure.
+- Files changed: `engine/packages/depot/src/conveyer/commit/apply.rs`, `engine/packages/depot/src/conveyer/db.rs`, `engine/packages/depot/tests/conveyer_commit.rs`, `engine/packages/depot/AGENTS.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+- Verification: `cargo check -p depot --features test-faults`; `cargo test -p depot --features test-faults --test conveyer_commit`; `cargo test -p depot --test conveyer_commit`; `cargo check -p depot --release`.
 - **Learnings for future iterations:**
-  - Build `tokio::time::timeout` inside the `Handle::block_on(async { ... })` context; constructing it outside the runtime panics.
-  - Use a multi-thread Tokio runtime for tests that drop a `NativeDatabase` from a separate `std::thread`, otherwise current-thread timers may not advance there.
-  - If a drop-time commit times out, `sqlite3_close_v2` can re-enter VFS close/flush work, so return immediately after logging.
+  - Commit fault hooks should use `DepotFaultPoint::Commit(...)` and carry `database_id` plus `database_branch_id` once branch resolution has happened.
+  - Pre-durable injected failures inside UDB transactions are wrapped as transaction failures, so tests should inspect the `anyhow` error chain.
+  - `AfterUdbCommit` is explicitly ambiguous: the caller gets an error, but a fresh `Db` should observe the committed head and pages.
 ---
-## 2026-05-01 16:29:09 PDT - US-020
-- Replaced the shard-cache fill queue's shared `Arc<Mutex<mpsc::Receiver<ShardCacheFillJob>>>` with `async-channel`.
-- Each cache-fill worker now owns a cloned receiver and awaits jobs directly, removing the serialized receiver lock from the dispatch path.
-- Files changed: `Cargo.lock`, `engine/packages/depot/Cargo.toml`, `engine/packages/depot/src/conveyer/read/cache_fill.rs`, `engine/packages/depot/AGENTS.md`, `.agent/notes/sqlite-review-issues.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
-- Verification: `cargo test -p depot`; `cargo check -p depot`.
+## 2026-05-01 22:03:44 PDT - US-010
+- Added feature-gated read-path fault hooks across scope resolution, PIDX scan, DELTA/SHARD/cold selection, cold-object missing, return, and shard-cache-fill enqueue points.
+- Extended `FaultyColdTier` with controller-backed fail, delay, and drop-artifact behavior while keeping normal builds free of controller symbols.
+- Tightened missing PIDX-owned DELTA handling so uncovered missing chunks fail loudly instead of returning zero pages.
+- Files changed: `engine/packages/depot/src/cold_tier/faulty.rs`, `engine/packages/depot/src/conveyer/db.rs`, `engine/packages/depot/src/conveyer/read.rs`, `engine/packages/depot/src/conveyer/read/cold.rs`, `engine/packages/depot/src/conveyer/read/shard.rs`, `engine/packages/depot/tests/cold_tier.rs`, `engine/packages/depot/tests/conveyer_read.rs`, `engine/packages/depot/AGENTS.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+- Verification: `cargo check -p depot --features test-faults`; `cargo check -p depot --tests --features test-faults`; `cargo check -p depot --release`; `cargo test -p depot --features test-faults --test conveyer_read -- --nocapture`; `cargo test -p depot --features test-faults --test cold_tier -- --nocapture`; `cargo test -p depot --test conveyer_read -- --nocapture`.
 - **Learnings for future iterations:**
-  - Use `async-channel::bounded` when Depot needs bounded multi-consumer worker dispatch.
-  - Keep shard-cache fill backpressure and duplicate coalescing in `ShardCacheFillQueue::enqueue`; only the worker receive side needs multi-consumer cloning.
+  - Read fault hooks can use `maybe_fire_read_fault` with optional page/shard scope so rules stay deterministic without global state.
+  - `FaultyColdTier::DropArtifact` has operation-specific semantics: GET returns `None`, while PUT writes bytes first and then returns an injected acknowledgement error.
+  - Tests that need missing first/middle/last delta chunks can replace the committed DELTA blob with many tiny valid chunks, then delete one chunk and assert the real read path fails.
 ---
-## 2026-05-01 16:33:36 PDT - US-021
-- Replaced debug-only `takeover::reconcile_blocking` with `takeover::reconcile_nonblocking`, scheduling reconcile on the current Tokio runtime or a detached background thread instead of joining from `Db::new_inner`.
-- Added `db_new_does_not_wait_for_takeover_reconcile`, which pauses the debug reconcile with a `Notify` gate, verifies another runtime task makes progress, and asserts the constructor returns before reconcile is released.
-- Files changed: `engine/packages/depot/src/takeover.rs`, `engine/packages/depot/src/conveyer/db.rs`, `engine/packages/depot/tests/takeover.rs`, `engine/packages/depot/AGENTS.md`, `.agent/notes/sqlite-review-issues.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
-- Verification: `cargo test -p depot db_new_does_not_wait_for_takeover_reconcile`, `cargo check -p depot`, `cargo test -p depot --test list_databases parent_tombstone_visibility_is_capped_across_deep_bucket_chain -- --nocapture`, and a clean rerun of `cargo test -p depot`.
+## 2026-05-01 22:20:16 PDT - US-011
+- Added branch-scoped workflow fault controllers for hot compaction, cold compaction, and reclaim workflow hooks.
+- Wired hot stage/install, cold upload/publish, reclaim planning/delete/retire/cleanup hooks, plus a test-only cold delete grace override.
+- Added compaction fault integration tests for delayed hot install, hot install failure after shard publish, cold publish failure after upload, and forced reclaim with shortened grace.
+- Files changed: `engine/packages/depot/src/compaction/companion.rs`, `engine/packages/depot/src/compaction/test_hooks.rs`, `engine/packages/depot/src/workflows/db_hot_compacter.rs`, `engine/packages/depot/src/workflows/db_cold_compacter.rs`, `engine/packages/depot/src/workflows/db_manager.rs`, `engine/packages/depot/src/workflows/db_reclaimer.rs`, `engine/packages/depot/tests/compaction_fault_hooks.rs`, `engine/packages/depot/AGENTS.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+- Verification: `cargo check -p depot --features test-faults`; `cargo check -p depot --tests --features test-faults`; `cargo check -p depot --release`; `RUST_LOG=error cargo test -p depot --features test-faults --test compaction_fault_hooks`.
 - **Learnings for future iterations:**
-  - Debug-only constructor checks still run on hot-path constructors, so schedule long or I/O-backed reconcile work in the background.
-  - Use `oneshot` for test completion signals that may fire before the waiter arms; `Notify::notify_waiters()` does not store a permit.
-  - A `Notify` gate is a deterministic slow-operation fixture when a test needs to hold async work pending without adding a real-clock sleep.
+  - Register workflow fault controllers with `compaction::test_hooks::register_workflow_fault_controller(database_branch_id, controller)` so hooks stay branch-scoped.
+  - Forced compaction results can include a terminal error while later retry work has repaired durable state; assert the durable state the driver observes, not transient mid-cycle rows.
+  - Reclaim tests that need cold deletion should use the test-only cold-object grace override instead of sleeping through the production grace window.
 ---
-## 2026-05-01 16:39:06 PDT - US-022
-- Replaced the active DB write fixture's `setTimeout(ACTIVE_DB_WRITE_DELAY_MS)` loop pacing with a WebSocket-driven Promise gate.
-- Unskipped and rewrote the active-db-writes sleep test to issue exactly 3 `continue-write` permits, wait for actor `write` acks, trigger sleep, then assert exactly 3 persisted write rows after wake.
-- Files changed: `rivetkit-typescript/packages/rivetkit/fixtures/driver-test-suite/sleep-db.ts`, `rivetkit-typescript/packages/rivetkit/tests/driver/actor-sleep-db.test.ts`, `.agent/notes/sqlite-review-issues.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
-- Verification: `pnpm vitest run tests/driver/actor-sleep-db.test.ts -t active-db-writes`; 10x loop of the same filter; `pnpm run check-types`; `pnpm biome check fixtures/driver-test-suite/sleep-db.ts tests/driver/actor-sleep-db.test.ts`; `pnpm run check:test-skips`; `pnpm run check:wait-for-comments`. `pnpm run check` is not defined in the package, and full `pnpm run lint` is blocked by pre-existing unrelated Biome diagnostics.
+## 2026-05-01 22:35:25 PDT - US-012
+- Added deterministic simple SQLite depot fault scenarios for failed commit rollback, ambiguous post-commit errors, failed hot compaction, failed cold publish, cold read failure after reclaim, and forced hot/cold/reclaim no-op reporting.
+- Extended scenario replay metadata with workload, branch head before/after workload, oracle result, and fired fault boundary assertions.
+- Wired the SQLite fault harness to a filesystem cold tier plus depot/workflow fault controllers, and added helpers for restore points, forced cold-ref reads, cold-get counters, and cold object delete grace overrides.
+- Files changed: `engine/packages/depot/src/conveyer/db.rs`, `rivetkit-rust/packages/rivetkit-sqlite/Cargo.toml`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/vfs_support.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/fault/scenario.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/fault/simple.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/fault/verify.rs`, `Cargo.lock`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+- Verification: `RUST_LOG=error cargo test -p rivetkit-sqlite simple_ -- --nocapture`; `cargo check -p rivetkit-sqlite --tests`; `cargo check -p depot --features test-faults`. Commands pass with pre-existing Rust 2024 unsafe-operation warnings in `rivetkit-rust/packages/rivetkit-sqlite/src/vfs.rs`.
 - **Learnings for future iterations:**
-  - WebSocket driver tests can make in-flight handler progress deterministic by having the actor await test-issued permit messages and ack each completed unit.
-  - Keep exact-count shutdown tests free of real-clock pacing; trigger sleep only after the expected actor ack has arrived.
+  - The scenario-managed filesystem cold tier must be wrapped with `FaultyColdTier::new_with_fault_controller_for_test` so cold-tier and workflow fault rules hit the same controller.
+  - Cold-ref seeding for reloadable VFS scenarios must write all pages in the shard and compute a real content hash before clearing hot/delta lookup rows.
+- A forced compaction request can legitimately do cold work after a hot-only settle; assert no-op reasons only after a full hot/cold/reclaim settle.
 ---
-## 2026-05-01 16:42:45 PDT - US-023
-- Added `ActorConnRaw.ready`, a per-connection Promise that resolves when the centralized connection status transition first reaches `connected`.
-- Added `ready resolves when connection first opens` in `tests/driver/actor-conn.test.ts` without `vi.waitFor`; the test asserts the Promise is initially pending, resolves when `isConnected` becomes true, and remains the same Promise on later reads.
-- Files changed: `rivetkit-typescript/packages/rivetkit/src/client/actor-conn.ts`, `rivetkit-typescript/packages/rivetkit/tests/driver/actor-conn.test.ts`, `.agent/notes/sqlite-review-issues.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
-- Verification: `pnpm vitest run tests/driver/actor-conn.test.ts -t "ready resolves when connection first opens"`; `pnpm run check-types`; `pnpm biome check src/client/actor-conn.ts tests/driver/actor-conn.test.ts`; `pnpm run check:wait-for-comments`. `pnpm run check` is not defined for `rivetkit-typescript/packages/rivetkit`.
+## 2026-05-01 22:41:19 PDT - US-013
+- Replaced the ignored chaos shell with two replayable ignored chaos seeds that generate deterministic logical workloads and seed-qualified failure context.
+- Added randomized chaos fault schedules across commit pause, read, hot compaction, cold compaction, reclaim, and cold-tier put/get hooks, with repeated strict reloads and forced hot/cold/reclaim cycles.
+- Verified each chaos scenario with SQLite integrity checks, native oracle comparison, depot invariant scanning, and fired-fault replay assertions.
+- Files changed: `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/fault/chaos.rs`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+- Verification: `cargo check -p rivetkit-sqlite --tests`; `RUST_LOG=error cargo test -p rivetkit-sqlite chaos -- --ignored --nocapture`. Commands pass with pre-existing Rust 2024 unsafe-operation warnings in `rivetkit-rust/packages/rivetkit-sqlite/src/vfs.rs`.
 - **Learnings for future iterations:**
-  - Await `connection.ready` when tests need the client WebSocket init round trip to complete.
-  - Resolve one-shot connection readiness from `#setConnStatus("connected")` so it stays aligned with `isConnected`.
+  - `FaultScenarioCtx` is not `Send`, so chaos tests should not move it into `tokio::spawn`.
+  - Cold-tier `DeleteObjects` is not guaranteed to fire in the current reclaim chaos flow; use deterministic `PutObject` and `GetObject` rules when asserting expected cold-tier hooks.
+  - Chaos failure context should include the seed in scenario names, checkpoints, and assertion messages so a failing run can be replayed directly.
 ---
-## 2026-05-01 16:47:42 PDT - US-024
-- Replaced startup-race `vi.waitFor` wrappers with `await connection.ready` plus a single direct DB action/read in the four requested driver test files.
-- Removed the obsolete startup/stopping polling comments and unused ready-timeout constants/imports.
-- Files changed: `rivetkit-typescript/packages/rivetkit/tests/driver/actor-db-stress.test.ts`, `rivetkit-typescript/packages/rivetkit/tests/driver/actor-db.test.ts`, `rivetkit-typescript/packages/rivetkit/tests/driver/actor-db-pragma-migration.test.ts`, `rivetkit-typescript/packages/rivetkit/tests/driver/actor-db-raw.test.ts`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
-- Verification: `pnpm run check-types`; `pnpm run check:wait-for-comments`; `pnpm vitest run tests/driver/actor-db-stress.test.ts tests/driver/actor-db.test.ts tests/driver/actor-db-pragma-migration.test.ts tests/driver/actor-db-raw.test.ts` passed. `pnpm run check` is not defined in `rivetkit-typescript/packages/rivetkit`; focused `pnpm biome check` is still blocked by pre-existing formatter/non-null diagnostics in touched files.
+## 2026-05-01 22:58:09 PDT - US-014
+- Added a production fault-leak check script for normal depot builds.
+- The script runs the no-feature release check, emits fresh release LLVM IR and scans for fault-only names, probes the no-feature depot artifact with `rustc` to confirm `depot::fault` and `disable_planning_timers` are unavailable, and validates `depot/test-faults` is only used by dev dependencies.
+- Files changed: `engine/packages/depot/scripts/check-production-fault-leaks.sh`, `engine/packages/depot/CLAUDE.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+- Verification: `engine/packages/depot/scripts/check-production-fault-leaks.sh`.
 - **Learnings for future iterations:**
-  - For first-action startup races, await the actor connection's `ready` promise before issuing the action instead of retrying the action itself.
-  - Reacquire keyed actor handles before verification when that is the existing test pattern, but still gate the single read on `ready`.
+  - Use `engine/packages/depot/scripts/check-production-fault-leaks.sh` as the production gate for depot fault-injection feature boundaries.
+  - A direct `rustc --emit=metadata` probe against the freshly built no-feature `libdepot` is enough to prove hidden public API fields without rebuilding depot through a nested Cargo project.
 ---
-## 2026-05-01 16:54:53 PDT - US-025
-- Replaced the target-actor `getCount()` polling loop in `actor-db.test.ts` with polling against a separate `lifecycleObserver` actor.
-- Added opt-in lifecycle event recording to `dbActorRaw` so the sleep test can wait for `sleep` events without sending actions to the target actor; the test asserts the recorded sleep timestamp stays within the original sleep observer window.
-- Replaced the hard-crash target-action retry loop with a single wake/read after `hardCrashActor(...)`.
-- Files changed: `rivetkit-typescript/packages/rivetkit/fixtures/driver-test-suite/actor-db-raw.ts`, `rivetkit-typescript/packages/rivetkit/tests/driver/actor-db.test.ts`, `rivetkit-typescript/CLAUDE.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
-- Verification: `pnpm vitest run tests/driver/actor-db.test.ts -t "persists across sleep"`; `pnpm vitest run tests/driver/actor-db.test.ts -t "hard crash"`; `pnpm run check-types`; `pnpm run check:wait-for-comments`; `pnpm biome check fixtures/driver-test-suite/actor-db-raw.ts tests/driver/actor-db.test.ts`. `pnpm run check` is not defined in `rivetkit-typescript/packages/rivetkit`.
+## 2026-05-01 23:53:37 PDT - US-015
+- Made strict VFS initial main-page fetch return an open/reload error for real depot read failures instead of silently seeding an empty SQLite page.
+- Changed the scenario reload smoke read hook to a non-failing delay and added a regression proving `BeforeReturnPages` failure during strict reload does not turn into `no such table`.
+- Files changed: `rivetkit-rust/packages/rivetkit-sqlite/src/vfs.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/vfs.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/fault/simple.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/fault/CLAUDE.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+- Verification: `cargo test -p rivetkit-sqlite strict_reload_read_fault_returns_reload_error_instead_of_empty_database -- --nocapture`; `cargo test -p rivetkit-sqlite fault_scenario_runs_setup_workload_reload_and_verify -- --nocapture`; `cargo check -p rivetkit-sqlite --tests`; `RUST_LOG=error cargo test -p rivetkit-sqlite simple_ -- --nocapture`. Commands pass with pre-existing Rust 2024 unsafe-operation warnings in `rivetkit-rust/packages/rivetkit-sqlite/src/vfs.rs`.
 - **Learnings for future iterations:**
-  - Polling a separate observer actor does not touch the target actor's HTTP request counter, so it can observe sleep without resetting the target sleep timer.
-  - Holding a normal target actor connection open can prevent this DB actor from sleeping; do not use a target connection as the sleep observer for this fixture.
+  - `fetch_initial_main_page` must distinguish known missing/uninitialized depot state from real read failures; failing read hooks should surface before SQLite can operate on an empty schema.
+  - Happy-path reload smoke tests should use non-failing read actions such as `delay(...)`, while failing read actions belong in explicit reload-error regression tests.
 ---
-## 2026-05-01 16:58:38 PDT - US-026
-- Fixed the shard-cache fill `wait_idle_for_test` lost-wakeup race by pre-arming and enabling `idle_notify.notified()` before loading `outstanding`.
-- Added `shard_cache_fill_wait_idle_prearms_before_rechecking_outstanding`, which forces work to drain and call `notify_waiters()` after the waiter sees nonzero outstanding but before it awaits.
-- Files changed: `engine/packages/depot/src/conveyer/read/cache_fill.rs`, `engine/packages/depot/src/conveyer/db.rs`, `engine/packages/depot/tests/conveyer_read.rs`, `engine/packages/depot/CLAUDE.md`, `.agent/notes/sqlite-review-issues.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
-- Verification: `cargo test -p depot shard_cache_fill_wait_idle_prearms_before_rechecking_outstanding`; `cargo test -p depot`.
+## 2026-05-02 00:00:28 PDT - US-016
+- Started fault scenario workloads in strict DirectStorage mode by closing the setup DB, enabling strict mode, evicting the depot `Db`, and reopening before branch-head capture.
+- Added scenario-level counter snapshots/assertions proving mirror reads, fills, and seeds stay unchanged during strict workloads.
+- Updated cold-ref seeding in strict scenarios to build cold shard rows from the live VFS cache instead of stale DirectStorage mirrors, and scoped the cold-object simple test to `ColdObjectMissing`.
+- Files changed: `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/fault/scenario.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/fault/simple.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/vfs.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/vfs_support.rs`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+- Verification: `cargo check -p rivetkit-sqlite --tests`; `RUST_LOG=error cargo test -p rivetkit-sqlite fault_scenario_runs_setup_workload_reload_and_verify -- --nocapture`; `RUST_LOG=error cargo test -p rivetkit-sqlite simple_ -- --nocapture`; `RUST_LOG=error cargo test -p rivetkit-sqlite chaos -- --ignored --nocapture`. Commands pass with pre-existing Rust 2024 unsafe-operation warnings in `rivetkit-rust/packages/rivetkit-sqlite/src/vfs.rs`.
 - **Learnings for future iterations:**
-  - `Notify::notify_waiters()` does not store permits, so counter waiters must create and enable `notified()` before the counter load and then re-check.
-  - A one-shot debug hook after a nonzero counter load can deterministically reproduce arm-after-check races without timing sleeps.
+  - Faults registered after `FaultScenario::run` enters strict workload mode are workload-only; setup remains free to use the non-strict helpers it needs.
+  - Generic read faults can fire during normal strict workload reads, so tests for later cold reads should use specific points such as `ColdObjectMissing` or carefully scoped invocation counts.
+  - Handcrafted cold refs in strict scenarios must be seeded from current live VFS pages, not from the DirectStorage mirror.
 ---
-## 2026-05-01 17:05:30 PDT - US-027
-- Collapsed Depot's branch read cache from separate `branch_id`, `ancestors`, `last_access_bucket`, and PIDX cache fields into one `CacheSnapshot`.
-- Updated `get_pages` and `commit` to read one snapshot for transaction hints and publish one replacement snapshot under a single write lock when branch state changes.
-- Added `branch_cache_snapshot_is_atomic_across_dbptr_move`, which warms the old branch cache, rolls DBPTR to a new branch, starts concurrent reads with a `Barrier`, and observes that the cache never exposes the new branch id with the old ancestry root.
-- Files changed: `engine/packages/depot/src/conveyer/db.rs`, `engine/packages/depot/src/conveyer/read.rs`, `engine/packages/depot/src/conveyer/commit/apply.rs`, `engine/packages/depot/tests/conveyer_read.rs`, `engine/packages/depot/CLAUDE.md`, `.agent/notes/sqlite-review-issues.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
-- Verification: `cargo test -p depot branch_cache_snapshot_is_atomic_across_dbptr_move -- --nocapture`; `cargo check -p depot`; `cargo test -p depot`.
+## 2026-05-02 00:06:25 PDT - US-017
+- Added branch-scoped workflow cold-tier test overrides behind `depot/test-faults`, with a guard that clears the override when the scenario shuts down.
+- Wired `FaultScenarioCtx` so manager workflows use the same fault-controller-backed cold tier as DirectStorage reads.
+- Added a simple regression proving `ColdTierFaultPoint::PutObject` fires during `DbColdCompacterWorkflow` upload before helper-created cold refs or verifier reads can account for it.
+- Files changed: `engine/packages/depot/src/compaction/types.rs`, `engine/packages/depot/src/compaction/shared.rs`, `engine/packages/depot/src/compaction/test_hooks.rs`, `engine/packages/depot/src/workflows/db_cold_compacter.rs`, `engine/packages/depot/src/workflows/db_manager.rs`, `engine/packages/depot/src/workflows/db_reclaimer.rs`, `engine/packages/depot/src/workflows/mod.rs`, `engine/packages/depot/AGENTS.md`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/fault/scenario.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/fault/simple.rs`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+- Verification: `cargo check -p depot --features test-faults`; `cargo check -p rivetkit-sqlite --tests`; `RUST_LOG=error cargo test -p rivetkit-sqlite simple_workflow_cold_upload_uses_fault_controller_cold_tier -- --nocapture`; `RUST_LOG=error cargo test -p depot --features test-faults --test compaction_fault_hooks -- --nocapture`; `RUST_LOG=error cargo test -p rivetkit-sqlite simple_ -- --nocapture`; `cargo check -p depot --release`. SQLite commands pass with pre-existing Rust 2024 unsafe-operation warnings in `rivetkit-rust/packages/rivetkit-sqlite/src/vfs.rs`.
 - **Learnings for future iterations:**
-  - Branch id, ancestry, access bucket, and PIDX cache are one logical read-cache snapshot; update them together so DBPTR moves cannot publish mixed cache state.
-  - Use `tokio::sync::Barrier` when a test needs multiple spawned tasks to start together. `Notify::notify_waiters()` is not a safe start gun unless waiters are already armed.
+  - Workflow cold-tier fault coverage needs a branch-scoped workflow override because workflow activities load cold storage from `TestCtx` config unless a `depot/test-faults` override is installed.
+  - Install the workflow cold-tier override when the scenario first starts the manager, after the branch id is known and before forced compaction dispatch.
+  - Assert expected cold-tier workflow faults immediately after forced compaction when the story needs to prove workload coverage rather than verifier coverage.
 ---
-## 2026-05-01 17:12:05 PDT - US-028
-- Added `cold_ref_retired_during_cold_object_fetch_errors_instead_of_zero_fill`, which pauses a filesystem cold-tier object read, concurrently retires the compaction cold-shard ref and deletes the cold object, then asserts `get_pages` returns `ShardCoverageMissing` instead of a zero-filled page.
-- Updated cold read-through to distinguish missing cold objects from sparse pages; compaction cold-shard object misses now error, while successful object fetches re-read the live `CMP/cold_shard` ref under `Serializable` before returning bytes or scheduling shard-cache fill.
-- Files changed: `engine/packages/depot/src/conveyer/read/cold.rs`, `engine/packages/depot/tests/conveyer_read.rs`, `engine/packages/depot/AGENTS.md`, `.agent/notes/sqlite-review-issues.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
-- Verification: `cargo test -p depot cold_ref_retired_during_cold_object_fetch_errors_instead_of_zero_fill -- --nocapture`; `cargo check -p depot`; `cargo test -p depot`.
+## 2026-05-02 00:14:02 PDT - US-018
+- Separated verifier cold-tier reads from workload fault accounting by giving depot invariant verification a non-faulting filesystem cold-tier view.
+- Moved expected-fault assertion before verifier stages and tagged scenario replay events with workload/verification phase.
+- Updated simple and chaos replay checks to assert exact fault points plus workload phase, and added a regression for verifier cold-tier GET isolation.
+- Files changed: `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/fault/scenario.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/fault/simple.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/fault/chaos.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/fault/mod.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/fault/CLAUDE.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+- Verification: `cargo check -p rivetkit-sqlite --tests`; `RUST_LOG=error cargo test -p rivetkit-sqlite simple_verifier_cold_get_fault_is_not_counted_as_workload_coverage -- --nocapture`; `RUST_LOG=error cargo test -p rivetkit-sqlite simple_ -- --nocapture`; `RUST_LOG=error cargo test -p rivetkit-sqlite chaos -- --ignored --nocapture`; `RUST_LOG=error cargo test -p rivetkit-sqlite fault_scenario_runs_setup_workload_reload_and_verify -- --nocapture`. Commands pass with pre-existing Rust 2024 unsafe-operation warnings in `rivetkit-rust/packages/rivetkit-sqlite/src/vfs.rs`.
 - **Learnings for future iterations:**
-  - A compaction cold-shard candidate is a real source edge: if the object disappears, return `ShardCoverageMissing` instead of falling through to sparse-page zero-fill.
-  - `PageMissing` remains distinct from `ObjectMissing` so sparse pages inside an otherwise valid cold object can still use normal zero-fill semantics.
-  - Cold read-through tests can deterministically pause `ColdTier::get_object` with a small wrapper and mutate UDB/cold storage before releasing the read.
+  - `FaultScenario::run` should assert expected workload faults before any verifier that can read cold objects.
+  - `verify_depot_invariants()` should use a non-faulting cold tier, even when the workload path uses `FaultyColdTier`.
+  - Replay assertions should check exact `DepotFaultPoint` plus `FaultReplayPhase::Workload`, not only boundary class and count.
 ---
-## 2026-05-01 17:15:47 PDT - US-029
-- Added Depot read-path regression coverage for SQLite sparse-page semantics.
-- `get_pages_zero_fills_sparse_page_without_any_source` pins that an in-range page with no source returns a zero page.
-- `get_pages_errors_for_corrupted_delta_source` pins that a corrupted delta source returns a decode error instead of zero-filling.
-- Files changed: `engine/packages/depot/tests/conveyer_read.rs`, `engine/packages/depot/AGENTS.md` via `CLAUDE.md`, `.agent/notes/sqlite-review-issues.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
-- Verification: `cargo test -p depot get_pages_ --test conveyer_read`; `cargo test -p depot`.
+## 2026-05-02 00:28:08 PDT - US-019
+- Removed handcrafted cold-ref seeding from end-to-end simple and chaos cold-tier coverage.
+- Renamed the remaining seeded cold-ref helper and regression so it is clearly harness-only.
+- Updated simple and chaos replay assertions to prove workflow-created cold refs reach the cold-tier GET fault, and taught the invariant scanner to allow stale hot shard cache rows below the compaction root.
+- Files changed: `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/fault/scenario.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/fault/simple.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/fault/chaos.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/fault/verify.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/fault/CLAUDE.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+- Verification: `RUST_LOG=error cargo test -p rivetkit-sqlite simple_ -- --nocapture`; `RUST_LOG=error cargo test -p rivetkit-sqlite chaos -- --ignored --nocapture`; `cargo check -p rivetkit-sqlite --tests`. Commands pass with pre-existing Rust 2024 unsafe-operation warnings in `rivetkit-rust/packages/rivetkit-sqlite/src/vfs.rs`.
 - **Learnings for future iterations:**
-  - Depot `get_pages` returns zero-filled bytes for legitimate sparse in-range pages only when no source exists.
-  - Corrupted source blobs should bubble a read/decode error instead of being treated as sparse pages.
+  - Workflow-created cold refs can be exercised without helper seeding by dropping the hot shard read artifact at `ReadFaultPoint::AfterShardBlobLoad`, which forces the read to continue to the cold ref path.
+  - Do not force an extra standalone reclaim in chaos just to create a cold read; it can perturb depot rows. Use the existing forced hot/cold/reclaim cycle for reclaim coverage.
+  - Hot shard rows below the compaction root are stale cache evidence. Invariant scans should validate their LTX shape and shard ownership without requiring compacted-away commit rows.
 ---
-## 2026-05-01 17:21:10 PDT - US-030
-- Added `create_restore_point_revalidates_target_commit_after_resolve_race`, which pauses restore-point creation after tx A resolves a timestamp target, clears the resolved `COMMITS`, `VTX`, and `PITR_INTERVAL` rows to model reclaim winning the gap, then resumes tx B and asserts `RestoreTargetExpired`.
-- Revalidated the resolved target commit row under `Serializable` inside `create_restore_point_for_resolved` before writing any Ready restore-point record, DB pin, pin count, or branch pin.
-- Added a debug-only restore-point pause hook and recorded the invariant in depot `CLAUDE.md` plus `.agent/notes/sqlite-review-issues.md`.
-- Files changed: `engine/packages/depot/src/conveyer/restore_point.rs`, `engine/packages/depot/src/conveyer/restore_point/pinned.rs`, `engine/packages/depot/src/conveyer/restore_point/test_hooks.rs`, `engine/packages/depot/tests/conveyer_restore_point.rs`, `engine/packages/depot/CLAUDE.md`, `.agent/notes/sqlite-review-issues.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
-- Verification: `cargo test -p depot create_restore_point_revalidates_target_commit_after_resolve_race -- --nocapture`, `cargo check -p depot`, and `cargo test -p depot`.
+## 2026-05-02 00:32:31 PDT - US-020
+- Added old/new/invalid classification for ambiguous post-commit oracle verification.
+- Kept ambiguous operations from mutating the committed native oracle until the reloaded depot-backed database is compared against old and separately computed new oracle dumps.
+- Updated the ambiguous simple scenario to assert the replay classification and row contents from that classification instead of assuming the new state only.
+- Files changed: `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/fault/oracle.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/fault/scenario.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/fault/simple.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/fault/CLAUDE.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+- Verification: `cargo check -p rivetkit-sqlite --tests`; `cargo test -p rivetkit-sqlite oracle -- --nocapture`; `RUST_LOG=error cargo test -p rivetkit-sqlite simple_ambiguous_post_commit_fault_classifies_durable_outcome -- --nocapture`; `RUST_LOG=error cargo test -p rivetkit-sqlite simple_ -- --nocapture`. Commands pass with pre-existing Rust 2024 unsafe-operation warnings in `rivetkit-rust/packages/rivetkit-sqlite/src/vfs.rs`.
 - **Learnings for future iterations:**
-  - A Ready restore-point record is only valid if the target `COMMITS/{txid}` row still exists in the same transaction that writes the pin.
-  - Debug-only pause hooks are useful for Depot race regressions when the production race is between two UDB transactions.
+  - Ambiguous post-commit scenario tests should leave the committed oracle at the old state until reload verification classifies the durable outcome.
+  - Use SQLite backup cloning to compute new-state oracle dumps without mutating the committed oracle.
+  - Replay checks for ambiguous outcomes should inspect `ambiguous_oracle_outcome` plus `oracle_result` values like `ambiguous:new`.
 ---
-## 2026-05-01 17:33:35 PDT - US-031
-- Folded `restore_database` rollback and undo restore-point creation into a single UDB transaction.
-- Split reusable transaction-level helpers out of branch rollback and restore-point pin creation so the public restore flow can compose them atomically.
-- Added `restore_database_rollback_and_undo_pin_are_atomic`, which injects a failure after rollback work but before undo pinning and asserts DBPTR stays unchanged with no undo restore point.
-- Made restore-point debug hooks one-shot and gave hooked tests unique database ids so parallel restore-point tests cannot steal hooks or park after a release.
-- Files changed: `engine/packages/depot/AGENTS.md`, `engine/packages/depot/src/conveyer/branch.rs`, `engine/packages/depot/src/conveyer/branch/lifecycle.rs`, `engine/packages/depot/src/conveyer/restore_point/pinned.rs`, `engine/packages/depot/src/conveyer/restore_point/restore.rs`, `engine/packages/depot/src/conveyer/restore_point/test_hooks.rs`, `engine/packages/depot/tests/conveyer_restore_point.rs`, `.agent/notes/sqlite-review-issues.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
-- Verification: `cargo test -p depot restore_database_rollback_and_undo_pin_are_atomic -- --nocapture`; `cargo test -p depot --test conveyer_restore_point -- --nocapture`; `cargo check -p depot`; `cargo test -p depot`.
+## 2026-05-02 00:41:42 PDT - US-021
+- Added decoded cold-object page presence to `DepotInvariantScanner` and made cold-backed PIDX validation require the exact referenced page.
+- Added a harness-only regression that rewrites a seeded cold object to remove page 1 while updating the cold ref hash/size, then proves invariant scanning rejects the PIDX row.
+- Files changed: `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/fault/verify.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/fault/scenario.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/fault/CLAUDE.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+- Verification: `cargo test -p rivetkit-sqlite depot_invariant_scanner_detects_cold_ref_missing_referenced_page -- --nocapture`; `cargo test -p rivetkit-sqlite depot_invariant_scanner -- --nocapture`; `cargo check -p rivetkit-sqlite --tests`. Commands pass with pre-existing Rust 2024 unsafe-operation warnings in `rivetkit-rust/packages/rivetkit-sqlite/src/vfs.rs`.
 - **Learnings for future iterations:**
-  - Restore rollback and undo restore-point pinning are one durability boundary; keep the DBPTR swap and undo pin write in the same UDB transaction.
-  - Debug-only restore-point hooks should be one-shot and scoped to unique test database ids because restore-point tests run in parallel.
+  - Cold ref metadata proves object identity and txid range, but PIDX backing must also check decoded object page presence for the specific `pgno`.
+  - Harness-only cold-ref corruption tests can rewrite the object and update the ref hash/size to isolate scanner invariants from hash validation.
 ---
-## 2026-05-01 17:37:47 PDT - US-032
-- Added `reclaimer_eviction_preserves_future_pin_reads_via_cold_ref` to cover shard-cache eviction when a restore-point pin is newer than the evicted SHARD.
-- The test creates a real DB, pins txid 2, seeds a matching cold-backed SHARD at txid 1, forces reclaim to evict the FDB SHARD row, clears hot PIDX for page 1, and asserts the read returns the nonzero page through `CMP/cold_shard`.
-- Files changed: `engine/packages/depot/tests/workflow_compaction_skeletons.rs`, `engine/packages/depot/AGENTS.md` (via `CLAUDE.md` symlink), `.agent/notes/sqlite-review-issues.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
-- Verification: `cargo test -p depot reclaimer_eviction_preserves_future_pin_reads_via_cold_ref -- --nocapture`, `cargo check -p depot`, and `cargo test -p depot` passed.
+## 2026-05-02 00:44:02 PDT - US-022
+- Fixed strict cold-tier read evidence by removing the setup `get_pages` read before baseline capture in `strict_direct_reopen_counts_cold_tier_get_for_cold_covered_page`.
+- Added a warm-cache regression proving a strict reopen can read from depot without issuing a cold-tier GET when shard cache fill has already completed.
+- Files changed: `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/vfs.rs`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+- Verification: `cargo test -p rivetkit-sqlite strict_direct -- --nocapture`; `cargo check -p rivetkit-sqlite --tests`. Commands pass with pre-existing Rust 2024 unsafe-operation warnings in `rivetkit-rust/packages/rivetkit-sqlite/src/vfs.rs`.
 - **Learnings for future iterations:**
-  - A DB pin at txid 2 does not exact-match-retain SHARD txid 1; safety comes from the reclaimer requiring matching `CMP/cold_shard` coverage before FDB SHARD eviction.
-  - To prove the post-eviction read uses cold coverage, clear the hot PIDX for the requested page and assert a nonzero page value that only the cold-backed SHARD can supply.
+  - Strict cold-tier evidence tests must capture baseline counters before any strict read, because cold reads enqueue background shard-cache fill.
+  - A warmed SHARD cache should increment depot read counters but not cold-tier GET counters on reopen.
 ---
-## 2026-05-01 17:43:55 PDT - US-033
-- Added `BumpSubSubject::WorkflowCreated { tag }` and safe tag-to-subject encoding in Gasoline.
-- Published workflow-created bumps after top-level workflow and sub-workflow creation commits; unique dispatches that return an existing workflow do not emit created bumps.
-- Added `workflow_created_bump_fires_for_workflow_tag`, which subscribes before dispatching a tagged workflow and asserts the bump arrives without polling.
-- Fixed the existing `join_signal!` doctest snippet so the required full Gasoline package test passes.
-- Files changed: `engine/packages/gasoline/src/db/mod.rs`, `engine/packages/gasoline/src/db/kv/mod.rs`, `engine/packages/gasoline/src/db/kv/subjects.rs`, `engine/packages/gasoline/src/signal.rs`, `engine/packages/gasoline/tests/db_bump.rs`, `.agent/notes/sqlite-review-issues.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
-- Verification: `cargo test -p gasoline workflow_created_bump_fires_for_workflow_tag`; `cargo test -p gasoline`; `cargo check -p gasoline`.
+## 2026-05-02 00:51:07 PDT - US-023
+- Added a table-driven high-risk simple fault matrix covering commit post-durable points, hot install/root-update points, cold upload/publish points, and reclaim hot/cold/cleanup points.
+- Added `FaultScenarioCtx::exec_with_durable_error` for post-durable errors whose depot state should still match the native oracle.
+- Disabled the internal VFS batch-atomic probe for fault scenario opens so probe writes cannot consume semantic depot fault rules.
+- Files changed: `rivetkit-rust/packages/rivetkit-sqlite/src/vfs.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/fault/scenario.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/fault/simple.rs`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+- Verification: `RUST_LOG=error cargo test -p rivetkit-sqlite simple_high_risk_fault_matrix -- --nocapture`; `RUST_LOG=error cargo test -p rivetkit-sqlite simple_ -- --nocapture`; `cargo check -p rivetkit-sqlite --tests`. Commands pass with pre-existing Rust 2024 unsafe-operation warnings in `rivetkit-rust/packages/rivetkit-sqlite/src/vfs.rs`.
 - **Learnings for future iterations:**
-  - Use `BumpSubSubject::WorkflowCreated { tag }` to wait for tagged workflow rows instead of polling `find_workflow`.
-  - Workflow-created bumps are emitted after the creation transaction commits, so waiters should still re-read the row after receiving the notification.
+  - Commit `BeforeCompactionSignal`/`AfterCompactionSignal` scenarios must create enough commits to cross the compaction dirty threshold before expecting signal hooks to fire.
+  - VFS fault scenarios should skip the internal batch-atomic probe because the probe performs real SQLite writes and can consume depot fault rules before the intended workload.
+  - Reclaim workflow faults can fire and still settle with no terminal forced-compaction error, so replay assertions are the durable proof of coverage for those cases.
 ---
-## 2026-05-01 17:48:05 PDT - US-034
-- Replaced the workflow-row wait in `workflow_compaction_skeletons.rs` with a `BumpSubSubject::WorkflowCreated { tag }` subscription.
-- `wait_for_workflow` now subscribes before its first `find_workflow` check and waits on workflow-created bumps instead of the 25ms `wait_until` polling loop.
-- Left `wait_until` in place for signal debug rows and UDB observation rows that still lack notification hooks.
-- Files changed: `engine/packages/depot/tests/workflow_compaction_skeletons.rs`, `engine/packages/depot/AGENTS.md` (via `CLAUDE.md` symlink), `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
-- Verification: `cargo test -p depot --test workflow_compaction_skeletons manager_spawns_companions_and_records_deltas_available -- --nocapture`; `cargo test -p depot`; `cargo check -p depot`.
+## 2026-05-02 00:55:51 PDT - US-024
+- Added heavy logical workload operations for multi-page blobs, indexed tables, schema changes, deletes, rollback-only inserts, and VACUUM.
+- Added two simple heavy workload scenarios covering multi-chunk depot DELTA writes, shard-boundary page counts, truncate/regrow through SQLite page-count changes, reloads, oracle comparison, and depot invariant scanning.
+- Files changed: `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/fault/workload.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/fault/scenario.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/fault/simple.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/fault/CLAUDE.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+- Verification: `cargo check -p rivetkit-sqlite --tests`; `RUST_LOG=error cargo test -p rivetkit-sqlite simple_heavy_workload -- --nocapture`; `RUST_LOG=error cargo test -p rivetkit-sqlite simple_ -- --nocapture`. Commands pass with pre-existing Rust 2024 unsafe-operation warnings in `rivetkit-rust/packages/rivetkit-sqlite/src/vfs.rs`.
 - **Learnings for future iterations:**
-  - Workflow row waits should subscribe to `BumpSubSubject::WorkflowCreated { tag }` before the first lookup so creation between checks cannot be missed.
-  - The generic `wait_until` helper is still appropriate for Depot test observations without a Gasoline or UDB notification source.
+  - Large logical SQLite blobs still need pseudorandom bytes to prove depot DELTA chunking; patterned payloads can compress into a single delta chunk.
+  - The fault scenario VFS currently persists 4 KiB pages even when a setup tries `PRAGMA page_size = 512`, so shard-boundary tests should assert page count rather than assume page size.
+  - `FaultScenarioCtx::latest_delta_chunk_count()` can scan depot rows directly for the current branch head when tests need storage-level evidence beyond SQLite `page_count`.
 ---
-## 2026-05-01 18:03:33 PDT - US-035
-- Added internal api-peer Depot inspect routes under `/depot/inspect/...` without touching api-public or generated public SDKs.
-- Implemented `depot::inspect` for bounded summary/catalog/bucket/database/branch JSON, paginated branch row-family scans, raw key lookup, raw scans, and best-effort key/value decode with unpadded base64url keys/cursors.
-- Added focused coverage for route registration, limit cap enforcement, cursor pagination, raw scan cursors, and decoded `pidx` rows.
-- Files changed: `.agent/specs/depot-inspect-api.md`, `Cargo.lock`, `engine/packages/api-peer/Cargo.toml`, `engine/packages/api-peer/src/{depot_inspect,lib,router}.rs`, `engine/packages/api-peer/tests/depot_inspect.rs`, `engine/packages/depot/{Cargo.toml,CLAUDE.md}`, `engine/packages/depot/src/{inspect,lib}.rs`, `engine/packages/depot/src/conveyer/keys.rs`, `engine/packages/depot/tests/inspect.rs`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
-- Verification: `cargo check -p depot -p rivet-api-peer`; `cargo test -p depot --test inspect`; `cargo test -p rivet-api-peer --test depot_inspect`; `cargo test -p depot`.
+## 2026-05-02 00:59:15 PDT - US-025
+- Added a non-ignored curated chaos seed and upgraded the ignored chaos seeds into longer soak profiles with more logical operations and reload cycles.
+- Added a hot-compaction pause overlap that runs a strict reload and depot read while the workflow is paused, then releases and verifies the forced compaction result.
+- Added elapsed classification for delayed cold-tier reads and richer replay assertion output with seed, checkpoint, workload, exact fault point, phase, and replay data.
+- Files changed: `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/fault/chaos.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/fault/CLAUDE.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+- Verification: `cargo check -p rivetkit-sqlite --tests`; `RUST_LOG=error cargo test -p rivetkit-sqlite chaos_curated_seed_19f0_ba5e -- --nocapture`; `RUST_LOG=error cargo test -p rivetkit-sqlite chaos_replay_seed -- --ignored --nocapture`. Commands pass with pre-existing Rust 2024 unsafe-operation warnings in `rivetkit-rust/packages/rivetkit-sqlite/src/vfs.rs`.
 - **Learnings for future iterations:**
-  - Keep Depot inspect scan/decode behavior in the Depot crate so tests can exercise pagination and decoding without going through HTTP.
-  - Use unpadded base64url for raw Depot inspect keys and cursors; branch row cursors are raw FDB keys and must stay inside the requested family prefix.
-  - `api-peer` is the only HTTP mount point for Depot inspect routes; do not add these internal diagnostics to api-public or generated SDKs.
+  - Use same-task `future::join` around depot pause handles for overlap coverage because `FaultScenarioCtx` is not `Send`.
+  - Keep one curated chaos seed non-ignored and push longer soak profiles behind `#[ignore]` so normal CI gets signal without absorbing soak runtime.
+  - Chaos assertion failures should include the seed, checkpoint label, workload, and replay events so a failed seed can be replayed directly.
+---
+## 2026-05-02 01:07:19 PDT - US-026
+- Reran the final depot and SQLite fault verification suite, including production leak checks, normal SQLite tests, and ignored chaos soak seeds.
+- Fixed one rerun failure by moving the broad `BeforeReturnPages` read fault registration in `strict_reload_read_fault_returns_reload_error_instead_of_empty_database` to immediately before `ctx.reload_database()`.
+- Files changed: `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/fault/simple.rs`, `rivetkit-rust/packages/rivetkit-sqlite/tests/inline/fault/CLAUDE.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+- Verification: `cargo check -p depot --features test-faults`; `cargo check -p depot --tests --features test-faults`; `cargo check -p depot --release`; `engine/packages/depot/scripts/check-production-fault-leaks.sh`; `cargo test -p depot --features test-faults --test fault_controller --test forced_compaction_test_driver --test conveyer_commit --test conveyer_read --test cold_tier --test compaction_fault_hooks -- --nocapture`; `cargo test -p depot --test conveyer_commit --test conveyer_read -- --nocapture`; `RUST_LOG=error cargo test -p rivetkit-sqlite`; `RUST_LOG=error cargo test -p rivetkit-sqlite chaos_replay_seed -- --ignored`; `cargo check -p rivetkit-sqlite --tests`. Normal SQLite runtime was 12.25s; ignored chaos runtime was 1.31s. Commands pass with pre-existing Rust 2024 unsafe-operation warnings in `vfs.rs`.
+- **Learnings for future iterations:**
+  - Broad read faults in strict scenarios can fire during ordinary workload writes. Register them immediately before the intended reload/read, or use a narrower fault point or invocation count.
+  - A full final rerun can use `RUST_LOG=error cargo test -p rivetkit-sqlite` for the normal suite and `RUST_LOG=error cargo test -p rivetkit-sqlite chaos_replay_seed -- --ignored` for the ignored chaos soak seeds.
+  - The production fault-leak gate rebuilds release LLVM IR and can take a couple of minutes even when normal `cargo check -p depot --release` is warm.
 ---

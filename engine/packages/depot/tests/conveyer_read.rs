@@ -4,6 +4,7 @@ use std::{sync::Arc, time::Duration};
 
 use anyhow::Result;
 use async_trait::async_trait;
+use futures_util::TryStreamExt;
 use depot::{
 	ACCESS_TOUCH_THROTTLE_MS,
 	cold_tier::{ColdTier, ColdTierObjectMetadata, FilesystemColdTier},
@@ -11,6 +12,7 @@ use depot::{
 	error::SqliteStorageError,
 	keys::{
 		branch_compaction_cold_shard_key, branch_compaction_root_key, branch_delta_chunk_key,
+		branch_delta_chunk_prefix,
 		branch_manifest_last_access_bucket_key, branch_manifest_last_access_ts_ms_key,
 		branch_commit_key, branch_meta_head_key, branch_pidx_key, branch_shard_key, PAGE_SIZE,
 	},
@@ -22,6 +24,11 @@ use depot::{
 		encode_cold_manifest_chunk, decode_compaction_root, encode_cold_manifest_index,
 		encode_cold_shard_ref, encode_compaction_root, encode_db_head,
 	},
+};
+#[cfg(feature = "test-faults")]
+use depot::{
+	cold_tier::FaultyColdTier,
+	fault::{DepotFaultController, DepotFaultPoint, ReadFaultPoint},
 };
 use gas::prelude::Id;
 use rivet_pools::NodeId;
@@ -180,6 +187,31 @@ async fn read_value(db: &universaldb::Database, key: Vec<u8>) -> Result<Option<V
 	.await
 }
 
+async fn read_prefix_keys(db: &universaldb::Database, prefix: Vec<u8>) -> Result<Vec<Vec<u8>>> {
+	db.run(move |tx| {
+		let prefix = prefix.clone();
+		async move {
+			let prefix_subspace = universaldb::Subspace::from(
+				universaldb::tuple::Subspace::from_bytes(prefix),
+			);
+			let informal = tx.informal();
+			let mut stream = informal.get_ranges_keyvalues(
+				universaldb::RangeOption {
+					mode: universaldb::options::StreamingMode::WantAll,
+					..universaldb::RangeOption::from(&prefix_subspace)
+				},
+				Serializable,
+			);
+			let mut keys = Vec::new();
+			while let Some(entry) = stream.try_next().await? {
+				keys.push(entry.key().to_vec());
+			}
+			Ok(keys)
+		}
+	})
+	.await
+}
+
 struct PausingColdTier {
 	inner: Arc<dyn ColdTier>,
 	pause_key: String,
@@ -254,6 +286,134 @@ macro_rules! read_matrix {
 		}))
 		.await
 	};
+}
+
+#[tokio::test]
+async fn get_pages_rejects_page_zero() -> Result<()> {
+	read_matrix!("depot-read-page-zero", |ctx, db, database_db| {
+		let err = database_db
+			.get_pages(vec![0])
+			.await
+			.expect_err("read should reject page 0");
+		assert!(err.to_string().contains("get_pages does not accept page 0"));
+
+		Ok(())
+	})
+}
+
+#[tokio::test]
+async fn missing_delta_without_fallback_errors_instead_of_zero_fill() -> Result<()> {
+	read_matrix!("depot-read-missing-delta-no-fallback", |ctx, db, database_db| {
+		database_db.commit(vec![dirty_page(1, 0x11)], 1, 1_000).await?;
+		let branch_id = read_database_branch_id(&db).await?;
+		seed(
+			&db,
+			Vec::new(),
+			vec![branch_delta_chunk_key(branch_id, 1, 0)],
+		)
+		.await?;
+
+		let err = database_db
+			.get_pages(vec![1])
+			.await
+			.expect_err("missing delta without fallback should fail loudly");
+		assert!(matches!(
+			err.downcast_ref::<SqliteStorageError>(),
+			Some(SqliteStorageError::ShardCoverageMissing { pgno: 1 })
+		));
+
+		Ok(())
+	})
+}
+
+#[tokio::test]
+async fn missing_delta_chunks_fail_loudly() -> Result<()> {
+	for label in ["first", "middle", "last"] {
+		let db = common::test_db_arc(&format!("depot-read-missing-{label}-delta")).await?;
+		let database_db = common::make_db(db.clone(), test_bucket(), TEST_DATABASE.to_string());
+		let dirty_pages = (1..=20)
+			.map(|pgno| dirty_page(pgno, pgno as u8))
+			.collect::<Vec<_>>();
+		database_db.commit(dirty_pages, 20, 1_000).await?;
+		let branch_id = read_database_branch_id(&db).await?;
+		let existing_chunk_keys =
+			read_prefix_keys(&db, branch_delta_chunk_prefix(branch_id, 1)).await?;
+		seed(&db, Vec::new(), existing_chunk_keys).await?;
+		let blob = encoded_blob(
+			1,
+			&(1..=20)
+				.map(|pgno| (pgno, pgno as u8))
+				.collect::<Vec<_>>(),
+		)?;
+		let chunk_writes = blob
+			.chunks(10)
+			.enumerate()
+			.map(|(idx, chunk)| {
+				(
+					branch_delta_chunk_key(branch_id, 1, idx as u32),
+					chunk.to_vec(),
+				)
+			})
+			.collect::<Vec<_>>();
+		seed(&db, chunk_writes, Vec::new()).await?;
+		let chunk_keys = read_prefix_keys(&db, branch_delta_chunk_prefix(branch_id, 1)).await?;
+		assert!(
+			chunk_keys.len() >= 3,
+			"test setup should create at least three delta chunks"
+		);
+		let deleted_chunk = match label {
+			"first" => 0,
+			"middle" => chunk_keys.len() / 2,
+			"last" => chunk_keys.len() - 1,
+			_ => unreachable!("test labels are fixed"),
+		};
+		seed(&db, Vec::new(), vec![chunk_keys[deleted_chunk].clone()]).await?;
+
+		let err = database_db
+			.get_pages(vec![20])
+			.await
+			.expect_err("missing delta chunk should fail loudly");
+		assert!(
+			err.chain().any(|cause| {
+				let message = cause.to_string();
+				message.contains("sqlite delta chunks must be contiguous")
+					|| message.contains("decode source blob for page")
+			}),
+			"unexpected error for missing {label} chunk: {err:?}"
+		);
+	}
+
+	Ok(())
+}
+
+#[cfg(feature = "test-faults")]
+#[tokio::test]
+async fn read_fault_before_return_pages_fails_with_page_scope() -> Result<()> {
+	let db = common::test_db_arc("depot-read-fault-before-return").await?;
+	let writer = common::make_db(db.clone(), test_bucket(), TEST_DATABASE.to_string());
+	writer.commit(vec![dirty_page(1, 0x11)], 1, 1_000).await?;
+	let controller = DepotFaultController::new();
+	controller
+		.at(DepotFaultPoint::Read(ReadFaultPoint::BeforeReturnPages))
+		.page_number(1)
+		.once()
+		.fail("before return failed")?;
+	let reader = Db::new_with_fault_controller_for_test(
+		db,
+		test_bucket(),
+		TEST_DATABASE.to_string(),
+		NodeId::new(),
+		controller.clone(),
+	);
+
+	let err = reader
+		.get_pages(vec![1])
+		.await
+		.expect_err("read fault should fail get_pages");
+	assert!(err.to_string().contains("before return failed"));
+	controller.assert_expected_fired()?;
+
+	Ok(())
 }
 
 #[tokio::test]
@@ -835,6 +995,151 @@ async fn get_pages_falls_back_to_compaction_cold_shard_ref() -> Result<()> {
 	.await
 }
 
+#[cfg(feature = "test-faults")]
+#[tokio::test]
+async fn cold_tier_drop_artifact_fault_errors_instead_of_zero_fill() -> Result<()> {
+	let (db, _db_dir) = common::test_db_with_dir("depot-read-cold-drop-artifact").await?;
+	let cold_dir = tempfile::tempdir()?;
+	let filesystem_tier = FilesystemColdTier::new(cold_dir.path());
+	let writer = common::make_db(db.clone(), test_bucket(), TEST_DATABASE.to_string());
+	writer.commit(vec![dirty_page(1, 0x11)], 1, 1_000).await?;
+	let branch_id = read_database_branch_id(&db).await?;
+	let object_key = format!(
+		"db/{}/shard/00000000/0000000000000001-drop.ltx",
+		branch_id.as_uuid().simple(),
+	);
+	let object_bytes = encoded_blob(1, &[(1, 0x66)])?;
+	filesystem_tier.put_object(&object_key, &object_bytes).await?;
+	let controller = DepotFaultController::new();
+	controller
+		.at(DepotFaultPoint::ColdTier(depot::fault::ColdTierFaultPoint::GetObject))
+		.once()
+		.drop_artifact()?;
+	let faulty_tier: Arc<dyn ColdTier> = Arc::new(
+		FaultyColdTier::new_with_fault_controller_for_test(
+			filesystem_tier,
+			"cold-drop-artifact-node",
+			controller.clone(),
+		),
+	);
+	let reader = Db::new_with_cold_tier_and_fault_controller_for_test(
+		db.clone(),
+		test_bucket(),
+		TEST_DATABASE.to_string(),
+		NodeId::new(),
+		faulty_tier,
+		controller.clone(),
+	);
+	seed(
+		&db,
+		vec![
+			(branch_compaction_root_key(branch_id), encode_compaction_root(compaction_root(2))?),
+			(
+				branch_compaction_cold_shard_key(branch_id, 0, 1),
+				encode_cold_shard_ref(cold_shard_ref(
+					object_key,
+					0,
+					1,
+					2,
+					&object_bytes,
+				))?,
+			),
+		],
+		vec![
+			branch_delta_chunk_key(branch_id, 1, 0),
+			branch_pidx_key(branch_id, 1),
+		],
+	)
+	.await?;
+
+	let err = reader
+		.get_pages(vec![1])
+		.await
+		.expect_err("dropped cold object should fail loudly");
+	assert!(matches!(
+		err.downcast_ref::<SqliteStorageError>(),
+		Some(SqliteStorageError::ShardCoverageMissing { pgno: 1 })
+	));
+	controller.assert_expected_fired()?;
+
+	Ok(())
+}
+
+#[tokio::test]
+async fn cold_shard_reads_cover_shard_boundaries() -> Result<()> {
+	let (db, _db_dir) = common::test_db_with_dir("depot-read-cold-boundaries").await?;
+	let cold_dir = tempfile::tempdir()?;
+	let tier: Arc<dyn ColdTier> = Arc::new(FilesystemColdTier::new(cold_dir.path()));
+	let database_db = Db::new_with_cold_tier(
+		db.clone(),
+		test_bucket(),
+		TEST_DATABASE.to_string(),
+		NodeId::new(),
+		tier.clone(),
+	);
+	let pgnos = [63, 64, 65, 127, 128, 129];
+	let dirty_pages = pgnos
+		.iter()
+		.map(|pgno| dirty_page(*pgno, *pgno as u8))
+		.collect::<Vec<_>>();
+	database_db.commit(dirty_pages, 129, 1_000).await?;
+	let branch_id = read_database_branch_id(&db).await?;
+	let shard_0_bytes = encoded_blob(1, &[(63, 0x63)])?;
+	let shard_1_bytes = encoded_blob(1, &[(64, 0x64), (65, 0x65), (127, 0x7f)])?;
+	let shard_2_bytes = encoded_blob(1, &[(128, 0x80), (129, 0x81)])?;
+	let shard_0_key = format!(
+		"db/{}/shard/00000000/0000000000000001-boundary.ltx",
+		branch_id.as_uuid().simple(),
+	);
+	let shard_1_key = format!(
+		"db/{}/shard/00000001/0000000000000001-boundary.ltx",
+		branch_id.as_uuid().simple(),
+	);
+	let shard_2_key = format!(
+		"db/{}/shard/00000002/0000000000000001-boundary.ltx",
+		branch_id.as_uuid().simple(),
+	);
+	tier.put_object(&shard_0_key, &shard_0_bytes).await?;
+	tier.put_object(&shard_1_key, &shard_1_bytes).await?;
+	tier.put_object(&shard_2_key, &shard_2_bytes).await?;
+	let mut deletes = read_prefix_keys(&db, branch_delta_chunk_prefix(branch_id, 1)).await?;
+	deletes.extend(pgnos.iter().map(|pgno| branch_pidx_key(branch_id, *pgno)));
+	seed(
+		&db,
+		vec![
+			(branch_compaction_root_key(branch_id), encode_compaction_root(compaction_root(2))?),
+			(
+				branch_compaction_cold_shard_key(branch_id, 0, 1),
+				encode_cold_shard_ref(cold_shard_ref(shard_0_key, 0, 1, 2, &shard_0_bytes))?,
+			),
+			(
+				branch_compaction_cold_shard_key(branch_id, 1, 1),
+				encode_cold_shard_ref(cold_shard_ref(shard_1_key, 1, 1, 2, &shard_1_bytes))?,
+			),
+			(
+				branch_compaction_cold_shard_key(branch_id, 2, 1),
+				encode_cold_shard_ref(cold_shard_ref(shard_2_key, 2, 1, 2, &shard_2_bytes))?,
+			),
+		],
+		deletes,
+	)
+	.await?;
+
+	assert_eq!(
+		database_db.get_pages(pgnos.to_vec()).await?,
+		vec![
+			FetchedPage { pgno: 63, bytes: Some(page(0x63)) },
+			FetchedPage { pgno: 64, bytes: Some(page(0x64)) },
+			FetchedPage { pgno: 65, bytes: Some(page(0x65)) },
+			FetchedPage { pgno: 127, bytes: Some(page(0x7f)) },
+			FetchedPage { pgno: 128, bytes: Some(page(0x80)) },
+			FetchedPage { pgno: 129, bytes: Some(page(0x81)) },
+		]
+	);
+
+	Ok(())
+}
+
 #[tokio::test]
 async fn cold_shard_read_returns_before_background_cache_fill() -> Result<()> {
 	common::test_matrix("depot-read-fill-before", |tier_mode, ctx| Box::pin(async move {
@@ -900,6 +1205,72 @@ async fn cold_shard_read_returns_before_background_cache_fill() -> Result<()> {
 		Ok(())
 	}))
 	.await
+}
+
+#[cfg(feature = "test-faults")]
+#[tokio::test]
+async fn shard_cache_fill_enqueue_drop_artifact_skips_background_fill() -> Result<()> {
+	let (db, _db_dir) = common::test_db_with_dir("depot-read-fill-drop").await?;
+	let cold_dir = tempfile::tempdir()?;
+	let tier: Arc<dyn ColdTier> = Arc::new(FilesystemColdTier::new(cold_dir.path()));
+	let writer = Db::new_with_cold_tier(
+		db.clone(),
+		test_bucket(),
+		TEST_DATABASE.to_string(),
+		NodeId::new(),
+		tier.clone(),
+	);
+	writer.commit(vec![dirty_page(1, 0x11)], 1, 1_000).await?;
+	let branch_id = read_database_branch_id(&db).await?;
+	let object_key = format!(
+		"db/{}/shard/00000000/0000000000000001-fill-drop.ltx",
+		branch_id.as_uuid().simple(),
+	);
+	let object_bytes = encoded_blob(1, &[(1, 0x71)])?;
+	let cold_ref = cold_shard_ref(object_key.clone(), 0, 1, 2, &object_bytes);
+	tier.put_object(&object_key, &object_bytes).await?;
+	seed(
+		&db,
+		vec![
+			(branch_compaction_root_key(branch_id), encode_compaction_root(compaction_root(2))?),
+			(
+				branch_compaction_cold_shard_key(branch_id, 0, 1),
+				encode_cold_shard_ref(cold_ref)?,
+			),
+		],
+		vec![
+			branch_delta_chunk_key(branch_id, 1, 0),
+			branch_pidx_key(branch_id, 1),
+		],
+	)
+	.await?;
+	let controller = DepotFaultController::new();
+	controller
+		.at(DepotFaultPoint::Read(ReadFaultPoint::ShardCacheFillEnqueue))
+		.shard_id(0)
+		.once()
+		.drop_artifact()?;
+	let reader = Db::new_with_cold_tier_and_fault_controller_for_test(
+		db.clone(),
+		test_bucket(),
+		TEST_DATABASE.to_string(),
+		NodeId::new(),
+		tier,
+		controller.clone(),
+	);
+
+	assert_eq!(
+		reader.get_pages(vec![1]).await?,
+		vec![FetchedPage {
+			pgno: 1,
+			bytes: Some(page(0x71)),
+		}]
+	);
+	reader.wait_for_shard_cache_fill_idle_for_test().await;
+	assert_eq!(read_value(&db, branch_shard_key(branch_id, 0, 1)).await?, None);
+	controller.assert_expected_fired()?;
+
+	Ok(())
 }
 
 #[tokio::test]

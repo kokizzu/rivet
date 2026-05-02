@@ -3,6 +3,8 @@ pub mod cold_tier;
 mod compaction;
 pub mod gc;
 pub mod conveyer;
+#[cfg(feature = "test-faults")]
+pub mod fault;
 pub mod inspect;
 pub mod metrics;
 pub mod workflows;

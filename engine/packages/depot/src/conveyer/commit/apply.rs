@@ -25,6 +25,10 @@ use crate::{
 	},
 	workflows::compaction::DeltasAvailable,
 };
+#[cfg(feature = "test-faults")]
+use crate::fault::{
+	CommitFaultPoint, DepotFaultContext, DepotFaultController, DepotFaultPoint,
+};
 
 use super::{
 	branch_init::{resolve_or_allocate_branch, write_root_branch_metadata},
@@ -44,6 +48,14 @@ impl Db {
 		now_ms: i64,
 	) -> Result<()> {
 		validate_dirty_pages(&dirty_pages)?;
+		#[cfg(feature = "test-faults")]
+		maybe_fire_commit_fault(
+			&self.fault_controller,
+			&self.database_id,
+			CommitFaultPoint::BeforeTx,
+			None,
+		)
+		.await?;
 
 		let node_id = self.node_id.to_string();
 		let labels = &[node_id.as_str()];
@@ -69,6 +81,8 @@ impl Db {
 		let database_id = self.database_id.clone();
 		let bucket_id = self.sqlite_bucket_id();
 		let dirty_pages_for_tx = dirty_pages.clone();
+		#[cfg(feature = "test-faults")]
+		let fault_controller = self.fault_controller.clone();
 
 		let result = self
 			.udb
@@ -79,11 +93,21 @@ impl Db {
 				let cached_ancestry = cached_ancestry.clone();
 				let cached_access_bucket = cached_access_bucket;
 				let last_deltas_available_at_ms = last_deltas_available_at_ms;
+				#[cfg(feature = "test-faults")]
+				let fault_controller = fault_controller.clone();
 
 				async move {
 					let branch_resolution =
 						resolve_or_allocate_branch(&tx, bucket_id, &database_id).await?;
 					let branch_id = branch_resolution.branch_id;
+					#[cfg(feature = "test-faults")]
+					maybe_fire_commit_fault(
+						&fault_controller,
+						&database_id,
+						CommitFaultPoint::AfterBranchResolution,
+						Some(branch_id),
+					)
+					.await?;
 					if !branch_resolution.database_initialized {
 						let branch_record = tx_get_value(
 							&tx,
@@ -135,6 +159,14 @@ impl Db {
 						.map(|bytes| decode_db_head(bytes.as_slice()))
 						.transpose()
 						.context("decode current sqlite db head")?;
+					#[cfg(feature = "test-faults")]
+					maybe_fire_commit_fault(
+						&fault_controller,
+						&database_id,
+						CommitFaultPoint::AfterHeadRead,
+						Some(branch_id),
+					)
+					.await?;
 					let compaction_root = tx_get_value(
 						&tx,
 						&keys::branch_compaction_root_key(branch_id),
@@ -159,6 +191,14 @@ impl Db {
 						collect_truncate_cleanup(&tx, branch_id, previous_db_size_pages, db_size_pages)
 							.await?;
 					test_hooks::maybe_pause_after_truncate_cleanup(&database_id).await;
+					#[cfg(feature = "test-faults")]
+					maybe_fire_commit_fault(
+						&fault_controller,
+						&database_id,
+						CommitFaultPoint::AfterTruncateCleanup,
+						Some(branch_id),
+					)
+					.await?;
 
 					let encoded_delta = encode_ltx_v3(
 						LtxHeader::delta(txid, db_size_pages, now_ms),
@@ -177,6 +217,14 @@ impl Db {
 							))
 						})
 						.collect::<Result<Vec<_>>>()?;
+					#[cfg(feature = "test-faults")]
+					maybe_fire_commit_fault(
+						&fault_controller,
+						&database_id,
+						CommitFaultPoint::AfterLtxEncode,
+						Some(branch_id),
+					)
+					.await?;
 
 					let new_head = DBHead {
 						head_txid: txid,
@@ -259,9 +307,25 @@ impl Db {
 					)?;
 					quota::cap_check_with_cap(would_be, hot_quota_cap)?;
 
+					#[cfg(feature = "test-faults")]
+					maybe_fire_commit_fault(
+						&fault_controller,
+						&database_id,
+						CommitFaultPoint::BeforeDeltaWrites,
+						Some(branch_id),
+					)
+					.await?;
 					for (key, value) in &delta_chunks {
 						tx.informal().set(key, value);
 					}
+					#[cfg(feature = "test-faults")]
+					maybe_fire_commit_fault(
+						&fault_controller,
+						&database_id,
+						CommitFaultPoint::BeforePidxWrites,
+						Some(branch_id),
+					)
+					.await?;
 					for pgno in &dirty_pgnos {
 						tx.informal()
 							.set(&keys::branch_pidx_key(branch_id, *pgno), &txid_bytes);
@@ -278,6 +342,14 @@ impl Db {
 						fence_truncate_cleanup_row(&tx, row).await?;
 						tx.informal().set(&row.key, value);
 					}
+					#[cfg(feature = "test-faults")]
+					maybe_fire_commit_fault(
+						&fault_controller,
+						&database_id,
+						CommitFaultPoint::BeforeHeadWrite,
+						Some(branch_id),
+					)
+					.await?;
 					tx.informal().set(&head_key, &encoded_head);
 					if head_at_fork_bytes.is_some() {
 						tx.informal().clear(&head_at_fork_key);
@@ -303,6 +375,14 @@ impl Db {
 						)
 						.await?;
 					}
+					#[cfg(feature = "test-faults")]
+					maybe_fire_commit_fault(
+						&fault_controller,
+						&database_id,
+						CommitFaultPoint::BeforeCommitRows,
+						Some(branch_id),
+					)
+					.await?;
 					tx.informal().atomic_op(
 						&commit_key,
 						&versionstamped_commit_row,
@@ -313,6 +393,14 @@ impl Db {
 						&txid_bytes,
 						MutationType::SetVersionstampedKey,
 					);
+					#[cfg(feature = "test-faults")]
+					maybe_fire_commit_fault(
+						&fault_controller,
+						&database_id,
+						CommitFaultPoint::BeforeQuotaMutation,
+						Some(branch_id),
+					)
+					.await?;
 					if quota_delta != 0 {
 						quota::atomic_add_branch(&tx, branch_id, quota_delta);
 					}
@@ -338,6 +426,14 @@ impl Db {
 				}
 			})
 			.await?;
+		#[cfg(feature = "test-faults")]
+		maybe_fire_commit_fault(
+			&self.fault_controller,
+			&self.database_id,
+			CommitFaultPoint::AfterUdbCommit,
+			Some(result.branch_id),
+		)
+		.await?;
 
 		*self.storage_used.write().await = Some(result.storage_used);
 		self.commit_bytes_since_rollup.fetch_add(
@@ -379,28 +475,73 @@ impl Db {
 			pidx,
 		});
 
-		self.publish_deltas_available_if_needed(result.deltas_available)
-			.await;
+		self.publish_deltas_available_if_needed(result.deltas_available, result.branch_id)
+			.await?;
 
 		Ok(())
 	}
 
-	async fn publish_deltas_available_if_needed(&self, signal: Option<DeltasAvailable>) {
+	async fn publish_deltas_available_if_needed(
+		&self,
+		signal: Option<DeltasAvailable>,
+		branch_id: DatabaseBranchId,
+	) -> Result<()> {
+		#[cfg(not(feature = "test-faults"))]
+		let _ = branch_id;
+
 		let Some(signal) = signal else {
-			return;
+			return Ok(());
 		};
 		let Some(signaler) = &self.compaction_signaler else {
-			return;
+			return Ok(());
 		};
 
+		#[cfg(feature = "test-faults")]
+		maybe_fire_commit_fault(
+			&self.fault_controller,
+			&self.database_id,
+			CommitFaultPoint::BeforeCompactionSignal,
+			Some(branch_id),
+		)
+		.await?;
 		let signal_at_ms = signal.dirty_updated_at_ms;
 		if let Err(err) = signaler(signal).await {
 			tracing::warn!(?err, "failed to send sqlite workflow compaction wakeup");
-			return;
+			return Ok(());
 		}
+		#[cfg(feature = "test-faults")]
+		maybe_fire_commit_fault(
+			&self.fault_controller,
+			&self.database_id,
+			CommitFaultPoint::AfterCompactionSignal,
+			Some(branch_id),
+		)
+		.await?;
 
 		*self.last_deltas_available_at_ms.write().await = Some(signal_at_ms);
+		Ok(())
 	}
+}
+
+#[cfg(feature = "test-faults")]
+async fn maybe_fire_commit_fault(
+	controller: &Option<DepotFaultController>,
+	database_id: &str,
+	point: CommitFaultPoint,
+	branch_id: Option<DatabaseBranchId>,
+) -> Result<()> {
+	let Some(controller) = controller else {
+		return Ok(());
+	};
+
+	let mut context = DepotFaultContext::new().database_id(database_id.to_string());
+	if let Some(branch_id) = branch_id {
+		context = context.database_branch_id(branch_id);
+	}
+	controller
+		.maybe_fire(DepotFaultPoint::Commit(point), context)
+		.await?;
+	Ok(())
 }
 
 fn validate_dirty_pages(dirty_pages: &[DirtyPage]) -> Result<()> {

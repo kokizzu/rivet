@@ -48,10 +48,10 @@ pub const DATABASE_BRANCH_ID_TAG: &str = "database_branch_id";
 
 pub type CompactionInputFingerprint = [u8; 32];
 
-#[cfg(test)]
+#[cfg(feature = "test-faults")]
 lazy_static::lazy_static! {
-	pub(crate) static ref WORKFLOW_TEST_COLD_TIER: parking_lot::Mutex<Option<Arc<dyn ColdTier>>> =
-		parking_lot::Mutex::new(None);
+	pub(crate) static ref WORKFLOW_TEST_COLD_TIERS: parking_lot::Mutex<Vec<(DatabaseBranchId, Arc<dyn ColdTier>)>> =
+		parking_lot::Mutex::new(Vec::new());
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -59,6 +59,32 @@ pub struct DbManagerInput {
 	pub database_branch_id: DatabaseBranchId,
 	#[serde(default)]
 	pub actor_id: Option<String>,
+	#[cfg(feature = "test-faults")]
+	#[serde(default)]
+	pub disable_planning_timers: bool,
+}
+
+impl DbManagerInput {
+	pub fn new(database_branch_id: DatabaseBranchId, actor_id: Option<String>) -> Self {
+		DbManagerInput {
+			database_branch_id,
+			actor_id,
+			#[cfg(feature = "test-faults")]
+			disable_planning_timers: false,
+		}
+	}
+
+	#[cfg(feature = "test-faults")]
+	pub fn with_planning_timers_disabled(
+		database_branch_id: DatabaseBranchId,
+		actor_id: Option<String>,
+	) -> Self {
+		DbManagerInput {
+			database_branch_id,
+			actor_id,
+			disable_planning_timers: true,
+		}
+	}
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

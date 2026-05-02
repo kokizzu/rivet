@@ -186,6 +186,21 @@ async fn run_hot_compaction_job(
 		})
 		.await?;
 	test_hooks::maybe_pause_after_hot_stage(database_branch_id).await;
+	#[cfg(feature = "test-faults")]
+	let output = match test_hooks::maybe_fire_hot_compaction_fault(
+		database_branch_id,
+		crate::fault::HotCompactionFaultPoint::AfterStageBeforeFinishSignal,
+	)
+	.await
+	{
+		Ok(Some(_)) | Ok(None) => output,
+		Err(err) => StageHotJobOutput {
+			status: CompactionJobStatus::Failed {
+				error: err.to_string(),
+			},
+			output_refs: Vec::new(),
+		},
+	};
 
 	let tag_value = database_branch_tag_value(database_branch_id);
 	ctx.signal(HotJobFinished {

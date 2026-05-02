@@ -1,16 +1,23 @@
 use crate::compaction::{*, shared::*};
 
+#[cfg(feature = "test-faults")]
+use crate::compaction::test_hooks;
+#[cfg(feature = "test-faults")]
+use crate::fault::ReclaimFaultPoint;
+
 #[workflow(DbManagerWorkflow)]
 pub async fn db_manager(ctx: &mut WorkflowCtx, input: &DbManagerInput) -> Result<()> {
 	let companion_workflow_ids = dispatch_companion_workflows(ctx, input.database_branch_id).await?;
 	let initial_deadline_ms = ctx.create_ts();
+	let initial_state = if manager_planning_timers_disabled(input) {
+		DbManagerState::new(companion_workflow_ids)
+	} else {
+		DbManagerState::new_with_initial_deadline(companion_workflow_ids, initial_deadline_ms)
+	};
 
 	ctx.lupe()
 		.commit_interval(1)
-		.with_state(DbManagerState::new_with_initial_deadline(
-			companion_workflow_ids,
-			initial_deadline_ms,
-		))
+		.with_state(initial_state)
 		.run(|ctx, state| {
 			let input = input.clone();
 			async move {
@@ -26,7 +33,7 @@ async fn run_manager_iteration(
 	state: &mut DbManagerState,
 	input: &DbManagerInput,
 ) -> Result<Loop<()>> {
-	let signals = listen_for_manager_signals(ctx, &state.planning_deadlines).await?;
+	let signals = listen_for_manager_signals(ctx, input, &state.planning_deadlines).await?;
 	let effects = manager_effects_for_signals(state, input, signals, ctx.create_ts());
 	execute_manager_effects(ctx, state, input, effects).await?;
 
@@ -372,7 +379,11 @@ async fn execute_refresh_effect(
 		})
 		.await?;
 
-	state.planning_deadlines = refresh.planning_deadlines.clone();
+	state.planning_deadlines = if manager_planning_timers_disabled(input) {
+		ManagerPlanningDeadlines::default()
+	} else {
+		refresh.planning_deadlines.clone()
+	};
 	state.last_observed_branch_lifecycle_generation = refresh.branch_lifecycle_generation;
 	if state.last_dirty_cursor.is_none()
 		&& let Some(dirty) = refresh.observed_dirty.as_ref()
@@ -683,13 +694,28 @@ async fn signal_companions_destroy(
 
 async fn listen_for_manager_signals(
 	ctx: &mut WorkflowCtx,
+	input: &DbManagerInput,
 	planning_deadlines: &ManagerPlanningDeadlines,
 ) -> Result<Vec<DbManagerSignal>> {
+	if manager_planning_timers_disabled(input) {
+		return ctx.listen_n::<DbManagerSignal>(256).await;
+	}
+
 	if let Some(deadline) = nearest_planning_deadline(planning_deadlines) {
 		ctx.listen_n_until::<DbManagerSignal>(deadline, 256).await
 	} else {
 		ctx.listen_n::<DbManagerSignal>(256).await
 	}
+}
+
+#[cfg(feature = "test-faults")]
+fn manager_planning_timers_disabled(input: &DbManagerInput) -> bool {
+	input.disable_planning_timers
+}
+
+#[cfg(not(feature = "test-faults"))]
+fn manager_planning_timers_disabled(_input: &DbManagerInput) -> bool {
+	false
 }
 
 fn nearest_planning_deadline(planning_deadlines: &ManagerPlanningDeadlines) -> Option<i64> {
@@ -711,12 +737,18 @@ pub async fn refresh_manager(
 ) -> Result<RefreshManagerOutput> {
 	let now_ms = ctx.ts();
 	let database_branch_id = input.database_branch_id;
-	let cold_storage_enabled = workflow_cold_storage_enabled(ctx.config());
+	let cold_storage_enabled = workflow_cold_storage_enabled(ctx.config(), database_branch_id);
+	#[cfg(feature = "test-faults")]
+	test_hooks::maybe_fire_reclaim_fault(database_branch_id, ReclaimFaultPoint::PlanBeforeSnapshot)
+		.await?;
 	let snapshot = ctx
 		.udb()?
 		.run(move |tx| async move {
 			read_manager_fdb_snapshot(&tx, database_branch_id, cold_storage_enabled, now_ms).await
 		})
+		.await?;
+	#[cfg(feature = "test-faults")]
+	test_hooks::maybe_fire_reclaim_fault(database_branch_id, ReclaimFaultPoint::PlanAfterSnapshot)
 		.await?;
 	let branch_is_live = snapshot
 		.branch_record

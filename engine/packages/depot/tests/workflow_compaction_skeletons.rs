@@ -1167,7 +1167,7 @@ async fn run_reclaim_force(
 ) -> Result<ForceCompactionResult> {
 	let tag_value = database_branch_tag_value(database_branch_id);
 	let manager_workflow_id = test_ctx
-		.workflow(DbManagerInput { database_branch_id, actor_id: None })
+		.workflow(DbManagerInput::new(database_branch_id, None))
 		.tag(DATABASE_BRANCH_ID_TAG, &tag_value)
 		.unique()
 		.dispatch()
@@ -1312,7 +1312,7 @@ async fn manager_spawns_companions_and_records_deltas_available() -> Result<()> 
 	seed_manager_branch(&test_ctx, database_branch_id, 0, None, None).await?;
 
 	let manager_workflow_id = test_ctx
-		.workflow(DbManagerInput { database_branch_id, actor_id: None })
+		.workflow(DbManagerInput::new(database_branch_id, None))
 		.tag(DATABASE_BRANCH_ID_TAG, &tag_value)
 		.unique()
 		.dispatch()
@@ -1390,7 +1390,7 @@ async fn manager_ignores_unrelated_branch_signals_without_mutating_state() -> Re
 	seed_manager_branch(&test_ctx, primary_branch_id, 0, None, None).await?;
 
 	let manager_workflow_id = test_ctx
-		.workflow(DbManagerInput { database_branch_id: primary_branch_id, actor_id: None })
+		.workflow(DbManagerInput::new(primary_branch_id, None))
 		.tag(DATABASE_BRANCH_ID_TAG, &tag_value)
 		.unique()
 		.dispatch()
@@ -1434,7 +1434,7 @@ async fn companion_ignores_unrelated_branch_signals_without_mutating_state() -> 
 	seed_manager_branch(&test_ctx, primary_branch_id, 0, None, None).await?;
 
 	let _manager_workflow_id = test_ctx
-		.workflow(DbManagerInput { database_branch_id: primary_branch_id, actor_id: None })
+		.workflow(DbManagerInput::new(primary_branch_id, None))
 		.tag(DATABASE_BRANCH_ID_TAG, &tag_value)
 		.unique()
 		.dispatch()
@@ -1493,7 +1493,7 @@ async fn companion_destroy_signal_stops_idle_hot_cold_and_reclaim() -> Result<()
 	seed_manager_branch(&test_ctx, database_branch_id, 0, None, None).await?;
 
 	let _manager_workflow_id = test_ctx
-		.workflow(DbManagerInput { database_branch_id, actor_id: None })
+		.workflow(DbManagerInput::new(database_branch_id, None))
 		.tag(DATABASE_BRANCH_ID_TAG, &tag_value)
 		.unique()
 		.dispatch()
@@ -1544,7 +1544,7 @@ async fn manager_destroy_stops_idle_companions() -> Result<()> {
 	seed_manager_branch(&test_ctx, database_branch_id, 0, None, None).await?;
 
 	let manager_workflow_id = test_ctx
-		.workflow(DbManagerInput { database_branch_id, actor_id: None })
+		.workflow(DbManagerInput::new(database_branch_id, None))
 		.tag(DATABASE_BRANCH_ID_TAG, &tag_value)
 		.unique()
 		.dispatch()
@@ -1615,7 +1615,7 @@ async fn manager_recreated_for_deleted_branch_stops_without_scheduling() -> Resu
 	clear_branch_record(&test_ctx, database_branch_id).await?;
 
 	let manager_workflow_id = test_ctx
-		.workflow(DbManagerInput { database_branch_id, actor_id: None })
+		.workflow(DbManagerInput::new(database_branch_id, None))
 		.tag(DATABASE_BRANCH_ID_TAG, &tag_value)
 		.unique()
 		.dispatch()
@@ -1678,7 +1678,7 @@ async fn manager_branch_not_live_stop_clears_active_jobs() -> Result<()> {
 	.await?;
 
 	let manager_workflow_id = test_ctx
-		.workflow(DbManagerInput { database_branch_id, actor_id: None })
+		.workflow(DbManagerInput::new(database_branch_id, None))
 		.tag(DATABASE_BRANCH_ID_TAG, &tag_value)
 		.unique()
 		.dispatch()
@@ -1738,7 +1738,7 @@ async fn manager_destroy_during_active_hot_job_completes() -> Result<()> {
 	.await?;
 
 	let manager_workflow_id = test_ctx
-		.workflow(DbManagerInput { database_branch_id, actor_id: None })
+		.workflow(DbManagerInput::new(database_branch_id, None))
 		.tag(DATABASE_BRANCH_ID_TAG, &tag_value)
 		.unique()
 		.dispatch()
@@ -1790,7 +1790,7 @@ async fn manager_rejects_hot_publish_after_lifecycle_generation_bump() -> Result
 	.await?;
 
 	let manager_workflow_id = test_ctx
-		.workflow(DbManagerInput { database_branch_id, actor_id: None })
+		.workflow(DbManagerInput::new(database_branch_id, None))
 		.tag(DATABASE_BRANCH_ID_TAG, &tag_value)
 		.unique()
 		.dispatch()
@@ -1921,7 +1921,7 @@ async fn manager_refresh_clears_idle_dirty_marker_without_planning_hot_job() -> 
 	.await?;
 
 	let manager_workflow_id = test_ctx
-		.workflow(DbManagerInput { database_branch_id, actor_id: None })
+		.workflow(DbManagerInput::new(database_branch_id, None))
 		.tag(DATABASE_BRANCH_ID_TAG, &tag_value)
 		.unique()
 		.dispatch()
@@ -1962,7 +1962,7 @@ async fn manager_refresh_plans_first_hot_job_from_fdb_state() -> Result<()> {
 	.await?;
 
 	let manager_workflow_id = test_ctx
-		.workflow(DbManagerInput { database_branch_id, actor_id: None })
+		.workflow(DbManagerInput::new(database_branch_id, None))
 		.tag(DATABASE_BRANCH_ID_TAG, &tag_value)
 		.unique()
 		.dispatch()
@@ -2007,7 +2007,7 @@ async fn duplicate_deltas_available_does_not_create_duplicate_hot_job() -> Resul
 	.await?;
 
 	let manager_workflow_id = test_ctx
-		.workflow(DbManagerInput { database_branch_id, actor_id: None })
+		.workflow(DbManagerInput::new(database_branch_id, None))
 		.tag(DATABASE_BRANCH_ID_TAG, &tag_value)
 		.unique()
 		.dispatch()
@@ -2052,7 +2052,7 @@ async fn force_compaction_noop_records_completion_result() -> Result<()> {
 	seed_manager_branch(&test_ctx, database_branch_id, 0, None, None).await?;
 
 	let manager_workflow_id = test_ctx
-		.workflow(DbManagerInput { database_branch_id, actor_id: None })
+		.workflow(DbManagerInput::new(database_branch_id, None))
 		.tag(DATABASE_BRANCH_ID_TAG, &tag_value)
 		.unique()
 		.dispatch()
@@ -2104,7 +2104,7 @@ async fn force_hot_compaction_publishes_planned_work_below_threshold() -> Result
 	seed_manager_branch(&test_ctx, database_branch_id, 1, None, None).await?;
 
 	let manager_workflow_id = test_ctx
-		.workflow(DbManagerInput { database_branch_id, actor_id: None })
+		.workflow(DbManagerInput::new(database_branch_id, None))
 		.tag(DATABASE_BRANCH_ID_TAG, &tag_value)
 		.unique()
 		.dispatch()
@@ -2165,7 +2165,7 @@ async fn force_hot_compaction_writes_pitr_interval_coverage() -> Result<()> {
 		let database_branch_id = read_database_branch_id(&test_ctx).await?;
 		let tag_value = database_branch_tag_value(database_branch_id);
 		let manager_workflow_id = test_ctx
-			.workflow(DbManagerInput { database_branch_id, actor_id: None })
+			.workflow(DbManagerInput::new(database_branch_id, None))
 			.tag(DATABASE_BRANCH_ID_TAG, &tag_value)
 			.unique()
 			.dispatch()
@@ -2245,7 +2245,7 @@ async fn e2e_pitr_timestamp_resolution_uses_force_compacted_interval_coverage() 
 			.await?;
 		let database_branch_id = read_database_branch_id(&test_ctx).await?;
 		let manager_workflow_id = test_ctx
-			.workflow(DbManagerInput { database_branch_id, actor_id: None })
+			.workflow(DbManagerInput::new(database_branch_id, None))
 			.tag(DATABASE_BRANCH_ID_TAG, &database_branch_tag_value(database_branch_id))
 			.unique()
 			.dispatch()
@@ -2320,7 +2320,7 @@ async fn e2e_pitr_timestamp_resolution_uses_previous_commit_through_quiet_period
 		.await?;
 	let database_branch_id = read_database_branch_id(&test_ctx).await?;
 	let manager_workflow_id = test_ctx
-		.workflow(DbManagerInput { database_branch_id, actor_id: None })
+		.workflow(DbManagerInput::new(database_branch_id, None))
 		.tag(DATABASE_BRANCH_ID_TAG, &database_branch_tag_value(database_branch_id))
 		.unique()
 		.dispatch()
@@ -2387,7 +2387,7 @@ async fn e2e_pitr_timestamp_resolution_expires_after_configured_retention() -> R
 		.await?;
 	let database_branch_id = read_database_branch_id(&test_ctx).await?;
 	let manager_workflow_id = test_ctx
-		.workflow(DbManagerInput { database_branch_id, actor_id: None })
+		.workflow(DbManagerInput::new(database_branch_id, None))
 		.tag(DATABASE_BRANCH_ID_TAG, &database_branch_tag_value(database_branch_id))
 		.unique()
 		.dispatch()
@@ -2467,7 +2467,7 @@ async fn e2e_restore_point_remains_readable_after_interval_coverage_expires() ->
 		.await?;
 	let database_branch_id = read_database_branch_id(&test_ctx).await?;
 	let manager_workflow_id = test_ctx
-		.workflow(DbManagerInput { database_branch_id, actor_id: None })
+		.workflow(DbManagerInput::new(database_branch_id, None))
 		.tag(DATABASE_BRANCH_ID_TAG, &database_branch_tag_value(database_branch_id))
 		.unique()
 		.dispatch()
@@ -2555,7 +2555,7 @@ async fn e2e_fork_and_restore_from_timestamp_selector_read_resolved_commit() -> 
 		.await?;
 	let old_branch_id = read_database_branch_id(&test_ctx).await?;
 	let manager_workflow_id = test_ctx
-		.workflow(DbManagerInput { database_branch_id: old_branch_id, actor_id: None })
+		.workflow(DbManagerInput::new(old_branch_id, None))
 		.tag(DATABASE_BRANCH_ID_TAG, &database_branch_tag_value(old_branch_id))
 		.unique()
 		.dispatch()
@@ -2659,7 +2659,7 @@ async fn hot_compacter_rejects_stale_pitr_interval_selection() -> Result<()> {
 	let database_branch_id = read_database_branch_id(&test_ctx).await?;
 	let tag_value = database_branch_tag_value(database_branch_id);
 	let manager_workflow_id = test_ctx
-		.workflow(DbManagerInput { database_branch_id, actor_id: None })
+		.workflow(DbManagerInput::new(database_branch_id, None))
 		.tag(DATABASE_BRANCH_ID_TAG, &tag_value)
 		.unique()
 		.dispatch()
@@ -2726,7 +2726,7 @@ async fn hot_install_rejects_staged_output_after_concurrent_commit() -> Result<(
 	let database_branch_id = read_database_branch_id(&test_ctx).await?;
 	let tag_value = database_branch_tag_value(database_branch_id);
 	let manager_workflow_id = test_ctx
-		.workflow(DbManagerInput { database_branch_id, actor_id: None })
+		.workflow(DbManagerInput::new(database_branch_id, None))
 		.tag(DATABASE_BRANCH_ID_TAG, &tag_value)
 		.unique()
 		.dispatch()
@@ -2814,7 +2814,7 @@ async fn force_reclaim_waits_for_reclaim_completion() -> Result<()> {
 	publish_test_shard_and_clear_pidx(&test_ctx, database_branch_id, 1).await?;
 
 	let manager_workflow_id = test_ctx
-		.workflow(DbManagerInput { database_branch_id, actor_id: None })
+		.workflow(DbManagerInput::new(database_branch_id, None))
 		.tag(DATABASE_BRANCH_ID_TAG, &tag_value)
 		.unique()
 		.dispatch()
@@ -2874,7 +2874,7 @@ async fn force_reclaim_reports_pidx_safety_gate() -> Result<()> {
 	.await?;
 
 	let manager_workflow_id = test_ctx
-		.workflow(DbManagerInput { database_branch_id, actor_id: None })
+		.workflow(DbManagerInput::new(database_branch_id, None))
 		.tag(DATABASE_BRANCH_ID_TAG, &tag_value)
 		.unique()
 		.dispatch()
@@ -2916,7 +2916,7 @@ async fn e2e_force_hot_compaction_preserves_reads_after_pidx_clear() -> Result<(
 	let database_branch_id = read_database_branch_id(&test_ctx).await?;
 	let tag_value = database_branch_tag_value(database_branch_id);
 	let manager_workflow_id = test_ctx
-		.workflow(DbManagerInput { database_branch_id, actor_id: None })
+		.workflow(DbManagerInput::new(database_branch_id, None))
 		.tag(DATABASE_BRANCH_ID_TAG, &tag_value)
 		.unique()
 		.dispatch()
@@ -2981,7 +2981,7 @@ async fn e2e_force_reclaim_removes_hot_rows_and_keeps_reads() -> Result<()> {
 		.expect("commit should exist before reclaim");
 	let tag_value = database_branch_tag_value(database_branch_id);
 	let manager_workflow_id = test_ctx
-		.workflow(DbManagerInput { database_branch_id, actor_id: None })
+		.workflow(DbManagerInput::new(database_branch_id, None))
 		.tag(DATABASE_BRANCH_ID_TAG, &tag_value)
 		.unique()
 		.dispatch()
@@ -3054,7 +3054,7 @@ async fn e2e_force_compaction_preserves_exact_restore_point_txid() -> Result<()>
 	let database_branch_id = read_database_branch_id(&test_ctx).await?;
 	let tag_value = database_branch_tag_value(database_branch_id);
 	let manager_workflow_id = test_ctx
-		.workflow(DbManagerInput { database_branch_id, actor_id: None })
+		.workflow(DbManagerInput::new(database_branch_id, None))
 		.tag(DATABASE_BRANCH_ID_TAG, &tag_value)
 		.unique()
 		.dispatch()
@@ -3145,7 +3145,7 @@ async fn e2e_force_reclaim_materializes_bucket_fork_pin() -> Result<()> {
 	database_db.commit(vec![dirty_page(1, 0x52)], 2, 1_002).await?;
 	let tag_value = database_branch_tag_value(database_branch_id);
 	let manager_workflow_id = test_ctx
-		.workflow(DbManagerInput { database_branch_id, actor_id: None })
+		.workflow(DbManagerInput::new(database_branch_id, None))
 		.tag(DATABASE_BRANCH_ID_TAG, &tag_value)
 		.unique()
 		.dispatch()
@@ -3241,7 +3241,7 @@ async fn force_cold_compaction_is_noop_when_cold_storage_disabled() -> Result<()
 	let database_branch_id = read_database_branch_id(&test_ctx).await?;
 	let tag_value = database_branch_tag_value(database_branch_id);
 	let manager_workflow_id = test_ctx
-		.workflow(DbManagerInput { database_branch_id, actor_id: None })
+		.workflow(DbManagerInput::new(database_branch_id, None))
 		.tag(DATABASE_BRANCH_ID_TAG, &tag_value)
 		.unique()
 		.dispatch()
@@ -3302,7 +3302,7 @@ async fn cold_disabled_read_missing_fdb_shard_returns_error() -> Result<()> {
 	let database_branch_id = read_database_branch_id(&test_ctx).await?;
 	let tag_value = database_branch_tag_value(database_branch_id);
 	let manager_workflow_id = test_ctx
-		.workflow(DbManagerInput { database_branch_id, actor_id: None })
+		.workflow(DbManagerInput::new(database_branch_id, None))
 		.tag(DATABASE_BRANCH_ID_TAG, &tag_value)
 		.unique()
 		.dispatch()
@@ -3374,7 +3374,7 @@ async fn configured_cold_storage_publishes_and_reads_workflow_cold_refs() -> Res
 	let database_branch_id = read_database_branch_id(&test_ctx).await?;
 	let tag_value = database_branch_tag_value(database_branch_id);
 	let manager_workflow_id = test_ctx
-		.workflow(DbManagerInput { database_branch_id, actor_id: None })
+		.workflow(DbManagerInput::new(database_branch_id, None))
 		.tag(DATABASE_BRANCH_ID_TAG, &tag_value)
 		.unique()
 		.dispatch()
@@ -3923,7 +3923,7 @@ async fn e2e_force_cold_publish_reads_after_hot_rows_removed() -> Result<()> {
 	let database_branch_id = read_database_branch_id(&test_ctx).await?;
 	let tag_value = database_branch_tag_value(database_branch_id);
 	let manager_workflow_id = test_ctx
-		.workflow(DbManagerInput { database_branch_id, actor_id: None })
+		.workflow(DbManagerInput::new(database_branch_id, None))
 		.tag(DATABASE_BRANCH_ID_TAG, &tag_value)
 		.unique()
 		.dispatch()
@@ -4001,7 +4001,7 @@ async fn e2e_dual_purpose_shard_cache_eviction_reads_and_refills() -> Result<()>
 		.await?;
 	let database_branch_id = read_database_branch_id(&test_ctx).await?;
 	let manager_workflow_id = test_ctx
-		.workflow(DbManagerInput { database_branch_id, actor_id: None })
+		.workflow(DbManagerInput::new(database_branch_id, None))
 		.tag(DATABASE_BRANCH_ID_TAG, &database_branch_tag_value(database_branch_id))
 		.unique()
 		.dispatch()
@@ -4116,7 +4116,7 @@ async fn e2e_cold_disabled_keeps_fdb_shard_and_skips_cold_work() -> Result<()> {
 	database_db.commit(vec![dirty_page(1, 0xa4)], 2, 1_001).await?;
 	let database_branch_id = read_database_branch_id(&test_ctx).await?;
 	let manager_workflow_id = test_ctx
-		.workflow(DbManagerInput { database_branch_id, actor_id: None })
+		.workflow(DbManagerInput::new(database_branch_id, None))
 		.tag(DATABASE_BRANCH_ID_TAG, &database_branch_tag_value(database_branch_id))
 		.unique()
 		.dispatch()
@@ -4213,7 +4213,7 @@ async fn e2e_cold_upload_failure_keeps_fdb_shard_readable() -> Result<()> {
 		.await?;
 	let database_branch_id = read_database_branch_id(&test_ctx).await?;
 	let manager_workflow_id = test_ctx
-		.workflow(DbManagerInput { database_branch_id, actor_id: None })
+		.workflow(DbManagerInput::new(database_branch_id, None))
 		.tag(DATABASE_BRANCH_ID_TAG, &database_branch_tag_value(database_branch_id))
 		.unique()
 		.dispatch()
@@ -4305,7 +4305,7 @@ async fn stale_pidx_missing_delta_falls_back_to_fdb_shard() -> Result<()> {
 	database_db.commit(vec![dirty_page(1, 0xa6)], 2, 1_001).await?;
 	let database_branch_id = read_database_branch_id(&test_ctx).await?;
 	let manager_workflow_id = test_ctx
-		.workflow(DbManagerInput { database_branch_id, actor_id: None })
+		.workflow(DbManagerInput::new(database_branch_id, None))
 		.tag(DATABASE_BRANCH_ID_TAG, &database_branch_tag_value(database_branch_id))
 		.unique()
 		.dispatch()
@@ -4389,7 +4389,7 @@ async fn e2e_workflow_compacts_reclaims_multiple_deltas_and_keeps_reads() -> Res
 	}
 	let tag_value = database_branch_tag_value(database_branch_id);
 	let manager_workflow_id = test_ctx
-		.workflow(DbManagerInput { database_branch_id, actor_id: None })
+		.workflow(DbManagerInput::new(database_branch_id, None))
 		.tag(DATABASE_BRANCH_ID_TAG, &tag_value)
 		.unique()
 		.dispatch()
@@ -4491,7 +4491,7 @@ async fn e2e_workflow_cold_publish_reclaim_retires_obsolete_object() -> Result<(
 	let database_branch_id = read_database_branch_id(&test_ctx).await?;
 	let tag_value = database_branch_tag_value(database_branch_id);
 	let manager_workflow_id = test_ctx
-		.workflow(DbManagerInput { database_branch_id, actor_id: None })
+		.workflow(DbManagerInput::new(database_branch_id, None))
 		.tag(DATABASE_BRANCH_ID_TAG, &tag_value)
 		.unique()
 		.dispatch()
@@ -4623,7 +4623,7 @@ async fn e2e_workflow_rejects_stale_hot_work_then_stops_on_branch_deletion() -> 
 	update_branch_lifecycle(&test_ctx, database_branch_id, BranchState::Live, 1).await?;
 	let tag_value = database_branch_tag_value(database_branch_id);
 	let manager_workflow_id = test_ctx
-		.workflow(DbManagerInput { database_branch_id, actor_id: None })
+		.workflow(DbManagerInput::new(database_branch_id, None))
 		.tag(DATABASE_BRANCH_ID_TAG, &tag_value)
 		.unique()
 		.dispatch()
@@ -4715,7 +4715,7 @@ async fn hot_compacter_writes_idempotent_staged_shard_output() -> Result<()> {
 	.await?;
 
 	let _manager_workflow_id = test_ctx
-		.workflow(DbManagerInput { database_branch_id, actor_id: None })
+		.workflow(DbManagerInput::new(database_branch_id, None))
 		.tag(DATABASE_BRANCH_ID_TAG, &tag_value)
 		.unique()
 		.dispatch()
@@ -4774,7 +4774,7 @@ async fn hot_compacter_rejects_stale_base_generation_without_staging() -> Result
 	.await?;
 
 	let _manager_workflow_id = test_ctx
-		.workflow(DbManagerInput { database_branch_id, actor_id: None })
+		.workflow(DbManagerInput::new(database_branch_id, None))
 		.tag(DATABASE_BRANCH_ID_TAG, &tag_value)
 		.unique()
 		.dispatch()
@@ -4841,7 +4841,7 @@ async fn hot_compacter_rejects_stale_lifecycle_generation_without_staging() -> R
 	update_branch_lifecycle(&test_ctx, database_branch_id, BranchState::Live, 1).await?;
 
 	let _manager_workflow_id = test_ctx
-		.workflow(DbManagerInput { database_branch_id, actor_id: None })
+		.workflow(DbManagerInput::new(database_branch_id, None))
 		.tag(DATABASE_BRANCH_ID_TAG, &tag_value)
 		.unique()
 		.dispatch()
@@ -4908,7 +4908,7 @@ async fn manager_schedules_cleanup_for_stale_hot_output() -> Result<()> {
 	update_branch_lifecycle(&test_ctx, database_branch_id, BranchState::Live, 7).await?;
 
 	let manager_workflow_id = test_ctx
-		.workflow(DbManagerInput { database_branch_id, actor_id: None })
+		.workflow(DbManagerInput::new(database_branch_id, None))
 		.tag(DATABASE_BRANCH_ID_TAG, &tag_value)
 		.unique()
 		.dispatch()
@@ -5017,7 +5017,7 @@ async fn manager_schedules_cleanup_for_stale_cold_output() -> Result<()> {
 	.await?;
 
 	let manager_workflow_id = test_ctx
-		.workflow(DbManagerInput { database_branch_id, actor_id: None })
+		.workflow(DbManagerInput::new(database_branch_id, None))
 		.tag(DATABASE_BRANCH_ID_TAG, &tag_value)
 		.unique()
 		.dispatch()
@@ -5106,7 +5106,7 @@ async fn manager_schedules_cold_cleanup_intent_when_cold_storage_disabled() -> R
 	.await?;
 
 	let manager_workflow_id = test_ctx
-		.workflow(DbManagerInput { database_branch_id, actor_id: None })
+		.workflow(DbManagerInput::new(database_branch_id, None))
 		.tag(DATABASE_BRANCH_ID_TAG, &tag_value)
 		.unique()
 		.dispatch()
@@ -5209,7 +5209,7 @@ async fn manager_cleans_uploaded_cold_output_when_active_publish_rejects() -> Re
 	publish_test_shard_and_clear_pidx(&test_ctx, database_branch_id, cold_threshold_head()).await?;
 
 	let manager_workflow_id = test_ctx
-		.workflow(DbManagerInput { database_branch_id, actor_id: None })
+		.workflow(DbManagerInput::new(database_branch_id, None))
 		.tag(DATABASE_BRANCH_ID_TAG, &tag_value)
 		.unique()
 		.dispatch()
@@ -5323,7 +5323,7 @@ async fn manager_publishes_hot_output_and_reads_through_shard_after_pidx_clear()
 	let tag_value = database_branch_tag_value(database_branch_id);
 
 	let manager_workflow_id = test_ctx
-		.workflow(DbManagerInput { database_branch_id, actor_id: None })
+		.workflow(DbManagerInput::new(database_branch_id, None))
 		.tag(DATABASE_BRANCH_ID_TAG, &tag_value)
 		.unique()
 		.dispatch()
@@ -5399,7 +5399,7 @@ async fn manager_publishes_cold_output_and_reads_through_cold_ref() -> Result<()
 	assert_eq!(seeded_head.head_txid, cold_threshold_head());
 
 	let manager_workflow_id = test_ctx
-		.workflow(DbManagerInput { database_branch_id, actor_id: None })
+		.workflow(DbManagerInput::new(database_branch_id, None))
 		.tag(DATABASE_BRANCH_ID_TAG, &tag_value)
 		.unique()
 		.dispatch()
@@ -5527,7 +5527,7 @@ async fn reclaimer_retires_cold_object_before_grace_delete_and_cleanup() -> Resu
 	.await?;
 
 	let manager_workflow_id = test_ctx
-		.workflow(DbManagerInput { database_branch_id, actor_id: None })
+		.workflow(DbManagerInput::new(database_branch_id, None))
 		.tag(DATABASE_BRANCH_ID_TAG, &tag_value)
 		.unique()
 		.dispatch()
@@ -5655,7 +5655,7 @@ async fn reclaimer_logs_and_retains_live_cold_ref_when_s3_object_is_missing() ->
 	.await?;
 
 	let manager_workflow_id = test_ctx
-		.workflow(DbManagerInput { database_branch_id, actor_id: None })
+		.workflow(DbManagerInput::new(database_branch_id, None))
 		.tag(DATABASE_BRANCH_ID_TAG, &tag_value)
 		.unique()
 		.dispatch()
@@ -5771,7 +5771,7 @@ async fn reclaimer_logs_and_retains_live_cold_ref_for_delete_issued_object() -> 
 		.await?;
 
 	let manager_workflow_id = test_ctx
-		.workflow(DbManagerInput { database_branch_id, actor_id: None })
+		.workflow(DbManagerInput::new(database_branch_id, None))
 		.tag(DATABASE_BRANCH_ID_TAG, &tag_value)
 		.unique()
 		.dispatch()
@@ -5830,7 +5830,7 @@ async fn cold_compacter_rejects_stale_base_generation_without_publish() -> Resul
 	publish_test_shard_and_clear_pidx(&test_ctx, database_branch_id, 1).await?;
 
 	let _manager_workflow_id = test_ctx
-		.workflow(DbManagerInput { database_branch_id, actor_id: None })
+		.workflow(DbManagerInput::new(database_branch_id, None))
 		.tag(DATABASE_BRANCH_ID_TAG, &tag_value)
 		.unique()
 		.dispatch()
@@ -5897,7 +5897,7 @@ async fn manager_hot_planning_materializes_exact_pinned_txid() -> Result<()> {
 	let _restore_point = seed_restore_point_db_pin(&test_ctx, database_branch_id, 50).await?;
 
 	let _manager_workflow_id = test_ctx
-		.workflow(DbManagerInput { database_branch_id, actor_id: None })
+		.workflow(DbManagerInput::new(database_branch_id, None))
 		.tag(DATABASE_BRANCH_ID_TAG, &tag_value)
 		.unique()
 		.dispatch()
@@ -5951,7 +5951,7 @@ async fn reclaimer_deletes_obsolete_fdb_rows_after_hot_coverage() -> Result<()> 
 	.await?;
 
 	let _manager_workflow_id = test_ctx
-		.workflow(DbManagerInput { database_branch_id, actor_id: None })
+		.workflow(DbManagerInput::new(database_branch_id, None))
 		.tag(DATABASE_BRANCH_ID_TAG, &tag_value)
 		.unique()
 		.dispatch()
@@ -6015,7 +6015,7 @@ async fn reclaimer_retains_rows_when_pidx_still_references_deleted_txid() -> Res
 	set_test_pidx(&test_ctx, database_branch_id, 1).await?;
 
 	let manager_workflow_id = test_ctx
-		.workflow(DbManagerInput { database_branch_id, actor_id: None })
+		.workflow(DbManagerInput::new(database_branch_id, None))
 		.tag(DATABASE_BRANCH_ID_TAG, &tag_value)
 		.unique()
 		.dispatch()
@@ -6066,7 +6066,7 @@ async fn reclaimer_rejects_stale_manifest_generation() -> Result<()> {
 	set_test_pidx(&test_ctx, database_branch_id, 1).await?;
 
 	let _manager_workflow_id = test_ctx
-		.workflow(DbManagerInput { database_branch_id, actor_id: None })
+		.workflow(DbManagerInput::new(database_branch_id, None))
 		.tag(DATABASE_BRANCH_ID_TAG, &tag_value)
 		.unique()
 		.dispatch()
@@ -6146,7 +6146,7 @@ async fn reclaimer_retains_pinned_txid_history() -> Result<()> {
 	let _restore_point = seed_restore_point_db_pin(&test_ctx, database_branch_id, 50).await?;
 
 	let _manager_workflow_id = test_ctx
-		.workflow(DbManagerInput { database_branch_id, actor_id: None })
+		.workflow(DbManagerInput::new(database_branch_id, None))
 		.tag(DATABASE_BRANCH_ID_TAG, &tag_value)
 		.unique()
 		.dispatch()
@@ -6192,7 +6192,7 @@ async fn reclaimer_retains_unexpired_pitr_interval_history() -> Result<()> {
 	seed_pitr_interval_coverage(&test_ctx, database_branch_id, 5_000, 50, i64::MAX).await?;
 
 	let _manager_workflow_id = test_ctx
-		.workflow(DbManagerInput { database_branch_id, actor_id: None })
+		.workflow(DbManagerInput::new(database_branch_id, None))
 		.tag(DATABASE_BRANCH_ID_TAG, &tag_value)
 		.unique()
 		.dispatch()
@@ -6239,7 +6239,7 @@ async fn reclaimer_deletes_expired_pitr_interval_and_reclaims_history() -> Resul
 	seed_pitr_interval_coverage(&test_ctx, database_branch_id, 5_000, 50, 0).await?;
 
 	let _manager_workflow_id = test_ctx
-		.workflow(DbManagerInput { database_branch_id, actor_id: None })
+		.workflow(DbManagerInput::new(database_branch_id, None))
 		.tag(DATABASE_BRANCH_ID_TAG, &tag_value)
 		.unique()
 		.dispatch()
@@ -6277,7 +6277,7 @@ async fn reclaimer_keeps_restore_point_after_pitr_interval_expires() -> Result<(
 	seed_pitr_interval_coverage(&test_ctx, database_branch_id, 5_000, 50, 0).await?;
 
 	let _manager_workflow_id = test_ctx
-		.workflow(DbManagerInput { database_branch_id, actor_id: None })
+		.workflow(DbManagerInput::new(database_branch_id, None))
 		.tag(DATABASE_BRANCH_ID_TAG, &tag_value)
 		.unique()
 		.dispatch()
@@ -6346,7 +6346,7 @@ async fn reclaimer_materializes_bucket_fork_pin_before_delete() -> Result<()> {
 	.await?;
 
 	let _manager_workflow_id = test_ctx
-		.workflow(DbManagerInput { database_branch_id, actor_id: None })
+		.workflow(DbManagerInput::new(database_branch_id, None))
 		.tag(DATABASE_BRANCH_ID_TAG, &tag_value)
 		.unique()
 		.dispatch()
@@ -6414,7 +6414,7 @@ async fn reclaimer_retains_history_when_bucket_proof_is_ambiguous() -> Result<()
 	.await?;
 
 	let manager_workflow_id = test_ctx
-		.workflow(DbManagerInput { database_branch_id, actor_id: None })
+		.workflow(DbManagerInput::new(database_branch_id, None))
 		.tag(DATABASE_BRANCH_ID_TAG, &tag_value)
 		.unique()
 		.dispatch()

@@ -11,10 +11,16 @@ mod tx;
 use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Context, Result, ensure};
+#[cfg(feature = "test-faults")]
+use crate::fault::{
+	DepotFaultAction, DepotFaultContext, DepotFaultController, DepotFaultFired,
+	DepotFaultPoint, ReadFaultPoint,
+};
 
 use crate::conveyer::{
 	Db,
 	db::{BranchAncestry, CacheSnapshot, touch_access_if_bucket_advanced},
+	error::SqliteStorageError,
 	keys::{self, PAGE_SIZE, SHARD_SIZE},
 	ltx::{DecodedLtx, decode_ltx_v3},
 	metrics,
@@ -60,6 +66,8 @@ impl Db {
 		let bucket_id = self.sqlite_bucket_id();
 		let pgnos_for_tx = pgnos.clone();
 		let now_ms = cache::now_ms()?;
+		#[cfg(feature = "test-faults")]
+		let fault_controller = self.fault_controller.clone();
 		let tx_result = self
 			.udb
 			.run(move |tx| {
@@ -69,8 +77,20 @@ impl Db {
 				let cached_pidx = cached_pidx.clone();
 				let cached_ancestry = cached_ancestry.clone();
 				let cached_access_bucket = cached_access_bucket;
+				#[cfg(feature = "test-faults")]
+				let fault_controller = fault_controller.clone();
 
 				async move {
+					#[cfg(feature = "test-faults")]
+					maybe_fire_read_fault(
+						&fault_controller,
+						ReadFaultPoint::BeforeScopeResolve,
+						&database_id,
+						None,
+						None,
+						None,
+					)
+					.await?;
 					let scope = resolve_storage_scope(
 						&tx,
 						bucket_id,
@@ -85,6 +105,16 @@ impl Db {
 					};
 					let StorageScope::Branch(plan) = &scope;
 					let head = plan.head.clone();
+					#[cfg(feature = "test-faults")]
+					maybe_fire_read_fault(
+						&fault_controller,
+						ReadFaultPoint::AfterScopeResolve,
+						&database_id,
+						Some(scope.branch_id()),
+						None,
+						None,
+					)
+					.await?;
 
 					let pgnos_in_range = pgnos
 						.into_iter()
@@ -158,6 +188,18 @@ impl Db {
 							pidx_by_pgno.entry(pgno).or_insert(page_ref);
 						}
 					}
+					#[cfg(feature = "test-faults")]
+					for pgno in &pgnos_in_range {
+						maybe_fire_read_fault(
+							&fault_controller,
+							ReadFaultPoint::AfterPidxScan,
+							&database_id,
+							Some(scope.branch_id()),
+							Some(*pgno),
+							Some(*pgno / SHARD_SIZE),
+						)
+						.await?;
+					}
 
 					let mut page_sources = BTreeMap::new();
 					let mut source_blobs = BTreeMap::new();
@@ -195,6 +237,30 @@ impl Db {
 						{
 							if !source_blobs.contains_key(delta_prefix) {
 								let blob = tx_load_delta_blob(&tx, delta_prefix).await?;
+								#[cfg(feature = "test-faults")]
+								let mut blob = blob;
+								#[cfg(feature = "test-faults")]
+								if matches!(
+									maybe_fire_read_fault(
+										&fault_controller,
+										if blob.is_some() {
+											ReadFaultPoint::AfterDeltaBlobLoad
+										} else {
+											ReadFaultPoint::DeltaBlobMissing
+										},
+										&database_id,
+										Some(scope.branch_id()),
+										Some(*pgno),
+										Some(*pgno / SHARD_SIZE),
+									)
+									.await?,
+									Some(DepotFaultFired {
+										action: DepotFaultAction::DropArtifact,
+										..
+									})
+								) {
+									blob = None;
+								}
 								if let Some(blob) = blob {
 									source_blobs.insert(delta_prefix.clone(), blob);
 								} else {
@@ -220,8 +286,27 @@ impl Db {
 
 						let shard_id = pgno / SHARD_SIZE;
 						if !shard_sources.contains_key(&shard_id) {
-							let source =
-								tx_load_latest_shard_blob(&tx, &scope, shard_id).await?;
+							let source = tx_load_latest_shard_blob(&tx, &scope, shard_id).await?;
+							#[cfg(feature = "test-faults")]
+							let mut source = source;
+							#[cfg(feature = "test-faults")]
+							if matches!(
+								maybe_fire_read_fault(
+									&fault_controller,
+									ReadFaultPoint::AfterShardBlobLoad,
+									&database_id,
+									Some(scope.branch_id()),
+									Some(*pgno),
+									Some(shard_id),
+								)
+								.await?,
+								Some(DepotFaultFired {
+									action: DepotFaultAction::DropArtifact,
+									..
+								})
+							) {
+								source = None;
+							}
 							shard_sources.insert(shard_id, source);
 						}
 
@@ -246,7 +331,27 @@ impl Db {
 								)
 								.await?
 							{
-								cold_candidates.push(reference.into());
+								#[cfg(feature = "test-faults")]
+								let drop_ref = matches!(
+									maybe_fire_read_fault(
+										&fault_controller,
+										ReadFaultPoint::ColdRefSelected,
+										&database_id,
+										Some(scope.branch_id()),
+										Some(*pgno),
+										Some(shard_id),
+									)
+									.await?,
+									Some(DepotFaultFired {
+										action: DepotFaultAction::DropArtifact,
+										..
+									})
+								);
+								#[cfg(not(feature = "test-faults"))]
+								let drop_ref = false;
+								if !drop_ref {
+									cold_candidates.push(reference.into());
+								}
 								touched_cache_backed_page = true;
 							}
 							cold_candidates.extend(
@@ -310,6 +415,16 @@ impl Db {
 		let mut returned_bytes = 0u64;
 
 		for pgno in pgnos {
+			#[cfg(feature = "test-faults")]
+			maybe_fire_read_fault(
+				&self.fault_controller,
+				ReadFaultPoint::BeforeReturnPages,
+				&self.database_id,
+				Some(tx_result.branch_id),
+				Some(pgno),
+				Some(pgno / SHARD_SIZE),
+			)
+			.await?;
 			if pgno > tx_result.db_size_pages {
 				pages.push(FetchedPage { pgno, bytes: None });
 				continue;
@@ -336,6 +451,9 @@ impl Db {
 				}
 				bytes.get_or_insert_with(|| vec![0; PAGE_SIZE as usize]).clone()
 			} else {
+				if stale_pidx_pgnos.contains(&pgno) {
+					return Err(SqliteStorageError::ShardCoverageMissing { pgno }.into());
+				}
 				tx_result
 					.shard_cache_read_outcomes
 					.entry(pgno)
@@ -391,6 +509,35 @@ impl Db {
 			last_access_bucket,
 			pidx,
 		});
+
+		#[cfg(feature = "test-faults")]
+		let mut shard_cache_fill_jobs = shard_cache_fill_jobs;
+		#[cfg(feature = "test-faults")]
+		{
+			let mut filtered_jobs = Vec::with_capacity(shard_cache_fill_jobs.len());
+			for job in shard_cache_fill_jobs {
+				let key = job.key();
+				let fired = maybe_fire_read_fault(
+					&self.fault_controller,
+					ReadFaultPoint::ShardCacheFillEnqueue,
+					&self.database_id,
+					Some(key.branch_id),
+					None,
+					Some(key.shard_id),
+				)
+				.await?;
+				if !matches!(
+					fired,
+					Some(DepotFaultFired {
+						action: DepotFaultAction::DropArtifact,
+						..
+					})
+				) {
+					filtered_jobs.push(job);
+				}
+			}
+			shard_cache_fill_jobs = filtered_jobs;
+		}
 
 		self.shard_cache_fill.enqueue_many(shard_cache_fill_jobs);
 
@@ -491,4 +638,32 @@ async fn fill_historical_delta_refs(
 	}
 
 	Ok(refs)
+}
+
+#[cfg(feature = "test-faults")]
+pub(super) async fn maybe_fire_read_fault(
+	fault_controller: &Option<DepotFaultController>,
+	point: ReadFaultPoint,
+	database_id: &str,
+	database_branch_id: Option<DatabaseBranchId>,
+	page_number: Option<u32>,
+	shard_id: Option<u32>,
+) -> Result<Option<DepotFaultFired>> {
+	let Some(controller) = fault_controller else {
+		return Ok(None);
+	};
+	let mut context = DepotFaultContext::new().database_id(database_id);
+	if let Some(database_branch_id) = database_branch_id {
+		context = context.database_branch_id(database_branch_id);
+	}
+	if let Some(page_number) = page_number {
+		context = context.page_number(page_number);
+	}
+	if let Some(shard_id) = shard_id {
+		context = context.shard_id(shard_id);
+	}
+
+	controller
+		.maybe_fire(DepotFaultPoint::Read(point), context)
+		.await
 }

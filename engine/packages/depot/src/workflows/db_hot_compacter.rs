@@ -5,6 +5,11 @@ use crate::compaction::{
 };
 use crate::workflows::db_manager::branch_record_is_live_at_generation;
 
+#[cfg(feature = "test-faults")]
+use crate::compaction::test_hooks;
+#[cfg(feature = "test-faults")]
+use crate::fault::{DepotFaultAction, HotCompactionFaultPoint};
+
 #[workflow(DbHotCompacterWorkflow)]
 pub async fn db_hot_compacter(ctx: &mut WorkflowCtx, input: &DbHotCompacterInput) -> Result<()> {
 	run_companion_loop(ctx, input.database_branch_id, CompanionKind::Hot).await
@@ -33,6 +38,13 @@ async fn stage_hot_job_tx(
 ) -> Result<StageHotJobOutput> {
 	if input.job_kind != CompactionJobKind::Hot {
 		return Ok(rejected_hot_job("hot compacter received a non-hot job"));
+	}
+	#[cfg(feature = "test-faults")]
+	if let Some(output) =
+		hot_stage_fault_output(input.database_branch_id, HotCompactionFaultPoint::StageBeforeInputRead)
+			.await?
+	{
+		return Ok(output);
 	}
 
 	let branch_record = tx_get_value(
@@ -121,8 +133,21 @@ async fn stage_hot_job_tx(
 	if input_fingerprint != input.input_fingerprint {
 		return Ok(rejected_hot_job("hot compaction input fingerprint changed"));
 	}
+	#[cfg(feature = "test-faults")]
+	if let Some(output) =
+		hot_stage_fault_output(input.database_branch_id, HotCompactionFaultPoint::StageAfterInputRead)
+			.await?
+	{
+		return Ok(output);
+	}
 
 	let output_refs = write_staged_hot_shards(tx, input, &head, &hot_inputs).await?;
+	#[cfg(feature = "test-faults")]
+	if let Some(output) =
+		hot_stage_after_shard_write_fault_output(tx, input, &output_refs).await?
+	{
+		return Ok(output);
+	}
 
 	Ok(StageHotJobOutput {
 		status: CompactionJobStatus::Succeeded,
@@ -134,6 +159,59 @@ fn rejected_hot_job(reason: impl Into<String>) -> StageHotJobOutput {
 	StageHotJobOutput {
 		status: CompactionJobStatus::Rejected {
 			reason: reason.into(),
+		},
+		output_refs: Vec::new(),
+	}
+}
+
+#[cfg(feature = "test-faults")]
+async fn hot_stage_fault_output(
+	database_branch_id: DatabaseBranchId,
+	point: HotCompactionFaultPoint,
+) -> Result<Option<StageHotJobOutput>> {
+	match test_hooks::maybe_fire_hot_compaction_fault(database_branch_id, point).await {
+		Ok(Some(_)) | Ok(None) => Ok(None),
+		Err(err) => Ok(Some(failed_hot_job(err))),
+	}
+}
+
+#[cfg(feature = "test-faults")]
+async fn hot_stage_after_shard_write_fault_output(
+	tx: &universaldb::Transaction,
+	input: &StageHotJobInput,
+	output_refs: &[HotShardOutputRef],
+) -> Result<Option<StageHotJobOutput>> {
+	match test_hooks::maybe_fire_hot_compaction_fault(
+		input.database_branch_id,
+		HotCompactionFaultPoint::StageAfterShardWrite,
+	)
+	.await
+	{
+		Ok(Some(fired)) if fired.action == DepotFaultAction::DropArtifact => {
+			for output_ref in output_refs {
+				tx.informal().clear(&keys::branch_compaction_stage_hot_shard_key(
+					input.database_branch_id,
+					input.job_id,
+					output_ref.shard_id,
+					output_ref.as_of_txid,
+					0,
+				));
+			}
+			Ok(Some(StageHotJobOutput {
+				status: CompactionJobStatus::Succeeded,
+				output_refs: output_refs.to_vec(),
+			}))
+		}
+		Ok(Some(_)) | Ok(None) => Ok(None),
+		Err(err) => Ok(Some(failed_hot_job(err))),
+	}
+}
+
+#[cfg(feature = "test-faults")]
+fn failed_hot_job(err: anyhow::Error) -> StageHotJobOutput {
+	StageHotJobOutput {
+		status: CompactionJobStatus::Failed {
+			error: err.to_string(),
 		},
 		output_refs: Vec::new(),
 	}
@@ -262,6 +340,10 @@ async fn install_hot_job_tx(
 		.iter()
 		.copied()
 		.collect::<BTreeSet<_>>();
+	#[cfg(feature = "test-faults")]
+	if let Some(output) = hot_install_before_staged_read_fault_output(tx, input).await? {
+		return Ok(output);
+	}
 	for output_ref in &input.output_refs {
 		if !coverage_txids.contains(&output_ref.as_of_txid)
 			|| output_ref.min_txid != input.input_range.txids.min_txid
@@ -295,7 +377,25 @@ async fn install_hot_job_tx(
 		}
 		staged_blobs.push((output_ref.clone(), staged_blob));
 	}
+	#[cfg(feature = "test-faults")]
+	if let Some(output) = hot_install_fault_output(
+		input.database_branch_id,
+		HotCompactionFaultPoint::InstallAfterStagedRead,
+	)
+	.await?
+	{
+		return Ok(output);
+	}
 
+	#[cfg(feature = "test-faults")]
+	if let Some(output) = hot_install_fault_output(
+		input.database_branch_id,
+		HotCompactionFaultPoint::InstallBeforeShardPublish,
+	)
+	.await?
+	{
+		return Ok(output);
+	}
 	for (output_ref, staged_blob) in &staged_blobs {
 		tx.informal().set(
 			&keys::branch_shard_key(
@@ -305,6 +405,15 @@ async fn install_hot_job_tx(
 			),
 			staged_blob,
 		);
+	}
+	#[cfg(feature = "test-faults")]
+	if let Some(output) = hot_install_fault_output(
+		input.database_branch_id,
+		HotCompactionFaultPoint::InstallAfterShardPublishBeforePidxClear,
+	)
+	.await?
+	{
+		return Ok(output);
 	}
 
 	for (key, value) in &hot_inputs.pidx_entries {
@@ -331,6 +440,15 @@ async fn install_hot_job_tx(
 		);
 	}
 
+	#[cfg(feature = "test-faults")]
+	if let Some(output) = hot_install_fault_output(
+		input.database_branch_id,
+		HotCompactionFaultPoint::InstallBeforeRootUpdate,
+	)
+	.await?
+	{
+		return Ok(output);
+	}
 	let next_root = CompactionRoot {
 		schema_version: root.schema_version,
 		manifest_generation: root.manifest_generation.saturating_add(1),
@@ -342,6 +460,15 @@ async fn install_hot_job_tx(
 		&keys::branch_compaction_root_key(input.database_branch_id),
 		&encode_compaction_root(next_root).context("encode sqlite compaction root for hot install")?,
 	);
+	#[cfg(feature = "test-faults")]
+	if let Some(output) = hot_install_fault_output(
+		input.database_branch_id,
+		HotCompactionFaultPoint::InstallAfterRootUpdate,
+	)
+	.await?
+	{
+		return Ok(output);
+	}
 
 	Ok(InstallHotJobOutput {
 		status: CompactionJobStatus::Succeeded,
@@ -353,6 +480,55 @@ fn rejected_hot_install(reason: impl Into<String>) -> InstallHotJobOutput {
 	InstallHotJobOutput {
 		status: CompactionJobStatus::Rejected {
 			reason: reason.into(),
+		},
+		output_refs: Vec::new(),
+	}
+}
+
+#[cfg(feature = "test-faults")]
+async fn hot_install_before_staged_read_fault_output(
+	tx: &universaldb::Transaction,
+	input: &InstallHotJobInput,
+) -> Result<Option<InstallHotJobOutput>> {
+	match test_hooks::maybe_fire_hot_compaction_fault(
+		input.database_branch_id,
+		HotCompactionFaultPoint::InstallBeforeStagedRead,
+	)
+	.await
+	{
+		Ok(Some(fired)) if fired.action == DepotFaultAction::DropArtifact => {
+			for output_ref in &input.output_refs {
+				tx.informal().clear(&keys::branch_compaction_stage_hot_shard_key(
+					input.database_branch_id,
+					input.job_id,
+					output_ref.shard_id,
+					output_ref.as_of_txid,
+					0,
+				));
+			}
+			Ok(None)
+		}
+		Ok(Some(_)) | Ok(None) => Ok(None),
+		Err(err) => Ok(Some(failed_hot_install(err))),
+	}
+}
+
+#[cfg(feature = "test-faults")]
+async fn hot_install_fault_output(
+	database_branch_id: DatabaseBranchId,
+	point: HotCompactionFaultPoint,
+) -> Result<Option<InstallHotJobOutput>> {
+	match test_hooks::maybe_fire_hot_compaction_fault(database_branch_id, point).await {
+		Ok(Some(_)) | Ok(None) => Ok(None),
+		Err(err) => Ok(Some(failed_hot_install(err))),
+	}
+}
+
+#[cfg(feature = "test-faults")]
+fn failed_hot_install(err: anyhow::Error) -> InstallHotJobOutput {
+	InstallHotJobOutput {
+		status: CompactionJobStatus::Failed {
+			error: err.to_string(),
 		},
 		output_refs: Vec::new(),
 	}

@@ -2,6 +2,8 @@ use anyhow::Result;
 use depot::cold_tier::{
 	ColdTier, ColdTierOperation, DisabledColdTier, FaultyColdTier, FilesystemColdTier,
 };
+#[cfg(feature = "test-faults")]
+use depot::fault::{ColdTierFaultPoint, DepotFaultController, DepotFaultPoint};
 use depot::metrics;
 use tempfile::Builder;
 
@@ -88,6 +90,76 @@ async fn faulty_tier_injects_operation_failures() -> Result<()> {
 		Some(b"image".to_vec()),
 		tier.get_object("db/a/image/0001.ltx").await?
 	);
+
+	Ok(())
+}
+
+#[cfg(feature = "test-faults")]
+#[tokio::test]
+async fn faulty_tier_controller_supports_operation_faults() -> Result<()> {
+	let root = Builder::new().prefix("sqlite-cold-tier").tempdir()?;
+	let controller = DepotFaultController::new();
+	controller
+		.at(DepotFaultPoint::ColdTier(ColdTierFaultPoint::PutObject))
+		.once()
+		.fail("put failed")?;
+	controller
+		.at(DepotFaultPoint::ColdTier(ColdTierFaultPoint::GetObject))
+		.once()
+		.drop_artifact()?;
+	controller
+		.at(DepotFaultPoint::ColdTier(ColdTierFaultPoint::ListPrefix))
+		.once()
+		.delay(std::time::Duration::from_millis(1))?;
+	controller
+		.at(DepotFaultPoint::ColdTier(ColdTierFaultPoint::DeleteObjects))
+		.once()
+		.fail("delete failed")?;
+	let tier = FaultyColdTier::new_with_fault_controller_for_test(
+		FilesystemColdTier::new(root.path()),
+		"faulty-tier-controller-node",
+		controller.clone(),
+	);
+
+	assert!(tier.put_object("db/a/image/0001.ltx", b"image").await.is_err());
+	tier.put_object("db/a/image/0001.ltx", b"image").await?;
+	assert_eq!(None, tier.get_object("db/a/image/0001.ltx").await?);
+	assert_eq!(
+		Some(b"image".to_vec()),
+		tier.get_object("db/a/image/0001.ltx").await?
+	);
+	let listed = tier.list_prefix("db/a").await?;
+	assert_eq!(listed.len(), 1);
+	assert!(tier
+		.delete_objects(&["db/a/image/0001.ltx".to_string()])
+		.await
+		.is_err());
+	controller.assert_expected_fired()?;
+
+	Ok(())
+}
+
+#[cfg(feature = "test-faults")]
+#[tokio::test]
+async fn faulty_tier_put_drop_artifact_writes_before_error() -> Result<()> {
+	let root = Builder::new().prefix("sqlite-cold-tier").tempdir()?;
+	let controller = DepotFaultController::new();
+	controller
+		.at(DepotFaultPoint::ColdTier(ColdTierFaultPoint::PutObject))
+		.once()
+		.drop_artifact()?;
+	let tier = FaultyColdTier::new_with_fault_controller_for_test(
+		FilesystemColdTier::new(root.path()),
+		"faulty-tier-put-drop-node",
+		controller.clone(),
+	);
+
+	assert!(tier.put_object("db/a/image/0001.ltx", b"image").await.is_err());
+	assert_eq!(
+		Some(b"image".to_vec()),
+		tier.get_object("db/a/image/0001.ltx").await?
+	);
+	controller.assert_expected_fired()?;
 
 	Ok(())
 }
