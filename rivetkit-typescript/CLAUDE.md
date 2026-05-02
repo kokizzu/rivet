@@ -130,6 +130,7 @@ The script installs each drizzle-orm version, typechecks `scripts/drizzle-compat
 - Runtime parity tests can instantiate `NapiCoreRuntime` and `WasmCoreRuntime` with fake binding classes, then drive shared actor glue through `buildNativeFactory(...)` without requiring generated NAPI or wasm artifacts.
 - Platform wasm smoke tests should reuse `packages/rivetkit/tests/platforms/shared-registry.ts` for the raw-SQL SQLite counter actor and public wasm `setup(...)` shape.
 - Platform smoke tests should use `packages/rivetkit/tests/platforms/shared-platform-harness.ts` for serverless runner setup, app process logging, temp app dirs, health checks, and pinned `pnpm dlx` CLI launches.
+- When adding, removing, or renaming a `packages/rivetkit/tests/driver/*.test.ts` file that uses `describeDriverMatrix`, update the Fast/Slow/Excluded test lists and the suite-description table in `.claude/skills/driver-test-runner/SKILL.md` in the same change.
 
 ## Cloudflare Workers Compatibility
 
