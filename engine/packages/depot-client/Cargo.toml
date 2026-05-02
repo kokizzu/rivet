@@ -1,11 +1,11 @@
 [package]
-name = "rivetkit-sqlite"
+name = "depot-client"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 workspace = "../../../"
-description = "Native SQLite VFS for RivetKit backed by depot"
+description = "Depot-backed native SQLite VFS client"
 
 [lib]
 crate-type = ["lib"]
@@ -18,7 +18,7 @@ tokio.workspace = true
 tracing.workspace = true
 getrandom = "0.2"
 rivet-envoy-protocol.workspace = true
-rivetkit-sqlite-types.workspace = true
+depot-client-types.workspace = true
 moka = { version = "0.12", default-features = false, features = ["sync"] }
 parking_lot.workspace = true
 

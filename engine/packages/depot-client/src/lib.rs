@@ -1,6 +1,6 @@
-//! SQLite library for RivetKit.
+//! Depot-backed SQLite client.
 //!
-//! Provides the native SQLite VFS used by RivetKit actors.
+//! Provides the native SQLite VFS used by Rivet actors.
 //!
 //! This is a pure Rust library. N-API bindings and transport clients
 //! live in separate crates that compose this one.
@@ -26,7 +26,7 @@ pub mod optimization_flags;
 /// SQLite query execution helpers.
 pub mod query;
 
-/// Custom SQLite VFS for actor-side sqlite-storage transport.
+pub use depot_client_types as types;
 
-pub use rivetkit_sqlite_types as types;
+/// Custom SQLite VFS for actor-side depot transport.
 pub mod vfs;

@@ -1,4 +1,4 @@
-//! Shared SQLite execution types for local and remote RivetKit backends.
+//! Shared SQLite execution types for local and remote depot client backends.
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum BindParam {

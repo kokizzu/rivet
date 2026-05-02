@@ -90,6 +90,7 @@
 				actor_id.to_string(),
 				runtime.handle().clone(),
 				config,
+				None,
 			)
 			.expect("v2 vfs should register");
 
@@ -109,6 +110,7 @@
 				SqliteTransport::from_direct(engine),
 				VfsConfig::default(),
 				unsafe { std::mem::zeroed() },
+				None,
 			)
 			.expect("vfs context should build")
 		}
@@ -1678,7 +1680,8 @@
 	fn direct_engine_marks_vfs_dead_after_transport_errors() {
 		let runtime = direct_runtime();
 		let harness = DirectEngineHarness::new();
-		let engine = runtime.block_on(harness.open_engine());		let transport = SqliteTransport::from_direct(engine);
+		let engine = runtime.block_on(harness.open_engine());
+		let transport = SqliteTransport::from_direct(engine);
 		let hooks = transport
 			.direct_hooks()
 			.expect("direct transport should expose test hooks");
@@ -1688,6 +1691,7 @@
 			harness.actor_id.clone(),
 			runtime.handle().clone(),
 			VfsConfig::default(),
+			None,
 		)
 		.expect("v2 vfs should register");
 		let db = open_database(vfs, &harness.actor_id).expect("sqlite database should open");
@@ -1720,7 +1724,8 @@
 	fn flush_dirty_pages_marks_vfs_dead_after_transport_error() {
 		let runtime = direct_runtime();
 		let harness = DirectEngineHarness::new();
-		let engine = runtime.block_on(harness.open_engine());		let transport = SqliteTransport::from_direct(engine);
+		let engine = runtime.block_on(harness.open_engine());
+		let transport = SqliteTransport::from_direct(engine);
 		let hooks = transport
 			.direct_hooks()
 			.expect("direct transport should expose test hooks");
@@ -1730,6 +1735,7 @@
 			harness.actor_id.clone(),
 			runtime.handle().clone(),
 			VfsConfig::default(),
+			None,
 		)
 		.expect("v2 vfs should register");
 		let db = open_database(vfs, &harness.actor_id).expect("sqlite database should open");
@@ -1764,7 +1770,8 @@
 	fn commit_atomic_write_marks_vfs_dead_after_transport_error() {
 		let runtime = direct_runtime();
 		let harness = DirectEngineHarness::new();
-		let engine = runtime.block_on(harness.open_engine());		let transport = SqliteTransport::from_direct(engine);
+		let engine = runtime.block_on(harness.open_engine());
+		let transport = SqliteTransport::from_direct(engine);
 		let hooks = transport
 			.direct_hooks()
 			.expect("direct transport should expose test hooks");
@@ -1774,6 +1781,7 @@
 			harness.actor_id.clone(),
 			runtime.handle().clone(),
 			VfsConfig::default(),
+			None,
 		)
 		.expect("v2 vfs should register");
 		let db = open_database(vfs, &harness.actor_id).expect("sqlite database should open");
@@ -1818,6 +1826,7 @@
 			harness.actor_id.clone(),
 			runtime.handle().clone(),
 			VfsConfig::default(),
+			None,
 		)
 		.expect("v2 vfs should register");
 		let db = open_database(vfs, &harness.actor_id).expect("sqlite database should open");
@@ -1861,6 +1870,7 @@
 			transport,
 			VfsConfig::default(),
 			unsafe { std::mem::zeroed() },
+			None,
 		)
 		.expect("vfs context should build");
 
@@ -1971,6 +1981,7 @@
 			harness.actor_id.clone(),
 			runtime.handle().clone(),
 			VfsConfig::default(),
+			None,
 		)
 		.expect("v2 vfs should register");
 		let db = open_database(vfs, &harness.actor_id).expect("sqlite database should open");
@@ -2306,6 +2317,7 @@
 			harness.actor_id.clone(),
 			runtime.handle().clone(),
 			VfsConfig::default(),
+			None,
 		)
 		.expect("v2 vfs should register");
 		let db = open_database(vfs, &harness.actor_id).expect("sqlite database should open");
@@ -2393,6 +2405,7 @@
 			harness.actor_id.clone(),
 			runtime.handle().clone(),
 			VfsConfig::default(),
+			None,
 		)
 		.expect("v2 vfs should register");
 		let db = open_database(vfs, &harness.actor_id).expect("sqlite database should open");
@@ -2560,6 +2573,7 @@
 			harness.actor_id.clone(),
 			runtime.handle().clone(),
 			VfsConfig::default(),
+			None,
 		)
 		.expect("vfs should register");
 		let db = open_database(vfs, &harness.actor_id).expect("db should open");

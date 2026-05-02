@@ -63,8 +63,8 @@ members = [
   "rivetkit-rust/packages/actor-persist",
   "rivetkit-rust/packages/rivetkit-core",
   "rivetkit-rust/packages/shared-types",
-  "rivetkit-rust/packages/rivetkit-sqlite",
-  "rivetkit-rust/packages/rivetkit-sqlite-types",
+  "engine/packages/depot-client",
+  "engine/packages/depot-client-types",
   "rivetkit-typescript/packages/rivetkit-napi",
   "rivetkit-typescript/packages/rivetkit-wasm"
 ]
@@ -558,11 +558,11 @@ members = [
     [workspace.dependencies.rivetkit-inspector-protocol]
     path = "rivetkit-rust/packages/inspector-protocol"
 
-    [workspace.dependencies.rivetkit-sqlite]
-    path = "rivetkit-rust/packages/rivetkit-sqlite"
+    [workspace.dependencies.depot-client]
+    path = "engine/packages/depot-client"
 
-    [workspace.dependencies.rivetkit-sqlite-types]
-    path = "rivetkit-rust/packages/rivetkit-sqlite-types"
+    [workspace.dependencies.depot-client-types]
+    path = "engine/packages/depot-client-types"
 
     [workspace.dependencies.rivetkit-core]
     path = "rivetkit-rust/packages/rivetkit-core"

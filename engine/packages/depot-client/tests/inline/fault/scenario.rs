@@ -893,6 +893,7 @@ fn open_fault_database(
 		actor_id.to_string(),
 		handle.clone(),
 		config,
+		None,
 	)
 	.map_err(anyhow::Error::msg)?;
 

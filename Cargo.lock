@@ -1840,6 +1840,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "depot-client"
+version = "2.3.0-rc.4"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "depot",
+ "depot-client-types",
+ "futures-util",
+ "gasoline",
+ "getrandom 0.2.16",
+ "libsqlite3-sys",
+ "moka",
+ "parking_lot",
+ "rivet-config",
+ "rivet-envoy-client",
+ "rivet-envoy-protocol",
+ "rivet-pools",
+ "rivet-test-deps",
+ "scc",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "universaldb",
+ "universalpubsub",
+]
+
+[[package]]
+name = "depot-client-types"
+version = "2.3.0-rc.4"
+
+[[package]]
 name = "der"
 version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4192,6 +4224,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "depot",
+ "depot-client",
  "futures-util",
  "gasoline",
  "http-body 1.0.1",
@@ -4212,7 +4245,6 @@ dependencies = [
  "rivet-pools",
  "rivet-runtime",
  "rivet-types",
- "rivetkit-sqlite",
  "rusqlite",
  "scc",
  "serde",
@@ -5969,6 +6001,8 @@ dependencies = [
  "anyhow",
  "base64 0.22.1",
  "ciborium",
+ "depot-client",
+ "depot-client-types",
  "futures",
  "getrandom 0.2.16",
  "http 1.3.1",
@@ -5986,8 +6020,6 @@ dependencies = [
  "rivetkit-client-protocol",
  "rivetkit-inspector-protocol",
  "rivetkit-shared-types",
- "rivetkit-sqlite",
- "rivetkit-sqlite-types",
  "scc",
  "serde",
  "serde_bare",
@@ -6024,6 +6056,7 @@ version = "2.3.0-rc.4"
 dependencies = [
  "anyhow",
  "async-trait",
+ "depot-client",
  "hex",
  "http 1.3.1",
  "napi",
@@ -6033,7 +6066,6 @@ dependencies = [
  "rivet-error",
  "rivetkit-actor-persist",
  "rivetkit-core",
- "rivetkit-sqlite",
  "scc",
  "serde",
  "serde_json",
@@ -6051,38 +6083,6 @@ dependencies = [
  "serde",
  "serde_json",
 ]
-
-[[package]]
-name = "rivetkit-sqlite"
-version = "2.3.0-rc.4"
-dependencies = [
- "anyhow",
- "async-trait",
- "depot",
- "futures-util",
- "gasoline",
- "getrandom 0.2.16",
- "libsqlite3-sys",
- "moka",
- "parking_lot",
- "rivet-config",
- "rivet-envoy-client",
- "rivet-envoy-protocol",
- "rivet-pools",
- "rivet-test-deps",
- "rivetkit-sqlite-types",
- "scc",
- "sha2",
- "tempfile",
- "tokio",
- "tracing",
- "universaldb",
- "universalpubsub",
-]
-
-[[package]]
-name = "rivetkit-sqlite-types"
-version = "2.3.0-rc.4"
 
 [[package]]
 name = "rivetkit-wasm"

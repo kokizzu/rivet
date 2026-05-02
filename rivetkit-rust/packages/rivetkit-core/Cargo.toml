@@ -17,7 +17,7 @@ native-runtime = [
 ]
 wasm-runtime = ["rivet-envoy-client/wasm-transport"]
 sqlite = ["sqlite-local"]
-sqlite-local = ["native-runtime", "dep:rivetkit-sqlite"]
+sqlite-local = ["native-runtime", "dep:depot-client"]
 sqlite-remote = []
 
 [dependencies]
@@ -38,8 +38,8 @@ rivetkit-shared-types.workspace = true
 rivetkit-actor-persist.workspace = true
 rivetkit-client-protocol.workspace = true
 rivetkit-inspector-protocol.workspace = true
-rivetkit-sqlite-types.workspace = true
-rivetkit-sqlite = { workspace = true, optional = true }
+depot-client-types.workspace = true
+depot-client = { workspace = true, optional = true }
 scc.workspace = true
 serde.workspace = true
 serde_json.workspace = true

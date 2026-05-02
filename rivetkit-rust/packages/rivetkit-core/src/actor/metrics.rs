@@ -762,7 +762,7 @@ impl ActorMetrics {
 }
 
 #[cfg(feature = "sqlite-local")]
-impl rivetkit_sqlite::vfs::SqliteVfsMetrics for ActorMetrics {
+impl depot_client::vfs::SqliteVfsMetrics for ActorMetrics {
 	fn record_resolve_pages(&self, requested_pages: u64) {
 		let Some(inner) = self.inner.as_ref().as_ref() else {
 			return;

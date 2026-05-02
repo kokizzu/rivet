@@ -38,7 +38,7 @@ mod moved_tests {
 	#[cfg(feature = "sqlite-local")]
 	#[test]
 	fn sqlite_read_pool_metrics_render() {
-		use rivetkit_sqlite::vfs::SqliteVfsMetrics;
+		use depot_client::vfs::SqliteVfsMetrics;
 
 		let metrics = ActorMetrics::new("actor-1", "test");
 		metrics.set_read_pool_active_readers(2);

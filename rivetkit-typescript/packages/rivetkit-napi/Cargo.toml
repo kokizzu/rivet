@@ -13,7 +13,7 @@ crate-type = ["cdylib"]
 napi = { version = "2", default-features = false, features = ["napi6", "async", "serde-json", "dyn-symbols"] }
 napi-derive = "2"
 async-trait.workspace = true
-rivetkit-sqlite.workspace = true
+depot-client.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 anyhow.workspace = true

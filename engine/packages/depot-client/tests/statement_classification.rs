@@ -2,7 +2,7 @@ use std::ffi::CString;
 use std::ptr;
 
 use libsqlite3_sys::{SQLITE_OK, sqlite3, sqlite3_close, sqlite3_open};
-use rivetkit_sqlite::query::{
+use depot_client::query::{
 	ExecuteRoute, StatementAuthorizerActionKind, classify_statement, exec_statements,
 	execute_single_statement, install_reader_authorizer,
 };

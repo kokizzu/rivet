@@ -20,7 +20,7 @@ use libsqlite3_sys::{
 	sqlite3_column_type, sqlite3_errmsg, sqlite3_finalize, sqlite3_last_insert_rowid,
 	sqlite3_prepare_v2, sqlite3_set_authorizer, sqlite3_step, sqlite3_stmt_readonly,
 };
-pub use rivetkit_sqlite_types::{
+pub use depot_client_types::{
 	BindParam, ColumnValue, ExecResult, ExecuteResult, ExecuteRoute, QueryResult,
 };
 

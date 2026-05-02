@@ -90,7 +90,7 @@ use std::{
 };
 
 use anyhow::Result;
-use rivetkit_sqlite::types::{BindParam, ColumnValue};
+use depot_client::types::{BindParam, ColumnValue};
 use sqlite_storage::{engine::SqliteEngine, error::SqliteStorageError, open::OpenConfig};
 use tokio::{
 	sync::{Notify, Semaphore},

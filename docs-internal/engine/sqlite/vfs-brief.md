@@ -28,4 +28,4 @@ The VFS does not write local SQLite database files. Local files would break the 
 
 - [SQLite VFS](../sqlite-vfs.md)
 - [Depot crash course](../depot.md)
-- VFS source: `rivetkit-rust/packages/rivetkit-sqlite/src/`
+- VFS source: `engine/packages/depot-client/src/`

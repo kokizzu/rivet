@@ -12,7 +12,7 @@ use rivet_envoy_client::protocol;
 use rivet_envoy_client::{
 	handle::EnvoyHandle, utils::RemoteSqliteIndeterminateResultError,
 };
-pub use rivetkit_sqlite_types::{
+pub use depot_client_types::{
 	BindParam, ColumnValue, ExecResult, ExecuteResult, ExecuteRoute, QueryResult,
 };
 use serde::Serialize;
@@ -29,7 +29,7 @@ use tracing::Instrument;
 use crate::error::SqliteRuntimeError;
 
 #[cfg(feature = "sqlite-local")]
-use rivetkit_sqlite::{
+use depot_client::{
 	database::{NativeDatabaseHandle, open_database_from_envoy},
 	optimization_flags::sqlite_optimization_flags,
 	vfs::{SqliteVfsMetrics, SqliteVfsMetricsSnapshot, VfsPreloadHintSnapshot},

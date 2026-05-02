@@ -1,11 +1,11 @@
 [package]
-name = "rivetkit-sqlite-types"
+name = "depot-client-types"
 version.workspace = true
 authors.workspace = true
 license.workspace = true
 edition.workspace = true
 workspace = "../../../"
-description = "Shared SQLite execution types for RivetKit"
+description = "Shared SQLite execution types for depot client"
 
 [lib]
 crate-type = ["lib"]

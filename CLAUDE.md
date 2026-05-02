@@ -113,12 +113,17 @@ docker-compose up -d
 
 ### SQLite Package
 
-- RivetKit SQLite is native-only: VFS and query execution live in `rivetkit-rust/packages/rivetkit-sqlite/`, core owns lifecycle, and NAPI only marshals JS types.
+- Depot client owns native SQLite VFS and query execution in `engine/packages/depot-client/`; core owns lifecycle, and NAPI only marshals JS types.
+- SQLite VFS direct tests should record workflow compaction wakes through `CompactionSignaler`, not call legacy `compact_default_batch`.
+- SQLite VFS correctness tests should use `DirectStorage`; do not reintroduce mock or envoy transport variants for those tests.
+- SQLite VFS `xSync` durability depends on depot's `sqlite_commit` reply waiting for the FDB transaction commit.
+- SQLite VFS process-global registrations must be owned by a Drop guard so panics unwind through `sqlite3_vfs_unregister`.
+- `NativeDatabase::Drop` must bound dirty-page flushes with a short timeout and return after logging if the commit future never resolves.
 - Actor2 workflows and envoy actors always use the SQLite v2 storage format; only old actor v1 workflows and pegboard runners use the v1 storage format. ("v2" here refers to the on-disk storage format, not envoy-protocol v2.)
 - Native SQLite VFS recent-page preload hints are actor-side Rust state surfaced by `NativeDatabase::snapshot_preload_hints()`; persist and consume them through runtime/envoy wiring, not JS APIs.
 - SQLite VFS file handles must enforce their reader or writer role; reader-owned handles fail closed on mutating callbacks.
 - Native SQLite single-statement work should route through the native execute path; keep `exec` as the multi-statement compatibility path.
-- Pegboard-envoy remote SQL execution should use `rivetkit-sqlite::database::open_database_from_engine` instead of direct `rusqlite` calls so native routing policy stays shared.
+- Native SQLite opens should use `depot_client::database::open_database_from_envoy` instead of direct `rusqlite` calls so native routing policy stays shared.
 - Pegboard-envoy remote SQL executor caches should use `Arc<OnceCell<NativeDatabaseHandle>>` values so first-use initialization stays lazy and single-flight per `(actor_id, sqlite_generation)`.
 - Sent remote SQL requests must fail with `sqlite.remote_indeterminate_result` on WebSocket disconnect; only unsent remote SQL may be sent after reconnect.
 - Native SQLite manual transactions keep an idle writer open until autocommit returns; route subsequent work through the writer instead of reader classification.

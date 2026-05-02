@@ -1,6 +1,6 @@
 //! Custom SQLite VFS backed by KV operations over the KV channel.
 //!
-//! This crate now owns the KV-backed SQLite behavior used by `rivetkit-napi`.
+//! This crate owns the KV-backed SQLite behavior used by `rivetkit-napi`.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::ffi::{CStr, CString, c_char, c_int, c_void};

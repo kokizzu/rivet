@@ -205,7 +205,7 @@ We explicitly do **not** import:
 - Lease-expiry and time-window tests use `tokio::time::pause()` + `advance()` for determinism.
 - Use a nil bucket `Db` to exercise branch-scoped hot compaction through public `compact_default_batch`.
 - Latency tests that depend on `UDB_SIMULATED_LATENCY_MS` must live in a dedicated integration test binary because UDB caches the env var once per process via `OnceLock`.
-- SQLite VFS integration and fault-injection tests live in `rivetkit-rust/packages/rivetkit-sqlite/` so they exercise the full VFS.
+- SQLite VFS integration and fault-injection tests live in `engine/packages/depot-client/` so they exercise the full VFS.
 - Depot fault-injection APIs live only behind `depot/test-faults`; enable the feature from dev/test dependencies only.
 - Production fault-leak checks run through `engine/packages/depot/scripts/check-production-fault-leaks.sh`.
 - Depot fault-controller tests live in `tests/fault_controller.rs` and run with `cargo test -p depot --features test-faults --test fault_controller`.

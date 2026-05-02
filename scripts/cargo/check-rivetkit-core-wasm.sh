@@ -5,7 +5,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 TARGET="wasm32-unknown-unknown"
 CORE_FEATURES="wasm-runtime,sqlite-remote"
 BANNED_CRATES=(
-	"rivetkit-sqlite"
+	"depot-client"
 	"libsqlite3-sys"
 	"tokio-tungstenite"
 	"mio"
