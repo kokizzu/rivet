@@ -76,8 +76,7 @@ impl CustomServeTrait for PegboardEnvoyWs {
 		// Parse URL to extract parameters
 		let url = url::Url::parse(&format!("ws://placeholder/{}", req_ctx.path()))
 			.context("failed to parse WebSocket URL")?;
-		let url_data = utils::UrlData::parse_url(url)
-			.map_err(|err| errors::WsError::InvalidUrl(err.to_string()).build())?;
+		let url_data = utils::UrlData::parse_url(url)?;
 
 		tracing::debug!(path=%req_ctx.path(), "tunnel ws connection established");
 
