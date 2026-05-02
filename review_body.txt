@@ -1,0 +1,44 @@
+## Code Review: fix(pegboard): use Iterator streaming mode in list_names so limit param is honored
+
+### Overview
+
+This PR fixes a bug where the `limit` parameter passed to `pegboard_actor_list_names` was not being honored, causing pagination to break and the default limit to be ignored. The root cause is a single-line change: `StreamingMode::Exact` to `StreamingMode::Iterator` in `list_names.rs`.
+
+Two previously-skipped tests are re-enabled and updated to use a new `setup_test_namespace_with_envoy_for_names` helper that pre-registers actor behaviors on the envoy before the test body runs.
+
+---
+
+### Bug Fix Assessment
+
+**Correct.** In FDB's streaming API, `StreamingMode::Exact` tells the client to batch-fetch exactly `limit` items in a single round trip -- it optimizes *fetching* but does not cap the number of items *returned* by the stream. `StreamingMode::Iterator` is the standard paging mode: results are returned incrementally and `limit` is honored as a hard cap. This matches every other user-bounded listing operation in the codebase (`list_for_ns`, `actor/keys.rs`, `envoy/list.rs`, etc.).
+
+---
+
+### Concerns
+
+**Same-class bug in `runner_config/list.rs`**
+
+`engine/packages/pegboard/src/ops/runner_config/list.rs:74` uses the identical pattern:
+
+```rust
+mode: StreamingMode::Exact,
+limit: Some(input.limit),
+```
+
+This path is not deprecated and backs the active runner config listing API. It likely has the same broken pagination behavior. `runner/list_names.rs:42` has the same issue but that is the deprecated runner path, so skipping it is more defensible. Worth fixing here or tracking as a follow-up.
+
+**`StreamingMode::Exact` with `limit: Some(1)` in `workflows/actor/runtime.rs:294`** is fine -- fetching exactly 1 item is the correct use of `Exact`.
+
+---
+
+### Test Changes
+
+The `setup_test_namespace_with_envoy_for_names` helper is a clean addition. Pre-registering actor behaviors ensures the envoy knows how to handle those actor names; without it, actor creation in the test body was apparently timing out (the removed ignore comment cited a full engine sweep timeout). The actor creation loop in the test body then populates the `ActorNameKey` index, and the list API reads from that index. The two-step setup is correct.
+
+The `_runner` binding in both re-enabled tests correctly keeps the `TestEnvoy` alive for the duration of the test.
+
+---
+
+### Summary
+
+The fix is correct and the tests validate the behavior. The one actionable follow-up is auditing `runner_config/list.rs` for the same `StreamingMode::Exact` + limit pagination bug.
