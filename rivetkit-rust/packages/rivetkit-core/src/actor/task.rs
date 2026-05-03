@@ -1229,6 +1229,12 @@ impl ActorTask {
 
 		self.transition_to(LifecycleState::Started);
 		self.spawn_run_handle(is_new).await?;
+		if is_new {
+			self.ctx
+				.persist_state(SaveStateOpts { immediate: true })
+				.await
+				.context("persist actor startup state")?;
+		}
 		self.reset_sleep_deadline().await;
 		self.ctx.drain_overdue_scheduled_events().await?;
 		tracing::debug!(
@@ -1480,6 +1486,8 @@ impl ActorTask {
 		let grace_period = self.factory.config().effective_sleep_grace_period();
 		self.sleep_deadline = None;
 		self.ctx.cancel_sleep_timer();
+		// Entering grace cancels the actor abort signal so user code blocked on
+		// queues or other actor scoped waits can unwind and let sleep finalize.
 		self.ctx.cancel_abort_signal_for_sleep();
 		self.sleep_grace = Some(SleepGraceState {
 			deadline: Instant::now() + grace_period,
@@ -1518,7 +1526,7 @@ impl ActorTask {
 		let Some(grace) = self.sleep_grace.as_ref() else {
 			return None;
 		};
-		if self.ctx.can_finalize_sleep() {
+		if self.ctx.can_finalize_shutdown(grace.reason) {
 			let reason = grace.reason;
 			self.sleep_grace = None;
 			return Some(LiveExit::Shutdown { reason });
@@ -1534,6 +1542,10 @@ impl ActorTask {
 			run_handle.abort();
 		}
 		self.ctx.cancel_shutdown_deadline();
+		// The deadline changes teardown from graceful draining to cancellation.
+		// Without this marker, final cleanup would wait on work that already
+		// exhausted its grace budget.
+		self.ctx.mark_shutdown_deadline_reached();
 		self.ctx.record_shutdown_timeout(grace.reason);
 		tracing::warn!(
 			actor_id = %self.ctx.actor_id(),
@@ -2141,6 +2153,12 @@ impl ActorTask {
 			"actor lifecycle transition"
 		);
 		self.lifecycle = lifecycle;
+		if matches!(lifecycle, LifecycleState::Started) {
+			// A restarted actor is a new generation. Clear shutdown state that was
+			// only meant to stop the previous generation.
+			self.ctx.reset_abort_signal_for_start();
+			self.ctx.clear_sleep_requested();
+		}
 		self.ctx
 			.set_started(matches!(lifecycle, LifecycleState::Started));
 	}
