@@ -368,8 +368,8 @@ pub async fn send_outbound(ctx: &ActivityCtx, input: &SendOutboundInput) -> Resu
 						.as_ref()
 						.and_then(|x| BASE64_STANDARD.decode(x).ok()),
 				},
-				// Empty because request ids are ephemeral. This is intercepted by guard and
-				// populated before it reaches the runner
+				// Request ids are ephemeral. Pegboard-envoy refreshes this on the
+				// WebSocket send path immediately before the actor start reaches envoy.
 				hibernating_requests: Vec::new(),
 				preloaded_kv: None,
 			});
