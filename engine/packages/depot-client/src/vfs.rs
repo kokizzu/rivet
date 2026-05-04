@@ -134,6 +134,7 @@ pub struct VfsConfig {
 	pub cache_capacity_pages: u64,
 	pub protected_cache_pages: usize,
 	pub page_cache_mode: SqliteVfsPageCacheMode,
+	pub staging_cache_ttl_ms: u64,
 	pub prefetch_depth: usize,
 	pub adaptive_prefetch_depth: usize,
 	pub max_prefetch_bytes: usize,
@@ -168,12 +169,13 @@ impl VfsConfig {
 			} else {
 				0
 			},
-			protected_cache_pages: if caches_pages {
-				flags.vfs_protected_cache_pages
+			protected_cache_pages: 0,
+			page_cache_mode: flags.vfs_page_cache_mode,
+			staging_cache_ttl_ms: if caches_pages {
+				flags.vfs_staging_cache_ttl_ms
 			} else {
 				0
 			},
-			page_cache_mode: flags.vfs_page_cache_mode,
 			prefetch_depth: if flags.read_ahead {
 				DEFAULT_PREFETCH_DEPTH
 			} else {
@@ -344,6 +346,7 @@ struct VfsState {
 	db_size_pages: u32,
 	page_size: usize,
 	page_cache: Cache<u32, Vec<u8>>,
+	committed_page_cache: Cache<u32, Vec<u8>>,
 	protected_page_cache: Arc<SccHashMap<u32, Vec<u8>>>,
 	write_buffer: WriteBuffer,
 	predictor: PrefetchPredictor,
@@ -790,13 +793,13 @@ fn push_coalesced_range(ranges: &mut VecDeque<VfsPreloadHintRange>, range: VfsPr
 
 impl VfsState {
 	fn new(config: &VfsConfig) -> Self {
-		let page_cache = Cache::builder()
-			.max_capacity(config.cache_capacity_pages)
-			.build();
+		let page_cache = build_page_cache(config);
+		let committed_page_cache = build_page_cache(config);
 		let mut state = Self {
 			db_size_pages: 1,
 			page_size: DEFAULT_PAGE_SIZE,
 			page_cache,
+			committed_page_cache,
 			protected_page_cache: Arc::new(SccHashMap::new()),
 			write_buffer: WriteBuffer::default(),
 			predictor: PrefetchPredictor::default(),
@@ -807,7 +810,7 @@ impl VfsState {
 			),
 			dead: false,
 		};
-		state.cache_page(config, PageCacheInsertKind::Target, 1, empty_db_page());
+		state.cache_page(config, PageCacheInsertKind::Startup, 1, empty_db_page());
 		state
 	}
 
@@ -836,9 +839,24 @@ impl VfsState {
 			return None;
 		}
 		self
-			.protected_page_cache
-			.read_sync(&pgno, |_, bytes| bytes.clone())
+			.committed_page_cache
+			.get(&pgno)
+			.or_else(|| self.protected_page_cache.read_sync(&pgno, |_, bytes| bytes.clone()))
 			.or_else(|| self.page_cache.get(&pgno))
+	}
+
+	fn cache_committed_page(&mut self, config: &VfsConfig, pgno: u32, bytes: Vec<u8>) {
+		if config.staging_cache_ttl_ms == 0 || !config.page_cache_mode.caches_any_pages() {
+			return;
+		}
+		self.committed_page_cache.insert(pgno, bytes);
+	}
+
+	fn evict_target_read_pages(&self, pgnos: &[u32]) {
+		for pgno in pgnos.iter().copied() {
+			self.page_cache.invalidate(&pgno);
+			self.protected_page_cache.remove_sync(&pgno);
+		}
 	}
 
 	fn seed_page(&mut self, config: &VfsConfig, kind: PageCacheInsertKind, pgno: u32, page: Vec<u8>) {
@@ -861,14 +879,24 @@ impl VfsState {
 
 	fn invalidate_page_cache(&mut self) {
 		self.page_cache.invalidate_all();
+		self.committed_page_cache.invalidate_all();
 		self.protected_page_cache.clear_sync();
 	}
+}
+
+fn build_page_cache(config: &VfsConfig) -> Cache<u32, Vec<u8>> {
+	let mut page_cache_builder = Cache::builder().max_capacity(config.cache_capacity_pages);
+	if config.staging_cache_ttl_ms > 0 {
+		page_cache_builder =
+			page_cache_builder.time_to_live(Duration::from_millis(config.staging_cache_ttl_ms));
+	}
+	page_cache_builder.build()
 }
 
 fn cache_page(
 	config: &VfsConfig,
 	page_cache: &Cache<u32, Vec<u8>>,
-	protected_page_cache: &SccHashMap<u32, Vec<u8>>,
+	_protected_page_cache: &SccHashMap<u32, Vec<u8>>,
 	kind: PageCacheInsertKind,
 	pgno: u32,
 	bytes: Vec<u8>,
@@ -876,21 +904,20 @@ fn cache_page(
 	if !should_cache_page(config, kind, pgno) {
 		return;
 	}
-	if pgno <= config.protected_cache_pages as u32 {
-		let _ = protected_page_cache.upsert_sync(pgno, bytes);
-	} else {
-		page_cache.insert(pgno, bytes);
-	}
+	page_cache.insert(pgno, bytes);
 }
 
 fn should_cache_page(config: &VfsConfig, kind: PageCacheInsertKind, pgno: u32) -> bool {
-	if pgno == 1 {
-		return true;
-	}
 	match kind {
-		PageCacheInsertKind::Target => config.page_cache_mode.caches_target_pages(),
-		PageCacheInsertKind::Prefetch => config.page_cache_mode.caches_prefetched_pages(),
-		PageCacheInsertKind::Startup => config.page_cache_mode.caches_startup_preloaded_pages(),
+		PageCacheInsertKind::Target => false,
+		PageCacheInsertKind::Prefetch => {
+			config.staging_cache_ttl_ms > 0 && config.page_cache_mode.caches_prefetched_pages()
+		}
+		PageCacheInsertKind::Startup => {
+			pgno == 1
+				|| (config.staging_cache_ttl_ms > 0
+					&& config.page_cache_mode.caches_startup_preloaded_pages())
+		}
 	}
 }
 
@@ -999,6 +1026,7 @@ impl VfsContext {
 			page_cache_entries: state
 				.page_cache
 				.entry_count()
+				.saturating_add(state.committed_page_cache.entry_count())
 				.saturating_add(state.protected_page_cache.len() as u64),
 			page_cache_capacity_pages: self.config.cache_capacity_pages,
 			write_buffer_dirty_pages: state.write_buffer.dirty.len() as u64,
@@ -1298,7 +1326,16 @@ impl VfsContext {
 							}
 						}
 					}
-					if let Some(bytes) = &fetched.bytes {
+					let bytes = if fetched.bytes.is_none()
+						&& self.commit_total.load(Relaxed) == 0
+						&& missing_pages.contains(&fetched.pgno)
+						&& fetched.pgno == 1
+					{
+						Some(empty_db_page())
+					} else {
+						fetched.bytes
+					};
+					if let Some(bytes) = &bytes {
 						let kind = if missing_pages.contains(&fetched.pgno) {
 							PageCacheInsertKind::Target
 						} else {
@@ -1313,7 +1350,7 @@ impl VfsContext {
 							bytes.clone(),
 						);
 					}
-					resolved.insert(fetched.pgno, fetched.bytes);
+					resolved.insert(fetched.pgno, bytes);
 				}
 				#[cfg(debug_assertions)]
 				{
@@ -1350,6 +1387,20 @@ impl VfsContext {
 				Ok(resolved)
 			}
 			protocol::SqliteGetPagesResponse::SqliteErrorResponse(error) => {
+				if self.commit_total.load(Relaxed) == 0
+					&& missing.contains(&1)
+					&& is_initial_main_page_missing(&error.message)
+				{
+					for pgno in missing {
+						let bytes = if pgno == 1 {
+							Some(empty_db_page())
+						} else {
+							None
+						};
+						resolved.entry(pgno).or_insert(bytes);
+					}
+					return Ok(resolved);
+				}
 				Err(GetPagesError::Other(error.message))
 			}
 		}
@@ -1450,12 +1501,7 @@ impl VfsContext {
 		let mut state = self.state.write();
 		state.db_size_pages = request.new_db_size_pages;
 		for dirty_page in &request.dirty_pages {
-			state.cache_page(
-				&self.config,
-				PageCacheInsertKind::Target,
-				dirty_page.pgno,
-				dirty_page.bytes.clone(),
-			);
+			state.cache_committed_page(&self.config, dirty_page.pgno, dirty_page.bytes.clone());
 		}
 		state.write_buffer.dirty.clear();
 		let state_update_ns = state_update_start.elapsed().as_nanos() as u64;
@@ -1563,12 +1609,7 @@ impl VfsContext {
 		let mut state = self.state.write();
 		state.db_size_pages = request.new_db_size_pages;
 		for dirty_page in &request.dirty_pages {
-			state.cache_page(
-				&self.config,
-				PageCacheInsertKind::Target,
-				dirty_page.pgno,
-				dirty_page.bytes.clone(),
-			);
+			state.cache_committed_page(&self.config, dirty_page.pgno, dirty_page.bytes.clone());
 		}
 		state.write_buffer.dirty.clear();
 		state.write_buffer.in_atomic_write = false;
@@ -2121,6 +2162,12 @@ unsafe extern "C" fn io_read(
 		let resolved = match ctx.resolve_pages(&requested_pages, true) {
 			Ok(pages) => pages,
 			Err(GetPagesError::Other(message)) => {
+				tracing::error!(
+					actor_id = %ctx.actor_id,
+					requested_pages = ?requested_pages,
+					error = %message,
+					"sqlite xRead failed to resolve pages"
+				);
 				ctx.mark_dead(message);
 				return SQLITE_IOERR_READ;
 			}
@@ -2151,7 +2198,7 @@ unsafe extern "C" fn io_read(
 		}
 
 		buf.fill(0);
-		for pgno in requested_pages {
+		for pgno in requested_pages.iter().copied() {
 			let Some(Some(bytes)) = resolved.get(&pgno) else {
 				continue;
 			};
@@ -2167,6 +2214,7 @@ unsafe extern "C" fn io_read(
 			buf[dest_offset..dest_offset + copy_len]
 				.copy_from_slice(&bytes[page_offset..page_offset + copy_len]);
 		}
+		ctx.state.read().evict_target_read_pages(&requested_pages);
 
 		if i_offset as usize + i_amt as usize > file_size {
 			return SQLITE_IOERR_SHORT_READ;

@@ -642,15 +642,16 @@ impl FaultScenarioCtx {
 
 	pub(crate) async fn seed_page_as_cold_ref_for_harness_test(&self, pgno: u32) -> Result<()> {
 		let dirty_pages = self.with_database_blocking(|db| {
-			let state = db._vfs.ctx().state.read();
+			let ctx = db._vfs.ctx();
+			let state = ctx.state.read();
 			(1..=state.db_size_pages)
 				.filter(|candidate_pgno| {
 					*candidate_pgno / depot::keys::SHARD_SIZE == pgno / depot::keys::SHARD_SIZE
 				})
 				.map(|candidate_pgno| {
-					let bytes = state.page_cache.get(&candidate_pgno).with_context(|| {
+					let bytes = state.cached_page(&ctx.config, candidate_pgno).with_context(|| {
 						format!(
-							"page {candidate_pgno} should be present in strict VFS cache before cold-ref seed"
+							"page {candidate_pgno} should be present in VFS cache before cold-ref seed"
 						)
 					})?;
 					Ok(DirtyPage {
