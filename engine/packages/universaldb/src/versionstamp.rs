@@ -62,13 +62,14 @@ pub fn substitute_versionstamp(
 	versionstamp: Versionstamp,
 ) -> Result<(), String> {
 	const VERSIONSTAMP_MARKER: u8 = 0x33;
-	const VERSIONSTAMP_SIZE: usize = 12;
+	const VERSIONSTAMP_SIZE: usize = 10;
 
 	if packed_data.len() < 4 {
 		return Err("Packed data too short to contain versionstamp offset".to_string());
 	}
 
-	let offset_bytes = packed_data.split_off(packed_data.len() - 4);
+	let data_len = packed_data.len() - 4;
+	let offset_bytes = &packed_data[data_len..];
 	let offset = u32::from_le_bytes([
 		offset_bytes[0],
 		offset_bytes[1],
@@ -76,11 +77,11 @@ pub fn substitute_versionstamp(
 		offset_bytes[3],
 	]) as usize;
 
-	if offset >= packed_data.len() {
+	if offset >= data_len {
 		return Err(format!(
 			"Invalid versionstamp offset: {} exceeds data length {}",
 			offset,
-			packed_data.len()
+			data_len
 		));
 	}
 
@@ -99,18 +100,19 @@ pub fn substitute_versionstamp(
 
 	let versionstamp_end = versionstamp_start + VERSIONSTAMP_SIZE;
 
-	if versionstamp_end > packed_data.len() {
+	if versionstamp_end > data_len {
 		return Err("Versionstamp extends beyond data bounds".to_string());
 	}
 
 	let existing_bytes = &packed_data[versionstamp_start..versionstamp_end];
 	if existing_bytes[0..10] != [0xff; 10] {
-		// Versionstamp is already complete, nothing to do
+		packed_data.truncate(data_len);
 		return Ok(());
 	}
 
 	let versionstamp_bytes = versionstamp.as_bytes();
-	packed_data[versionstamp_start..versionstamp_end].copy_from_slice(versionstamp_bytes);
+	packed_data[versionstamp_start..versionstamp_end].copy_from_slice(&versionstamp_bytes[..10]);
+	packed_data.truncate(data_len);
 
 	Ok(())
 }
@@ -123,7 +125,8 @@ pub fn substitute_raw_versionstamp(
 		return Err("Packed data too short to contain versionstamp offset".to_string());
 	}
 
-	let offset_bytes = data.split_off(data.len() - 4);
+	let data_len = data.len() - 4;
+	let offset_bytes = &data[data_len..];
 	let offset = u32::from_le_bytes([
 		offset_bytes[0],
 		offset_bytes[1],
@@ -135,15 +138,16 @@ pub fn substitute_raw_versionstamp(
 		.checked_add(versionstamp_len)
 		.ok_or_else(|| "Versionstamp offset overflowed".to_string())?;
 
-	if versionstamp_end > data.len() {
+	if versionstamp_end > data_len {
 		return Err(format!(
 			"Invalid versionstamp offset: {} exceeds data length {}",
 			offset,
-			data.len()
+			data_len
 		));
 	}
 
 	data[offset..versionstamp_end].copy_from_slice(&versionstamp.as_bytes()[..versionstamp_len]);
+	data.truncate(data_len);
 
 	Ok(data)
 }
