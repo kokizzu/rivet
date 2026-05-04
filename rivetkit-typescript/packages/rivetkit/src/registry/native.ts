@@ -269,6 +269,9 @@ type NativeDatabaseClientState = {
 type NativeActorRuntimeState = {
 	sql?: ReturnType<typeof wrapJsNativeDatabase>;
 	databaseClient?: NativeDatabaseClientState;
+	keepAwakeCount?: number;
+	deferSleepCleanupUntilKeepAwakeIdle?: boolean;
+	deferredSleepCleanupActorCtx?: ActorContextHandleAdapter;
 	varsInitialized?: boolean;
 	vars?: unknown;
 	destroyGate?: NativeDestroyGate;
@@ -410,8 +413,35 @@ function resolveNativeDestroy(runtime: CoreRuntime, ctx: ActorContextHandle) {
 	gate.destroyCompletion = undefined;
 }
 
-function clearNativeRuntimeState(runtime: CoreRuntime, ctx: ActorContextHandle) {
+function clearNativeRuntimeState(
+	runtime: CoreRuntime,
+	ctx: ActorContextHandle,
+) {
 	callNativeSync(() => runtime.actorClearRuntimeState(ctx));
+}
+
+async function cleanupNativeSleepRuntimeState(
+	runtime: CoreRuntime,
+	ctx: ActorContextHandle,
+): Promise<void> {
+	await closeNativeDatabaseClient(runtime, ctx);
+	await closeNativeSqlDatabase(runtime, ctx);
+	clearNativeRuntimeState(runtime, ctx);
+}
+
+async function cleanupDeferredNativeSleepRuntimeState(
+	runtime: CoreRuntime,
+	ctx: ActorContextHandle,
+	runtimeState: NativeActorRuntimeState,
+): Promise<void> {
+	runtimeState.deferSleepCleanupUntilKeepAwakeIdle = false;
+	const actorCtx = runtimeState.deferredSleepCleanupActorCtx;
+	runtimeState.deferredSleepCleanupActorCtx = undefined;
+	try {
+		await cleanupNativeSleepRuntimeState(runtime, ctx);
+	} finally {
+		await actorCtx?.dispose();
+	}
 }
 
 function closeNativeSqlDatabase(
@@ -2777,35 +2807,52 @@ export class ActorContextHandleAdapter {
 	}
 
 	keepAwake<T>(promise: Promise<T>): Promise<T> {
-		// Forward to core `keep_awake`, which holds the keep_awake counter
-		// for the duration of the promise (blocks both idle sleep and grace
-		// finalize). The promise value is returned unchanged; core only
-		// observes the settle signal.
-		//
-		// Counter-arm race (acceptable): the NAPI `keep_awake` call is async,
-		// so the Rust `keep_awake_guard()` increment happens on first poll of
-		// the Rust future, not synchronously when JS calls this method. There
-		// is a sub-millisecond window where idle-sleep evaluation could
-		// observe `keep_awake_count == 0`. In practice the idle timer runs on
-		// `sleep_timeout` (default 30s), so the next poll always observes the
-		// counter before the timer fires. Same race exists for `waitUntil`.
-		// We accept this trade-off in exchange for keeping the JS API
-		// fire-and-forget; core stays the single source of truth for sleep
-		// gating logic. Logging the rejection avoids unhandled-promise warnings
-		// without blocking the caller.
-		callNative(() =>
-			this.#runtime.actorKeepAwake(
-				this.#ctx,
-				Promise.resolve(promise).then(() => null),
-			),
-		).catch((error) => {
-			if (!isClosedTaskRegistrationError(error)) {
+		const runtimeState = getNativeRuntimeState(this.#runtime, this.#ctx);
+		// Increment before native registration so sleep cleanup observes JS work
+		// even if the promise settles immediately.
+		runtimeState.keepAwakeCount = (runtimeState.keepAwakeCount ?? 0) + 1;
+		let registered = false;
+		const trackedPromise = Promise.resolve(promise)
+			.catch((error) => {
 				logger().warn({
-					msg: "keepAwake bridge to native runtime failed",
+					msg: "keepAwake promise rejected",
 					error: stringifyError(error),
 				});
+			})
+			.finally(async () => {
+				if (!registered) {
+					return;
+				}
+				runtimeState.keepAwakeCount = Math.max(
+					(runtimeState.keepAwakeCount ?? 1) - 1,
+					0,
+				);
+				if (
+					runtimeState.keepAwakeCount === 0 &&
+					runtimeState.deferSleepCleanupUntilKeepAwakeIdle
+				) {
+					await cleanupDeferredNativeSleepRuntimeState(
+						this.#runtime,
+						this.#ctx,
+						runtimeState,
+					);
+				}
+			})
+			.then(() => null);
+		try {
+			callNativeSync(() =>
+				this.#runtime.actorKeepAwake(this.#ctx, trackedPromise),
+			);
+			registered = true;
+		} catch (error) {
+			runtimeState.keepAwakeCount = Math.max(
+				(runtimeState.keepAwakeCount ?? 1) - 1,
+				0,
+			);
+			if (!isClosedTaskRegistrationError(error)) {
+				throw error;
 			}
-		});
+		}
 		return promise;
 	}
 
@@ -3966,9 +4013,14 @@ export function buildNativeFactory(
 						}
 					}
 				} finally {
-					await actorCtx.closeDatabase();
-					clearNativeRuntimeState(runtime, ctx);
-					await actorCtx.dispose();
+					const runtimeState = getNativeRuntimeState(runtime, ctx);
+					if ((runtimeState.keepAwakeCount ?? 0) > 0) {
+						runtimeState.deferSleepCleanupUntilKeepAwakeIdle = true;
+						runtimeState.deferredSleepCleanupActorCtx = actorCtx;
+					} else {
+						await cleanupNativeSleepRuntimeState(runtime, ctx);
+						await actorCtx.dispose();
+					}
 				}
 			},
 		),

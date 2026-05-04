@@ -619,6 +619,12 @@ impl ActorContext {
 		future.await
 	}
 
+	pub fn keep_awake_region(&self) -> KeepAwakeRegion {
+		KeepAwakeRegion {
+			guard: Some(self.keep_awake_guard()),
+		}
+	}
+
 	pub async fn internal_keep_awake<F>(&self, future: F) -> F::Output
 	where
 		F: Future,
@@ -1327,7 +1333,7 @@ impl ActorContext {
 
 	fn keep_awake_guard(&self) -> KeepAwakeGuard {
 		let region = self
-			.keep_awake_region()
+			.keep_awake_region_state()
 			.with_log_fields("keep_awake", Some(self.actor_id().to_owned()));
 		let guard = KeepAwakeGuard::new(self.clone(), region);
 		self.reset_sleep_timer();
@@ -1639,6 +1645,10 @@ pub struct WebSocketCallbackRegion {
 	guard: Option<WebSocketCallbackGuard>,
 }
 
+pub struct KeepAwakeRegion {
+	guard: Option<KeepAwakeGuard>,
+}
+
 impl WebSocketCallbackGuard {
 	fn new(ctx: ActorContext, kind: UserTaskKind, region: RegionGuard) -> Self {
 		Self {
@@ -1661,6 +1671,13 @@ impl Drop for WebSocketCallbackGuard {
 
 impl Drop for WebSocketCallbackRegion {
 	fn drop(&mut self) {
+		self.guard.take();
+	}
+}
+
+impl Drop for KeepAwakeRegion {
+	fn drop(&mut self) {
+		// Take the guard explicitly to mirror WebSocketCallbackRegion.
 		self.guard.take();
 	}
 }
