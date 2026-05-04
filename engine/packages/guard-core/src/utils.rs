@@ -226,7 +226,9 @@ pub(crate) fn should_retry_request(res: &Result<Response<ResponseBody>>) -> bool
 	}
 }
 
-// Determine if a response should trigger a retry: 503 + x-rivet-error
+// Determine if a response should trigger a retry. Guard-specific actor startup
+// failures, including guard.actor_ready_timeout, are signaled as 503 with
+// x-rivet-error and should be retried against a freshly resolved target.
 pub(crate) fn should_retry_request_inner(status: StatusCode, headers: &hyper::HeaderMap) -> bool {
 	status == StatusCode::SERVICE_UNAVAILABLE && headers.contains_key(X_RIVET_ERROR)
 }
@@ -294,3 +296,7 @@ pub(crate) fn to_hyper_close(frame: Option<CloseFrame>) -> hyper_tungstenite::tu
 		))
 	}
 }
+
+#[cfg(test)]
+#[path = "utils/tests.rs"]
+mod tests;
