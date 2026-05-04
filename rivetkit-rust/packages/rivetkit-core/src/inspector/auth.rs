@@ -11,6 +11,7 @@ use subtle::ConstantTimeEq;
 
 use crate::ActorContext;
 use crate::actor::keys::INSPECTOR_TOKEN_KEY;
+use crate::actor::preload::PreloadedKv;
 
 /// Test-only override. Not a public/production auth mechanism; production
 /// inspector auth goes through the per-actor KV token.
@@ -75,15 +76,26 @@ impl InspectorAuth {
 /// precedence over any KV-stored token and we do not want to pin a per-actor
 /// token that will never be consulted.
 pub async fn init_inspector_token(ctx: &ActorContext) -> Result<()> {
+	init_inspector_token_with_preload(ctx, None).await
+}
+
+pub(crate) async fn init_inspector_token_with_preload(
+	ctx: &ActorContext,
+	preloaded_kv: Option<&PreloadedKv>,
+) -> Result<()> {
 	if configured_test_token().is_some() {
 		return Ok(());
 	}
 
-	let existing = ctx
-		.kv()
-		.get(&INSPECTOR_TOKEN_KEY)
-		.await
-		.context("load inspector token")?;
+	let existing =
+		match preloaded_kv.and_then(|preloaded| preloaded.key_entry(&INSPECTOR_TOKEN_KEY)) {
+			Some(existing) => existing,
+			None => ctx
+				.kv()
+				.get(&INSPECTOR_TOKEN_KEY)
+				.await
+				.context("load inspector token")?,
+		};
 	if existing.is_some() {
 		return Ok(());
 	}

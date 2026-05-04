@@ -1211,9 +1211,12 @@ impl ActorTask {
 			.await
 			.context("persist actor initialization")?;
 		let init_inspector_token_started_at = Instant::now();
-		crate::inspector::init_inspector_token(&self.ctx)
-			.await
-			.context("initialize inspector token")?;
+		crate::inspector::auth::init_inspector_token_with_preload(
+			&self.ctx,
+			self.preloaded_kv.as_ref(),
+		)
+		.await
+		.context("initialize inspector token")?;
 		tracing::debug!(
 			actor_id = %actor_id,
 			duration_ms = duration_ms_f64(init_inspector_token_started_at.elapsed()),
@@ -1250,9 +1253,10 @@ impl ActorTask {
 	async fn load_persisted_startup(&mut self) -> Result<PersistedStartup> {
 		match std::mem::take(&mut self.preload_persisted_actor) {
 			PreloadedPersistedActor::Some(preloaded) => {
+				let last_pushed_alarm = self.load_startup_last_pushed_alarm().await?;
 				return Ok(PersistedStartup {
 					actor: preloaded,
-					last_pushed_alarm: Self::load_last_pushed_alarm(self.ctx.kv().clone()).await?,
+					last_pushed_alarm,
 				});
 			}
 			PreloadedPersistedActor::BundleExistsButEmpty => {
@@ -1265,6 +1269,16 @@ impl ActorTask {
 				});
 			}
 			PreloadedPersistedActor::NoBundle => {}
+		}
+
+		if self.preloaded_kv.is_some() {
+			let actor =
+				self.decode_persisted_actor_startup(self.load_startup_key(PERSIST_DATA_KEY).await?)?;
+			let last_pushed_alarm = self.load_startup_last_pushed_alarm().await?;
+			return Ok(PersistedStartup {
+				actor,
+				last_pushed_alarm,
+			});
 		}
 
 		let mut values = self
@@ -1297,14 +1311,41 @@ impl ActorTask {
 		})
 	}
 
-	async fn load_last_pushed_alarm(kv: crate::kv::Kv) -> Result<Option<i64>> {
-		kv.get(LAST_PUSHED_ALARM_KEY)
+	async fn load_startup_key(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+		if let Some(entry) = self
+			.preloaded_kv
+			.as_ref()
+			.and_then(|preloaded| preloaded.key_entry(key))
+		{
+			return Ok(entry);
+		}
+
+		self.ctx
+			.kv()
+			.get(key)
 			.await
-			.context("load persisted last pushed alarm")?
+			.context("load persisted actor startup key")
+	}
+
+	async fn load_startup_last_pushed_alarm(&self) -> Result<Option<i64>> {
+		self.load_startup_key(LAST_PUSHED_ALARM_KEY)
+			.await?
 			.map(|bytes| decode_last_pushed_alarm(&bytes))
 			.transpose()
 			.context("decode persisted last pushed alarm")
 			.map(Option::flatten)
+	}
+
+	fn decode_persisted_actor_startup(&self, encoded: Option<Vec<u8>>) -> Result<PersistedActor> {
+		match encoded {
+			Some(bytes) => {
+				decode_persisted_actor(&bytes).context("decode persisted actor startup data")
+			}
+			None => Ok(PersistedActor {
+				input: self.start_input.clone(),
+				..PersistedActor::default()
+			}),
+		}
 	}
 
 	fn ensure_actor_event_channel(&mut self) {

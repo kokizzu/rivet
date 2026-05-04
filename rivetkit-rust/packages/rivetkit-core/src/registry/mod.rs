@@ -550,6 +550,7 @@ impl RegistryDispatcher {
 							[1],
 							[3],
 							[5, 1, 1],
+							[6],
 						],
 						"prefixes": [
 							{

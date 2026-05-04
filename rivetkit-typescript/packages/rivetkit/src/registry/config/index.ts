@@ -423,6 +423,7 @@ export function buildActorNames(
 					Array.from(KEYS.PERSIST_DATA),
 					Array.from(KEYS.INSPECTOR_TOKEN),
 					Array.from(queueMetadataKey()),
+					Array.from(KEYS.LAST_PUSHED_ALARM),
 				],
 				prefixes: [
 					{

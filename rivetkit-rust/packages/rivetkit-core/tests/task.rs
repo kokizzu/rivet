@@ -31,9 +31,12 @@ mod moved_tests {
 		ConnHandle, HibernatableConnectionMetadata, decode_persisted_connection,
 	};
 	use crate::actor::context::tests::new_with_kv;
-	use crate::actor::keys::{LAST_PUSHED_ALARM_KEY, PERSIST_DATA_KEY, make_connection_key};
+	use crate::actor::keys::{
+		CONN_PREFIX, INSPECTOR_TOKEN_KEY, LAST_PUSHED_ALARM_KEY, PERSIST_DATA_KEY,
+		QUEUE_MESSAGES_PREFIX, WORKFLOW_STORAGE_PREFIX, make_connection_key,
+	};
 	use crate::actor::messages::{ActorEvent, SerializeStateReason, StateDelta};
-	use crate::actor::preload::PreloadedPersistedActor;
+	use crate::actor::preload::{PreloadedKv, PreloadedPersistedActor};
 	use crate::actor::sleep::CanSleep;
 	use crate::actor::state::{
 		PersistedActor, PersistedScheduleEvent, RequestSaveOpts, decode_last_pushed_alarm,
@@ -47,6 +50,7 @@ mod moved_tests {
 	use crate::inspector::auth::test_inspector_env_lock;
 	use crate::kv::tests::new_in_memory;
 	use crate::{ActorConfig, ActorContext, ActorFactory};
+	use rivet_envoy_client::utils::EnvoyShutdownError;
 
 	fn test_hook_lock() -> &'static AsyncMutex<()> {
 		static LOCK: OnceLock<AsyncMutex<()>> = OnceLock::new();
@@ -2106,6 +2110,259 @@ mod moved_tests {
 		// already told us the persisted bundle exists and is empty.
 		assert_eq!(kv.test_batch_get_call_count(), 1);
 		assert!(ctx.persisted_actor().has_initialized);
+	}
+
+	#[tokio::test]
+	async fn startup_uses_preloaded_last_pushed_alarm_without_live_kv() {
+		let _env_guard = test_inspector_env_lock().lock().expect("env lock poisoned");
+		unsafe {
+			std::env::remove_var("_RIVET_TEST_INSPECTOR_TOKEN");
+		}
+
+		let future_ts = 4_102_445_000_000;
+		let persisted = PersistedActor {
+			has_initialized: true,
+			scheduled_events: vec![PersistedScheduleEvent {
+				event_id: "evt-preloaded-alarm".to_owned(),
+				timestamp: future_ts,
+				action: "tick".to_owned(),
+				args: None,
+			}],
+			..PersistedActor::default()
+		};
+		let encoded_alarm =
+			encode_last_pushed_alarm(Some(future_ts)).expect("last pushed alarm should encode");
+		let preloaded_kv = PreloadedKv::new_with_requested_get_keys(
+			vec![
+				(LAST_PUSHED_ALARM_KEY.to_vec(), encoded_alarm),
+				(
+					INSPECTOR_TOKEN_KEY.to_vec(),
+					b"startup-preload-token".to_vec(),
+				),
+			],
+			vec![
+				PERSIST_DATA_KEY.to_vec(),
+				LAST_PUSHED_ALARM_KEY.to_vec(),
+				INSPECTOR_TOKEN_KEY.to_vec(),
+				vec![5, 1, 1],
+			],
+			vec![
+				WORKFLOW_STORAGE_PREFIX.to_vec(),
+				CONN_PREFIX.to_vec(),
+				QUEUE_MESSAGES_PREFIX.to_vec(),
+			],
+		);
+
+		let (handle, mut rx) = test_envoy_handle();
+		tokio::spawn(async move {
+			while let Some(message) = rx.recv().await {
+				if let ToEnvoyMessage::KvRequest { response_tx, .. } = message {
+					let _ = response_tx.send(Err(anyhow::anyhow!(EnvoyShutdownError)));
+				}
+			}
+		});
+
+		let ctx = new_with_kv(
+			"actor-preloaded-alarm",
+			"task-preloaded-alarm",
+			Vec::new(),
+			"local",
+			crate::kv::Kv::new(handle.clone(), "actor-preloaded-alarm"),
+		);
+		ctx.configure_envoy(handle, Some(31));
+		let mut task = new_task(ctx.clone())
+			.with_preloaded_persisted_actor(PreloadedPersistedActor::Some(persisted))
+			.with_preloaded_kv(Some(preloaded_kv));
+		let (start_tx, start_rx) = oneshot::channel();
+
+		task.handle_lifecycle(LifecycleCommand::Start { reply: start_tx })
+			.await;
+		start_rx
+			.await
+			.expect("start reply should send")
+			.expect("start should use preloaded alarm without live kv");
+
+		assert_eq!(ctx.last_pushed_alarm(), Some(future_ts));
+	}
+
+	#[tokio::test]
+	async fn startup_decodes_persisted_actor_from_preloaded_kv_without_live_kv() {
+		let _env_guard = test_inspector_env_lock().lock().expect("env lock poisoned");
+		unsafe {
+			std::env::remove_var("_RIVET_TEST_INSPECTOR_TOKEN");
+		}
+
+		let future_ts = 4_102_445_061_000;
+		let persisted = PersistedActor {
+			has_initialized: true,
+			state: b"preloaded-state".to_vec(),
+			scheduled_events: vec![PersistedScheduleEvent {
+				event_id: "evt-preloaded-persisted".to_owned(),
+				timestamp: future_ts,
+				action: "tick".to_owned(),
+				args: None,
+			}],
+			..PersistedActor::default()
+		};
+		let encoded_persisted =
+			encode_persisted_actor(&persisted).expect("persisted actor should encode");
+		let encoded_alarm =
+			encode_last_pushed_alarm(Some(future_ts)).expect("last pushed alarm should encode");
+		let preloaded_kv = PreloadedKv::new_with_requested_get_keys(
+			vec![
+				(PERSIST_DATA_KEY.to_vec(), encoded_persisted),
+				(LAST_PUSHED_ALARM_KEY.to_vec(), encoded_alarm),
+				(
+					INSPECTOR_TOKEN_KEY.to_vec(),
+					b"startup-persisted-preload-token".to_vec(),
+				),
+			],
+			vec![
+				PERSIST_DATA_KEY.to_vec(),
+				LAST_PUSHED_ALARM_KEY.to_vec(),
+				INSPECTOR_TOKEN_KEY.to_vec(),
+				vec![5, 1, 1],
+			],
+			vec![
+				WORKFLOW_STORAGE_PREFIX.to_vec(),
+				CONN_PREFIX.to_vec(),
+				QUEUE_MESSAGES_PREFIX.to_vec(),
+			],
+		);
+
+		let (handle, mut rx) = test_envoy_handle();
+		tokio::spawn(async move {
+			while let Some(message) = rx.recv().await {
+				if let ToEnvoyMessage::KvRequest { response_tx, .. } = message {
+					let _ = response_tx.send(Err(anyhow::anyhow!(EnvoyShutdownError)));
+				}
+			}
+		});
+
+		let ctx = new_with_kv(
+			"actor-preloaded-persisted",
+			"task-preloaded-persisted",
+			Vec::new(),
+			"local",
+			crate::kv::Kv::new(handle.clone(), "actor-preloaded-persisted"),
+		);
+		ctx.configure_envoy(handle, Some(33));
+		let mut task = new_task(ctx.clone()).with_preloaded_kv(Some(preloaded_kv));
+		let (start_tx, start_rx) = oneshot::channel();
+
+		task.handle_lifecycle(LifecycleCommand::Start { reply: start_tx })
+			.await;
+		start_rx
+			.await
+			.expect("start reply should send")
+			.expect("start should decode persisted actor from preloaded kv");
+
+		assert_eq!(ctx.persisted_actor().state, b"preloaded-state");
+		assert_eq!(ctx.last_pushed_alarm(), Some(future_ts));
+	}
+
+	#[tokio::test]
+	async fn startup_uses_preloaded_alarm_with_partial_startup_preload() {
+		let _env_guard = test_inspector_env_lock().lock().expect("env lock poisoned");
+		unsafe {
+			std::env::remove_var("_RIVET_TEST_INSPECTOR_TOKEN");
+		}
+
+		let future_ts = 4_102_445_123_000;
+		let persisted = PersistedActor {
+			has_initialized: true,
+			scheduled_events: vec![PersistedScheduleEvent {
+				event_id: "evt-partial-preload-alarm".to_owned(),
+				timestamp: future_ts,
+				action: "tick".to_owned(),
+				args: None,
+			}],
+			..PersistedActor::default()
+		};
+		let encoded_persisted =
+			encode_persisted_actor(&persisted).expect("persisted actor should encode");
+		let encoded_alarm =
+			encode_last_pushed_alarm(Some(future_ts)).expect("last pushed alarm should encode");
+		let preloaded_kv = PreloadedKv::new_with_requested_get_keys(
+			vec![
+				(LAST_PUSHED_ALARM_KEY.to_vec(), encoded_alarm),
+				(
+					INSPECTOR_TOKEN_KEY.to_vec(),
+					b"startup-partial-preload-token".to_vec(),
+				),
+			],
+			vec![
+				LAST_PUSHED_ALARM_KEY.to_vec(),
+				INSPECTOR_TOKEN_KEY.to_vec(),
+				vec![5, 1, 1],
+			],
+			vec![
+				WORKFLOW_STORAGE_PREFIX.to_vec(),
+				CONN_PREFIX.to_vec(),
+				QUEUE_MESSAGES_PREFIX.to_vec(),
+			],
+		);
+
+		let saw_persist_live_get = Arc::new(AtomicBool::new(false));
+		let saw_persist_live_get_for_task = Arc::clone(&saw_persist_live_get);
+		let (handle, mut rx) = test_envoy_handle();
+		tokio::spawn(async move {
+			while let Some(message) = rx.recv().await {
+				if let ToEnvoyMessage::KvRequest {
+					data, response_tx, ..
+				} = message
+				{
+					match data {
+						protocol::KvRequestData::KvGetRequest(request) => {
+							assert_eq!(
+								request.keys,
+								vec![PERSIST_DATA_KEY.to_vec()],
+								"partial preload should only live-fetch missing persisted actor data"
+							);
+							saw_persist_live_get_for_task.store(true, Ordering::SeqCst);
+							let _ = response_tx.send(Ok(
+								protocol::KvResponseData::KvGetResponse(protocol::KvGetResponse {
+									keys: vec![PERSIST_DATA_KEY.to_vec()],
+									values: vec![encoded_persisted.clone()],
+									metadata: vec![protocol::KvMetadata {
+										version: Vec::new(),
+										update_ts: 0,
+									}],
+								}),
+							));
+						}
+						protocol::KvRequestData::KvPutRequest(_) => {
+							let _ = response_tx.send(Ok(protocol::KvResponseData::KvPutResponse));
+						}
+						other => {
+							let _ = response_tx
+								.send(Err(anyhow::anyhow!("unexpected KV request: {other:?}")));
+						}
+					}
+				}
+			}
+		});
+
+		let ctx = new_with_kv(
+			"actor-partial-preload-alarm",
+			"task-partial-preload-alarm",
+			Vec::new(),
+			"local",
+			crate::kv::Kv::new(handle.clone(), "actor-partial-preload-alarm"),
+		);
+		ctx.configure_envoy(handle, Some(32));
+		let mut task = new_task(ctx.clone()).with_preloaded_kv(Some(preloaded_kv));
+		let (start_tx, start_rx) = oneshot::channel();
+
+		task.handle_lifecycle(LifecycleCommand::Start { reply: start_tx })
+			.await;
+		start_rx
+			.await
+			.expect("start reply should send")
+			.expect("start should use preloaded alarm in partial preload bundle");
+
+		assert!(saw_persist_live_get.load(Ordering::SeqCst));
+		assert_eq!(ctx.last_pushed_alarm(), Some(future_ts));
 	}
 
 	#[tokio::test]

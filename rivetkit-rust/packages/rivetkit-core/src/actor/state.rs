@@ -550,7 +550,13 @@ impl ActorContext {
 	}
 
 	pub fn set_has_initialized(&self, has_initialized: bool) {
-		self.0.persisted.write().has_initialized = has_initialized;
+		{
+			let mut persisted = self.0.persisted.write();
+			if persisted.has_initialized == has_initialized {
+				return;
+			}
+			persisted.has_initialized = has_initialized;
+		}
 		self.0
 			.metrics
 			.inc_state_mutation(StateMutationReason::HasInitialized);
