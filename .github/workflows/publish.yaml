@@ -2,17 +2,16 @@
 # Publish
 # =============================================================================
 #
-# Single workflow for preview publish (PRs + main pushes) AND release cuts
-# (workflow_dispatch). The build, npm publish, R2 upload, and Docker manifest
-# steps run identically for all three triggers. Only the npm dist-tag,
+# Single workflow for preview publish AND release cuts. Both triggers are
+# manual (workflow_dispatch). The build, npm publish, R2 upload, and Docker
+# manifest steps run identically for both modes. Only the npm dist-tag,
 # release-specific retagging, git tag, and GitHub release differ.
 #
 # Triggers and mapping:
-#   pull_request      → trigger=pr      npm_tag=pr-N   build_mode=debug
-#   push: main        → trigger=main    npm_tag=main   build_mode=debug
-#   workflow_dispatch → trigger=release npm_tag=latest build_mode=release
-#                       (npm_tag becomes `rc` if version contains `-rc.`, or
-#                        `next` if `latest=false`)
+#   workflow_dispatch (no version)   → trigger=branch  npm_tag=<sanitized branch>  build_mode=debug
+#   workflow_dispatch (with version) → trigger=release npm_tag=latest              build_mode=release
+#                                       (npm_tag becomes `rc` if version contains `-rc.`, or
+#                                        `next` if `latest=false`)
 #
 # See .agent/specs/publish-flow-unification.md for the design.
 # ============================================================================
@@ -20,18 +19,14 @@
 name: publish
 
 on:
-  pull_request:
-  push:
-    branches:
-      - main
   workflow_dispatch:
     inputs:
       version:
-        description: "Version to release (e.g. 2.5.0 or 2.5.0-rc.1)"
-        required: true
+        description: "Version to release (e.g. 2.5.0 or 2.5.0-rc.1). Leave empty for preview publish on the dispatched branch."
+        required: false
         type: string
       latest:
-        description: "Tag as @latest"
+        description: "Tag as @latest (release only)"
         required: true
         type: boolean
         default: true
@@ -53,8 +48,6 @@ jobs:
       npm_tag: ${{ steps.ctx.outputs.npm_tag }}
       sha: ${{ steps.ctx.outputs.sha }}
       latest: ${{ steps.ctx.outputs.latest }}
-      pr_number: ${{ steps.ctx.outputs.pr_number }}
-      is_fork: ${{ steps.fork.outputs.is_fork }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -69,14 +62,6 @@ jobs:
       - id: ctx
         name: Resolve publish context
         run: pnpm --filter=publish exec tsx src/ci/bin.ts context-output
-      - name: Compute is_fork flag
-        id: fork
-        run: |
-          if [ "${{ github.event_name }}" = "pull_request" ] && [ "${{ github.event.pull_request.head.repo.fork }}" = "true" ]; then
-            echo "is_fork=true" >> $GITHUB_OUTPUT
-          else
-            echo "is_fork=false" >> $GITHUB_OUTPUT
-          fi
 
   # ---------------------------------------------------------------------------
   # build — matrix of native/engine artifacts
@@ -84,7 +69,6 @@ jobs:
   build:
     needs: [context]
     name: "Build ${{ matrix.name }}"
-    if: needs.context.outputs.is_fork != 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -238,7 +222,6 @@ jobs:
   build-wasm:
     needs: [context]
     name: "Build rivetkit-wasm"
-    if: needs.context.outputs.is_fork != 'true'
     runs-on: depot-ubuntu-24.04-8
     permissions:
       contents: read
@@ -277,7 +260,6 @@ jobs:
   docker-images:
     needs: [context]
     name: "Docker ${{ matrix.arch_suffix }}"
-    if: needs.context.outputs.is_fork != 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -341,7 +323,6 @@ jobs:
     name: "Publish"
     if: |
       !cancelled() &&
-      needs.context.outputs.is_fork != 'true' &&
       needs.build.result == 'success' &&
       needs.build-wasm.result == 'success' &&
       needs.docker-images.result == 'success'
@@ -530,15 +511,3 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: pnpm --filter=publish exec tsx src/ci/bin.ts gh-release --version ${{ needs.context.outputs.version }}
-
-      # ---- preview-only tail ----
-      - name: Comment on PR
-        if: needs.context.outputs.trigger == 'pr'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
-        run: |
-          pnpm --filter=publish exec tsx src/ci/bin.ts comment-pr \
-            --pr-number ${{ needs.context.outputs.pr_number }} \
-            --version ${{ needs.context.outputs.version }} \
-            --tag ${{ needs.context.outputs.npm_tag }}
