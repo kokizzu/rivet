@@ -219,8 +219,18 @@ impl Db {
 			let bytes = loaded_objects
 				.get(object_key)
 				.expect("cold object should be loaded before decode");
-			let decoded = decode_ltx_v3(bytes)
-				.with_context(|| format!("decode sqlite cold layer {object_key}"))?;
+			let decoded = decode_ltx_v3(bytes).with_context(|| {
+				let len = bytes.len();
+				let head_n = len.min(64);
+				let tail_start = len.saturating_sub(64);
+				format!(
+					"decode sqlite cold layer {object_key}; \
+					 len={}; head={}; tail={}",
+					len,
+					crate::compaction::shared::hex_lower(&bytes[..head_n]),
+					crate::compaction::shared::hex_lower(&bytes[tail_start..]),
+				)
+			})?;
 			decoded_objects.insert(object_key.to_string(), decoded);
 		}
 

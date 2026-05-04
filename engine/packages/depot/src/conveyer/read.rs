@@ -430,8 +430,19 @@ impl Db {
 					.with_context(|| format!("missing source blob for page {pgno}"))?;
 
 				if !decoded_blobs.contains_key(source_key) {
-					let decoded = decode_ltx_v3(blob)
-						.with_context(|| format!("decode source blob for page {pgno}"))?;
+					let decoded = decode_ltx_v3(blob).with_context(|| {
+						let len = blob.len();
+						let head_n = len.min(64);
+						let tail_start = len.saturating_sub(64);
+						format!(
+							"decode source blob for page {pgno}; \
+							 source_key={}; len={}; head={}; tail={}",
+							crate::compaction::shared::hex_lower(source_key),
+							len,
+							crate::compaction::shared::hex_lower(&blob[..head_n]),
+							crate::compaction::shared::hex_lower(&blob[tail_start..]),
+						)
+					})?;
 					decoded_blobs.insert(source_key.clone(), decoded);
 				}
 
