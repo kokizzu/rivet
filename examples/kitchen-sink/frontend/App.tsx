@@ -97,6 +97,7 @@ type ActorPanelActor = {
 	handle: {
 		action: (request: { name: string; args: unknown[] }) => Promise<unknown>;
 		fetch: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
+		resolve: () => Promise<string>;
 		webSocket: () => Promise<WebSocket>;
 	} | null;
 	connection: {
@@ -424,6 +425,7 @@ function ActorView({
 				</div>
 
 				<div className="actor-inspector">
+					<HealthPanel actor={actor} endpoint={rivetEndpoint} />
 					{stateAction && (
 						<StatePanel
 							actor={actor}
@@ -434,6 +436,63 @@ function ActorView({
 					<EventsPanel actor={actor} defaultEvents={page.defaultEvents} />
 				</div>
 			</div>
+		</div>
+	);
+}
+
+// ── Health Panel ──────────────────────────────────
+
+function HealthPanel({
+	actor,
+	endpoint,
+}: {
+	actor: ActorPanelActor;
+	endpoint: string;
+}) {
+	const [result, setResult] = useState("No health check yet.");
+	const [isChecking, setIsChecking] = useState(false);
+
+	const checkHealth = useCallback(async () => {
+		if (!actor.handle) return;
+
+		setIsChecking(true);
+		const start = performance.now();
+		try {
+			const actorId = await actor.handle.resolve();
+			const url = appendEndpointPath(
+				endpoint,
+				`/gateway/${encodeURIComponent(actorId)}/health`,
+			);
+			const response = await fetch(url);
+			const text = await response.text();
+			const latencyMs = performance.now() - start;
+			setResult(
+				`Status ${response.status} in ${latencyMs.toFixed(0)}ms${text ? `\n${text}` : ""}`,
+			);
+		} catch (error) {
+			setResult(
+				`Error: ${error instanceof Error ? error.message : String(error)}`,
+			);
+		} finally {
+			setIsChecking(false);
+		}
+	}, [actor.handle, endpoint]);
+
+	return (
+		<div className="inspector-section">
+			<div className="inspector-section-header">
+				<span className="inspector-label">Health</span>
+				<button
+					className="inspector-action-btn"
+					onClick={() => void checkHealth()}
+					disabled={!actor.handle || isChecking}
+					type="button"
+					title="Ping gateway health"
+				>
+					{isChecking ? "\u00b7\u00b7\u00b7" : "Ping"}
+				</button>
+			</div>
+			<pre className="state-display">{result}</pre>
 		</div>
 	);
 }
@@ -1078,8 +1137,10 @@ function MockAgenticLoopPanel({ page }: { page: PageConfig }) {
 	const [lastVerification, setLastVerification] = useState("No requests yet.");
 	const [lastHistory, setLastHistory] = useState("No history loaded yet.");
 	const [lastBypass, setLastBypass] = useState("No bypass requests yet.");
+	const [lastHealth, setLastHealth] = useState("No health checks yet.");
 	const [isConnecting, setIsConnecting] = useState(false);
 	const [isRunningInference, setIsRunningInference] = useState(false);
+	const [isCheckingHealth, setIsCheckingHealth] = useState(false);
 	const [stats, setStats] = useState({
 		requests: 0,
 		expectedRows: 0,
@@ -1088,6 +1149,8 @@ function MockAgenticLoopPanel({ page }: { page: PageConfig }) {
 		maxReconnectMs: 0,
 		sleepPosts: 0,
 		sleepErrors: 0,
+		httpOk: 0,
+		wsOk: 0,
 		bypassHttpOk: 0,
 		bypassWsOk: 0,
 		actorStopping: 0,
@@ -1189,6 +1252,7 @@ function MockAgenticLoopPanel({ page }: { page: PageConfig }) {
 		setLastVerification("No requests yet.");
 		setLastHistory("No history loaded yet.");
 		setLastBypass("No bypass requests yet.");
+		setLastHealth("No health checks yet.");
 		setStats({
 			requests: 0,
 			expectedRows: 0,
@@ -1197,6 +1261,8 @@ function MockAgenticLoopPanel({ page }: { page: PageConfig }) {
 			maxReconnectMs: 0,
 			sleepPosts: 0,
 			sleepErrors: 0,
+			httpOk: 0,
+			wsOk: 0,
 			bypassHttpOk: 0,
 			bypassWsOk: 0,
 			actorStopping: 0,
@@ -1206,6 +1272,36 @@ function MockAgenticLoopPanel({ page }: { page: PageConfig }) {
 		});
 		setLogs([]);
 	}, [clearProgressTimer]);
+
+	const checkHealth = useCallback(async () => {
+		if (!actorId) {
+			addLog("error", "resolve an actor before checking health");
+			return;
+		}
+
+		const url = appendEndpointPath(
+			endpoint,
+			`/gateway/${encodeURIComponent(actorId)}/health`,
+		);
+		const start = performance.now();
+		setIsCheckingHealth(true);
+		addLog("info", "health check sent");
+		try {
+			const response = await fetch(url, {
+				headers: token ? { "x-rivet-token": token } : undefined,
+			});
+			const text = await response.text();
+			const message = `health ${response.status} in ${(performance.now() - start).toFixed(0)}ms${text ? `: ${text}` : ""}`;
+			setLastHealth(message);
+			addLog(response.ok ? "ok" : "error", message);
+		} catch (error) {
+			const message = `health failed: ${error instanceof Error ? error.message : String(error)}`;
+			setLastHealth(message);
+			addLog("error", message);
+		} finally {
+			setIsCheckingHealth(false);
+		}
+	}, [actorId, addLog, endpoint, token]);
 
 	const requestHistory = useCallback(() => {
 		if (socketRef.current?.readyState !== WebSocket.OPEN) return;
@@ -1393,7 +1489,9 @@ function MockAgenticLoopPanel({ page }: { page: PageConfig }) {
 				token,
 				encoding: "json",
 			});
-			const handle = client.mockAgenticLoop.getOrCreate([key]) as AgenticHandle;
+			const handle = client.mockAgenticLoop.getOrCreate([
+				key,
+			]) as unknown as AgenticHandle;
 			handleRef.current = handle;
 			const resolvedActorId = await handle.resolve();
 			setActorId(resolvedActorId);
@@ -1527,10 +1625,10 @@ function MockAgenticLoopPanel({ page }: { page: PageConfig }) {
 		}
 	}, [actorId, addLog, endpoint, namespace, token]);
 
-	const noteActorStopping = useCallback((label: string, status: number, text: string) => {
+	const noteActorStopping = useCallback((message: string, text: string) => {
 		setStats((prev) => ({ ...prev, actorStopping: prev.actorStopping + 1 }));
-		setLastBypass(`${label}: actor.stopping (${status})`);
-		addLog("warn", `${label} actor.stopping ${text}`);
+		setLastBypass(message);
+		addLog("warn", `${message} ${text}`);
 	}, [addLog]);
 
 	const testHttpBypass = useCallback(async () => {
@@ -1539,18 +1637,22 @@ function MockAgenticLoopPanel({ page }: { page: PageConfig }) {
 			addLog("error", "connect before testing bypass");
 			return;
 		}
+		const start = performance.now();
+		addLog("info", "http bypass sent");
 		try {
 			const response = await handle.fetch("/bypass", {
 				gateway: { bypassConnectable: true },
 			});
 			const text = await response.text();
+			const latencyMs = performance.now() - start;
 			if (!response.ok) {
+				const message = `http bypass ${response.status} in ${latencyMs.toFixed(0)}ms: ${text}`;
 				if (text.includes('"code":"stopping"')) {
-					noteActorStopping("http bypass", response.status, text);
+					noteActorStopping(message, text);
 					return;
 				}
-				setLastBypass(`http bypass failed ${response.status}: ${text}`);
-				addLog("error", `http bypass ${response.status}: ${text}`);
+				setLastBypass(message);
+				addLog("error", message);
 				return;
 			}
 			const payload = JSON.parse(text) as {
@@ -1569,14 +1671,61 @@ function MockAgenticLoopPanel({ page }: { page: PageConfig }) {
 				sleepProofHttp:
 					prev.sleepProofHttp + (sleepStatus.sleepStarted ? 1 : 0),
 			}));
-			setLastBypass(
-				`http bypass ok: sleepStarted=${sleepStatus.sleepStarted}`,
-			);
-			addLog("ok", `http bypass sleepStarted=${sleepStatus.sleepStarted}`);
+			const message = `http bypass ${response.status} in ${latencyMs.toFixed(0)}ms: ok`;
+			setLastBypass(message);
+			addLog("ok", message);
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
 			setLastBypass(`http bypass error: ${message}`);
 			addLog("error", `http bypass error: ${message}`);
+		}
+	}, [addLog, noteActorStopping]);
+
+	const testHttp = useCallback(async () => {
+		const handle = handleRef.current;
+		if (!handle) {
+			addLog("error", "connect before testing http");
+			return;
+		}
+		const start = performance.now();
+		addLog("info", "http sent");
+		try {
+			const response = await handle.fetch("/bypass");
+			const text = await response.text();
+			const latencyMs = performance.now() - start;
+			if (!response.ok) {
+				const message = `http ${response.status} in ${latencyMs.toFixed(0)}ms: ${text}`;
+				if (text.includes('"code":"stopping"')) {
+					noteActorStopping(message, text);
+					return;
+				}
+				setLastBypass(message);
+				addLog("error", message);
+				return;
+			}
+			const payload = JSON.parse(text) as {
+				type?: string;
+				transport?: string;
+				sleepStarted?: unknown;
+				sleepStartedAt?: unknown;
+			};
+			const sleepStatus = sleepStatusFromPayload("http", payload);
+			if (payload.type !== "bypass" || payload.transport !== "http") {
+				throw new Error(`unexpected body ${text}`);
+			}
+			setStats((prev) => ({
+				...prev,
+				httpOk: prev.httpOk + 1,
+				sleepProofHttp:
+					prev.sleepProofHttp + (sleepStatus.sleepStarted ? 1 : 0),
+			}));
+			const message = `http ${response.status} in ${latencyMs.toFixed(0)}ms: ok`;
+			setLastBypass(message);
+			addLog("ok", message);
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			setLastBypass(`http error: ${message}`);
+			addLog("error", `http error: ${message}`);
 		}
 	}, [addLog, noteActorStopping]);
 
@@ -1653,6 +1802,81 @@ function MockAgenticLoopPanel({ page }: { page: PageConfig }) {
 					socket.readyState === WebSocket.CONNECTING)
 			) {
 				socket.close(1000, "bypass probe complete");
+			}
+		}
+	}, [addLog]);
+
+	const testWebSocket = useCallback(async () => {
+		const handle = handleRef.current;
+		if (!handle) {
+			addLog("error", "connect before testing ws");
+			return;
+		}
+		const probeId = crypto.randomUUID();
+		let socket: WebSocket | null = null;
+		try {
+			socket = await handle.webSocket("/bypass");
+			await waitForSocketOpen(socket);
+			const result = await new Promise<Extract<AgenticServerMessage, { type: "pong" }>>(
+				(resolve, reject) => {
+					const timeout = setTimeout(() => {
+						cleanup();
+						reject(new Error("timed out waiting for ws pong"));
+					}, 10_000);
+					const cleanup = () => {
+						clearTimeout(timeout);
+						socket?.removeEventListener("message", onMessage);
+						socket?.removeEventListener("close", onClose);
+						socket?.removeEventListener("error", onError);
+					};
+					const onMessage = (event: MessageEvent) => {
+						if (typeof event.data !== "string") return;
+						const message = JSON.parse(event.data) as AgenticServerMessage;
+						if (message.type !== "pong" || message.probeId !== probeId) return;
+						cleanup();
+						resolve(message);
+					};
+					const onClose = (event: CloseEvent) => {
+						cleanup();
+						reject(
+							new Error(`closed code=${event.code} reason=${event.reason}`),
+						);
+					};
+					const onError = () => {
+						cleanup();
+						reject(new Error("websocket error"));
+					};
+					socket?.addEventListener("message", onMessage);
+					socket?.addEventListener("close", onClose, { once: true });
+					socket?.addEventListener("error", onError, { once: true });
+					socket?.send(JSON.stringify({ type: "ping", probeId }));
+				},
+			);
+			const sleepStatus = sleepStatusFromPayload("ws", result);
+			setStats((prev) => ({
+				...prev,
+				wsOk: prev.wsOk + 1,
+				sleepProofWs: prev.sleepProofWs + (sleepStatus.sleepStarted ? 1 : 0),
+			}));
+			setLastBypass(`ws ok: sleepStarted=${sleepStatus.sleepStarted}`);
+			addLog("ok", `ws sleepStarted=${sleepStatus.sleepStarted}`);
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			if (message.includes("actor.stopping") || message.includes("Server Error")) {
+				setStats((prev) => ({ ...prev, actorStopping: prev.actorStopping + 1 }));
+				setLastBypass(`ws transient close: ${message}`);
+				addLog("warn", `ws transient close: ${message}`);
+			} else {
+				setLastBypass(`ws error: ${message}`);
+				addLog("error", `ws error: ${message}`);
+			}
+		} finally {
+			if (
+				socket &&
+				(socket.readyState === WebSocket.OPEN ||
+					socket.readyState === WebSocket.CONNECTING)
+			) {
+				socket.close(1000, "ws probe complete");
 			}
 		}
 	}, [addLog]);
@@ -1817,6 +2041,15 @@ function MockAgenticLoopPanel({ page }: { page: PageConfig }) {
 					<button className="primary" onClick={() => void forceSleep()} disabled={!actorId} type="button">
 						Force Sleep
 					</button>
+					<button className="secondary" onClick={() => void checkHealth()} disabled={!actorId || isCheckingHealth} type="button">
+						{isCheckingHealth ? "Checking..." : "Health Check"}
+					</button>
+					<button className="secondary" onClick={() => void testHttp()} disabled={!handleRef.current} type="button">
+						Test HTTP
+					</button>
+					<button className="secondary" onClick={() => void testWebSocket()} disabled={!handleRef.current} type="button">
+						Test WS
+					</button>
 					<button className="secondary" onClick={() => void testHttpBypass()} disabled={!handleRef.current} type="button">
 						Test HTTP Bypass
 					</button>
@@ -1825,6 +2058,7 @@ function MockAgenticLoopPanel({ page }: { page: PageConfig }) {
 					</button>
 				</div>
 				<div className="agentic-result">{lastBypass}</div>
+				<div className="agentic-result">{lastHealth}</div>
 			</section>
 
 			<section className="agentic-panel">
@@ -1872,6 +2106,8 @@ function MockAgenticLoopPanel({ page }: { page: PageConfig }) {
 					<AgenticStat label="Max Reconnect" value={`${stats.maxReconnectMs.toFixed(0)}ms`} />
 					<AgenticStat label="Sleep Posts" value={stats.sleepPosts} />
 					<AgenticStat label="Sleep Errors" value={stats.sleepErrors} />
+					<AgenticStat label="HTTP" value={stats.httpOk} />
+					<AgenticStat label="WS" value={stats.wsOk} />
 					<AgenticStat label="HTTP Bypass" value={stats.bypassHttpOk} />
 					<AgenticStat label="WS Bypass" value={stats.bypassWsOk} />
 					<AgenticStat label="Stopping" value={stats.actorStopping} />
