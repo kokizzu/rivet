@@ -1,8 +1,12 @@
 // @ts-nocheck
 import { type TestContext, vi } from "vitest";
-import { type Client, createClient } from "../../src/client/mod";
-import { getLogger } from "../../src/common/log";
 import type { registry } from "../../fixtures/driver-test-suite/registry-static";
+import {
+	type Client,
+	type ClientConfigInput,
+	createClient,
+} from "../../src/client/mod";
+import { getLogger } from "../../src/common/log";
 import type { DriverTestConfig } from "./shared-types";
 
 export const FAKE_TIME = new Date("2024-01-01T00:00:00.000Z");
@@ -26,6 +30,9 @@ function timing(label: string, startedAt: number, testName?: string) {
 export async function setupDriverTest(
 	c: TestContext,
 	driverTestConfig: DriverTestConfig,
+	options: {
+		client?: Partial<ClientConfigInput>;
+	} = {},
 ): Promise<{
 	client: Client<typeof registry>;
 	endpoint: string;
@@ -62,6 +69,7 @@ export async function setupDriverTest(
 		// Disable metadata lookup to prevent redirect to the wrong port.
 		// Each test starts a runtime on a dynamic namespace and pool.
 		disableMetadataLookup: true,
+		...options.client,
 	});
 	timing("setup.client", clientStartedAt, testName);
 	timing("setup.total", setupStartedAt, testName);

@@ -35,6 +35,27 @@ export interface ActorGatewayOptions {
 	bypassConnectable?: boolean;
 }
 
+export type ResolvedActorGatewayOptions = Required<ActorGatewayOptions>;
+
+export function resolveActorGatewayOptions(
+	defaults: ActorGatewayOptions = {},
+	overrides?: ActorGatewayOptions,
+): ResolvedActorGatewayOptions {
+	return {
+		bypassConnectable:
+			overrides?.bypassConnectable ?? defaults.bypassConnectable ?? false,
+	};
+}
+
+export interface ActorActionOptions {
+	gateway?: ActorGatewayOptions;
+	signal?: AbortSignal;
+}
+
+export interface ActorConnectOptions {
+	gateway?: ActorGatewayOptions;
+}
+
 export interface ActorFetchInit extends RequestInit {
 	gateway?: ActorGatewayOptions;
 }

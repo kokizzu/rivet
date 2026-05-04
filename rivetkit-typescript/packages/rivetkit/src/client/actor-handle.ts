@@ -25,11 +25,15 @@ import type { EngineControlClient } from "@/engine-client/driver";
 import { decodeCborCompat, deserializeWithEncoding, encodeCborCompat } from "@/serde";
 import { bufferToArrayBuffer } from "@/utils";
 import type {
+	ActorActionOptions,
+	ActorConnectOptions,
 	ActorDefinitionActions,
 	ActorFetchInit,
 	ActorDefinitionQueueSend,
+	ActorGatewayOptions,
 	ActorWebSocketOptions,
 } from "./actor-common";
+import { resolveActorGatewayOptions } from "./actor-common";
 import { type ActorConn, ActorConnRaw } from "./actor-conn";
 import {
 	type ActorResolutionState,
@@ -65,6 +69,7 @@ export class ActorHandleRaw {
 	#driver: EngineControlClient;
 	#encoding: Encoding;
 	#actorResolutionState: ActorResolutionState;
+	#gatewayOptions: ActorGatewayOptions;
 	#params: unknown;
 	#getParams?: () => Promise<unknown>;
 	#resolvedActorId?: string;
@@ -85,11 +90,13 @@ export class ActorHandleRaw {
 		getParams: (() => Promise<unknown>) | undefined,
 		encoding: Encoding,
 		actorResolutionState: ActorResolutionState,
+		gatewayOptions: ActorGatewayOptions = {},
 	) {
 		this.#client = client;
 		this.#driver = driver;
 		this.#encoding = encoding;
 		this.#actorResolutionState = actorResolutionState;
+		this.#gatewayOptions = gatewayOptions;
 		this.#params = params;
 		this.#getParams = getParams;
 	}
@@ -139,7 +146,13 @@ export class ActorHandleRaw {
 						encoding: this.#encoding,
 						params: this.#params,
 						customFetch: async (request: Request) => {
-							return await this.#driver.sendRequest(target, request);
+							return await this.#driver.sendRequest(
+								target,
+								request,
+								resolveActorGatewayOptions(
+									this.#gatewayOptions,
+								),
+							);
 						},
 					}).send(name, body, options as any);
 				} catch (err) {
@@ -224,8 +237,7 @@ export class ActorHandleRaw {
 	>(opts: {
 		name: string;
 		args: Args;
-		signal?: AbortSignal;
-	}): Promise<Response> {
+	} & ActorActionOptions): Promise<Response> {
 		if (
 			typeof opts === "string" ||
 			typeof opts !== "object" ||
@@ -247,10 +259,13 @@ export class ActorHandleRaw {
 	async #sendActionNow(opts: {
 		name: string;
 		args: unknown[];
-		signal?: AbortSignal;
-	}): Promise<unknown> {
+	} & ActorActionOptions): Promise<unknown> {
 		const maxAttempts = this.#getDynamicQueryMaxAttempts();
 		let useQueryTarget = false;
+		const gatewayOptions = resolveActorGatewayOptions(
+			this.#gatewayOptions,
+			opts.gateway,
+		);
 
 		for (let attempt = 0; attempt < maxAttempts; attempt++) {
 			let actorId: string | undefined;
@@ -294,10 +309,12 @@ export class ActorHandleRaw {
 					},
 					body: opts.args,
 					encoding: this.#encoding,
-					customFetch: this.#driver.sendRequest.bind(
-						this.#driver,
-						target,
-					),
+					customFetch: async (request) =>
+						await this.#driver.sendRequest(
+							target,
+							request,
+							gatewayOptions,
+						),
 					signal: opts?.signal,
 					requestVersion: CLIENT_PROTOCOL_CURRENT_VERSION,
 					requestVersionedDataHandler: HTTP_ACTION_REQUEST_VERSIONED,
@@ -550,7 +567,10 @@ export class ActorHandleRaw {
 	 * @template AD The actor class that this connection is for.
 	 * @returns {ActorConn<AD>} A connection to the actor.
 	 */
-	connect(params?: unknown): ActorConn<AnyActorDefinition> {
+	connect(
+		params?: unknown,
+		options: ActorConnectOptions = {},
+	): ActorConn<AnyActorDefinition> {
 		logger().debug({
 			msg: "establishing connection from handle",
 			query: this.#actorResolutionState,
@@ -566,6 +586,7 @@ export class ActorHandleRaw {
 			getParams,
 			this.#encoding,
 			this.#actorResolutionState,
+			resolveActorGatewayOptions(this.#gatewayOptions, options.gateway),
 		);
 
 		return this.#client[CREATE_ACTOR_CONN_PROXY](
@@ -588,6 +609,10 @@ export class ActorHandleRaw {
 		const maxAttempts = this.#getDynamicQueryMaxAttempts();
 		let useQueryTarget = false;
 		const { gateway, ...requestInit } = init ?? {};
+		const gatewayOptions = resolveActorGatewayOptions(
+			this.#gatewayOptions,
+			gateway,
+		);
 
 		for (let attempt = 0; attempt < maxAttempts; attempt++) {
 			let actorId: string | undefined;
@@ -600,7 +625,7 @@ export class ActorHandleRaw {
 					this.#params,
 					input,
 					requestInit,
-					gateway,
+					gatewayOptions,
 				);
 				const retry = await this.#shouldRetryRawFetchResponse(
 					response,
@@ -793,7 +818,11 @@ export class ActorHandleRaw {
 		options: ActorWebSocketOptions = {},
 	) {
 		const params = await this.#resolveConnectionParams();
-		const target = options.gateway?.bypassConnectable
+		const gatewayOptions = resolveActorGatewayOptions(
+			this.#gatewayOptions,
+			options.gateway,
+		);
+		const target = gatewayOptions.bypassConnectable
 			? await this.#resolveActionTarget(false)
 			: getGatewayTarget(this.#actorResolutionState);
 		return await rawWebSocket(
@@ -802,7 +831,7 @@ export class ActorHandleRaw {
 			params,
 			path,
 			protocols,
-			options.gateway,
+			gatewayOptions,
 		);
 	}
 
@@ -828,6 +857,7 @@ export class ActorHandleRaw {
 	async getGatewayUrl(): Promise<string> {
 		return await this.#driver.buildGatewayUrl(
 			getGatewayTarget(this.#actorResolutionState),
+			this.#gatewayOptions,
 		);
 	}
 
@@ -870,7 +900,7 @@ export type ActorHandle<AD extends AnyActorDefinition> = Omit<
 	"connect" | "send"
 > & {
 	// Add typed version of ActorConn (instead of using AnyActorDefinition)
-	connect(params?: unknown): ActorConn<AD>;
+	connect(params?: unknown, options?: ActorConnectOptions): ActorConn<AD>;
 	// Resolve method returns the actor ID
 	resolve(): Promise<string>;
 } & ActorDefinitionQueueSend<AD> &

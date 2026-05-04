@@ -34,7 +34,10 @@ import type {
 	ActorDefinitionActions,
 	ActorDefinitionEventSubscriptions,
 	ActorDefinitionQueueSend,
+	ActorGatewayOptions,
+	ResolvedActorGatewayOptions,
 } from "./actor-common";
+import { resolveActorGatewayOptions } from "./actor-common";
 import {
 	type ActorResolutionState,
 	checkForSchedulingError,
@@ -53,6 +56,7 @@ import {
 	type QueueSendResult,
 	type QueueSendWaitOptions,
 } from "./queue";
+import { resolveGatewayTarget } from "./resolve-gateway-target";
 import {
 	type WebSocketMessage as ConnMessage,
 	messageLength,
@@ -186,6 +190,7 @@ export class ActorConnRaw {
 	#getParams?: () => Promise<unknown>;
 	#encoding: Encoding;
 	#actorResolutionState: ActorResolutionState;
+	#gatewayOptions: ResolvedActorGatewayOptions;
 
 	// TODO: ws message queue
 
@@ -203,6 +208,7 @@ export class ActorConnRaw {
 		getParams: (() => Promise<unknown>) | undefined,
 		encoding: Encoding,
 		actorResolutionState: ActorResolutionState,
+		gatewayOptions: ActorGatewayOptions = {},
 	) {
 		this.#client = client;
 		this.#driver = driver;
@@ -210,6 +216,7 @@ export class ActorConnRaw {
 		this.#getParams = getParams;
 		this.#encoding = encoding;
 		this.#actorResolutionState = actorResolutionState;
+		this.#gatewayOptions = resolveActorGatewayOptions(gatewayOptions);
 		this.#readyPromise = promiseWithResolvers((reason) =>
 			logger().warn({
 				msg: "unhandled ready promise rejection",
@@ -225,6 +232,7 @@ export class ActorConnRaw {
 				return await this.#driver.sendRequest(
 					getGatewayTarget(this.#actorResolutionState),
 					request,
+					this.#gatewayOptions,
 				);
 			},
 		});
@@ -570,12 +578,15 @@ export class ActorConnRaw {
 
 	async #connectWebSocket() {
 		const params = await this.#resolveConnectionParams();
-		const target = getGatewayTarget(this.#actorResolutionState);
+		const target = this.#gatewayOptions.bypassConnectable
+			? await this.#resolveGatewayTargetForBypass()
+			: getGatewayTarget(this.#actorResolutionState);
 		const ws = await this.#driver.openWebSocket(
 			PATH_CONNECT,
 			target,
 			this.#encoding,
 			params,
+			this.#gatewayOptions,
 		);
 		invariant(ws, "websocket should have been created");
 		logger().debug({
@@ -621,6 +632,25 @@ export class ActorConnRaw {
 				});
 			}
 		});
+	}
+
+	async #resolveGatewayTargetForBypass() {
+		if ("getForId" in this.#actorResolutionState) {
+			return {
+				directId: this.#actorResolutionState.getForId.actorId,
+			} as const;
+		}
+
+		if (this.#actorId) {
+			return { directId: this.#actorId } as const;
+		}
+
+		return {
+			directId: await resolveGatewayTarget(
+				this.#driver,
+				this.#actorResolutionState,
+			),
+		} as const;
 	}
 
 	/** Called by the onopen event from drivers. */

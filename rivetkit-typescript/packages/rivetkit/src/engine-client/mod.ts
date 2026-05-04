@@ -2,20 +2,25 @@ import type { Context as HonoContext } from "hono";
 import invariant from "invariant";
 import { deserializeActorKey, serializeActorKey } from "@/actor/keys";
 import type { ClientConfig } from "@/client/client";
-import { noopNext } from "@/common/utils";
 import {
-	type ActorOutput,
-	type CreateInput,
-	type GatewayTarget,
-	type GatewayRequestOptions,
-	type GetForIdInput,
-	type GetOrCreateWithKeyInput,
-	type GetWithKeyInput,
-	type ListActorsInput,
-	type RuntimeDisplayInformation,
-	type EngineControlClient,
-} from "@/engine-client/driver";
+	PATH_CONNECT,
+	PATH_WEBSOCKET_BASE,
+	PATH_WEBSOCKET_PREFIX,
+} from "@/common/actor-router-consts";
+import { noopNext } from "@/common/utils";
 import type { Actor as ApiActor } from "@/engine-api/actors";
+import type {
+	ActorOutput,
+	CreateInput,
+	EngineControlClient,
+	GatewayRequestOptions,
+	GatewayTarget,
+	GetForIdInput,
+	GetOrCreateWithKeyInput,
+	GetWithKeyInput,
+	ListActorsInput,
+	RuntimeDisplayInformation,
+} from "@/engine-client/driver";
 import type { Encoding, UniversalWebSocket } from "@/mod";
 import { encodeCborCompat, uint8ArrayToBase64 } from "@/serde";
 import { combineUrlPath, type GetUpgradeWebSocket } from "@/utils";
@@ -252,7 +257,11 @@ export class RemoteEngineControlClient implements EngineControlClient {
 		await this.#metadataPromise;
 
 		const path = requestPath(actorRequest);
-		const gatewayUrl = this.#buildGatewayUrlForTarget(target, path, options);
+		const gatewayUrl = this.#buildGatewayUrlForTarget(
+			target,
+			path,
+			options,
+		);
 		const httpOptions = {
 			...options,
 			directActorId: options.bypassConnectable
@@ -277,7 +286,11 @@ export class RemoteEngineControlClient implements EngineControlClient {
 	): Promise<UniversalWebSocket> {
 		await this.#metadataPromise;
 
-		const gatewayUrl = this.#buildGatewayUrlForTarget(target, path, options);
+		const gatewayUrl = this.#buildGatewayUrlForTarget(
+			target,
+			path,
+			options,
+		);
 
 		return openWebSocketToGateway(
 			this.#config,
@@ -410,7 +423,11 @@ export class RemoteEngineControlClient implements EngineControlClient {
 	): string {
 		const endpoint = getEndpoint(this.#config);
 
-		if (options.bypassConnectable && directActorIdFromTarget(target)) {
+		if (
+			options.bypassConnectable &&
+			directActorIdFromTarget(target) &&
+			canUseDirectBypassPath(path)
+		) {
 			return combineUrlPath(endpoint, path);
 		}
 
@@ -456,6 +473,25 @@ export class RemoteEngineControlClient implements EngineControlClient {
 
 		throw new Error("unreachable: unknown gateway target type");
 	}
+}
+
+function canUseDirectBypassPath(path: string): boolean {
+	return (
+		isActorHttpRequestPath(path) ||
+		path === PATH_CONNECT ||
+		path === PATH_WEBSOCKET_BASE ||
+		path.startsWith(PATH_WEBSOCKET_PREFIX)
+	);
+}
+
+function isActorHttpRequestPath(path: string): boolean {
+	const stripped = path.slice("/request".length);
+	return (
+		path.startsWith("/request") &&
+		(stripped.length === 0 ||
+			stripped.startsWith("/") ||
+			stripped.startsWith("?"))
+	);
 }
 
 function directActorIdFromTarget(target: GatewayTarget): string | undefined {
