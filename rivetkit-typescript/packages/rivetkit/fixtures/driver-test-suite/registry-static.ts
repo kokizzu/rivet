@@ -42,7 +42,11 @@ import {
 	dbLifecycleFailing,
 	dbLifecycleObserver,
 } from "./db-lifecycle";
-import { destroyActor, destroyObserver } from "./destroy";
+import {
+	destroyAbortSignalActor,
+	destroyActor,
+	destroyObserver,
+} from "./destroy";
 import { customTimeoutActor, errorHandlingActor } from "./error-handling";
 import { fileSystemHibernationCleanupActor } from "./file-system-hibernation-cleanup";
 import { hibernationActor, hibernationSleepWindowActor } from "./hibernation";
@@ -281,6 +285,7 @@ export const registry = setup({
 		// From destroy.ts
 		destroyActor,
 		destroyObserver,
+		destroyAbortSignalActor,
 		// From hibernation.ts
 		hibernationActor,
 		hibernationSleepWindowActor,
