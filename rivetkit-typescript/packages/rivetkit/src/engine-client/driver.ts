@@ -7,14 +7,13 @@ import type { ActorQuery, CrashPolicy } from "@/client/query";
 export type GatewayTarget = { directId: string } | ActorQuery;
 
 export interface GatewayRequestOptions {
-	bypassConnectable?: boolean;
 	skipReadyWait?: boolean;
 }
 
-export function shouldBypassConnectable(
+export function shouldSkipReadyWait(
 	options: GatewayRequestOptions = {},
 ): boolean {
-	return options.bypassConnectable === true || options.skipReadyWait === true;
+	return options.skipReadyWait === true;
 }
 
 export interface EngineControlClient {

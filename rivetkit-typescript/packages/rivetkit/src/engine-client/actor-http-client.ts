@@ -1,14 +1,11 @@
 import type { ClientConfig } from "@/client/config";
 import {
 	HEADER_RIVET_ACTOR,
-	HEADER_RIVET_BYPASS_CONNECTABLE,
+	HEADER_RIVET_SKIP_READY_WAIT,
 	HEADER_RIVET_TARGET,
 	HEADER_RIVET_TOKEN,
 } from "@/common/actor-router-consts";
-import {
-	shouldBypassConnectable,
-	type GatewayRequestOptions,
-} from "./driver";
+import { shouldSkipReadyWait, type GatewayRequestOptions } from "./driver";
 
 export interface HttpGatewayRequestOptions extends GatewayRequestOptions {
 	directActorId?: string;
@@ -82,8 +79,8 @@ function buildGuardHeaders(
 		headers.set(HEADER_RIVET_TARGET, "actor");
 		headers.set(HEADER_RIVET_ACTOR, options.directActorId);
 	}
-	if (shouldBypassConnectable(options)) {
-		headers.set(HEADER_RIVET_BYPASS_CONNECTABLE, "1");
+	if (shouldSkipReadyWait(options)) {
+		headers.set(HEADER_RIVET_SKIP_READY_WAIT, "1");
 	}
 	return headers;
 }

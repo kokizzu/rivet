@@ -9,7 +9,7 @@ import {
 } from "@/common/actor-router-consts";
 import { noopNext } from "@/common/utils";
 import type { Actor as ApiActor } from "@/engine-api/actors";
-import { shouldBypassConnectable } from "@/engine-client/driver";
+import { shouldSkipReadyWait } from "@/engine-client/driver";
 import type {
 	ActorOutput,
 	CreateInput,
@@ -265,7 +265,7 @@ export class RemoteEngineControlClient implements EngineControlClient {
 		);
 		const httpOptions = {
 			...options,
-			directActorId: shouldBypassConnectable(options)
+			directActorId: shouldSkipReadyWait(options)
 				? directActorIdFromTarget(target)
 				: undefined,
 		};
@@ -300,7 +300,7 @@ export class RemoteEngineControlClient implements EngineControlClient {
 			params,
 			{
 				...options,
-				directActorId: shouldBypassConnectable(options)
+				directActorId: shouldSkipReadyWait(options)
 					? directActorIdFromTarget(target)
 					: undefined,
 			},
@@ -425,9 +425,9 @@ export class RemoteEngineControlClient implements EngineControlClient {
 		const endpoint = getEndpoint(this.#config);
 
 		if (
-			shouldBypassConnectable(options) &&
+			shouldSkipReadyWait(options) &&
 			directActorIdFromTarget(target) &&
-			canUseDirectBypassPath(path)
+			canUseDirectSkipReadyWaitPath(path)
 		) {
 			return combineUrlPath(endpoint, path);
 		}
@@ -476,13 +476,17 @@ export class RemoteEngineControlClient implements EngineControlClient {
 	}
 }
 
-function canUseDirectBypassPath(path: string): boolean {
+function canUseDirectSkipReadyWaitPath(path: string): boolean {
 	return (
 		isActorHttpRequestPath(path) ||
-		path === PATH_CONNECT ||
-		path === PATH_WEBSOCKET_BASE ||
+		isPathOrQuery(path, PATH_CONNECT) ||
+		isPathOrQuery(path, PATH_WEBSOCKET_BASE) ||
 		path.startsWith(PATH_WEBSOCKET_PREFIX)
 	);
+}
+
+function isPathOrQuery(path: string, basePath: string): boolean {
+	return path === basePath || path.startsWith(`${basePath}?`);
 }
 
 function isActorHttpRequestPath(path: string): boolean {

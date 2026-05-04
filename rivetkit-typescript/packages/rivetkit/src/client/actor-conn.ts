@@ -578,8 +578,8 @@ export class ActorConnRaw {
 
 	async #connectWebSocket() {
 		const params = await this.#resolveConnectionParams();
-		const target = this.#gatewayOptions.bypassConnectable
-			? await this.#resolveGatewayTargetForBypass()
+		const target = this.#gatewayOptions.skipReadyWait
+			? await this.#resolveGatewayTargetForSkipReadyWait()
 			: getGatewayTarget(this.#actorResolutionState);
 		const ws = await this.#driver.openWebSocket(
 			PATH_CONNECT,
@@ -634,7 +634,7 @@ export class ActorConnRaw {
 		});
 	}
 
-	async #resolveGatewayTargetForBypass() {
+	async #resolveGatewayTargetForSkipReadyWait() {
 		if ("getForId" in this.#actorResolutionState) {
 			return {
 				directId: this.#actorResolutionState.getForId.actorId,

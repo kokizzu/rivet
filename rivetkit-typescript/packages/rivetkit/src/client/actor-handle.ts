@@ -264,7 +264,7 @@ export class ActorHandleRaw {
 		let useQueryTarget = false;
 		const gatewayOptions = resolveActorGatewayOptions(
 			this.#gatewayOptions,
-			opts.gateway,
+			opts,
 		);
 
 		for (let attempt = 0; attempt < maxAttempts; attempt++) {
@@ -586,7 +586,7 @@ export class ActorHandleRaw {
 			getParams,
 			this.#encoding,
 			this.#actorResolutionState,
-			resolveActorGatewayOptions(this.#gatewayOptions, options.gateway),
+			resolveActorGatewayOptions(this.#gatewayOptions, options),
 		);
 
 		return this.#client[CREATE_ACTOR_CONN_PROXY](
@@ -608,10 +608,12 @@ export class ActorHandleRaw {
 	) {
 		const maxAttempts = this.#getDynamicQueryMaxAttempts();
 		let useQueryTarget = false;
-		const { gateway, ...requestInit } = init ?? {};
+		const { skipReadyWait, ...requestInit } = init ?? {};
 		const gatewayOptions = resolveActorGatewayOptions(
 			this.#gatewayOptions,
-			gateway,
+			{
+				skipReadyWait,
+			},
 		);
 
 		for (let attempt = 0; attempt < maxAttempts; attempt++) {
@@ -820,9 +822,9 @@ export class ActorHandleRaw {
 		const params = await this.#resolveConnectionParams();
 		const gatewayOptions = resolveActorGatewayOptions(
 			this.#gatewayOptions,
-			options.gateway,
+			options,
 		);
-		const target = gatewayOptions.bypassConnectable
+		const target = gatewayOptions.skipReadyWait
 			? await this.#resolveActionTarget(false)
 			: getGatewayTarget(this.#actorResolutionState);
 		return await rawWebSocket(

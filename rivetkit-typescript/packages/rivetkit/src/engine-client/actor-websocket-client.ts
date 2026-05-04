@@ -8,7 +8,7 @@ import {
 	WS_PROTOCOL_STANDARD as WS_PROTOCOL_RIVETKIT,
 	WS_PROTOCOL_TARGET,
 	WS_PROTOCOL_ACTOR,
-	WS_PROTOCOL_BYPASS_CONNECTABLE,
+	WS_PROTOCOL_SKIP_READY_WAIT,
 	WS_PROTOCOL_TEST_ACK_HOOK,
 	WS_PROTOCOL_TOKEN,
 } from "@/common/actor-router-consts";
@@ -18,10 +18,7 @@ import type { ActorGatewayQuery, CrashPolicy } from "@/client/query";
 import type { Encoding, UniversalWebSocket } from "@/mod";
 import { encodeCborCompat, uint8ArrayToBase64 } from "@/serde";
 import { combineUrlPath } from "@/utils";
-import {
-	shouldBypassConnectable,
-	type GatewayRequestOptions,
-} from "./driver";
+import { shouldSkipReadyWait, type GatewayRequestOptions } from "./driver";
 import { logger } from "./log";
 
 class BufferedRemoteWebSocket implements UniversalWebSocket {
@@ -272,8 +269,8 @@ export function buildActorQueryGatewayUrl(
 	if (token !== undefined) {
 		params.append("rvt-token", token);
 	}
-	if (shouldBypassConnectable(options)) {
-		params.append("rvt-bypass_connectable", "true");
+	if (shouldSkipReadyWait(options)) {
+		params.append("rvt-skip-ready-wait", "true");
 	}
 
 	const queryString = params.toString();
@@ -378,7 +375,7 @@ export async function openWebSocketToGateway(
 }
 
 export function buildWebSocketProtocols(
-	_runConfig: ClientConfig,
+	runConfig: ClientConfig,
 	encoding: Encoding,
 	params?: unknown,
 	ackHookToken?: string,
@@ -394,9 +391,12 @@ export function buildWebSocketProtocols(
 	if (target) {
 		protocols.push(`${WS_PROTOCOL_TARGET}${target.target}`);
 		protocols.push(`${WS_PROTOCOL_ACTOR}${target.actorId}`);
+		if (runConfig.token) {
+			protocols.push(`${WS_PROTOCOL_TOKEN}${runConfig.token}`);
+		}
 	}
-	if (shouldBypassConnectable(options)) {
-		protocols.push(WS_PROTOCOL_BYPASS_CONNECTABLE);
+	if (shouldSkipReadyWait(options)) {
+		protocols.push(WS_PROTOCOL_SKIP_READY_WAIT);
 	}
 	if (params) {
 		protocols.push(

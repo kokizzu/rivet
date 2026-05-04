@@ -72,10 +72,10 @@ export const ClientConfigSchemaBase = z.object({
 
 	gateway: z
 		.object({
-			bypassConnectable: z.boolean().optional().default(false),
+			skipReadyWait: z.boolean().optional().default(false),
 		})
 		.optional()
-		.default(() => ({ bypassConnectable: false })),
+		.default(() => ({ skipReadyWait: false })),
 
 	// See RunConfig.getUpgradeWebSocket
 	//
@@ -154,7 +154,7 @@ export function convertRegistryConfigToClientConfig(
 		namespace: config.namespace,
 		poolName: config.envoy.poolName,
 		headers: config.headers,
-		gateway: { bypassConnectable: false },
+		gateway: { skipReadyWait: false },
 		encoding: "bare",
 		getUpgradeWebSocket: undefined,
 		// We don't need health checks for internal clients

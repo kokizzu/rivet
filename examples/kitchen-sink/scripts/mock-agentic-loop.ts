@@ -236,18 +236,14 @@ type BypassHandle = {
 	fetch: (
 		input: string,
 		init?: RequestInit & {
-			gateway?: {
-				skipReadyWait?: boolean;
-			};
+			skipReadyWait?: boolean;
 		},
 	) => Promise<Response>;
 	webSocket: (
 		path?: string,
 		protocols?: string | string[],
 		options?: {
-			gateway?: {
-				skipReadyWait?: boolean;
-			};
+			skipReadyWait?: boolean;
 		},
 	) => Promise<WebSocket>;
 };
@@ -1223,9 +1219,7 @@ async function runBypassAttempt(
 				handle.fetch(`/bypass?probe=${encodeURIComponent(probeId)}`, {
 					method: "GET",
 					signal: controller.signal,
-					gateway: {
-						skipReadyWait: true,
-					},
+					skipReadyWait: true,
 				}),
 				"bypass http",
 				BYPASS_TIMEOUT_MS,
@@ -1263,9 +1257,7 @@ async function runBypassAttempt(
 
 		const ws = await withTimeout(
 			handle.webSocket("/bypass", undefined, {
-				gateway: {
-					skipReadyWait: true,
-				},
+				skipReadyWait: true,
 			}),
 			"bypass websocket create",
 			BYPASS_TIMEOUT_MS,

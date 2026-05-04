@@ -259,7 +259,7 @@ You can also pass the endpoint without auth and provide `RIVET_NAMESPACE` and `R
 
 Requests are normally held at the gateway until the actor is ready to accept traffic. An actor is not ready while it's still starting (before `onWake` finishes) or while it's in the [sleep grace period](/docs/actors/lifecycle#shutdown-sequence) (running `onSleep`, `waitUntil`, and pending disconnects).
 
-Pass `gateway.skipReadyWait: true` on the [low-level HTTP and WebSocket APIs](#low-level-http--websocket) to deliver immediately and reach the actor's `onRequest` / `onWebSocket` handler in either window:
+Pass `skipReadyWait: true` on the [low-level HTTP and WebSocket APIs](#low-level-http--websocket) to deliver immediately and reach the actor's `onRequest` / `onWebSocket` handler in either window:
 
 ```ts @nocheck
 import { createClient } from "rivetkit/client";
@@ -268,11 +268,11 @@ const client = createClient();
 const handle = client.chatRoom.getOrCreate(["general"]);
 
 const response = await handle.fetch("/healthz", {
-  gateway: { skipReadyWait: true },
+  skipReadyWait: true,
 });
 
 const ws = await handle.webSocket("probe", undefined, {
-  gateway: { skipReadyWait: true },
+  skipReadyWait: true,
 });
 ```
 

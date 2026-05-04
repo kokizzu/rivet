@@ -9,8 +9,8 @@ use hyper::header::HeaderName;
 use rivet_guard_core::{RouteConfig, RouteTarget, RoutingOutput, request_context::RequestContext};
 
 use super::{
-	SEC_WEBSOCKET_PROTOCOL, WS_PROTOCOL_ACTOR, WS_PROTOCOL_BYPASS_CONNECTABLE, WS_PROTOCOL_TOKEN,
-	X_RIVET_BYPASS_CONNECTABLE, X_RIVET_TOKEN, actor_path::ParsedActorPath,
+	SEC_WEBSOCKET_PROTOCOL, WS_PROTOCOL_ACTOR, WS_PROTOCOL_SKIP_READY_WAIT, WS_PROTOCOL_TOKEN,
+	X_RIVET_SKIP_READY_WAIT, X_RIVET_TOKEN, actor_path::ParsedActorPath,
 };
 use crate::{
 	errors,
@@ -70,14 +70,13 @@ pub async fn route_request_path_based_inner(
 
 	tracing::debug!(?actor_path, "routing using path-based actor routing");
 
-	let (actor_id, token, stripped_path, bypass_connectable) = match actor_path {
+	let (actor_id, token, stripped_path, skip_ready_wait) = match actor_path {
 		ParsedActorPath::Direct(path) => (
 			Id::parse(&path.actor_id).context("invalid actor id in path")?,
 			read_gateway_token_for_path_based(req_ctx, path.token.as_deref())?
 				.map(ToOwned::to_owned),
 			path.stripped_path.clone(),
-			// TODO:
-			false,
+			read_skip_ready_wait_for_path_based(req_ctx)?,
 		),
 		ParsedActorPath::Query(path) => match resolve_query(ctx, &path.query).await? {
 			ResolveQueryActorResult::Found { actor_id } => (
@@ -85,7 +84,7 @@ pub async fn route_request_path_based_inner(
 				read_gateway_token_for_path_based(req_ctx, path.token.as_deref())?
 					.map(ToOwned::to_owned),
 				path.stripped_path.clone(),
-				path.query.bypass_connectable(),
+				path.query.skip_ready_wait(),
 			),
 			ResolveQueryActorResult::Forward { dc_label } => {
 				let peer_dc = ctx
@@ -116,7 +115,7 @@ pub async fn route_request_path_based_inner(
 		actor_id,
 		&stripped_path,
 		token.as_deref(),
-		bypass_connectable,
+		skip_ready_wait,
 	)
 	.await
 	.map(Some)
@@ -148,7 +147,7 @@ pub async fn route_request(
 	set_non_preflight_cors(req_ctx);
 
 	// Extract actor ID and token from WebSocket protocol or HTTP headers
-	let (actor_id_str, token, bypass_connectable) = if req_ctx.is_websocket() {
+	let (actor_id_str, token, skip_ready_wait) = if req_ctx.is_websocket() {
 		// For WebSocket, parse the sec-websocket-protocol header
 		let protocols_header = req_ctx
 			.headers()
@@ -182,11 +181,11 @@ pub async fn route_request(
 			.find_map(|p| p.strip_prefix(WS_PROTOCOL_TOKEN))
 			.map(ToOwned::to_owned);
 
-		let bypass_connectable = protocols
+		let skip_ready_wait = protocols
 			.iter()
-			.any(|p| p == &WS_PROTOCOL_BYPASS_CONNECTABLE);
+			.any(|p| p == &WS_PROTOCOL_SKIP_READY_WAIT);
 
-		(actor_id, token, bypass_connectable)
+		(actor_id, token, skip_ready_wait)
 	} else {
 		// For HTTP, use headers
 		let actor_id = req_ctx
@@ -210,9 +209,9 @@ pub async fn route_request(
 			.context("invalid x-rivet-token header")?
 			.map(ToOwned::to_owned);
 
-		let bypass_connectable = req_ctx.headers().contains_key(X_RIVET_BYPASS_CONNECTABLE);
+		let skip_ready_wait = read_skip_ready_wait_header(req_ctx)?;
 
-		(actor_id.to_string(), token, bypass_connectable)
+		(actor_id.to_string(), token, skip_ready_wait)
 	};
 
 	// Find actor to route to
@@ -226,7 +225,7 @@ pub async fn route_request(
 		actor_id,
 		&stripped_path,
 		token.as_deref(),
-		bypass_connectable,
+		skip_ready_wait,
 	)
 	.await
 	.map(Some)
@@ -247,7 +246,7 @@ async fn route_request_inner(
 	actor_id: Id,
 	stripped_path: &str,
 	_token: Option<&str>,
-	bypass_connectable: bool,
+	skip_ready_wait: bool,
 ) -> Result<RoutingOutput> {
 	// NOTE: Token validation implemented in EE
 
@@ -323,7 +322,7 @@ async fn route_request_inner(
 				actor_id,
 				actor,
 				stripped_path,
-				bypass_connectable,
+				skip_ready_wait,
 				ready_sub2,
 				stopped_sub2,
 				fail_sub2,
@@ -338,7 +337,7 @@ async fn route_request_inner(
 				actor_id,
 				actor,
 				stripped_path,
-				bypass_connectable,
+				skip_ready_wait,
 				ready_sub,
 				stopped_sub,
 				fail_sub,
@@ -361,7 +360,7 @@ async fn handle_actor_v2(
 	actor_id: Id,
 	actor: pegboard::ops::actor::get_for_gateway::Output,
 	stripped_path: &str,
-	bypass_connectable: bool,
+	skip_ready_wait: bool,
 	mut ready_sub: SubscriptionHandle<pegboard::workflows::actor2::Ready>,
 	mut stopped_sub: SubscriptionHandle<pegboard::workflows::actor2::Stopped>,
 	mut fail_sub: SubscriptionHandle<pegboard::workflows::actor2::Failed>,
@@ -378,7 +377,7 @@ async fn handle_actor_v2(
 	}
 
 	let envoy_key = if let (Some(envoy_key), true) =
-		(actor.envoy_key, actor.connectable || bypass_connectable)
+		(actor.envoy_key, actor.connectable || skip_ready_wait)
 	{
 		envoy_key
 	} else {
@@ -464,7 +463,7 @@ async fn handle_actor_v1(
 	actor_id: Id,
 	actor: pegboard::ops::actor::get_for_gateway::Output,
 	stripped_path: &str,
-	bypass_connectable: bool,
+	skip_ready_wait: bool,
 	mut ready_sub: SubscriptionHandle<pegboard::workflows::actor::Ready>,
 	mut stopped_sub: SubscriptionHandle<pegboard::workflows::actor::Stopped>,
 	mut fail_sub: SubscriptionHandle<pegboard::workflows::actor::Failed>,
@@ -490,7 +489,7 @@ async fn handle_actor_v1(
 	}
 
 	let runner_id = if let (Some(runner_id), true) =
-		(actor.runner_id, actor.connectable || bypass_connectable)
+		(actor.runner_id, actor.connectable || skip_ready_wait)
 	{
 		runner_id
 	} else {
@@ -555,7 +554,7 @@ async fn handle_actor_v1(
 						actor_id,
 						actor,
 						stripped_path,
-						bypass_connectable,
+						skip_ready_wait,
 						ready_sub2,
 						stopped_sub2,
 						fail_sub2,
@@ -623,6 +622,46 @@ fn read_gateway_token_for_path_based<'a>(
 			.map(|x| x.to_str())
 			.transpose()
 			.context("invalid x-rivet-token header")
+	}
+}
+
+fn read_skip_ready_wait_for_path_based(req_ctx: &RequestContext) -> Result<bool> {
+	if req_ctx.is_websocket() {
+		Ok(req_ctx
+			.headers()
+			.get(SEC_WEBSOCKET_PROTOCOL)
+			.and_then(|protocols| protocols.to_str().ok())
+			.is_some_and(|protocols| {
+				protocols
+					.split(',')
+					.map(|p| p.trim())
+					.any(|p| p == WS_PROTOCOL_SKIP_READY_WAIT)
+			}))
+	} else {
+		read_skip_ready_wait_header(req_ctx)
+	}
+}
+
+fn read_skip_ready_wait_header(req_ctx: &RequestContext) -> Result<bool> {
+	let Some(value) = req_ctx.headers().get(X_RIVET_SKIP_READY_WAIT) else {
+		return Ok(false);
+	};
+
+	let value = value.to_str().context("invalid x-rivet-skip-ready-wait header")?;
+	parse_skip_ready_wait_bool(value).ok_or_else(|| {
+		crate::errors::InvalidHeader {
+			header: X_RIVET_SKIP_READY_WAIT.to_string(),
+			detail: "expected true, false, 1, or 0".to_string(),
+		}
+		.build()
+	})
+}
+
+fn parse_skip_ready_wait_bool(value: &str) -> Option<bool> {
+	match value {
+		"true" | "1" => Some(true),
+		"false" | "0" => Some(false),
+		_ => None,
 	}
 }
 

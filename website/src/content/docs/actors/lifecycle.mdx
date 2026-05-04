@@ -763,7 +763,7 @@ curl -X POST \
 
 ### Skip Ready Wait
 
-The gateway normally holds requests until the actor is ready. The actor is not ready during startup (before `onWake` finishes) or during the sleep grace period (while `onSleep` and `waitUntil` are running). Probes and readiness checks can opt out with `gateway.skipReadyWait` to reach the actor's `onRequest` or `onWebSocket` handler in either window.
+The gateway normally holds requests until the actor is ready. The actor is not ready during startup (before `onWake` finishes) or during the sleep grace period (while `onSleep` and `waitUntil` are running). Probes and readiness checks can opt out with `skipReadyWait` to reach the actor's `onRequest` or `onWebSocket` handler in either window.
 
 See [Skip Ready Wait](/docs/clients/javascript#skip-ready-wait) on the JavaScript client page for usage.
 

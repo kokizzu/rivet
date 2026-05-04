@@ -32,7 +32,6 @@ export type ActorActionFunction<
 ) => Promise<Response>;
 
 export interface ActorGatewayOptions {
-	bypassConnectable?: boolean;
 	skipReadyWait?: boolean;
 }
 
@@ -42,35 +41,22 @@ export function resolveActorGatewayOptions(
 	defaults: ActorGatewayOptions = {},
 	overrides?: ActorGatewayOptions,
 ): ResolvedActorGatewayOptions {
-	const bypassConnectable =
-		overrides?.bypassConnectable ??
-		overrides?.skipReadyWait ??
-		defaults.bypassConnectable ??
-		defaults.skipReadyWait ??
-		false;
+	const skipReadyWait = overrides?.skipReadyWait ?? defaults.skipReadyWait ?? false;
 
 	return {
-		bypassConnectable,
-		skipReadyWait: bypassConnectable,
+		skipReadyWait,
 	};
 }
 
-export interface ActorActionOptions {
-	gateway?: ActorGatewayOptions;
+export interface ActorActionOptions extends ActorGatewayOptions {
 	signal?: AbortSignal;
 }
 
-export interface ActorConnectOptions {
-	gateway?: ActorGatewayOptions;
-}
+export type ActorConnectOptions = ActorGatewayOptions;
 
-export interface ActorFetchInit extends RequestInit {
-	gateway?: ActorGatewayOptions;
-}
+export type ActorFetchInit = RequestInit & ActorGatewayOptions;
 
-export interface ActorWebSocketOptions {
-	gateway?: ActorGatewayOptions;
-}
+export type ActorWebSocketOptions = ActorGatewayOptions;
 
 /**
  * Maps action methods from actor definition to typed function signatures.

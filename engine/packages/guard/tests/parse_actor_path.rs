@@ -39,7 +39,7 @@ fn parses_query_actor_get_paths() {
 						"shard-2".to_string(),
 						"alpha@beta".to_string(),
 					],
-					bypass_connectable: false,
+					skip_ready_wait: false,
 				}
 			);
 		}
@@ -74,7 +74,7 @@ fn parses_query_actor_get_or_create_paths_with_input_and_region() {
 					input: Some(input_bytes),
 					region: Some("us-west-2".to_string()),
 					crash_policy: None,
-					bypass_connectable: false,
+					skip_ready_wait: false,
 				}
 			);
 		}
@@ -104,7 +104,7 @@ fn parses_query_actor_get_or_create_paths_with_multi_component_key() {
 					input: Some(input_bytes),
 					region: None,
 					crash_policy: None,
-					bypass_connectable: false,
+					skip_ready_wait: false,
 				}
 			);
 			assert_eq!(path.stripped_path, "/socket");
@@ -126,7 +126,7 @@ fn parses_query_actor_get_paths_with_empty_key() {
 					namespace: "default".to_string(),
 					name: "lobby".to_string(),
 					key: Vec::new(),
-					bypass_connectable: false,
+					skip_ready_wait: false,
 				}
 			);
 			assert_eq!(path.stripped_path, "/");
@@ -152,7 +152,7 @@ fn omits_key_when_not_present() {
 					input: None,
 					region: None,
 					crash_policy: None,
-					bypass_connectable: false,
+					skip_ready_wait: false,
 				}
 			);
 			assert_eq!(path.stripped_path, "/");
@@ -174,7 +174,7 @@ fn parses_simple_multi_component_keys() {
 					namespace: "default".to_string(),
 					name: "lobby".to_string(),
 					key: vec!["a".to_string(), "b".to_string(), "c".to_string()],
-					bypass_connectable: false,
+					skip_ready_wait: false,
 				}
 			);
 		}
@@ -199,7 +199,7 @@ fn parses_crash_policy_param() {
 					input: None,
 					region: None,
 					crash_policy: Some(rivet_types::actors::CrashPolicy::Restart),
-					bypass_connectable: false,
+					skip_ready_wait: false,
 				}
 			);
 		}
@@ -208,8 +208,8 @@ fn parses_crash_policy_param() {
 }
 
 #[test]
-fn parses_bypass_connectable_query_bool_strings() {
-	let path = "/gateway/worker/request/bypass?rvt-namespace=default&rvt-method=getOrCreate&rvt-runner=default&rvt-bypass_connectable=true";
+fn parses_skip_ready_wait_query_bool_strings() {
+	let path = "/gateway/worker/request/skip-ready-wait?rvt-namespace=default&rvt-method=getOrCreate&rvt-runner=default&rvt-skip-ready-wait=true";
 	let result = parse_actor_path(path).unwrap().unwrap();
 
 	match result {
@@ -224,10 +224,10 @@ fn parses_bypass_connectable_query_bool_strings() {
 					input: None,
 					region: None,
 					crash_policy: None,
-					bypass_connectable: true,
+					skip_ready_wait: true,
 				}
 			);
-			assert_eq!(path.stripped_path, "/request/bypass");
+			assert_eq!(path.stripped_path, "/request/skip-ready-wait");
 		}
 		ParsedActorPath::Direct(_) => panic!("expected query actor path"),
 	}
@@ -236,10 +236,10 @@ fn parses_bypass_connectable_query_bool_strings() {
 #[test]
 fn identifies_gateway_paths_without_parsing_query_params() {
 	assert!(is_actor_gateway_path(
-		"/gateway/worker/request/bypass?rvt-bypass_connectable=true"
+		"/gateway/worker/request/skip-ready-wait?rvt-skip-ready-wait=true"
 	));
 	assert!(is_actor_gateway_path("/gateway/actor-id"));
-	assert!(!is_actor_gateway_path("/request/bypass"));
+	assert!(!is_actor_gateway_path("/request/skip-ready-wait"));
 	assert!(!is_actor_gateway_path("/gateway//worker"));
 }
 
@@ -317,7 +317,7 @@ fn handles_interleaved_rvt_and_actor_params() {
 					namespace: "default".to_string(),
 					name: "lobby".to_string(),
 					key: Vec::new(),
-					bypass_connectable: false,
+					skip_ready_wait: false,
 				}
 			);
 		}
@@ -341,7 +341,7 @@ fn decodes_plus_as_space_in_rvt_values() {
 					namespace: "my ns".to_string(),
 					name: "lobby".to_string(),
 					key: vec!["hello world".to_string()],
-					bypass_connectable: false,
+					skip_ready_wait: false,
 				}
 			);
 			// Actor param + is preserved literally.
