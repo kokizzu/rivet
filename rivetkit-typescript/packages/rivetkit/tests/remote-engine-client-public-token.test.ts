@@ -1,6 +1,12 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { ClientConfigSchema } from "@/client/config";
-import { HEADER_RIVET_TOKEN } from "@/common/actor-router-consts";
+import {
+	HEADER_RIVET_ACTOR,
+	HEADER_RIVET_BYPASS_CONNECTABLE,
+	HEADER_RIVET_TARGET,
+	HEADER_RIVET_TOKEN,
+} from "@/common/actor-router-consts";
+import { createClient } from "@/client/mod";
 import { RemoteEngineControlClient } from "@/engine-client/mod";
 
 describe.sequential("RemoteEngineControlClient public token usage", () => {
@@ -74,6 +80,75 @@ describe.sequential("RemoteEngineControlClient public token usage", () => {
 			"public-http-token",
 		);
 		expect(actorRequest?.headers.get("x-user-header")).toBe("present");
+	});
+
+	test("sets bypass connectable header for actor HTTP gateway requests", async () => {
+		const fetchCalls: Request[] = [];
+		const fetchMock = vi.fn(async (input: Request | URL | string) => {
+			const request = normalizeRequest(input);
+			fetchCalls.push(request);
+			return new Response("ok");
+		});
+		vi.stubGlobal("fetch", fetchMock);
+
+		const driver = new RemoteEngineControlClient(
+			ClientConfigSchema.parse({
+				endpoint: "https://api.rivet.dev",
+				disableMetadataLookup: true,
+			}),
+		);
+
+		const response = await driver.sendRequest(
+			{ directId: "actor-http-bypass" },
+			new Request("http://actor/request/bypass"),
+			{ bypassConnectable: true },
+		);
+
+		expect(response.status).toBe(200);
+		expect(fetchCalls).toHaveLength(1);
+
+		const actorRequest = fetchCalls[0];
+		expect(actorRequest?.url).toBe("https://api.rivet.dev/request/bypass");
+		expect(actorRequest?.headers.get(HEADER_RIVET_TARGET)).toBe("actor");
+		expect(actorRequest?.headers.get(HEADER_RIVET_ACTOR)).toBe(
+			"actor-http-bypass",
+		);
+		expect(actorRequest?.headers.get(HEADER_RIVET_BYPASS_CONNECTABLE)).toBe(
+			"1",
+		);
+	});
+
+	test("handle fetch forwards bypass connectable to browser request", async () => {
+		const fetchCalls: Request[] = [];
+		const fetchMock = vi.fn(async (input: Request | URL | string) => {
+			const request = normalizeRequest(input);
+			fetchCalls.push(request);
+			return new Response("ok");
+		});
+		vi.stubGlobal("fetch", fetchMock);
+
+		const client = createClient({
+			endpoint: "https://api.rivet.dev",
+			disableMetadataLookup: true,
+		});
+		const handle = client.getForId("mockAgenticLoop", "actor-http-bypass");
+
+		const response = await handle.fetch("/bypass", {
+			gateway: { bypassConnectable: true },
+		});
+
+		expect(response.status).toBe(200);
+		expect(fetchCalls).toHaveLength(1);
+
+		const actorRequest = fetchCalls[0];
+		expect(actorRequest?.url).toBe("https://api.rivet.dev/request/bypass");
+		expect(actorRequest?.headers.get(HEADER_RIVET_TARGET)).toBe("actor");
+		expect(actorRequest?.headers.get(HEADER_RIVET_ACTOR)).toBe(
+			"actor-http-bypass",
+		);
+		expect(actorRequest?.headers.get(HEADER_RIVET_BYPASS_CONNECTABLE)).toBe(
+			"1",
+		);
 	});
 
 	test("uses metadata clientToken for actor websocket gateway requests", async () => {
