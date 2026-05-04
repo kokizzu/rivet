@@ -625,6 +625,19 @@ pub(super) fn normalize_actor_request_path(path: &str) -> String {
 	}
 }
 
+#[cfg(test)]
+pub(super) fn is_actor_request_path(path: &str) -> bool {
+	let Some(stripped) = path.strip_prefix("/request") else {
+		return false;
+	};
+
+	stripped.is_empty()
+		|| stripped
+			.as_bytes()
+			.first()
+			.is_some_and(|byte| matches!(byte, b'/' | b'?'))
+}
+
 pub(super) fn build_envoy_response(response: Response) -> Result<HttpResponse> {
 	let (status, headers, body) = response.to_parts();
 

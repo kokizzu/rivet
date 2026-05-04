@@ -1160,6 +1160,7 @@ impl ActorTask {
 	}
 
 	fn dispatch_lifecycle_error(&self) -> Option<anyhow::Error> {
+		// TODO: Share admission policy with RegistryDispatcher::active_actor.
 		if self.ctx.destroy_requested() {
 			self.ctx.warn_work_sent_to_stopping_instance("dispatch");
 			return Some(ActorLifecycleError::Destroying.build());

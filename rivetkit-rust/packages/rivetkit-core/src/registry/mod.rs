@@ -808,6 +808,7 @@ impl RegistryDispatcher {
 			match instance.get() {
 					ActorInstanceState::Active(instance) => {
 						let instance = instance.clone();
+						// TODO: Share admission policy with ActorTask::dispatch_lifecycle_error.
 						if instance.ctx.started() {
 							if instance.ctx.destroy_requested() {
 								instance
