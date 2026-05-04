@@ -3,7 +3,8 @@ use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
 use std::ptr;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail, ensure};
 use depot::{
@@ -54,6 +55,8 @@ use super::workload::LogicalOp;
 type StageFuture = Pin<Box<dyn Future<Output = Result<()>>>>;
 type Stage = Box<dyn FnOnce(FaultScenarioCtx) -> StageFuture>;
 type FaultSetup = Box<dyn FnOnce(&DepotFaultController) -> Result<()>>;
+
+static FAULT_SCENARIO_RUN_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum FaultProfile {
@@ -190,6 +193,15 @@ impl FaultScenario {
 	}
 
 	pub(crate) fn run(self) -> Result<()> {
+		// Fault scenarios install process-global workflow hooks for compaction
+		// workflows, then spin and shut down workflow workers. Running multiple
+		// scenarios in the same test process can make one scenario observe another
+		// scenario's worker/debug lifecycle instead of its own force-compaction ack.
+		let Some(_run_guard) = FAULT_SCENARIO_RUN_LOCK.try_lock() else {
+			bail!(
+				"depot-client fault scenarios cannot run in parallel; rerun with `cargo test -p depot-client fault -- --test-threads=1`"
+			);
+		};
 		let runtime = Builder::new_multi_thread()
 			.worker_threads(2)
 			.enable_all()
@@ -436,8 +448,16 @@ impl FaultScenarioCtx {
 		let manager_workflow_id = self.manager_workflow_id(database_branch_id).await?;
 		let test_ctx = self.inner.test_ctx.lock().await;
 		DepotCompactionTestDriver::new(&test_ctx)
+			.with_wait_timeout(self.force_compaction_wait_timeout())
 			.force_compaction(manager_workflow_id, database_branch_id, work)
 			.await
+	}
+
+	fn force_compaction_wait_timeout(&self) -> Duration {
+		match self.inner.profile {
+			FaultProfile::Simple => Duration::from_secs(30),
+			FaultProfile::Chaos => Duration::from_secs(120),
+		}
 	}
 
 	pub(crate) async fn verify_sqlite_integrity(&self) -> Result<()> {

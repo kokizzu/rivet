@@ -4,16 +4,18 @@ use std::sync::Arc;
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use depot::{
 	cold_tier::ColdTier,
+	conveyer::branch::resolve_database_branch,
 	keys,
 	ltx::{DecodedLtx, decode_ltx_v3},
 	types::{
-		BranchState, ColdShardRef, CommitRow, DatabaseBranchId, decode_cold_shard_ref,
+		BranchState, BucketId, ColdShardRef, CommitRow, DatabaseBranchId, decode_cold_shard_ref,
 		decode_commit_row, decode_compaction_root, decode_database_branch_record,
 		decode_database_pointer, decode_db_head, decode_db_history_pin,
 		decode_pitr_interval_coverage, decode_retired_cold_object, decode_sqlite_cmp_dirty,
 	},
 };
 use futures_util::TryStreamExt;
+use rivet_pools::__rivet_util::Id;
 use sha2::{Digest, Sha256};
 use universaldb::{
 	RangeOption,
@@ -119,7 +121,14 @@ impl<'a> InvariantScan<'a> {
 	}
 
 	async fn check_database_pointer(&mut self) -> Result<Option<DatabaseBranchId>> {
-		let mut current = None;
+		let resolved = resolve_database_branch(
+			self.tx,
+			BucketId::from_gas_id(Id::nil()),
+			&self.database_id,
+			Serializable,
+		)
+		.await?;
+		let mut scanned_current = None;
 		for (key, value) in scan_prefix(self.tx, keys::database_pointer_cur_prefix()).await? {
 			let decoded_key = keys::decode_database_pointer_cur_key(&key);
 			let pointer = decode_database_pointer(&value);
@@ -127,7 +136,7 @@ impl<'a> InvariantScan<'a> {
 				(Ok((_bucket_branch_id, database_id)), Ok(pointer))
 					if database_id == self.database_id =>
 				{
-					if current.replace(pointer.current_branch).is_some() {
+					if scanned_current.replace(pointer.current_branch).is_some() {
 						self.violate("database pointer appeared more than once");
 					}
 				}
@@ -141,13 +150,16 @@ impl<'a> InvariantScan<'a> {
 			}
 		}
 
-		if current.is_none() {
-			self.violate(format!(
-				"database pointer for {} is missing",
-				self.database_id
-			));
+		let Some(current) = resolved else {
+			self.violate(format!("database pointer for {} is missing", self.database_id));
+			return Ok(None);
+		};
+		if let Some(scanned_current) = scanned_current
+			&& scanned_current != current
+		{
+			self.violate("database pointer scan disagreed with branch resolution");
 		}
-		Ok(current)
+		Ok(Some(current))
 	}
 
 	async fn check_branch_record(&mut self, branch_id: DatabaseBranchId) -> Result<()> {
