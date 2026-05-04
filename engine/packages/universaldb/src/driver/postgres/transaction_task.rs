@@ -9,9 +9,7 @@ use crate::{
 	options::{ConflictRangeType, MutationType},
 	tx_ops::Operation,
 	value::{KeyValue, Slice, Values},
-	versionstamp::{
-		generate_versionstamp, substitute_raw_versionstamp, substitute_versionstamp_if_incomplete,
-	},
+	versionstamp::{generate_versionstamp, substitute_raw_versionstamp},
 };
 
 pub enum TransactionCommand {
@@ -385,10 +383,7 @@ impl TransactionTask {
 
 		for op in operations {
 			match op {
-				Operation::Set { key, value } => {
-					// TODO: versionstamps need to be calculated on the sql side, not in rust
-					let value = substitute_versionstamp_if_incomplete(value.clone(), 0);
-
+				Operation::SetValue { key, value } => {
 					let query = "INSERT INTO kv (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = $2";
 					let stmt = tx.prepare_cached(query).await.map_err(map_postgres_error)?;
 

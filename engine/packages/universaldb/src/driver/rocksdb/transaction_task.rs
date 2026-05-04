@@ -14,9 +14,7 @@ use crate::{
 	options::{ConflictRangeType, MutationType},
 	tx_ops::Operation,
 	value::{KeyValue, Slice, Values},
-	versionstamp::{
-		generate_versionstamp, substitute_raw_versionstamp, substitute_versionstamp_if_incomplete,
-	},
+	versionstamp::{generate_versionstamp, substitute_raw_versionstamp},
 };
 
 pub enum TransactionCommand {
@@ -321,12 +319,7 @@ impl TransactionTask {
 		// Apply all operations to the transaction
 		for op in operations {
 			match op {
-				Operation::Set { key, value } => {
-					// Substitute versionstamp if incomplete
-					// For now, just use the simple substitution - we can improve this later
-					// to ensure all versionstamps in a transaction have the same base timestamp
-					let value = substitute_versionstamp_if_incomplete(value.clone(), 0);
-
+				Operation::SetValue { key, value } => {
 					txn.put(key, &value)
 						.context("failed to set key in rocksdb")?;
 				}
