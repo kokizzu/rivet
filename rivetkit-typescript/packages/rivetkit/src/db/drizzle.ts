@@ -10,7 +10,7 @@ import type {
 	SqliteDatabase,
 } from "@/common/database/config";
 import { toSqliteBindings } from "@/common/database/shared";
-import { getNodeCrypto } from "@/utils/node";
+import { sha256Hex } from "@/utils/crypto";
 
 export type { SQLiteTable } from "drizzle-orm/sqlite-core";
 export {
@@ -243,10 +243,7 @@ async function runMigrations<TSchema extends DrizzleSchema>(
 
 		await db.execute(
 			"INSERT INTO __drizzle_migrations (hash, created_at) VALUES (?, ?)",
-			getNodeCrypto()
-				.createHash("sha256")
-				.update(migration)
-				.digest("hex"),
+			await sha256Hex(migration),
 			entry.when,
 		);
 	}
