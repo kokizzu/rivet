@@ -26,6 +26,7 @@ use crate::optimization_flags::{
 };
 use crate::query::{BindParam, ColumnValue};
 use crate::vfs::SqliteVfsMetrics;
+use crate::worker::SqliteWorkerFatalError;
 
 use super::*;
 
@@ -108,6 +109,7 @@ impl SqliteTransport for RecordingInitialPagesTransport {
 						bytes: Some(vec![pgno as u8; DEFAULT_PAGE_SIZE]),
 					})
 					.collect(),
+				head_txid: Some(0),
 			},
 		))
 	}
@@ -130,6 +132,8 @@ impl SqliteTransport for MissingDbTransport {
 	) -> anyhow::Result<protocol::SqliteGetPagesResponse> {
 		Ok(protocol::SqliteGetPagesResponse::SqliteErrorResponse(
 			protocol::SqliteErrorResponse {
+				group: "depot".to_string(),
+				code: "database_not_found".to_string(),
 				message: "sqlite database was not found in this bucket branch".to_string(),
 			},
 		))
@@ -164,7 +168,11 @@ fn startup_initial_pages_do_not_require_preload_hints_on_open() {
 		))
 		.expect("initial pages should load");
 
-	let loaded_pgnos = pages.iter().map(|(pgno, _)| *pgno).collect::<Vec<_>>();
+	let loaded_pgnos = pages
+		.pages
+		.iter()
+		.map(|(pgno, _)| *pgno)
+		.collect::<Vec<_>>();
 	assert_eq!(*transport.requested_pgnos.lock(), vec![1, 2, 3, 4]);
 	assert_eq!(loaded_pgnos, vec![1, 2, 3, 4]);
 }
@@ -387,28 +395,44 @@ fn open_worker_handle_with_metrics(
 	harness: &DirectEngineHarness,
 	metrics: Option<Arc<dyn SqliteVfsMetrics>>,
 ) -> crate::database::NativeDatabaseHandle {
+	open_worker_handle_with_vfs(runtime, harness, metrics).1
+}
+
+fn open_worker_handle_with_vfs(
+	runtime: &tokio::runtime::Runtime,
+	harness: &DirectEngineHarness,
+	metrics: Option<Arc<dyn SqliteVfsMetrics>>,
+) -> (Arc<SqliteVfs>, crate::database::NativeDatabaseHandle) {
 	let engine = runtime.block_on(harness.open_engine());
 	let transport = Arc::new(DirectDepotTransport::new(engine));
-	let initial_main_page = runtime
-		.block_on(fetch_initial_main_page_for_registration(
+	let config = VfsConfig::default();
+	let initial_pages = runtime
+		.block_on(fetch_initial_pages_for_registration(
 			transport.clone(),
 			&harness.actor_id,
+			&config,
 		))
-		.expect("initial main page preload should succeed");
+		.expect("initial pages preload should succeed");
 	let vfs = Arc::new(
-		SqliteVfs::register_with_transport_and_initial_page(
+		SqliteVfs::register_with_transport_and_initial_pages(
 			&next_test_name("sqlite-worker-vfs"),
 			transport,
 			harness.actor_id.clone(),
 			runtime.handle().clone(),
-			VfsConfig::default(),
-			initial_main_page,
+			config,
+			initial_pages,
 			None,
 		)
 		.expect("worker vfs should register"),
 	);
-	crate::database::NativeDatabaseHandle::new_with_metrics(vfs, harness.actor_id.clone(), metrics)
-		.expect("worker handle should start")
+	let db =
+		crate::database::NativeDatabaseHandle::new_with_metrics(
+			vfs.clone(),
+			harness.actor_id.clone(),
+			metrics,
+		)
+		.expect("worker handle should start");
+	(vfs, db)
 }
 
 #[derive(Default)]
@@ -1177,6 +1201,7 @@ fn strict_direct_reopen_counts_cold_tier_get_for_cold_covered_page() {
 	let page = runtime
 		.block_on(engine.get_pages(&harness.actor_id, &[1]))
 		.expect("page 1 should be fetched from depot")
+		.pages
 		.into_iter()
 		.find(|page| page.pgno == 1)
 		.and_then(|page| page.bytes)
@@ -1220,6 +1245,7 @@ fn strict_direct_warmed_shard_cache_does_not_count_as_cold_tier_evidence() {
 	let page = runtime
 		.block_on(engine.get_pages(&harness.actor_id, &[1]))
 		.expect("page 1 should be fetched from depot")
+		.pages
 		.into_iter()
 		.find(|page| page.pgno == 1)
 		.and_then(|page| page.bytes)
@@ -1235,6 +1261,7 @@ fn strict_direct_warmed_shard_cache_does_not_count_as_cold_tier_evidence() {
 	let cold_page = runtime
 		.block_on(engine.get_pages(&harness.actor_id, &[1]))
 		.expect("strict direct read should hit cold tier")
+		.pages
 		.into_iter()
 		.find(|page| page.pgno == 1)
 		.and_then(|page| page.bytes)
@@ -3493,6 +3520,123 @@ fn resolve_pages_surfaces_read_path_error_response() {
 }
 
 #[test]
+fn resolve_pages_sends_known_head_txid_as_read_fence() {
+	let runtime = direct_runtime();
+	let harness = DirectEngineHarness::new();
+	let engine = runtime.block_on(harness.open_engine());
+	runtime
+		.block_on(engine.apply_commit(
+			&harness.actor_id,
+			vec![depot::types::DirtyPage {
+				pgno: 2,
+				bytes: vec![0x44; DEFAULT_PAGE_SIZE],
+			}],
+			2,
+		))
+		.expect("mirror seed should succeed");
+	let transport = Arc::new(DirectMirrorTransport::new(engine));
+	let hooks = transport.direct_hooks();
+	let ctx = VfsContext::new(
+		harness.actor_id.clone(),
+		runtime.handle().clone(),
+		transport,
+		VfsConfig::default(),
+		unsafe { std::mem::zeroed() },
+		Vec::new(),
+		None,
+	)
+	.expect("vfs context should build");
+	{
+		let mut state = ctx.state.write();
+		state.db_size_pages = 2;
+		state.head_txid = Some(7);
+	}
+
+	ctx.resolve_pages(&[2], false)
+		.expect("read should fetch from transport");
+	let requests = hooks.get_pages_requests();
+	let request = requests.last().expect("get_pages request should be recorded");
+	assert_eq!(request.expected_head_txid, Some(7));
+}
+
+#[test]
+fn fatal_sqlite_error_reports_first_message_through_worker_boundary() {
+	let runtime = direct_runtime();
+	let harness = DirectEngineHarness::new();
+	let (vfs, db) = open_worker_handle_with_vfs(&runtime, &harness, None);
+	let ctx = vfs.ctx();
+	runtime
+		.block_on(db.exec("SELECT 1;".to_string()))
+		.expect("worker should initialize before fatal state is injected");
+
+	ctx.mark_fatal("first fatal sqlite error".to_string());
+	ctx.mark_fatal("second fatal sqlite error".to_string());
+
+	assert!(ctx.is_dead());
+	assert_eq!(ctx.clone_fatal_error().as_deref(), Some("first fatal sqlite error"));
+
+	let err = runtime
+		.block_on(db.exec("SELECT 1;".to_string()))
+		.expect_err("fatal VFS state should fail before SQL execution");
+	let fatal = err
+		.downcast_ref::<SqliteWorkerFatalError>()
+		.expect("error should be typed as fatal worker error");
+	assert_eq!(fatal.message(), "first fatal sqlite error");
+
+	runtime
+		.block_on(db.close())
+		.expect("worker should still close cleanly after fatal state");
+}
+
+#[test]
+fn head_fence_ioerr_maps_to_fatal_worker_error_and_future_operations_fail_closed() {
+	let runtime = direct_runtime();
+	let harness = DirectEngineHarness::new();
+	let stale = open_worker_handle(&runtime, &harness);
+	runtime
+		.block_on(stale.exec("SELECT 1;".to_string()))
+		.expect("stale worker should initialize before becoming stale");
+	let writer = open_worker_handle(&runtime, &harness);
+
+	runtime
+		.block_on(writer.exec("CREATE TABLE writer_first (value INTEGER);".to_string()))
+		.expect("writer should advance depot head");
+
+	let err = runtime
+		.block_on(stale.exec("CREATE TABLE stale_writer (value INTEGER);".to_string()))
+		.expect_err("stale writer should hit a fatal head fence mismatch");
+	let fatal = err
+		.downcast_ref::<SqliteWorkerFatalError>()
+		.expect("head fence mismatch should be surfaced as a fatal worker error");
+	assert!(
+		fatal.message().contains("head fence mismatch"),
+		"unexpected fatal message: {}",
+		fatal.message()
+	);
+	assert!(
+		stale
+			.clone_fatal_error()
+			.is_some_and(|message| message.contains("head fence mismatch")),
+		"VFS should retain the fatal head fence error"
+	);
+
+	let err = runtime
+		.block_on(stale.exec("SELECT 1;".to_string()))
+		.expect_err("future operations should fail closed from stored fatal state");
+	assert!(
+		err.downcast_ref::<SqliteWorkerFatalError>().is_some(),
+		"future error should remain typed as fatal worker error: {err:#}"
+	);
+
+	runtime
+		.block_on(stale.close())
+		.expect("stale worker should still close cleanly");
+	runtime
+		.block_on(writer.close())
+		.expect("writer worker should close cleanly");
+}
+
+#[test]
 fn commit_buffered_pages_uses_fast_path() {
 	let runtime = direct_runtime();
 	let harness = DirectEngineHarness::new();
@@ -3506,6 +3650,7 @@ fn commit_buffered_pages_uses_fast_path() {
 			BufferedCommitRequest {
 				actor_id: harness.actor_id.clone(),
 				new_db_size_pages: 1,
+				expected_head_txid: None,
 				dirty_pages: vec![protocol::SqliteDirtyPage {
 					pgno: 1,
 					bytes: empty_db_page(),

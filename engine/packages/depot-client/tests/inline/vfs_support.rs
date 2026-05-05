@@ -10,6 +10,7 @@ use async_trait::async_trait;
 use depot::{
 	cold_tier::{ColdTier, ColdTierObjectMetadata},
 	conveyer::{Db, db::CompactionSignaler},
+	error::SqliteStorageError,
 	fault::DepotFaultController,
 	keys::{
 		SHARD_SIZE, branch_compaction_cold_shard_key, branch_compaction_root_key,
@@ -333,14 +334,24 @@ impl DirectStorage {
 		&self,
 		actor_id: &str,
 		pgnos: &[u32],
-	) -> anyhow::Result<Vec<depot::types::FetchedPage>> {
+	) -> anyhow::Result<depot::types::GetPagesResult> {
+		self.get_pages_with_options(actor_id, pgnos, depot::types::GetPagesOptions::default())
+			.await
+	}
+
+	pub(crate) async fn get_pages_with_options(
+		&self,
+		actor_id: &str,
+		pgnos: &[u32],
+		options: depot::types::GetPagesOptions,
+	) -> anyhow::Result<depot::types::GetPagesResult> {
 		if let Some(message) = self.hooks.take_get_pages_error() {
 			return Err(anyhow::anyhow!(message));
 		}
 
 		let actor_db = self.actor_db(actor_id.to_string()).await;
 		self.counters.depot_get_pages.fetch_add(1, Ordering::SeqCst);
-		actor_db.get_pages(pgnos.to_vec()).await
+		actor_db.get_pages_with_options(pgnos.to_vec(), options).await
 	}
 
 	pub(crate) async fn read_mirror(
@@ -411,11 +422,23 @@ impl SqliteTransport for DirectDepotTransport {
 		&self,
 		request: protocol::SqliteGetPagesRequest,
 	) -> Result<protocol::SqliteGetPagesResponse> {
+		self.storage.hooks.record_get_pages_request(request.clone());
 		let pgnos = request.pgnos.clone();
-		match self.storage.get_pages(&request.actor_id, &pgnos).await {
-			Ok(pages) => Ok(protocol::SqliteGetPagesResponse::SqliteGetPagesOk(
+		match self
+			.storage
+			.get_pages_with_options(
+				&request.actor_id,
+				&pgnos,
+				depot::types::GetPagesOptions {
+					expected_head_txid: request.expected_head_txid,
+				},
+			)
+			.await
+		{
+			Ok(result) => Ok(protocol::SqliteGetPagesResponse::SqliteGetPagesOk(
 				protocol::SqliteGetPagesOk {
-					pages: pages.into_iter().map(protocol_fetched_page).collect(),
+					pages: result.pages.into_iter().map(protocol_fetched_page).collect(),
+					head_txid: Some(result.head_txid),
 				},
 			)),
 			Err(err) => Ok(protocol::SqliteGetPagesResponse::SqliteErrorResponse(
@@ -441,10 +464,21 @@ impl SqliteTransport for DirectDepotTransport {
 			.collect::<Vec<_>>();
 		let actor_db = self.storage.actor_db(actor_id).await;
 		match actor_db
-			.commit(dirty_pages, request.db_size_pages, request.now_ms)
+			.commit_with_options(
+				dirty_pages,
+				request.db_size_pages,
+				request.now_ms,
+				depot::types::CommitOptions {
+					expected_head_txid: request.expected_head_txid,
+				},
+			)
 			.await
 		{
-			Ok(_) => Ok(protocol::SqliteCommitResponse::SqliteCommitOk),
+			Ok(result) => Ok(protocol::SqliteCommitResponse::SqliteCommitOk(
+				protocol::SqliteCommitOk {
+					head_txid: Some(result.head_txid),
+				},
+			)),
 			Err(err) => Ok(protocol::SqliteCommitResponse::SqliteErrorResponse(
 				sqlite_error_response(&err),
 			)),
@@ -472,6 +506,7 @@ impl SqliteTransport for DirectMirrorTransport {
 		&self,
 		request: protocol::SqliteGetPagesRequest,
 	) -> Result<protocol::SqliteGetPagesResponse> {
+		self.storage.hooks.record_get_pages_request(request.clone());
 		if let Some(message) = self.storage.hooks.take_get_pages_error() {
 			return Err(anyhow::anyhow!(message));
 		}
@@ -483,6 +518,7 @@ impl SqliteTransport for DirectMirrorTransport {
 		Ok(protocol::SqliteGetPagesResponse::SqliteGetPagesOk(
 			protocol::SqliteGetPagesOk {
 				pages: pages.into_iter().map(protocol_fetched_page).collect(),
+				head_txid: None,
 			},
 		))
 	}
@@ -507,7 +543,11 @@ impl SqliteTransport for DirectMirrorTransport {
 			.apply_commit(&actor_id, dirty_pages, request.db_size_pages)
 			.await
 		{
-			Ok(()) => Ok(protocol::SqliteCommitResponse::SqliteCommitOk),
+			Ok(()) => Ok(protocol::SqliteCommitResponse::SqliteCommitOk(
+				protocol::SqliteCommitOk {
+					head_txid: None,
+				},
+			)),
 			Err(err) => Ok(protocol::SqliteCommitResponse::SqliteErrorResponse(
 				sqlite_error_response(&err),
 			)),
@@ -562,6 +602,7 @@ pub(crate) struct DirectTransportHooks {
 	fail_next_get_pages: Mutex<Option<String>>,
 	hang_next_commit: Mutex<bool>,
 	pause_next_commit: Mutex<Option<DirectCommitGate>>,
+	get_pages_requests: Mutex<Vec<protocol::SqliteGetPagesRequest>>,
 	commit_requests: Mutex<Vec<protocol::SqliteCommitRequest>>,
 }
 
@@ -582,6 +623,16 @@ impl DirectTransportHooks {
 		&self,
 	) -> parking_lot::MutexGuard<'_, Vec<protocol::SqliteCommitRequest>> {
 		self.commit_requests.lock()
+	}
+
+	pub(crate) fn get_pages_requests(
+		&self,
+	) -> parking_lot::MutexGuard<'_, Vec<protocol::SqliteGetPagesRequest>> {
+		self.get_pages_requests.lock()
+	}
+
+	pub(crate) fn record_get_pages_request(&self, req: protocol::SqliteGetPagesRequest) {
+		self.get_pages_requests.lock().push(req);
 	}
 
 	pub(crate) fn record_commit_request(&self, req: protocol::SqliteCommitRequest) {
@@ -684,7 +735,17 @@ fn sqlite_error_reason(err: &anyhow::Error) -> String {
 }
 
 pub(crate) fn sqlite_error_response(err: &anyhow::Error) -> protocol::SqliteErrorResponse {
+	let structured = depot_error(err)
+		.map(|err| rivet_error::RivetError::extract(&err.clone().build()))
+		.unwrap_or_else(|| rivet_error::RivetError::extract(err));
 	protocol::SqliteErrorResponse {
+		group: structured.group().to_string(),
+		code: structured.code().to_string(),
 		message: sqlite_error_reason(err),
 	}
+}
+
+fn depot_error(err: &anyhow::Error) -> Option<&SqliteStorageError> {
+	err.chain()
+		.find_map(|source| source.downcast_ref::<SqliteStorageError>())
 }

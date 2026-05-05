@@ -86,23 +86,27 @@ fn commit_response_ok_and_err_roundtrip() -> anyhow::Result<()> {
 	let ok = roundtrip_to_envoy(protocol::ToEnvoy::ToEnvoySqliteCommitResponse(
 		protocol::ToEnvoySqliteCommitResponse {
 			request_id: 1,
-			data: protocol::SqliteCommitResponse::SqliteCommitOk,
+			data: protocol::SqliteCommitResponse::SqliteCommitOk(protocol::SqliteCommitOk {
+				head_txid: Some(7),
+			}),
 		},
 	))?;
 	let protocol::ToEnvoy::ToEnvoySqliteCommitResponse(ok) = ok else {
 		panic!("expected commit response");
 	};
 	assert_eq!(ok.request_id, 1);
-	assert!(matches!(
-		ok.data,
-		protocol::SqliteCommitResponse::SqliteCommitOk
-	));
+	let protocol::SqliteCommitResponse::SqliteCommitOk(ok) = ok.data else {
+		panic!("expected ok response");
+	};
+	assert_eq!(ok.head_txid, Some(7));
 
 	let err = roundtrip_to_envoy(protocol::ToEnvoy::ToEnvoySqliteCommitResponse(
 		protocol::ToEnvoySqliteCommitResponse {
 			request_id: 2,
 			data: protocol::SqliteCommitResponse::SqliteErrorResponse(
 				protocol::SqliteErrorResponse {
+					group: "depot".into(),
+					code: "quota_exceeded".into(),
 					message: "quota exceeded".into(),
 				},
 			),
@@ -164,7 +168,7 @@ fn expected_generation_optional_present_and_absent() -> anyhow::Result<()> {
 
 #[test]
 fn protocol_version_constant_matches_schema_version() {
-	assert_eq!(PROTOCOL_VERSION, 4);
+	assert_eq!(PROTOCOL_VERSION, 5);
 }
 
 #[test]

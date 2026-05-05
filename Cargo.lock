@@ -1810,6 +1810,7 @@ dependencies = [
  "aws-config",
  "aws-sdk-s3",
  "base64 0.22.1",
+ "depot-client-types",
  "futures-util",
  "gasoline",
  "lazy_static",
@@ -1856,6 +1857,7 @@ dependencies = [
  "parking_lot",
  "rivet-config",
  "rivet-envoy-protocol",
+ "rivet-error",
  "rivet-pools",
  "rivet-test-deps",
  "scc",
@@ -1876,6 +1878,7 @@ dependencies = [
  "depot",
  "depot-client",
  "rivet-envoy-protocol",
+ "rivet-error",
  "tokio",
 ]
 

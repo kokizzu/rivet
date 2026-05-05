@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
+use depot::error::SqliteStorageError;
 use depot_client::{
 	database::{NativeDatabaseHandle, open_database_from_transport},
 	vfs::{SqliteTransport, SqliteVfsMetrics},
@@ -48,22 +49,31 @@ impl SqliteTransport for EmbeddedDepotSqliteTransport {
 		&self,
 		request: protocol::SqliteGetPagesRequest,
 	) -> Result<protocol::SqliteGetPagesResponse> {
-		match self.db.get_pages(request.pgnos).await {
-			Ok(pages) => Ok(protocol::SqliteGetPagesResponse::SqliteGetPagesOk(
+		match self
+			.db
+			.get_pages_with_options(
+				request.pgnos,
+				depot::types::GetPagesOptions {
+					expected_head_txid: request.expected_head_txid,
+				},
+			)
+			.await
+		{
+			Ok(result) => Ok(protocol::SqliteGetPagesResponse::SqliteGetPagesOk(
 				protocol::SqliteGetPagesOk {
-					pages: pages
+					pages: result
+						.pages
 						.into_iter()
 						.map(|page| protocol::SqliteFetchedPage {
 							pgno: page.pgno,
 							bytes: page.bytes,
 						})
 						.collect(),
+					head_txid: Some(result.head_txid),
 				},
 			)),
 			Err(err) => Ok(protocol::SqliteGetPagesResponse::SqliteErrorResponse(
-				protocol::SqliteErrorResponse {
-					message: sqlite_error_reason(&err),
-				},
+				sqlite_error_response(&err),
 			)),
 		}
 	}
@@ -74,7 +84,7 @@ impl SqliteTransport for EmbeddedDepotSqliteTransport {
 	) -> Result<protocol::SqliteCommitResponse> {
 		match self
 			.db
-			.commit(
+			.commit_with_options(
 				request
 					.dirty_pages
 					.into_iter()
@@ -85,14 +95,19 @@ impl SqliteTransport for EmbeddedDepotSqliteTransport {
 					.collect(),
 				request.db_size_pages,
 				request.now_ms,
+				depot::types::CommitOptions {
+					expected_head_txid: request.expected_head_txid,
+				},
 			)
 			.await
 		{
-			Ok(()) => Ok(protocol::SqliteCommitResponse::SqliteCommitOk),
-			Err(err) => Ok(protocol::SqliteCommitResponse::SqliteErrorResponse(
-				protocol::SqliteErrorResponse {
-					message: sqlite_error_reason(&err),
+			Ok(result) => Ok(protocol::SqliteCommitResponse::SqliteCommitOk(
+				protocol::SqliteCommitOk {
+					head_txid: Some(result.head_txid),
 				},
+			)),
+			Err(err) => Ok(protocol::SqliteCommitResponse::SqliteErrorResponse(
+				sqlite_error_response(&err),
 			)),
 		}
 	}
@@ -103,4 +118,20 @@ fn sqlite_error_reason(err: &anyhow::Error) -> String {
 		.map(ToString::to_string)
 		.collect::<Vec<_>>()
 		.join(": ")
+}
+
+fn sqlite_error_response(err: &anyhow::Error) -> protocol::SqliteErrorResponse {
+	let structured = depot_error(err)
+		.map(|err| rivet_error::RivetError::extract(&err.clone().build()))
+		.unwrap_or_else(|| rivet_error::RivetError::extract(err));
+	protocol::SqliteErrorResponse {
+		group: structured.group().to_string(),
+		code: structured.code().to_string(),
+		message: sqlite_error_reason(err),
+	}
+}
+
+fn depot_error(err: &anyhow::Error) -> Option<&SqliteStorageError> {
+	err.chain()
+		.find_map(|source| source.downcast_ref::<SqliteStorageError>())
 }

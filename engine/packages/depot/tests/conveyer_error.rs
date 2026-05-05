@@ -1,4 +1,4 @@
-use depot::error::SqliteStorageError;
+use depot::error::{HEAD_FENCE_MISMATCH_CODE, HEAD_FENCE_MISMATCH_GROUP, SqliteStorageError};
 
 #[test]
 fn pitr_errors_are_typed_and_downcastable() {
@@ -8,6 +8,18 @@ fn pitr_errors_are_typed_and_downcastable() {
 		.expect("depot errors should remain typed");
 
 	assert_eq!(storage_err, &SqliteStorageError::ForkOutOfRetention);
+}
+
+#[test]
+fn head_fence_mismatch_constants_match_rivet_error_schema() {
+	let err = SqliteStorageError::HeadFenceMismatch {
+		expected_head_txid: 1,
+		actual_head_txid: 2,
+	};
+	let rivet_err = rivet_error::RivetError::extract(&err.build());
+
+	assert_eq!(rivet_err.group(), HEAD_FENCE_MISMATCH_GROUP);
+	assert_eq!(rivet_err.code(), HEAD_FENCE_MISMATCH_CODE);
 }
 
 #[test]

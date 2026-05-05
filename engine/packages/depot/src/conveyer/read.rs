@@ -25,7 +25,7 @@ use crate::conveyer::{
 	ltx::{DecodedLtx, decode_ltx_v3},
 	metrics,
 	page_index::DeltaPageIndex,
-	types::{DatabaseBranchId, FetchedPage},
+	types::{DatabaseBranchId, FetchedPage, GetPagesOptions, GetPagesResult},
 };
 
 use self::{
@@ -38,6 +38,21 @@ use self::{
 
 impl Db {
 	pub async fn get_pages(&self, pgnos: Vec<u32>) -> Result<Vec<FetchedPage>> {
+		self.get_pages_with_metadata(pgnos)
+			.await
+			.map(|result| result.pages)
+	}
+
+	pub async fn get_pages_with_metadata(&self, pgnos: Vec<u32>) -> Result<GetPagesResult> {
+		self.get_pages_with_options(pgnos, GetPagesOptions::default())
+			.await
+	}
+
+	pub async fn get_pages_with_options(
+		&self,
+		pgnos: Vec<u32>,
+		options: GetPagesOptions,
+	) -> Result<GetPagesResult> {
 		let node_id = self.node_id.to_string();
 		let labels = &[node_id.as_str()];
 		let _timer = metrics::SQLITE_PUMP_GET_PAGES_DURATION
@@ -65,6 +80,7 @@ impl Db {
 		let bucket_id = self.sqlite_bucket_id();
 		let pgnos_for_tx = pgnos.clone();
 		let now_ms = cache::now_ms()?;
+		let expected_head_txid = options.expected_head_txid;
 		#[cfg(feature = "test-faults")]
 		let fault_controller = self.fault_controller.clone();
 		let tx_result = self
@@ -76,6 +92,7 @@ impl Db {
 				let cached_pidx = cached_pidx.clone();
 				let cached_ancestry = cached_ancestry.clone();
 				let cached_access_bucket = cached_access_bucket;
+				let expected_head_txid = expected_head_txid;
 				#[cfg(feature = "test-faults")]
 				let fault_controller = fault_controller.clone();
 
@@ -114,6 +131,22 @@ impl Db {
 						None,
 					)
 					.await?;
+					if let Some(expected_head_txid) = expected_head_txid {
+						if expected_head_txid != head.head_txid {
+							tracing::error!(
+								%database_id,
+								branch_id = ?scope.branch_id(),
+								expected_head_txid,
+								actual_head_txid = head.head_txid,
+								"sqlite head fence mismatch while reading; this indicates multiple actor instances are accessing the same sqlite database in parallel, which is incorrect actor lifecycle behavior"
+							);
+							return Err(SqliteStorageError::HeadFenceMismatch {
+								expected_head_txid,
+								actual_head_txid: head.head_txid,
+							}
+							.into());
+						}
+					}
 
 					let pgnos_in_range = pgnos
 						.into_iter()
@@ -125,6 +158,7 @@ impl Db {
 							branch_id,
 							branch_ancestry: scope.branch_ancestry(),
 							access_bucket: None,
+							head_txid: head.head_txid,
 							db_size_pages: head.db_size_pages,
 							loaded_pidx_rows: None,
 							page_sources: BTreeMap::new(),
@@ -376,6 +410,7 @@ impl Db {
 						branch_id,
 						branch_ancestry: scope.branch_ancestry(),
 						access_bucket,
+						head_txid: head.head_txid,
 						db_size_pages: head.db_size_pages,
 						loaded_pidx_rows,
 						page_sources,
@@ -549,7 +584,11 @@ impl Db {
 
 		self.shard_cache_fill.enqueue_many(shard_cache_fill_jobs);
 
-		Ok(pages)
+		Ok(GetPagesResult {
+			pages,
+			head_txid: tx_result.head_txid,
+			db_size_pages: tx_result.db_size_pages,
+		})
 	}
 }
 
@@ -557,6 +596,7 @@ struct GetPagesTxResult {
 	branch_id: DatabaseBranchId,
 	branch_ancestry: BranchAncestry,
 	access_bucket: Option<i64>,
+	head_txid: u64,
 	db_size_pages: u32,
 	loaded_pidx_rows: Option<Vec<(u32, u64)>>,
 	page_sources: BTreeMap<u32, Vec<u8>>,

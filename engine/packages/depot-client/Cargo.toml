@@ -29,6 +29,7 @@ depot = { workspace = true, features = ["test-faults"] }
 futures-util.workspace = true
 gas.workspace = true
 rivet-config.workspace = true
+rivet-error.workspace = true
 rivet-pools.workspace = true
 rivet-test-deps.workspace = true
 sha2.workspace = true

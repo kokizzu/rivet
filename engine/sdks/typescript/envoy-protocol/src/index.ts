@@ -679,29 +679,38 @@ function write7(bc: bare.ByteCursor, x: readonly SqliteFetchedPage[]): void {
 
 export type SqliteGetPagesOk = {
     readonly pages: readonly SqliteFetchedPage[]
+    readonly headTxid: u64 | null
 }
 
 export function readSqliteGetPagesOk(bc: bare.ByteCursor): SqliteGetPagesOk {
     return {
         pages: read7(bc),
+        headTxid: read2(bc),
     }
 }
 
 export function writeSqliteGetPagesOk(bc: bare.ByteCursor, x: SqliteGetPagesOk): void {
     write7(bc, x.pages)
+    write2(bc, x.headTxid)
 }
 
 export type SqliteErrorResponse = {
+    readonly group: string
+    readonly code: string
     readonly message: string
 }
 
 export function readSqliteErrorResponse(bc: bare.ByteCursor): SqliteErrorResponse {
     return {
+        group: bare.readString(bc),
+        code: bare.readString(bc),
         message: bare.readString(bc),
     }
 }
 
 export function writeSqliteErrorResponse(bc: bare.ByteCursor, x: SqliteErrorResponse): void {
+    bare.writeString(bc, x.group)
+    bare.writeString(bc, x.code)
     bare.writeString(bc, x.message)
 }
 
@@ -787,7 +796,19 @@ export function writeSqliteCommitRequest(bc: bare.ByteCursor, x: SqliteCommitReq
     write2(bc, x.expectedHeadTxid)
 }
 
-export type SqliteCommitOk = null
+export type SqliteCommitOk = {
+    readonly headTxid: u64 | null
+}
+
+export function readSqliteCommitOk(bc: bare.ByteCursor): SqliteCommitOk {
+    return {
+        headTxid: read2(bc),
+    }
+}
+
+export function writeSqliteCommitOk(bc: bare.ByteCursor, x: SqliteCommitOk): void {
+    write2(bc, x.headTxid)
+}
 
 export type SqliteCommitResponse =
     | { readonly tag: "SqliteCommitOk"; readonly val: SqliteCommitOk }
@@ -798,7 +819,7 @@ export function readSqliteCommitResponse(bc: bare.ByteCursor): SqliteCommitRespo
     const tag = bare.readU8(bc)
     switch (tag) {
         case 0:
-            return { tag: "SqliteCommitOk", val: null }
+            return { tag: "SqliteCommitOk", val: readSqliteCommitOk(bc) }
         case 1:
             return { tag: "SqliteErrorResponse", val: readSqliteErrorResponse(bc) }
         default: {
@@ -812,6 +833,7 @@ export function writeSqliteCommitResponse(bc: bare.ByteCursor, x: SqliteCommitRe
     switch (x.tag) {
         case "SqliteCommitOk": {
             bare.writeU8(bc, 0)
+            writeSqliteCommitOk(bc, x.val)
             break
         }
         case "SqliteErrorResponse": {
@@ -3247,4 +3269,4 @@ function assert(condition: boolean, message?: string): asserts condition {
     if (!condition) throw new Error(message ?? "Assertion failed")
 }
 
-export const VERSION = 4;
+export const VERSION = 5;

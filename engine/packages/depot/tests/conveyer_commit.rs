@@ -23,11 +23,11 @@ use depot::{
 	ltx::{LtxHeader, encode_ltx_v3},
 	quota::{self, SQLITE_MAX_STORAGE_BYTES},
 	types::{
-		BucketId, CompactionRoot, DBHead, DatabaseBranchId, DirtyPage, FetchedPage, MetaCompact,
-		SqliteCmpDirty, decode_bucket_branch_record, decode_bucket_pointer, decode_commit_row,
-		decode_database_branch_record, decode_database_pointer, decode_db_head,
-		decode_sqlite_cmp_dirty, encode_compaction_root, encode_db_head, encode_meta_compact,
-		encode_sqlite_cmp_dirty,
+		BucketId, CommitOptions, CompactionRoot, DBHead, DatabaseBranchId, DirtyPage, FetchedPage,
+		GetPagesOptions, MetaCompact, SqliteCmpDirty, decode_bucket_branch_record,
+		decode_bucket_pointer, decode_commit_row, decode_database_branch_record,
+		decode_database_pointer, decode_db_head, decode_sqlite_cmp_dirty, encode_compaction_root,
+		encode_db_head, encode_meta_compact, encode_sqlite_cmp_dirty,
 	},
 	workflows::compaction::DeltasAvailable,
 };
@@ -270,6 +270,105 @@ async fn commit_lazily_initializes_meta_on_first_write() -> Result<()> {
 		assert_eq!(
 			database_db.get_pages(vec![1]).await?,
 			vec![fetched_page(1, 0x11)]
+		);
+
+		Ok(())
+	})
+}
+
+#[tokio::test]
+async fn commit_head_fence_rejects_stale_writer() -> Result<()> {
+	commit_matrix!("depot-commit-head-fence-stale", |ctx, db, database_db| {
+		let _ = &db;
+		let first = database_db
+			.commit_with_options(
+				vec![page(1, 0x11)],
+				1,
+				1_000,
+				CommitOptions {
+					expected_head_txid: Some(0),
+				},
+			)
+			.await?;
+		assert_eq!(first.head_txid, 1);
+
+		let err = database_db
+			.commit_with_options(
+				vec![page(1, 0x22)],
+				1,
+				1_001,
+				CommitOptions {
+					expected_head_txid: Some(0),
+				},
+			)
+			.await
+			.expect_err("stale writer should be rejected");
+		assert!(
+			err.chain()
+				.any(|source| source.to_string().contains("head fence mismatch")),
+			"unexpected error: {err:#}"
+		);
+		assert_eq!(
+			database_db.get_pages(vec![1]).await?,
+			vec![fetched_page(1, 0x11)]
+		);
+
+		Ok(())
+	})
+}
+
+#[tokio::test]
+async fn get_pages_head_fence_rejects_stale_reader() -> Result<()> {
+	commit_matrix!("depot-get-pages-head-fence-stale", |ctx, db, database_db| {
+		let _ = &db;
+		let first = database_db
+			.commit_with_options(
+				vec![page(1, 0x11)],
+				1,
+				1_000,
+				CommitOptions {
+					expected_head_txid: Some(0),
+				},
+			)
+			.await?;
+		assert_eq!(first.head_txid, 1);
+
+		let read = database_db
+			.get_pages_with_options(
+				vec![1],
+				GetPagesOptions {
+					expected_head_txid: Some(1),
+				},
+			)
+			.await?;
+		assert_eq!(read.head_txid, 1);
+		assert_eq!(read.pages, vec![fetched_page(1, 0x11)]);
+
+		let second = database_db
+			.commit_with_options(
+				vec![page(1, 0x22)],
+				1,
+				1_001,
+				CommitOptions {
+					expected_head_txid: Some(1),
+				},
+			)
+			.await?;
+		assert_eq!(second.head_txid, 2);
+
+		let err = database_db
+			.get_pages_with_options(
+				vec![1],
+				GetPagesOptions {
+					expected_head_txid: Some(1),
+				},
+			)
+			.await
+			.expect_err("stale reader should be rejected");
+		assert!(
+			err.chain()
+				.any(|source| source.to_string().contains("head fence mismatch")),
+			"unexpected error: {err:#}"
 		);
 
 		Ok(())

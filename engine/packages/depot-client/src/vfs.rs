@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use async_trait::async_trait;
+use depot_client_types::is_head_fence_mismatch;
 use libsqlite3_sys::*;
 use moka::sync::Cache;
 use parking_lot::{Mutex, RwLock};
@@ -119,7 +120,6 @@ pub trait SqliteTransport: Send + Sync {
 }
 
 pub type SqliteTransportHandle = Arc<dyn SqliteTransport>;
-
 fn sqlite_now_ms() -> Result<i64> {
 	use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -221,6 +221,21 @@ pub struct VfsPreloadHintSnapshot {
 	pub ranges: Vec<VfsPreloadHintRange>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub(crate) struct InitialPages {
+	pub pages: Vec<(u32, Vec<u8>)>,
+	pub head_txid: Option<u64>,
+}
+
+impl From<Vec<(u32, Vec<u8>)>> for InitialPages {
+	fn from(pages: Vec<(u32, Vec<u8>)>) -> Self {
+		Self {
+			pages,
+			head_txid: None,
+		}
+	}
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommitPath {
 	Fast,
@@ -232,12 +247,14 @@ pub struct BufferedCommitRequest {
 	pub actor_id: String,
 	pub new_db_size_pages: u32,
 	pub dirty_pages: Vec<protocol::SqliteDirtyPage>,
+	pub expected_head_txid: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
 pub struct BufferedCommitOutcome {
 	pub path: CommitPath,
 	pub db_size_pages: u32,
+	pub head_txid: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -321,6 +338,7 @@ pub struct VfsContext {
 	state: RwLock<VfsState>,
 	aux_files: RwLock<BTreeMap<String, Arc<AuxFileState>>>,
 	last_error: Mutex<Option<String>>,
+	fatal_error: RwLock<Option<String>>,
 	#[cfg(test)]
 	fail_next_aux_open: Mutex<Option<String>>,
 	#[cfg(test)]
@@ -345,6 +363,7 @@ pub struct VfsContext {
 #[derive(Debug, Clone)]
 struct VfsState {
 	db_size_pages: u32,
+	head_txid: Option<u64>,
 	page_size: usize,
 	page_cache: Cache<u32, Vec<u8>>,
 	committed_page_cache: Cache<u32, Vec<u8>>,
@@ -413,6 +432,7 @@ struct RecentPageAccess {
 
 #[derive(Debug)]
 enum GetPagesError {
+	Fatal(String),
 	Other(String),
 }
 
@@ -798,6 +818,7 @@ impl VfsState {
 		let committed_page_cache = build_page_cache(config);
 		let mut state = Self {
 			db_size_pages: 1,
+			head_txid: None,
 			page_size: DEFAULT_PAGE_SIZE,
 			page_cache,
 			committed_page_cache,
@@ -939,11 +960,13 @@ impl VfsContext {
 		transport: SqliteTransportHandle,
 		config: VfsConfig,
 		io_methods: sqlite3_io_methods,
-		initial_pages: Vec<(u32, Vec<u8>)>,
+		initial_pages: impl Into<InitialPages>,
 		metrics: Option<Arc<dyn SqliteVfsMetrics>>,
 	) -> std::result::Result<Self, String> {
 		let mut state = VfsState::new(&config);
-		for (pgno, page) in initial_pages {
+		let initial_pages = initial_pages.into();
+		state.head_txid = initial_pages.head_txid;
+		for (pgno, page) in initial_pages.pages {
 			state.seed_page(&config, PageCacheInsertKind::Startup, pgno, page);
 		}
 
@@ -955,6 +978,7 @@ impl VfsContext {
 			state: RwLock::new(state),
 			aux_files: RwLock::new(BTreeMap::new()),
 			last_error: Mutex::new(None),
+			fatal_error: RwLock::new(None),
 			#[cfg(test)]
 			fail_next_aux_open: Mutex::new(None),
 			#[cfg(test)]
@@ -986,6 +1010,10 @@ impl VfsContext {
 
 	fn clone_last_error(&self) -> Option<String> {
 		self.last_error.lock().clone()
+	}
+
+	fn clone_fatal_error(&self) -> Option<String> {
+		self.fatal_error.read().clone()
 	}
 
 	pub(crate) fn take_last_error(&self) -> Option<String> {
@@ -1118,6 +1146,14 @@ impl VfsContext {
 		self.state.write().dead = true;
 	}
 
+	fn mark_fatal(&self, message: String) {
+		self.mark_dead(message.clone());
+		let mut fatal_error = self.fatal_error.write();
+		if fatal_error.is_none() {
+			*fatal_error = Some(message);
+		}
+	}
+
 	pub(crate) fn snapshot_preload_hints(&self) -> VfsPreloadHintSnapshot {
 		if !self.config.recent_page_hints {
 			return VfsPreloadHintSnapshot::default();
@@ -1218,6 +1254,7 @@ impl VfsContext {
 			prediction_budget,
 			predicted_pgnos,
 			db_size_pages,
+			expected_head_txid,
 		) = {
 			let mut state = self.state.write();
 			for pgno in target_pgnos.iter().copied() {
@@ -1260,6 +1297,7 @@ impl VfsContext {
 				prediction_budget,
 				predicted_pgnos,
 				state.db_size_pages,
+				state.head_txid,
 			)
 		};
 
@@ -1303,7 +1341,7 @@ impl VfsContext {
 				actor_id: self.actor_id.clone(),
 				pgnos: to_fetch.clone(),
 				expected_generation: None,
-				expected_head_txid: None,
+				expected_head_txid,
 			}))
 			.map_err(|err| GetPagesError::Other(err.to_string()))?;
 		if let Some(metrics) = &self.metrics {
@@ -1312,6 +1350,10 @@ impl VfsContext {
 
 		match response {
 			protocol::SqliteGetPagesResponse::SqliteGetPagesOk(ok) => {
+				let response_head_txid = ok.head_txid;
+				if let Some(head_txid) = response_head_txid {
+					self.state.write().head_txid = Some(head_txid);
+				}
 				let missing_pages = missing.iter().copied().collect::<HashSet<_>>();
 				let (page_cache, protected_page_cache) = {
 					let state = self.state.read();
@@ -1339,6 +1381,7 @@ impl VfsContext {
 						&& missing_pages.contains(&fetched.pgno)
 						&& fetched.pgno == 1
 					{
+						self.state.write().head_txid = Some(0);
 						Some(empty_db_page())
 					} else {
 						fetched.bytes
@@ -1409,6 +1452,9 @@ impl VfsContext {
 					}
 					return Ok(resolved);
 				}
+				if is_head_fence_mismatch_response(&error) {
+					return Err(GetPagesError::Fatal(error.message));
+				}
 				Err(GetPagesError::Other(error.message))
 			}
 		}
@@ -1445,6 +1491,7 @@ impl VfsContext {
 			BufferedCommitRequest {
 				actor_id: self.actor_id.clone(),
 				new_db_size_pages: state.db_size_pages,
+				expected_head_txid: state.head_txid,
 				dirty_pages: state
 					.write_buffer
 					.dirty
@@ -1473,7 +1520,7 @@ impl VfsContext {
 						?err,
 						"sqlite flush commit failed"
 					);
-					mark_dead_for_non_fence_commit_error(self, &err);
+					handle_non_finalize_commit_error(self, &err);
 					return Err(err);
 				}
 			};
@@ -1507,7 +1554,10 @@ impl VfsContext {
 		}
 		let state_update_start = Instant::now();
 		let mut state = self.state.write();
-		state.db_size_pages = request.new_db_size_pages;
+		state.db_size_pages = outcome.db_size_pages;
+		state.head_txid = outcome
+			.head_txid
+			.or_else(|| state.head_txid.map(|head_txid| head_txid.saturating_add(1)));
 		for dirty_page in &request.dirty_pages {
 			state.cache_committed_page(&self.config, dirty_page.pgno, dirty_page.bytes.clone());
 		}
@@ -1555,6 +1605,7 @@ impl VfsContext {
 			BufferedCommitRequest {
 				actor_id: self.actor_id.clone(),
 				new_db_size_pages: state.db_size_pages,
+				expected_head_txid: state.head_txid,
 				dirty_pages: state
 					.write_buffer
 					.dirty
@@ -1580,7 +1631,7 @@ impl VfsContext {
 						?err,
 						"sqlite atomic commit failed"
 					);
-					mark_dead_for_non_fence_commit_error(self, &err);
+					handle_non_finalize_commit_error(self, &err);
 					return Err(err);
 				}
 			};
@@ -1615,7 +1666,10 @@ impl VfsContext {
 		self.clear_last_error();
 		let state_update_start = Instant::now();
 		let mut state = self.state.write();
-		state.db_size_pages = request.new_db_size_pages;
+		state.db_size_pages = outcome.db_size_pages;
+		state.head_txid = outcome
+			.head_txid
+			.or_else(|| state.head_txid.map(|head_txid| head_txid.saturating_add(1)));
 		for dirty_page in &request.dirty_pages {
 			state.cache_committed_page(&self.config, dirty_page.pgno, dirty_page.bytes.clone());
 		}
@@ -1696,9 +1750,9 @@ fn assert_batch_atomic_probe(db: *mut sqlite3, vfs: &SqliteVfs) -> std::result::
 	Ok(())
 }
 
-fn mark_dead_for_non_fence_commit_error(ctx: &VfsContext, err: &CommitBufferError) {
+fn handle_non_finalize_commit_error(ctx: &VfsContext, err: &CommitBufferError) {
 	match err {
-		CommitBufferError::FenceMismatch(_) => {}
+		CommitBufferError::FenceMismatch(message) => ctx.mark_fatal(message.clone()),
 		CommitBufferError::StageNotFound(stage_id) => {
 			ctx.mark_dead(format!(
 				"sqlite stage {stage_id} missing during commit finalize"
@@ -1708,31 +1762,38 @@ fn mark_dead_for_non_fence_commit_error(ctx: &VfsContext, err: &CommitBufferErro
 	}
 }
 
-fn mark_dead_from_fence_commit_error(ctx: &VfsContext, err: &CommitBufferError) {
+fn handle_finalize_fence_error(ctx: &VfsContext, err: &CommitBufferError) {
 	if let CommitBufferError::FenceMismatch(reason) = err {
-		ctx.mark_dead(reason.clone());
+		ctx.mark_fatal(reason.clone());
 	}
 }
 
+#[cfg(test)]
 pub(crate) async fn fetch_initial_main_page_for_registration(
 	transport: SqliteTransportHandle,
 	actor_id: &str,
 ) -> std::result::Result<Option<Vec<u8>>, String> {
-	fetch_initial_main_page(transport, actor_id.to_string()).await
+	fetch_initial_pages(transport, actor_id.to_string(), 1)
+		.await
+		.map(|pages| {
+			pages
+				.pages
+				.into_iter()
+				.find(|(pgno, _)| *pgno == 1)
+				.map(|(_, bytes)| bytes)
+		})
 }
 
 pub(crate) async fn fetch_initial_pages_for_registration(
 	transport: SqliteTransportHandle,
 	actor_id: &str,
 	config: &VfsConfig,
-) -> std::result::Result<Vec<(u32, Vec<u8>)>, String> {
+) -> std::result::Result<InitialPages, String> {
 	if !config.startup_preload_first_pages
 		|| !config.page_cache_mode.caches_startup_preloaded_pages()
 		|| config.startup_preload_max_bytes < DEFAULT_PAGE_SIZE
 	{
-		return fetch_initial_main_page_for_registration(transport, actor_id)
-			.await
-			.map(|page| page.into_iter().map(|page| (1, page)).collect());
+		return fetch_initial_pages(transport, actor_id.to_string(), 1).await;
 	}
 
 	let page_count_from_bytes = config.startup_preload_max_bytes / DEFAULT_PAGE_SIZE;
@@ -1743,25 +1804,11 @@ pub(crate) async fn fetch_initial_pages_for_registration(
 	fetch_initial_pages(transport, actor_id.to_string(), page_count).await
 }
 
-async fn fetch_initial_main_page(
-	transport: SqliteTransportHandle,
-	actor_id: String,
-) -> std::result::Result<Option<Vec<u8>>, String> {
-	fetch_initial_pages(transport, actor_id, 1)
-		.await
-		.map(|pages| {
-			pages
-				.into_iter()
-				.find(|(pgno, _)| *pgno == 1)
-				.map(|(_, bytes)| bytes)
-		})
-}
-
 async fn fetch_initial_pages(
 	transport: SqliteTransportHandle,
 	actor_id: String,
 	page_count: u32,
-) -> std::result::Result<Vec<(u32, Vec<u8>)>, String> {
+) -> std::result::Result<InitialPages, String> {
 	let request_actor_id = actor_id.clone();
 	let response = transport
 		.get_pages(protocol::SqliteGetPagesRequest {
@@ -1773,11 +1820,14 @@ async fn fetch_initial_pages(
 		.await;
 
 	match response {
-		Ok(protocol::SqliteGetPagesResponse::SqliteGetPagesOk(ok)) => Ok(ok
-			.pages
-			.into_iter()
-			.filter_map(|page| page.bytes.map(|bytes| (page.pgno, bytes)))
-			.collect()),
+		Ok(protocol::SqliteGetPagesResponse::SqliteGetPagesOk(ok)) => Ok(InitialPages {
+			pages: ok
+				.pages
+				.into_iter()
+				.filter_map(|page| page.bytes.map(|bytes| (page.pgno, bytes)))
+				.collect(),
+			head_txid: ok.head_txid,
+		}),
 		Ok(protocol::SqliteGetPagesResponse::SqliteErrorResponse(error)) => {
 			if !is_initial_main_page_missing(&error.message) {
 				return Err(format!(
@@ -1790,7 +1840,10 @@ async fn fetch_initial_pages(
 				error = %error.message,
 				"sqlite initial page fetch did not find persisted data"
 			);
-			Ok(Vec::new())
+			Ok(InitialPages {
+				pages: Vec::new(),
+				head_txid: Some(0),
+			})
 		}
 		Err(err) => Err(format!("sqlite initial page fetch failed: {err}")),
 	}
@@ -1824,7 +1877,7 @@ async fn commit_buffered_pages(
 		db_size_pages: request.new_db_size_pages,
 		now_ms: sqlite_now_ms().map_err(|err| CommitBufferError::Other(err.to_string()))?,
 		expected_generation: None,
-		expected_head_txid: None,
+		expected_head_txid: request.expected_head_txid,
 	};
 	metrics.serialize_ns += serialize_start.elapsed().as_nanos() as u64;
 	let transport_start = Instant::now();
@@ -1833,20 +1886,29 @@ async fn commit_buffered_pages(
 		.await
 		.map_err(|err| CommitBufferError::Other(err.to_string()))?
 	{
-		protocol::SqliteCommitResponse::SqliteCommitOk => {
+		protocol::SqliteCommitResponse::SqliteCommitOk(ok) => {
 			metrics.transport_ns += transport_start.elapsed().as_nanos() as u64;
 			Ok((
 				BufferedCommitOutcome {
 					path: CommitPath::Fast,
 					db_size_pages: request.new_db_size_pages,
+					head_txid: ok.head_txid,
 				},
 				metrics,
 			))
 		}
 		protocol::SqliteCommitResponse::SqliteErrorResponse(error) => {
-			Err(CommitBufferError::Other(error.message))
+			if is_head_fence_mismatch_response(&error) {
+				Err(CommitBufferError::FenceMismatch(error.message))
+			} else {
+				Err(CommitBufferError::Other(error.message))
+			}
 		}
 	}
+}
+
+fn is_head_fence_mismatch_response(error: &protocol::SqliteErrorResponse) -> bool {
+	is_head_fence_mismatch(&error.group, &error.code)
 }
 
 unsafe fn get_file(p: *mut sqlite3_file) -> &'static mut VfsFile {
@@ -2110,7 +2172,7 @@ unsafe extern "C" fn io_close(p_file: *mut sqlite3_file) -> c_int {
 			Ok(()) => SQLITE_OK,
 			Err(err) => {
 				let ctx = &*file.ctx;
-				mark_dead_from_fence_commit_error(ctx, &err);
+				handle_finalize_fence_error(ctx, &err);
 				SQLITE_IOERR
 			}
 		}
@@ -2174,6 +2236,16 @@ unsafe extern "C" fn io_read(
 
 		let resolved = match ctx.resolve_pages(&requested_pages, true) {
 			Ok(pages) => pages,
+			Err(GetPagesError::Fatal(message)) => {
+				tracing::error!(
+					actor_id = %ctx.actor_id,
+					requested_pages = ?requested_pages,
+					error = %message,
+					"sqlite xRead hit fatal sqlite error"
+				);
+				ctx.mark_fatal(message);
+				return SQLITE_IOERR_READ;
+			}
 			Err(GetPagesError::Other(message)) => {
 				tracing::error!(
 					actor_id = %ctx.actor_id,
@@ -2306,6 +2378,10 @@ unsafe extern "C" fn io_write(
 			} else {
 				match ctx.resolve_pages(&pages_to_resolve, false) {
 					Ok(pages) => pages,
+					Err(GetPagesError::Fatal(message)) => {
+						ctx.mark_fatal(message);
+						return SQLITE_IOERR_WRITE;
+					}
 					Err(GetPagesError::Other(message)) => {
 						ctx.mark_dead(message);
 						return SQLITE_IOERR_WRITE;
@@ -2420,7 +2496,7 @@ unsafe extern "C" fn io_sync(p_file: *mut sqlite3_file, _flags: c_int) -> c_int 
 					?err,
 					"sqlite sync failed"
 				);
-				mark_dead_from_fence_commit_error(ctx, &err);
+				handle_finalize_fence_error(ctx, &err);
 				SQLITE_IOERR_FSYNC
 			}
 		}
@@ -2497,7 +2573,7 @@ unsafe extern "C" fn io_file_control(
 						?err,
 						"sqlite atomic write file control failed"
 					);
-					mark_dead_from_fence_commit_error(ctx, &err);
+					handle_finalize_fence_error(ctx, &err);
 					SQLITE_IOERR
 				}
 			},
@@ -2739,6 +2815,10 @@ impl SqliteVfs {
 		self.ctx.clone_last_error()
 	}
 
+	pub fn clone_fatal_error(&self) -> Option<String> {
+		self.ctx.clone_fatal_error()
+	}
+
 	pub(crate) fn snapshot_preload_hints(&self) -> VfsPreloadHintSnapshot {
 		self.ctx.snapshot_preload_hints()
 	}
@@ -2762,7 +2842,7 @@ impl SqliteVfs {
 			actor_id,
 			runtime,
 			config,
-			Vec::new(),
+			InitialPages::default(),
 			metrics,
 		)
 	}
@@ -2787,7 +2867,10 @@ impl SqliteVfs {
 			actor_id,
 			runtime,
 			config,
-			initial_pages,
+			InitialPages {
+				pages: initial_pages,
+				head_txid: None,
+			},
 			metrics,
 		)
 	}
@@ -2798,7 +2881,7 @@ impl SqliteVfs {
 		actor_id: String,
 		runtime: Handle,
 		config: VfsConfig,
-		initial_pages: Vec<(u32, Vec<u8>)>,
+		initial_pages: InitialPages,
 		metrics: Option<Arc<dyn SqliteVfsMetrics>>,
 	) -> std::result::Result<Self, String> {
 		let mut io_methods: sqlite3_io_methods = unsafe { std::mem::zeroed() };
@@ -2942,7 +3025,7 @@ impl Drop for NativeDatabase {
 						return;
 					}
 					Err(err) => {
-						mark_dead_for_non_fence_commit_error(ctx, &err);
+						handle_non_finalize_commit_error(ctx, &err);
 						tracing::warn!(?err, "failed to flush sqlite database before close");
 					}
 				}

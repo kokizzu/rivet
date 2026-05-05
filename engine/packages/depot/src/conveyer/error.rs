@@ -2,6 +2,10 @@ use rivet_error::RivetError;
 use serde::Serialize;
 use std::fmt;
 
+pub use depot_client_types::{
+	HEAD_FENCE_MISMATCH_CODE, HEAD_FENCE_MISMATCH_GROUP, is_head_fence_mismatch,
+};
+
 #[derive(Debug, Clone, PartialEq, Eq, RivetError)]
 #[error("depot")]
 pub enum SqliteStorageError {
@@ -28,6 +32,16 @@ pub enum SqliteStorageError {
 	CommitTooLarge {
 		actual_size_bytes: u64,
 		max_size_bytes: u64,
+	},
+
+	#[error(
+		"head_fence_mismatch",
+		"SQLite head fence mismatch.",
+		"SQLite head fence mismatch. Expected head txid {expected_head_txid}, but current head txid is {actual_head_txid}."
+	)]
+	HeadFenceMismatch {
+		expected_head_txid: u64,
+		actual_head_txid: u64,
 	},
 
 	#[error(
@@ -134,6 +148,13 @@ impl fmt::Display for SqliteStorageError {
 			} => write!(
 				f,
 				"CommitTooLarge: raw dirty pages were {actual_size_bytes} bytes, limit is {max_size_bytes} bytes"
+			),
+			SqliteStorageError::HeadFenceMismatch {
+				expected_head_txid,
+				actual_head_txid,
+			} => write!(
+				f,
+				"sqlite head fence mismatch: expected head txid {expected_head_txid}, current head txid {actual_head_txid}"
 			),
 			SqliteStorageError::SqliteStorageQuotaExceeded {
 				remaining_bytes,

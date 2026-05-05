@@ -22,8 +22,9 @@ use crate::{
 		page_index::DeltaPageIndex,
 		quota,
 		types::{
-			BranchState, CommitRow, DBHead, DatabaseBranchId, DirtyPage, decode_compaction_root,
-			decode_database_branch_record, decode_db_head, encode_commit_row, encode_db_head,
+			BranchState, CommitOptions, CommitResult, CommitRow, DBHead, DatabaseBranchId,
+			DirtyPage, decode_compaction_root, decode_database_branch_record, decode_db_head,
+			encode_commit_row, encode_db_head,
 		},
 		udb,
 	},
@@ -47,6 +48,23 @@ impl Db {
 		db_size_pages: u32,
 		now_ms: i64,
 	) -> Result<()> {
+		self.commit_with_options(
+			dirty_pages,
+			db_size_pages,
+			now_ms,
+			CommitOptions::default(),
+		)
+		.await
+		.map(|_| ())
+	}
+
+	pub async fn commit_with_options(
+		&self,
+		dirty_pages: Vec<DirtyPage>,
+		db_size_pages: u32,
+		now_ms: i64,
+		options: CommitOptions,
+	) -> Result<CommitResult> {
 		validate_dirty_pages(&dirty_pages)?;
 		#[cfg(feature = "test-faults")]
 		maybe_fire_commit_fault(
@@ -82,6 +100,7 @@ impl Db {
 		let database_id = self.database_id.clone();
 		let bucket_id = self.sqlite_bucket_id();
 		let dirty_pages_for_tx = dirty_pages.clone();
+		let expected_head_txid = options.expected_head_txid;
 		#[cfg(feature = "test-faults")]
 		let fault_controller = self.fault_controller.clone();
 
@@ -91,6 +110,7 @@ impl Db {
 				let database_id = database_id.clone();
 				let bucket_id = bucket_id;
 				let dirty_pages = dirty_pages_for_tx.clone();
+				let expected_head_txid = expected_head_txid;
 				let cached_ancestry = cached_ancestry.clone();
 				let cached_access_bucket = cached_access_bucket;
 				let last_deltas_available_at_ms = last_deltas_available_at_ms;
@@ -160,6 +180,23 @@ impl Db {
 						.map(|bytes| decode_db_head(bytes.as_slice()))
 						.transpose()
 						.context("decode current sqlite db head")?;
+					let actual_head_txid = previous_head.as_ref().map_or(0, |head| head.head_txid);
+					if let Some(expected_head_txid) = expected_head_txid {
+						if expected_head_txid != actual_head_txid {
+							tracing::error!(
+								%database_id,
+								?branch_id,
+								expected_head_txid,
+								actual_head_txid,
+								"sqlite head fence mismatch; this indicates multiple actor instances are writing the same sqlite database in parallel, which is incorrect actor lifecycle behavior"
+							);
+							return Err(SqliteStorageError::HeadFenceMismatch {
+								expected_head_txid,
+								actual_head_txid,
+							}
+							.into());
+						}
+					}
 					#[cfg(feature = "test-faults")]
 					maybe_fire_commit_fault(
 						&fault_controller,
@@ -483,7 +520,10 @@ impl Db {
 		self.publish_deltas_available_if_needed(result.deltas_available, result.branch_id)
 			.await?;
 
-		Ok(())
+		Ok(CommitResult {
+			head_txid: result.txid,
+			db_size_pages,
+		})
 	}
 
 	async fn publish_deltas_available_if_needed(

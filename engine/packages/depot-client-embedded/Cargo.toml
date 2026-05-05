@@ -16,4 +16,5 @@ async-trait.workspace = true
 depot.workspace = true
 depot-client.workspace = true
 rivet-envoy-protocol.workspace = true
+rivet-error.workspace = true
 tokio.workspace = true

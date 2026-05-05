@@ -504,6 +504,8 @@ fn worker_error_code(error: &anyhow::Error) -> &'static str {
 		.is_some()
 	{
 		"overloaded"
+	} else if error.downcast_ref::<SqliteWorkerFatalError>().is_some() {
+		"fatal"
 	} else if error.downcast_ref::<SqliteWorkerClosingError>().is_some() {
 		"closing"
 	} else if error.downcast_ref::<SqliteWorkerDeadError>().is_some() {
@@ -561,6 +563,29 @@ impl fmt::Display for SqliteWorkerCloseTimeoutError {
 }
 
 impl Error for SqliteWorkerCloseTimeoutError {}
+
+#[derive(Debug, Clone)]
+pub struct SqliteWorkerFatalError {
+	message: String,
+}
+
+impl SqliteWorkerFatalError {
+	pub fn new(message: String) -> Self {
+		Self { message }
+	}
+
+	pub fn message(&self) -> &str {
+		&self.message
+	}
+}
+
+impl fmt::Display for SqliteWorkerFatalError {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		write!(f, "sqlite worker hit fatal storage error: {}", self.message)
+	}
+}
+
+impl Error for SqliteWorkerFatalError {}
 
 fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
 	if let Some(message) = payload.downcast_ref::<&str>() {

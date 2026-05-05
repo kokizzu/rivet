@@ -2,7 +2,7 @@ use anyhow::{Context, bail};
 use bytes::Bytes;
 use depot::{
 	conveyer::Db,
-	error::SqliteStorageError,
+	error::{is_head_fence_mismatch, SqliteStorageError},
 	workflows::compaction::{
 		DATABASE_BRANCH_ID_TAG, DbManagerInput, DeltasAvailable, database_branch_tag_value,
 	},
@@ -693,19 +693,28 @@ async fn handle_sqlite_get_pages(
 	validate_sqlite_actor(ctx, conn, &request.actor_id).await?;
 
 	let actor_db = actor_db(ctx, conn, request.actor_id.clone()).await?;
-	let pages = actor_db.get_pages(request.pgnos).await?;
-	Ok(sqlite_get_pages_ok(pages).await?)
+	let result = actor_db
+		.get_pages_with_options(
+			request.pgnos,
+			depot::types::GetPagesOptions {
+				expected_head_txid: request.expected_head_txid,
+			},
+		)
+		.await?;
+	Ok(sqlite_get_pages_ok(result).await?)
 }
 
 async fn sqlite_get_pages_ok(
-	pages: Vec<depot::types::FetchedPage>,
+	result: depot::types::GetPagesResult,
 ) -> Result<protocol::SqliteGetPagesResponse> {
 	Ok(protocol::SqliteGetPagesResponse::SqliteGetPagesOk(
 		protocol::SqliteGetPagesOk {
-			pages: pages
+			pages: result
+				.pages
 				.into_iter()
 				.map(sqlite_runtime::protocol_sqlite_conveyer_fetched_page)
 				.collect(),
+			head_txid: Some(result.head_txid),
 		},
 	))
 }
@@ -724,7 +733,7 @@ async fn handle_sqlite_commit(
 	let actor_id = request.actor_id.clone();
 	let actor_db = actor_db(ctx, conn, actor_id.clone()).await?;
 	let engine_result = actor_db
-		.commit(
+		.commit_with_options(
 			request
 				.dirty_pages
 				.into_iter()
@@ -732,17 +741,26 @@ async fn handle_sqlite_commit(
 				.collect(),
 			request.db_size_pages,
 			request.now_ms,
+			depot::types::CommitOptions {
+				expected_head_txid: request.expected_head_txid,
+			},
 		)
 		.await;
 	let response_build_start = Instant::now();
 	let response = match engine_result {
-		Ok(()) => Ok(protocol::SqliteCommitResponse::SqliteCommitOk),
+		Ok(result) => Ok(protocol::SqliteCommitResponse::SqliteCommitOk(
+			protocol::SqliteCommitOk {
+				head_txid: Some(result.head_txid),
+			},
+		)),
 		Err(err) => match depot_error(&err) {
 			Some(SqliteStorageError::CommitTooLarge {
 				actual_size_bytes,
 				max_size_bytes,
 			}) => Ok(protocol::SqliteCommitResponse::SqliteErrorResponse(
 				protocol::SqliteErrorResponse {
+					group: "depot".to_string(),
+					code: "commit_too_large".to_string(),
 					message: format!(
 						"sqlite commit too large: actual_size_bytes={actual_size_bytes}, max_size_bytes={max_size_bytes}"
 					),
@@ -1093,7 +1111,8 @@ async fn actor_db(ctx: &StandaloneCtx, conn: &Conn, actor_id: String) -> Result<
 }
 
 fn depot_error(err: &anyhow::Error) -> Option<&SqliteStorageError> {
-	err.downcast_ref::<SqliteStorageError>()
+	err.chain()
+		.find_map(|source| source.downcast_ref::<SqliteStorageError>())
 }
 
 fn sqlite_error_reason(err: &anyhow::Error) -> String {
@@ -1104,7 +1123,19 @@ fn sqlite_error_reason(err: &anyhow::Error) -> String {
 }
 
 fn sqlite_error_response(err: &anyhow::Error) -> protocol::SqliteErrorResponse {
+	let structured = depot_error(err)
+		.map(|err| rivet_error::RivetError::extract(&err.clone().build()))
+		.unwrap_or_else(|| rivet_error::RivetError::extract(err));
+	if is_head_fence_mismatch(structured.group(), structured.code()) {
+		tracing::error!(
+			error_group = structured.group(),
+			error_code = structured.code(),
+			"sqlite head fence mismatch from Depot; this indicates multiple actor instances are accessing the same sqlite database in parallel, which is incorrect actor lifecycle behavior"
+		);
+	}
 	protocol::SqliteErrorResponse {
+		group: structured.group().to_string(),
+		code: structured.code().to_string(),
 		message: sqlite_error_reason(err),
 	}
 }

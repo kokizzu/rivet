@@ -1,12 +1,12 @@
 use std::collections::HashSet;
 use std::io::Cursor;
-#[cfg(feature = "sqlite-local")]
 use std::sync::{
 	Arc,
 	atomic::{AtomicBool, Ordering},
 };
 
 use anyhow::{Context, Result};
+use depot_client_types::is_head_fence_mismatch;
 pub use depot_client_types::{BindParam, ColumnValue, ExecResult, ExecuteResult, QueryResult};
 #[cfg(feature = "sqlite-local")]
 use parking_lot::Mutex;
@@ -34,7 +34,7 @@ use depot_client::{
 	vfs::{SqliteVfsMetrics, SqliteVfsMetricsSnapshot},
 	worker::{
 		SQLITE_WORKER_QUEUE_CAPACITY, SqliteWorkerCloseTimeoutError, SqliteWorkerClosingError,
-		SqliteWorkerDeadError, SqliteWorkerOverloadedError,
+		SqliteWorkerDeadError, SqliteWorkerFatalError, SqliteWorkerOverloadedError,
 	},
 };
 #[cfg(feature = "sqlite-local")]
@@ -89,7 +89,6 @@ pub struct SqliteDb {
 	open_lock: Arc<AsyncMutex<()>>,
 	#[cfg(feature = "sqlite-local")]
 	worker_failure_task: Arc<Mutex<Option<JoinHandle<()>>>>,
-	#[cfg(feature = "sqlite-local")]
 	worker_fatal_reported: Arc<AtomicBool>,
 	#[cfg(feature = "sqlite-local")]
 	vfs_metrics: Option<Arc<dyn SqliteVfsMetrics>>,
@@ -119,7 +118,6 @@ impl SqliteDb {
 			open_lock: Default::default(),
 			#[cfg(feature = "sqlite-local")]
 			worker_failure_task: Default::default(),
-			#[cfg(feature = "sqlite-local")]
 			worker_fatal_reported: Default::default(),
 			#[cfg(feature = "sqlite-local")]
 			vfs_metrics: None,
@@ -167,8 +165,9 @@ impl SqliteDb {
 					let vfs_metrics = self.vfs_metrics.clone();
 					let rt_handle = tokio::runtime::Handle::try_current()
 						.context("open sqlite database requires a tokio runtime")?;
+					self.worker_fatal_reported.store(false, Ordering::Release);
 
-					let native_db = open_database_from_transport(
+					let native_db = self.map_local_worker_result(open_database_from_transport(
 						Arc::new(EnvoySqliteTransport::new(config.handle.clone())),
 						config.actor_id.clone(),
 						config
@@ -177,8 +176,7 @@ impl SqliteDb {
 						rt_handle,
 						vfs_metrics,
 					)
-					.await?;
-					self.worker_fatal_reported.store(false, Ordering::Release);
+					.await)?;
 					self.start_worker_failure_monitor(native_db.clone(), config);
 					*self.db.lock() = Some(native_db);
 					Ok(())
@@ -379,7 +377,7 @@ impl SqliteDb {
 		report_sqlite_worker_fatal(
 			&self.worker_fatal_reported,
 			config,
-			format!("sqlite worker failed: {error}"),
+			sqlite_worker_fatal_message(error),
 		);
 	}
 
@@ -467,7 +465,7 @@ impl SqliteDb {
 				Ok(query_result_from_protocol(ok.result))
 			}
 			protocol::SqliteExecResponse::SqliteErrorResponse(error) => {
-				Err(remote_sqlite_error_response(error.message))
+				Err(self.remote_sqlite_error_response(error))
 			}
 		}
 	}
@@ -495,7 +493,7 @@ impl SqliteDb {
 				Ok(execute_result_from_protocol(ok.result))
 			}
 			protocol::SqliteExecuteResponse::SqliteErrorResponse(error) => {
-				Err(remote_sqlite_error_response(error.message))
+				Err(self.remote_sqlite_error_response(error))
 			}
 		}
 	}
@@ -538,9 +536,23 @@ impl SqliteDb {
 			.clone()
 			.ok_or_else(|| sqlite_not_configured("handle"))
 	}
+
+	fn remote_sqlite_error_response(&self, error: protocol::SqliteErrorResponse) -> anyhow::Error {
+		if is_head_fence_mismatch_response(&error) {
+			if let Ok(config) = self.runtime_config() {
+				report_sqlite_worker_fatal(
+					&self.worker_fatal_reported,
+					config,
+					format!("remote sqlite fatal storage error: {}", error.message),
+				);
+			}
+			return SqliteRuntimeError::Closed.build();
+		}
+
+		remote_sqlite_error_response(error.message)
+	}
 }
 
-#[cfg(feature = "sqlite-local")]
 fn report_sqlite_worker_fatal(reported: &AtomicBool, config: SqliteRuntimeConfig, message: String) {
 	if reported.swap(true, Ordering::AcqRel) {
 		return;
@@ -582,10 +594,20 @@ fn select_sqlite_backend(enabled: bool, remote_sqlite: bool) -> SqliteBackend {
 
 #[cfg(feature = "sqlite-local")]
 fn is_fatal_worker_error(error: &anyhow::Error) -> bool {
-	error.downcast_ref::<SqliteWorkerDeadError>().is_some()
+	error.downcast_ref::<SqliteWorkerFatalError>().is_some()
+		|| error.downcast_ref::<SqliteWorkerDeadError>().is_some()
 		|| error
 			.downcast_ref::<SqliteWorkerCloseTimeoutError>()
 			.is_some()
+}
+
+#[cfg(feature = "sqlite-local")]
+fn sqlite_worker_fatal_message(error: &anyhow::Error) -> String {
+	if let Some(error) = error.downcast_ref::<SqliteWorkerFatalError>() {
+		return format!("sqlite fatal storage error: {}", error.message());
+	}
+
+	format!("sqlite worker failed: {error}")
 }
 
 #[cfg(feature = "sqlite-local")]
@@ -604,6 +626,7 @@ fn map_local_worker_error(error: anyhow::Error) -> anyhow::Error {
 
 	if error.downcast_ref::<SqliteWorkerClosingError>().is_some()
 		|| error.downcast_ref::<SqliteWorkerDeadError>().is_some()
+		|| error.downcast_ref::<SqliteWorkerFatalError>().is_some()
 	{
 		return SqliteRuntimeError::Closed.build();
 	}
@@ -701,6 +724,10 @@ fn remote_sqlite_error_response(message: String) -> anyhow::Error {
 	}
 
 	SqliteRuntimeError::RemoteExecutionFailed { message }.build()
+}
+
+fn is_head_fence_mismatch_response(error: &protocol::SqliteErrorResponse) -> bool {
+	is_head_fence_mismatch(&error.group, &error.code)
 }
 impl std::fmt::Debug for SqliteDb {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

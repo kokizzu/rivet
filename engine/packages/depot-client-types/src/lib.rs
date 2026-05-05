@@ -1,5 +1,12 @@
 //! Shared SQLite execution types for local and remote depot client backends.
 
+pub const HEAD_FENCE_MISMATCH_GROUP: &str = "depot";
+pub const HEAD_FENCE_MISMATCH_CODE: &str = "head_fence_mismatch";
+
+pub fn is_head_fence_mismatch(group: &str, code: &str) -> bool {
+	group == HEAD_FENCE_MISMATCH_GROUP && code == HEAD_FENCE_MISMATCH_CODE
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum BindParam {
 	Null,

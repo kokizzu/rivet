@@ -10,7 +10,7 @@ use crate::{
 		SqliteVfsMetricsSnapshot, VfsConfig, VfsPreloadHintSnapshot,
 		fetch_initial_pages_for_registration,
 	},
-	worker::SqliteWorkerHandle,
+	worker::{SqliteWorkerFatalError, SqliteWorkerHandle},
 };
 
 #[derive(Clone)]
@@ -70,7 +70,8 @@ impl NativeDatabaseHandle {
 	}
 
 	pub async fn exec(&self, sql: String) -> Result<QueryResult> {
-		self.worker.exec(sql).await
+		self.check_fatal_error()?;
+		self.map_worker_result(self.worker.exec(sql).await)
 	}
 
 	pub async fn query(&self, sql: String, params: Option<Vec<BindParam>>) -> Result<QueryResult> {
@@ -91,11 +92,15 @@ impl NativeDatabaseHandle {
 		sql: String,
 		params: Option<Vec<BindParam>>,
 	) -> Result<ExecuteResult> {
-		self.worker.execute(sql, params).await
+		self.check_fatal_error()?;
+		self.map_worker_result(self.worker.execute(sql, params).await)
 	}
 
 	pub async fn close(&self) -> Result<()> {
-		self.worker.close().await
+		match self.worker.close().await {
+			Ok(()) => Ok(()),
+			Err(error) => Err(self.fatal_error().unwrap_or(error)),
+		}
 	}
 
 	pub async fn wait_for_worker_failure(&self) -> bool {
@@ -104,6 +109,10 @@ impl NativeDatabaseHandle {
 
 	pub fn take_last_kv_error(&self) -> Option<String> {
 		self.vfs.take_last_error()
+	}
+
+	pub fn clone_fatal_error(&self) -> Option<String> {
+		self.vfs.clone_fatal_error()
 	}
 
 	pub fn snapshot_preload_hints(&self) -> VfsPreloadHintSnapshot {
@@ -130,7 +139,30 @@ impl NativeDatabaseHandle {
 	}
 
 	async fn initialize(&self) -> Result<()> {
-		self.worker.wait_ready().await
+		self.map_worker_result(self.worker.wait_ready().await)
+	}
+
+	fn check_fatal_error(&self) -> Result<()> {
+		if let Some(error) = self.fatal_error() {
+			return Err(error);
+		}
+
+		Ok(())
+	}
+
+	fn map_worker_result<T>(&self, result: Result<T>) -> Result<T> {
+		match result {
+			Ok(value) => {
+				self.check_fatal_error()?;
+				Ok(value)
+			}
+			Err(error) => Err(self.fatal_error().unwrap_or(error)),
+		}
+	}
+
+	fn fatal_error(&self) -> Option<anyhow::Error> {
+		self.clone_fatal_error()
+			.map(|message| SqliteWorkerFatalError::new(message).into())
 	}
 }
 
