@@ -29,7 +29,9 @@ impl OwnedVersionedData for Actor {
 			1 => Ok(Self::V1(serde_bare::from_slice(payload)?)),
 			2 => Ok(Self::V2(serde_bare::from_slice(payload)?)),
 			3 => Ok(Self::V3(serde_bare::from_slice(payload)?)),
-			4 => Ok(Self::V4(serde_bare::from_slice(payload)?)),
+			4 => Ok(Self::V4(Self::decode_v4_with_legacy_raw_args_fallback(
+				payload,
+			)?)),
 			_ => bail!("invalid actor persist version: {version}"),
 		}
 	}
@@ -54,6 +56,58 @@ impl OwnedVersionedData for Actor {
 }
 
 impl Actor {
+	fn decode_v4_with_legacy_raw_args_fallback(payload: &[u8]) -> Result<v4::Actor> {
+		#[derive(serde::Deserialize)]
+		struct LegacyRawV4Actor {
+			input: Option<Vec<u8>>,
+			has_initialized: bool,
+			state: Vec<u8>,
+			scheduled_events: Vec<LegacyRawV4ScheduleEvent>,
+		}
+
+		#[derive(serde::Deserialize)]
+		struct LegacyRawV4ScheduleEvent {
+			event_id: String,
+			timestamp_ms: i64,
+			action: String,
+			args: Vec<u8>,
+		}
+
+		// serde_bare accepts any nonzero bool as true, so legacy raw args can
+		// sometimes decode as current v4. Only accept canonical current-v4 bytes.
+		let current_error = match serde_bare::from_slice::<v4::Actor>(payload) {
+			Ok(actor) => {
+				if serde_bare::to_vec(&actor).is_ok_and(|encoded| encoded == payload) {
+					return Ok(actor);
+				}
+				None
+			}
+			Err(error) => Some(error),
+		};
+
+		// A short-lived v4 writer stored schedule args as raw `data` while
+		// the fixed v4 schema expects `optional<Cbor>`. Decode that reused
+		// version so actors persisted by the bad writer can restart.
+		match serde_bare::from_slice::<LegacyRawV4Actor>(payload) {
+			Ok(actor) => Ok(v4::Actor {
+				input: actor.input,
+				has_initialized: actor.has_initialized,
+				state: actor.state,
+				scheduled_events: actor
+					.scheduled_events
+					.into_iter()
+					.map(|event| v4::ScheduleEvent {
+						event_id: event.event_id,
+						timestamp: event.timestamp_ms,
+						action: event.action,
+						args: (!event.args.is_empty()).then_some(event.args),
+					})
+					.collect(),
+			}),
+			Err(legacy_error) => Err(current_error.unwrap_or(legacy_error).into()),
+		}
+	}
+
 	fn v1_to_v2(self) -> Result<Self> {
 		let Self::V1(data) = self else {
 			bail!("expected actor persist v1 Actor");
