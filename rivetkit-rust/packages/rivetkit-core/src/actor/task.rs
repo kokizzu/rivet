@@ -1205,11 +1205,16 @@ impl ActorTask {
 		let is_new = !persisted.actor.has_initialized;
 		self.ctx.load_persisted_actor(persisted.actor);
 		self.ctx.load_last_pushed_alarm(persisted.last_pushed_alarm);
-		self.ctx.set_has_initialized(true);
-		self.ctx
-			.persist_state(SaveStateOpts { immediate: true })
-			.await
-			.context("persist actor initialization")?;
+		// New manual-startup runtimes must not persist initialization until the
+		// runtime startup_ready handshake completes. The runtime preamble owns
+		// initial state creation.
+		if !is_new || !self.factory.requires_manual_startup_ready() {
+			self.ctx.set_has_initialized(true);
+			self.ctx
+				.persist_state(SaveStateOpts { immediate: true })
+				.await
+				.context("persist actor initialization")?;
+		}
 		let init_inspector_token_started_at = Instant::now();
 		crate::inspector::auth::init_inspector_token_with_preload(
 			&self.ctx,
@@ -1234,6 +1239,12 @@ impl ActorTask {
 		self.transition_to(LifecycleState::Started);
 		self.spawn_run_handle(is_new).await?;
 		if is_new {
+			// Manual-startup runtimes usually mark initialization during their
+			// preamble. This is the fallback for runtimes that completed startup
+			// without doing so.
+			if !self.ctx.persisted_actor().has_initialized {
+				self.ctx.set_has_initialized(true);
+			}
 			self.ctx
 				.persist_state(SaveStateOpts { immediate: true })
 				.await

@@ -209,6 +209,7 @@ async fn run_preamble(
 	snapshot: Option<Vec<u8>>,
 	hibernated: Vec<(rivetkit_core::ConnHandle, Vec<u8>)>,
 ) -> Result<RunHandlerSlot> {
+	let snapshot = normalize_startup_snapshot(bindings.create_state.is_some(), snapshot);
 	let is_new = snapshot.is_none();
 
 	// Run database migrations before any user lifecycle hook so `c.db` is
@@ -288,6 +289,18 @@ async fn run_preamble(
 	}
 
 	Ok(run_handler)
+}
+
+fn normalize_startup_snapshot(
+	has_create_state: bool,
+	snapshot: Option<Vec<u8>>,
+) -> Option<Vec<u8>> {
+	// Empty state with createState means a previous process persisted
+	// initialization before the runtime produced initial state.
+	match snapshot {
+		Some(bytes) if bytes.is_empty() && has_create_state => None,
+		other => other,
+	}
 }
 
 fn configure_run_handler(bindings: &CallbackBindings, ctx: &ActorContext) -> RunHandlerSlot {

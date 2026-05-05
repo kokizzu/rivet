@@ -2114,6 +2114,73 @@ mod moved_tests {
 	}
 
 	#[tokio::test]
+	async fn manual_startup_does_not_mark_initialized_before_runtime_preamble() {
+		let kv = new_in_memory();
+		let ctx = new_with_kv(
+			"actor-manual-startup-init",
+			"task-manual-startup-init",
+			Vec::new(),
+			"local",
+			kv,
+		);
+		let (observed_tx, observed_rx) = oneshot::channel();
+		let observed_tx = Arc::new(Mutex::new(Some(observed_tx)));
+		let factory = Arc::new(ActorFactory::new_with_manual_startup_ready(
+			Default::default(),
+			move |mut start| {
+				let observed_tx = observed_tx.clone();
+				Box::pin(async move {
+					observed_tx
+						.lock()
+						.expect("observed lock poisoned")
+						.take()
+						.expect("observed sender should exist")
+						.send(start.ctx.persisted_actor().has_initialized)
+						.expect("observed sender should send");
+					start.ctx.set_state_initial(vec![4, 5, 6]);
+					start.ctx.set_has_initialized(true);
+					start
+						.startup_ready
+						.take()
+						.expect("manual runtime should receive startup ready sender")
+						.send(Ok(()))
+						.expect("startup ready receiver should exist");
+
+					while let Some(event) = start.events.recv().await {
+						match event {
+							ActorEvent::SerializeState { reply, .. } => {
+								reply.send(Ok(vec![StateDelta::ActorState(start.ctx.state())]));
+							}
+							ActorEvent::RunGracefulCleanup { reply, .. } => {
+								reply.send(Ok(()));
+							}
+							_ => {}
+						}
+					}
+					Ok(())
+				})
+			},
+		));
+		let mut task = new_task_with_factory(ctx.clone(), factory);
+		let (start_tx, start_rx) = oneshot::channel();
+
+		task.handle_lifecycle(LifecycleCommand::Start { reply: start_tx })
+			.await;
+		start_rx
+			.await
+			.expect("start reply should send")
+			.expect("start should succeed");
+
+		assert!(!observed_rx.await.expect("runtime should observe startup"));
+		assert!(ctx.persisted_actor().has_initialized);
+		assert_eq!(ctx.state(), vec![4, 5, 6]);
+
+		let run_handle = task.run_handle.take().expect("run handle should exist");
+		run_handle.abort();
+		let _ = run_handle.await;
+	}
+
+	#[tokio::test]
 	async fn startup_uses_preloaded_last_pushed_alarm_without_live_kv() {
 		let _env_guard = test_inspector_env_lock().lock().expect("env lock poisoned");
 		unsafe {

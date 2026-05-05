@@ -5,15 +5,15 @@ mod moved_tests {
 	use std::sync::Arc as StdArc;
 	use std::time::Duration;
 
-	use rivet_error::RivetError as RivetTransportError;
 	use rivet_error::{RivetError as RivetTransportError, RivetErrorSchema};
 	use rivetkit_actor_persist::versioned as persist_versioned;
 	use rivetkit_core::Kv;
-	use rivetkit_core::actor::state::PERSIST_DATA_KEY;
 	use tokio::sync::oneshot;
 	use vbare::OwnedVersionedData;
 
 	use super::*;
+
+	const PERSIST_DATA_KEY: &[u8] = &[1];
 
 	fn test_adapter_config() -> AdapterConfig {
 		let timeout = Duration::from_secs(1);
@@ -62,6 +62,20 @@ mod moved_tests {
 	fn assert_error_code(error: anyhow::Error, code: &str) {
 		let error = RivetTransportError::extract(&error);
 		assert_eq!(error.code(), code);
+	}
+
+	#[test]
+	fn startup_snapshot_recovery_only_treats_empty_stateful_snapshot_as_new() {
+		assert_eq!(normalize_startup_snapshot(true, Some(Vec::new())), None);
+		assert_eq!(
+			normalize_startup_snapshot(false, Some(Vec::new())),
+			Some(Vec::new())
+		);
+		assert_eq!(
+			normalize_startup_snapshot(true, Some(vec![1, 2, 3])),
+			Some(vec![1, 2, 3])
+		);
+		assert_eq!(normalize_startup_snapshot(true, None), None);
 	}
 
 	fn schema_ptr(error: &anyhow::Error) -> *const RivetErrorSchema {
