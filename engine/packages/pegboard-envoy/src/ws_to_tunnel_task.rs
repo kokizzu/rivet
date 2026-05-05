@@ -2,7 +2,7 @@ use anyhow::{Context, bail};
 use bytes::Bytes;
 use depot::{
 	conveyer::Db,
-	error::{is_head_fence_mismatch, SqliteStorageError},
+	error::{SqliteStorageError, is_head_fence_mismatch},
 	workflows::compaction::{
 		DATABASE_BRANCH_ID_TAG, DbManagerInput, DeltasAvailable, database_branch_tag_value,
 	},

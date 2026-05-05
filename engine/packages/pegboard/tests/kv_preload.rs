@@ -5,11 +5,9 @@ use rivet_config::config::pegboard::Pegboard;
 use rivet_data::converted::ActorNameKeyData;
 use serde_json::json;
 
-async fn setup_recipient(test_name: &str) -> Result<(
-	rivet_test_deps::TestDeps,
-	kv::Recipient,
-	Id,
-)> {
+async fn setup_recipient(
+	test_name: &str,
+) -> Result<(rivet_test_deps::TestDeps, kv::Recipient, Id)> {
 	let test_id = Uuid::new_v4();
 	let dc_label = 1;
 	let datacenters = [(
@@ -108,8 +106,7 @@ async fn preload_oversized_exact_key_is_not_marked_requested() -> Result<()> {
 
 #[tokio::test]
 async fn preload_missing_exact_key_is_marked_requested() -> Result<()> {
-	let (test_deps, recipient, namespace_id) =
-		setup_recipient("preload_missing_exact_key").await?;
+	let (test_deps, recipient, namespace_id) = setup_recipient("preload_missing_exact_key").await?;
 	let db = &test_deps.pools.udb()?;
 	let actor_name = "preload-missing-exact-key";
 	let key = b"missing-exact-key".to_vec();

@@ -155,7 +155,7 @@ pub(crate) async fn batch_preload(
 					// "preloaded and absent" from "not preloaded".
 					requested_get_keys.push(key.clone());
 				}
-				}
+			}
 
 			// 2. Read prefix ranges in priority order. Each prefix is bounded by
 			// its per-prefix max_bytes and the remaining global budget.

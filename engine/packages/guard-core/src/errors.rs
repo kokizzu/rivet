@@ -109,19 +109,11 @@ pub struct ServiceUnavailable;
 pub struct ActorStoppedWhileWaiting;
 
 #[derive(RivetError, Serialize, Deserialize)]
-#[error(
-	"guard",
-	"tunnel_request_aborted",
-	"Actor tunnel aborted the request."
-)]
+#[error("guard", "tunnel_request_aborted", "Actor tunnel aborted the request.")]
 pub struct TunnelRequestAborted;
 
 #[derive(RivetError, Serialize, Deserialize)]
-#[error(
-	"guard",
-	"tunnel_message_timeout",
-	"Actor tunnel message timed out."
-)]
+#[error("guard", "tunnel_message_timeout", "Actor tunnel message timed out.")]
 pub struct TunnelMessageTimeout;
 
 #[derive(RivetError, Serialize, Deserialize)]

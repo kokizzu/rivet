@@ -860,10 +860,12 @@ impl VfsState {
 		if !can_read_cached_page(config, pgno) {
 			return None;
 		}
-		self
-			.committed_page_cache
+		self.committed_page_cache
 			.get(&pgno)
-			.or_else(|| self.protected_page_cache.read_sync(&pgno, |_, bytes| bytes.clone()))
+			.or_else(|| {
+				self.protected_page_cache
+					.read_sync(&pgno, |_, bytes| bytes.clone())
+			})
 			.or_else(|| self.page_cache.get(&pgno))
 	}
 

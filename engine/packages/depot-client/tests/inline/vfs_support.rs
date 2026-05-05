@@ -351,7 +351,9 @@ impl DirectStorage {
 
 		let actor_db = self.actor_db(actor_id.to_string()).await;
 		self.counters.depot_get_pages.fetch_add(1, Ordering::SeqCst);
-		actor_db.get_pages_with_options(pgnos.to_vec(), options).await
+		actor_db
+			.get_pages_with_options(pgnos.to_vec(), options)
+			.await
 	}
 
 	pub(crate) async fn read_mirror(
@@ -437,7 +439,11 @@ impl SqliteTransport for DirectDepotTransport {
 		{
 			Ok(result) => Ok(protocol::SqliteGetPagesResponse::SqliteGetPagesOk(
 				protocol::SqliteGetPagesOk {
-					pages: result.pages.into_iter().map(protocol_fetched_page).collect(),
+					pages: result
+						.pages
+						.into_iter()
+						.map(protocol_fetched_page)
+						.collect(),
 					head_txid: Some(result.head_txid),
 				},
 			)),
@@ -544,9 +550,7 @@ impl SqliteTransport for DirectMirrorTransport {
 			.await
 		{
 			Ok(()) => Ok(protocol::SqliteCommitResponse::SqliteCommitOk(
-				protocol::SqliteCommitOk {
-					head_txid: None,
-				},
+				protocol::SqliteCommitOk { head_txid: None },
 			)),
 			Err(err) => Ok(protocol::SqliteCommitResponse::SqliteErrorResponse(
 				sqlite_error_response(&err),

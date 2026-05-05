@@ -181,9 +181,7 @@ pub async fn route_request(
 			.find_map(|p| p.strip_prefix(WS_PROTOCOL_TOKEN))
 			.map(ToOwned::to_owned);
 
-		let skip_ready_wait = protocols
-			.iter()
-			.any(|p| p == &WS_PROTOCOL_SKIP_READY_WAIT);
+		let skip_ready_wait = protocols.iter().any(|p| p == &WS_PROTOCOL_SKIP_READY_WAIT);
 
 		(actor_id, token, skip_ready_wait)
 	} else {
@@ -647,7 +645,9 @@ fn read_skip_ready_wait_header(req_ctx: &RequestContext) -> Result<bool> {
 		return Ok(false);
 	};
 
-	let value = value.to_str().context("invalid x-rivet-skip-ready-wait header")?;
+	let value = value
+		.to_str()
+		.context("invalid x-rivet-skip-ready-wait header")?;
 	parse_skip_ready_wait_bool(value).ok_or_else(|| {
 		crate::errors::InvalidHeader {
 			header: X_RIVET_SKIP_READY_WAIT.to_string(),

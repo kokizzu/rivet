@@ -48,14 +48,9 @@ impl Db {
 		db_size_pages: u32,
 		now_ms: i64,
 	) -> Result<()> {
-		self.commit_with_options(
-			dirty_pages,
-			db_size_pages,
-			now_ms,
-			CommitOptions::default(),
-		)
-		.await
-		.map(|_| ())
+		self.commit_with_options(dirty_pages, db_size_pages, now_ms, CommitOptions::default())
+			.await
+			.map(|_| ())
 	}
 
 	pub async fn commit_with_options(

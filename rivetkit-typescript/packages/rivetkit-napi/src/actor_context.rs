@@ -18,8 +18,8 @@ use napi_derive::napi;
 use parking_lot::Mutex;
 use rivetkit_core::types::ActorKeySegment;
 use rivetkit_core::{
-	ActorContext as CoreActorContext, ConnHandle as CoreConnHandle, Request as CoreRequest,
-	KeepAwakeRegion, RequestSaveOpts, StateDelta, WebSocketCallbackRegion,
+	ActorContext as CoreActorContext, ConnHandle as CoreConnHandle, KeepAwakeRegion,
+	Request as CoreRequest, RequestSaveOpts, StateDelta, WebSocketCallbackRegion,
 };
 use scc::HashMap as SccHashMap;
 use tokio::sync::mpsc::UnboundedSender;

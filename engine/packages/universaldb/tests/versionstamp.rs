@@ -146,11 +146,7 @@ fn test_substitute_raw_versionstamp_preserves_depot_suffix_bytes() {
 
 #[test]
 fn test_substitute_versionstamp_matches_official_tuple_operand_layout() {
-	let tuple = (
-		"prefix",
-		Versionstamp::incomplete(12345),
-		"suffix",
-	);
+	let tuple = ("prefix", Versionstamp::incomplete(12345), "suffix");
 	let mut ours = pack_with_versionstamp(&tuple);
 	let official = ours.clone();
 	let versionstamp = generate_versionstamp(54321);

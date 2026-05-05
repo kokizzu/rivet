@@ -319,60 +319,63 @@ async fn commit_head_fence_rejects_stale_writer() -> Result<()> {
 
 #[tokio::test]
 async fn get_pages_head_fence_rejects_stale_reader() -> Result<()> {
-	commit_matrix!("depot-get-pages-head-fence-stale", |ctx, db, database_db| {
-		let _ = &db;
-		let first = database_db
-			.commit_with_options(
-				vec![page(1, 0x11)],
-				1,
-				1_000,
-				CommitOptions {
-					expected_head_txid: Some(0),
-				},
-			)
-			.await?;
-		assert_eq!(first.head_txid, 1);
+	commit_matrix!(
+		"depot-get-pages-head-fence-stale",
+		|ctx, db, database_db| {
+			let _ = &db;
+			let first = database_db
+				.commit_with_options(
+					vec![page(1, 0x11)],
+					1,
+					1_000,
+					CommitOptions {
+						expected_head_txid: Some(0),
+					},
+				)
+				.await?;
+			assert_eq!(first.head_txid, 1);
 
-		let read = database_db
-			.get_pages_with_options(
-				vec![1],
-				GetPagesOptions {
-					expected_head_txid: Some(1),
-				},
-			)
-			.await?;
-		assert_eq!(read.head_txid, 1);
-		assert_eq!(read.pages, vec![fetched_page(1, 0x11)]);
+			let read = database_db
+				.get_pages_with_options(
+					vec![1],
+					GetPagesOptions {
+						expected_head_txid: Some(1),
+					},
+				)
+				.await?;
+			assert_eq!(read.head_txid, 1);
+			assert_eq!(read.pages, vec![fetched_page(1, 0x11)]);
 
-		let second = database_db
-			.commit_with_options(
-				vec![page(1, 0x22)],
-				1,
-				1_001,
-				CommitOptions {
-					expected_head_txid: Some(1),
-				},
-			)
-			.await?;
-		assert_eq!(second.head_txid, 2);
+			let second = database_db
+				.commit_with_options(
+					vec![page(1, 0x22)],
+					1,
+					1_001,
+					CommitOptions {
+						expected_head_txid: Some(1),
+					},
+				)
+				.await?;
+			assert_eq!(second.head_txid, 2);
 
-		let err = database_db
-			.get_pages_with_options(
-				vec![1],
-				GetPagesOptions {
-					expected_head_txid: Some(1),
-				},
-			)
-			.await
-			.expect_err("stale reader should be rejected");
-		assert!(
-			err.chain()
-				.any(|source| source.to_string().contains("head fence mismatch")),
-			"unexpected error: {err:#}"
-		);
+			let err = database_db
+				.get_pages_with_options(
+					vec![1],
+					GetPagesOptions {
+						expected_head_txid: Some(1),
+					},
+				)
+				.await
+				.expect_err("stale reader should be rejected");
+			assert!(
+				err.chain()
+					.any(|source| source.to_string().contains("head fence mismatch")),
+				"unexpected error: {err:#}"
+			);
 
-		Ok(())
-	})
+			Ok(())
+		}
+	)
 }
 
 #[tokio::test]

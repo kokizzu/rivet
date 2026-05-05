@@ -65,10 +65,7 @@ fn vfs_config_wires_optimization_flags() {
 		config.cache_capacity_pages,
 		DEFAULT_VFS_PAGE_CACHE_CAPACITY_PAGES / 2
 	);
-	assert_eq!(
-		config.protected_cache_pages,
-		0
-	);
+	assert_eq!(config.protected_cache_pages, 0);
 	assert_eq!(
 		config.staging_cache_ttl_ms,
 		DEFAULT_VFS_STAGING_CACHE_TTL_MS / 2
@@ -425,13 +422,12 @@ fn open_worker_handle_with_vfs(
 		)
 		.expect("worker vfs should register"),
 	);
-	let db =
-		crate::database::NativeDatabaseHandle::new_with_metrics(
-			vfs.clone(),
-			harness.actor_id.clone(),
-			metrics,
-		)
-		.expect("worker handle should start");
+	let db = crate::database::NativeDatabaseHandle::new_with_metrics(
+		vfs.clone(),
+		harness.actor_id.clone(),
+		metrics,
+	)
+	.expect("worker handle should start");
 	(vfs, db)
 }
 
@@ -3555,7 +3551,9 @@ fn resolve_pages_sends_known_head_txid_as_read_fence() {
 	ctx.resolve_pages(&[2], false)
 		.expect("read should fetch from transport");
 	let requests = hooks.get_pages_requests();
-	let request = requests.last().expect("get_pages request should be recorded");
+	let request = requests
+		.last()
+		.expect("get_pages request should be recorded");
 	assert_eq!(request.expected_head_txid, Some(7));
 }
 
@@ -3573,7 +3571,10 @@ fn fatal_sqlite_error_reports_first_message_through_worker_boundary() {
 	ctx.mark_fatal("second fatal sqlite error".to_string());
 
 	assert!(ctx.is_dead());
-	assert_eq!(ctx.clone_fatal_error().as_deref(), Some("first fatal sqlite error"));
+	assert_eq!(
+		ctx.clone_fatal_error().as_deref(),
+		Some("first fatal sqlite error")
+	);
 
 	let err = runtime
 		.block_on(db.exec("SELECT 1;".to_string()))

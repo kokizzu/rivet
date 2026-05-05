@@ -1283,8 +1283,8 @@ impl ActorTask {
 		}
 
 		if self.preloaded_kv.is_some() {
-			let actor =
-				self.decode_persisted_actor_startup(self.load_startup_key(PERSIST_DATA_KEY).await?)?;
+			let actor = self
+				.decode_persisted_actor_startup(self.load_startup_key(PERSIST_DATA_KEY).await?)?;
 			let last_pushed_alarm = self.load_startup_last_pushed_alarm().await?;
 			return Ok(PersistedStartup {
 				actor,
@@ -2213,14 +2213,13 @@ impl ActorTask {
 			// only meant to stop the previous generation.
 			self.ctx.reset_abort_signal_for_start();
 			self.ctx.clear_sleep_requested();
-			}
-			self.ctx
-				.set_started(matches!(
-					lifecycle,
-					LifecycleState::Started | LifecycleState::SleepGrace
-				));
 		}
+		self.ctx.set_started(matches!(
+			lifecycle,
+			LifecycleState::Started | LifecycleState::SleepGrace
+		));
 	}
+}
 
 fn shutdown_reason_label(reason: ShutdownKind) -> &'static str {
 	match reason {

@@ -118,14 +118,12 @@ impl OwnedVersionedData for ToEnvoy {
 
 	fn deserialize_version(payload: &[u8], version: u16) -> Result<Self> {
 		Ok(Self::V5(match version {
-			1 => convert_to_envoy_v4_to_v5(convert_to_envoy_v3_to_v4(
-				convert_to_envoy_v2_to_v3(convert_to_envoy_v1_to_v2(serde_bare::from_slice(
-					payload,
-				)?)?)?,
-			)?)?,
-			2 => convert_to_envoy_v4_to_v5(convert_to_envoy_v3_to_v4(
-				convert_to_envoy_v2_to_v3(serde_bare::from_slice(payload)?)?,
-			)?)?,
+			1 => convert_to_envoy_v4_to_v5(convert_to_envoy_v3_to_v4(convert_to_envoy_v2_to_v3(
+				convert_to_envoy_v1_to_v2(serde_bare::from_slice(payload)?)?,
+			)?)?)?,
+			2 => convert_to_envoy_v4_to_v5(convert_to_envoy_v3_to_v4(convert_to_envoy_v2_to_v3(
+				serde_bare::from_slice(payload)?,
+			)?)?)?,
 			3 => convert_to_envoy_v4_to_v5(convert_to_envoy_v3_to_v4(serde_bare::from_slice(
 				payload,
 			)?)?)?,
@@ -190,9 +188,9 @@ impl OwnedVersionedData for ToRivet {
 
 	fn deserialize_version(payload: &[u8], version: u16) -> Result<Self> {
 		Ok(Self::V5(match version {
-			1 | 2 => convert_to_rivet_v4_to_v5(convert_to_rivet_v3_to_v4(convert_to_rivet_v2_to_v3(
-				serde_bare::from_slice(payload)?,
-			)?)?)?,
+			1 | 2 => convert_to_rivet_v4_to_v5(convert_to_rivet_v3_to_v4(
+				convert_to_rivet_v2_to_v3(serde_bare::from_slice(payload)?)?,
+			)?)?,
 			3 => convert_to_rivet_v4_to_v5(convert_to_rivet_v3_to_v4(serde_bare::from_slice(
 				payload,
 			)?)?)?,
@@ -479,8 +477,10 @@ impl OwnedVersionedData for ActorCommandKeyData {
 			}
 			3 => {
 				let data = data_v4()?;
-				serde_bare::to_vec(&convert_same_bytes_ref::<_, v3::ActorCommandKeyData>(&data)?)
-					.map_err(Into::into)
+				serde_bare::to_vec(&convert_same_bytes_ref::<_, v3::ActorCommandKeyData>(
+					&data,
+				)?)
+				.map_err(Into::into)
 			}
 			4 => serde_bare::to_vec(&data_v4()?).map_err(Into::into),
 			5 => serde_bare::to_vec(&data).map_err(Into::into),
@@ -612,9 +612,9 @@ fn convert_sqlite_get_pages_response_v4_to_v5(
 			})
 		}
 		v4::SqliteGetPagesResponse::SqliteErrorResponse(error) => {
-			v5::SqliteGetPagesResponse::SqliteErrorResponse(
-				convert_sqlite_error_response_v4_to_v5(error),
-			)
+			v5::SqliteGetPagesResponse::SqliteErrorResponse(convert_sqlite_error_response_v4_to_v5(
+				error,
+			))
 		}
 	})
 }
@@ -629,9 +629,9 @@ fn convert_sqlite_get_pages_response_v5_to_v4(
 			})
 		}
 		v5::SqliteGetPagesResponse::SqliteErrorResponse(error) => {
-			v4::SqliteGetPagesResponse::SqliteErrorResponse(
-				convert_sqlite_error_response_v5_to_v4(error),
-			)
+			v4::SqliteGetPagesResponse::SqliteErrorResponse(convert_sqlite_error_response_v5_to_v4(
+				error,
+			))
 		}
 	})
 }
@@ -641,14 +641,12 @@ fn convert_sqlite_commit_response_v4_to_v5(
 ) -> Result<v5::SqliteCommitResponse> {
 	Ok(match message {
 		v4::SqliteCommitResponse::SqliteCommitOk => {
-			v5::SqliteCommitResponse::SqliteCommitOk(v5::SqliteCommitOk {
-				head_txid: None,
-			})
+			v5::SqliteCommitResponse::SqliteCommitOk(v5::SqliteCommitOk { head_txid: None })
 		}
 		v4::SqliteCommitResponse::SqliteErrorResponse(error) => {
-			v5::SqliteCommitResponse::SqliteErrorResponse(
-				convert_sqlite_error_response_v4_to_v5(error),
-			)
+			v5::SqliteCommitResponse::SqliteErrorResponse(convert_sqlite_error_response_v4_to_v5(
+				error,
+			))
 		}
 	})
 }
@@ -657,13 +655,11 @@ fn convert_sqlite_commit_response_v5_to_v4(
 	message: v5::SqliteCommitResponse,
 ) -> Result<v4::SqliteCommitResponse> {
 	Ok(match message {
-		v5::SqliteCommitResponse::SqliteCommitOk(_) => {
-			v4::SqliteCommitResponse::SqliteCommitOk
-		}
+		v5::SqliteCommitResponse::SqliteCommitOk(_) => v4::SqliteCommitResponse::SqliteCommitOk,
 		v5::SqliteCommitResponse::SqliteErrorResponse(error) => {
-			v4::SqliteCommitResponse::SqliteErrorResponse(
-				convert_sqlite_error_response_v5_to_v4(error),
-			)
+			v4::SqliteCommitResponse::SqliteErrorResponse(convert_sqlite_error_response_v5_to_v4(
+				error,
+			))
 		}
 	})
 }
@@ -676,9 +672,9 @@ fn convert_sqlite_exec_response_v4_to_v5(
 			v5::SqliteExecResponse::SqliteExecOk(convert_same_bytes(ok)?)
 		}
 		v4::SqliteExecResponse::SqliteErrorResponse(error) => {
-			v5::SqliteExecResponse::SqliteErrorResponse(
-				convert_sqlite_error_response_v4_to_v5(error),
-			)
+			v5::SqliteExecResponse::SqliteErrorResponse(convert_sqlite_error_response_v4_to_v5(
+				error,
+			))
 		}
 	})
 }
@@ -691,9 +687,9 @@ fn convert_sqlite_exec_response_v5_to_v4(
 			v4::SqliteExecResponse::SqliteExecOk(convert_same_bytes(ok)?)
 		}
 		v5::SqliteExecResponse::SqliteErrorResponse(error) => {
-			v4::SqliteExecResponse::SqliteErrorResponse(
-				convert_sqlite_error_response_v5_to_v4(error),
-			)
+			v4::SqliteExecResponse::SqliteErrorResponse(convert_sqlite_error_response_v5_to_v4(
+				error,
+			))
 		}
 	})
 }
@@ -706,9 +702,9 @@ fn convert_sqlite_execute_response_v4_to_v5(
 			v5::SqliteExecuteResponse::SqliteExecuteOk(convert_same_bytes(ok)?)
 		}
 		v4::SqliteExecuteResponse::SqliteErrorResponse(error) => {
-			v5::SqliteExecuteResponse::SqliteErrorResponse(
-				convert_sqlite_error_response_v4_to_v5(error),
-			)
+			v5::SqliteExecuteResponse::SqliteErrorResponse(convert_sqlite_error_response_v4_to_v5(
+				error,
+			))
 		}
 	})
 }
@@ -721,9 +717,9 @@ fn convert_sqlite_execute_response_v5_to_v4(
 			v4::SqliteExecuteResponse::SqliteExecuteOk(convert_same_bytes(ok)?)
 		}
 		v5::SqliteExecuteResponse::SqliteErrorResponse(error) => {
-			v4::SqliteExecuteResponse::SqliteErrorResponse(
-				convert_sqlite_error_response_v5_to_v4(error),
-			)
+			v4::SqliteExecuteResponse::SqliteErrorResponse(convert_sqlite_error_response_v5_to_v4(
+				error,
+			))
 		}
 	})
 }

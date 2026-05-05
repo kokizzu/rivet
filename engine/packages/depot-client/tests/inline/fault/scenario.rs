@@ -649,11 +649,13 @@ impl FaultScenarioCtx {
 					*candidate_pgno / depot::keys::SHARD_SIZE == pgno / depot::keys::SHARD_SIZE
 				})
 				.map(|candidate_pgno| {
-					let bytes = state.cached_page(&ctx.config, candidate_pgno).with_context(|| {
-						format!(
-							"page {candidate_pgno} should be present in VFS cache before cold-ref seed"
-						)
-					})?;
+					let bytes = state
+						.cached_page(&ctx.config, candidate_pgno)
+						.with_context(|| {
+							format!(
+								"page {candidate_pgno} should be present in VFS cache before cold-ref seed"
+							)
+						})?;
 					Ok(DirtyPage {
 						pgno: candidate_pgno,
 						bytes,

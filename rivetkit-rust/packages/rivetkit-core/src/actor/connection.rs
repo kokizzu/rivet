@@ -688,8 +688,7 @@ impl ActorContext {
 			return Err(error);
 		}
 
-		self
-			.emit_connection_preflight(&conn, params.clone(), request.clone())
+		self.emit_connection_preflight(&conn, params.clone(), request.clone())
 			.await?;
 		self.insert_existing(conn.clone());
 

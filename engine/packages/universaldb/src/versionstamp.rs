@@ -80,8 +80,7 @@ pub fn substitute_versionstamp(
 	if offset >= data_len {
 		return Err(format!(
 			"Invalid versionstamp offset: {} exceeds data length {}",
-			offset,
-			data_len
+			offset, data_len
 		));
 	}
 
@@ -141,8 +140,7 @@ pub fn substitute_raw_versionstamp(
 	if versionstamp_end > data_len {
 		return Err(format!(
 			"Invalid versionstamp offset: {} exceeds data length {}",
-			offset,
-			data_len
+			offset, data_len
 		));
 	}
 

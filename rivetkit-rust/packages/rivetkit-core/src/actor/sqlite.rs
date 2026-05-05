@@ -167,16 +167,18 @@ impl SqliteDb {
 						.context("open sqlite database requires a tokio runtime")?;
 					self.worker_fatal_reported.store(false, Ordering::Release);
 
-					let native_db = self.map_local_worker_result(open_database_from_transport(
-						Arc::new(EnvoySqliteTransport::new(config.handle.clone())),
-						config.actor_id.clone(),
-						config
-							.generation
-							.ok_or_else(|| sqlite_not_configured("generation"))?,
-						rt_handle,
-						vfs_metrics,
-					)
-					.await)?;
+					let native_db = self.map_local_worker_result(
+						open_database_from_transport(
+							Arc::new(EnvoySqliteTransport::new(config.handle.clone())),
+							config.actor_id.clone(),
+							config
+								.generation
+								.ok_or_else(|| sqlite_not_configured("generation"))?,
+							rt_handle,
+							vfs_metrics,
+						)
+						.await,
+					)?;
 					self.start_worker_failure_monitor(native_db.clone(), config);
 					*self.db.lock() = Some(native_db);
 					Ok(())

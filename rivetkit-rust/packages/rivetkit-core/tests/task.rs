@@ -2388,16 +2388,16 @@ mod moved_tests {
 								"partial preload should only live-fetch missing persisted actor data"
 							);
 							saw_persist_live_get_for_task.store(true, Ordering::SeqCst);
-							let _ = response_tx.send(Ok(
-								protocol::KvResponseData::KvGetResponse(protocol::KvGetResponse {
+							let _ = response_tx.send(Ok(protocol::KvResponseData::KvGetResponse(
+								protocol::KvGetResponse {
 									keys: vec![PERSIST_DATA_KEY.to_vec()],
 									values: vec![encoded_persisted.clone()],
 									metadata: vec![protocol::KvMetadata {
 										version: Vec::new(),
 										update_ts: 0,
 									}],
-								}),
-							));
+								},
+							)));
 						}
 						protocol::KvRequestData::KvPutRequest(_) => {
 							let _ = response_tx.send(Ok(protocol::KvResponseData::KvPutResponse));
