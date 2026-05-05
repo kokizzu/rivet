@@ -8,6 +8,8 @@ type ConnParams = {
 	label?: string;
 	beforeDelayMs?: number;
 	createDelayMs?: number;
+	rejectBefore?: boolean;
+	rejectCreate?: boolean;
 };
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -38,12 +40,18 @@ export const connPreflightVisibilityActor = actor({
 		if (params?.beforeDelayMs) {
 			await sleep(params.beforeDelayMs);
 		}
+		if (params?.rejectBefore) {
+			throw new Error("rejected before connect");
+		}
 	},
 	createConnState: async (c, params: ConnParams): Promise<ConnState> => {
 		c.state.createStarted += 1;
 		c.state.createVisibleLabels.push(visibleLabels(c));
 		if (params?.createDelayMs) {
 			await sleep(params.createDelayMs);
+		}
+		if (params?.rejectCreate) {
+			throw new Error("rejected create conn state");
 		}
 		return { label: params?.label ?? "anonymous" };
 	},

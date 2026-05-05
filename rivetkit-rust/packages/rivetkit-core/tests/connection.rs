@@ -166,6 +166,49 @@ mod moved_tests {
 		event_task.await.expect("event task should complete");
 	}
 
+	#[tokio::test]
+	async fn transport_close_during_preflight_never_emits_connection_closed() {
+		let ctx = ActorContext::new_with_kv(
+			"actor-preflight-transport-close",
+			"actor",
+			Vec::new(),
+			"local",
+			Kv::new_in_memory(),
+		);
+		ctx.configure_connection_runtime(crate::actor::config::ActorConfig::default());
+		let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+		ctx.configure_actor_events(Some(events_tx));
+		let closed_conn_id = Arc::new(Mutex::new(None::<String>));
+
+		let event_closed_conn_id = closed_conn_id.clone();
+		let event_task = tokio::spawn(async move {
+			match events_rx.recv().await.expect("preflight event") {
+				ActorEvent::ConnectionPreflight { conn, reply, .. } => {
+					conn.disconnect(Some("transport closed"))
+						.await
+						.expect("pending connection transport close should succeed");
+					reply.send(Err(anyhow::anyhow!("reject after transport close")));
+				}
+				other => panic!("unexpected event: {other:?}"),
+			}
+
+			if let Ok(Some(ActorEvent::ConnectionClosed { conn })) =
+				tokio::time::timeout(Duration::from_millis(20), events_rx.recv()).await
+			{
+				*event_closed_conn_id.lock() = Some(conn.id().to_owned());
+			}
+		});
+
+		let error = ctx
+			.connect_with_state(vec![1], false, None, None, async { Ok(vec![2]) })
+			.await
+			.expect_err("connection should fail");
+
+		assert!(format!("{error:#}").contains("reject after transport close"));
+		assert_eq!(*closed_conn_id.lock(), None);
+		event_task.await.expect("event task should complete");
+	}
+
 	#[test]
 	fn persisted_connection_uses_ts_v4_fixed_id_wire_format() {
 		let persisted = PersistedConnection {
