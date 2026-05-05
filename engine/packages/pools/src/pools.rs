@@ -26,6 +26,8 @@ impl Pools {
 		let token = CancellationToken::new();
 		let node_id = NodeId::new();
 
+		install_rustls_provider();
+
 		let (ups, udb) = tokio::try_join!(
 			crate::db::ups::setup(&config, client_name),
 			crate::db::udb::setup(&config),
@@ -54,6 +56,8 @@ impl Pools {
 		let client_name = "rivet";
 		let token = CancellationToken::new();
 		let node_id = NodeId::new();
+
+		install_rustls_provider();
 
 		let (ups, udb) = tokio::try_join!(
 			crate::db::ups::setup(&config, client_name),
@@ -95,5 +99,12 @@ impl Pools {
 
 	pub fn udb(&self) -> Result<UdbPool> {
 		self.0.udb.clone().ok_or(Error::MissingUdbPool.into())
+	}
+}
+
+fn install_rustls_provider() {
+	let provider = rustls::crypto::ring::default_provider();
+	if provider.install_default().is_err() {
+		tracing::debug!("crypto provider already installed in this process");
 	}
 }
