@@ -4,12 +4,14 @@ export function getComputeAddendum({
 	namespace,
 	apiUrl,
 	cloudApiUrl,
+	rivetRunUrl,
 }: {
 	cloudToken: string;
 	publishableToken: string;
 	namespace: string;
 	apiUrl: string;
 	cloudApiUrl: string;
+	rivetRunUrl: string;
 }) {
 	return `# Compute Deployment Steps
 ## Step 1: Load the RivetKit docs
@@ -22,11 +24,13 @@ Add a note to the project's \`CLAUDE.md\` / \`AGENTS.md\` (create one if missing
 
 Do **not** rewrite the project into a hand-mounted HTTP handler. Keep the existing \`registry.start()\` call as-is.
 
-When the app runs on Rivet Compute, Compute automatically runs it in serverless mode (it sets \`RIVETKIT_RUNTIME_MODE=serverless\` for you). In that mode \`registry.start()\` binds an HTTP listener instead of opening a long-lived connection to the engine, so no manual Hono handler is needed. The client API is still served under \`/api/rivet\`, so a frontend should target that mount path:
+When the app runs on Rivet Compute, Compute automatically runs it in serverless mode (it sets \`RIVETKIT_RUNTIME_MODE=serverless\` for you). In that mode \`registry.start()\` binds an HTTP listener instead of opening a long-lived connection to the engine, so no manual Hono handler is needed. The client API is still served under \`/api/rivet\`, so a frontend served from the same origin should target that mount path:
 
 \`\`\`ts
 const client = createClient(location.origin + "/api/rivet");
 \`\`\`
+
+Once deployed, the app is publicly reachable at its Rivet Run URL, \`${rivetRunUrl}\`. An external client (not served from the same origin) connects to the actor API at \`${rivetRunUrl}api/rivet\`.
 
 **Serving a frontend:** \`registry.start()\` serves static files automatically. Put the frontend build output in a \`public/\` directory and it is served with zero extra wiring. If the build outputs somewhere else (e.g. \`dist/\`), set \`RIVETKIT_PUBLIC_DIR\` to that directory.
 
@@ -95,6 +99,8 @@ When the command finishes successfully, proceed to Step 5 to verify the deployme
 These are different tokens with different scopes. Do not mix them up.
 
 \`@rivetkit/cli deploy\` waits for the managed pool to become ready before it exits, so a successful deploy means the deployment is already live. You do not need to poll deployment status separately.
+
+The deployed app is served at its Rivet Run URL: \`${rivetRunUrl}\`. Open it in a browser to confirm the frontend loads, or verify the serverless runtime is up with \`curl ${rivetRunUrl}api/rivet/health\` (expects a 200).
 
 If the deploy fails or you need to debug, read the deployment logs with the CLI (it resolves the token from \`~/.rivet/credentials\`):
 

@@ -37,7 +37,7 @@ import {
 } from "@/components/actors";
 import { defineStepper } from "@/components/ui/stepper";
 import { deriveProviderFromMetadata } from "@/lib/data";
-import { cloudEnv, engineEnv } from "@/lib/env";
+import { cloudEnv, engineEnv, getRivetRunUrl } from "@/lib/env";
 import { features } from "@/lib/features";
 import { usePublishableToken } from "@/queries/accessors";
 import { queryClient } from "@/queries/global";
@@ -1002,6 +1002,7 @@ function useComputeInstructionsCode() {
 		namespace,
 		apiUrl: cloudEnv().VITE_APP_API_URL,
 		cloudApiUrl: cloudEnv().VITE_APP_CLOUD_API_URL,
+		rivetRunUrl: getRivetRunUrl(namespace),
 	});
 
 	return `${agentInstructions}\n\n---\n\n${computeAddendum}`;
