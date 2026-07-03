@@ -115,7 +115,7 @@ Verify actors work end-to-end:
 
 2. Wait ~10 seconds for the actor to start, then hit its health endpoint through the gateway using the public token:
    \`\`\`bash
-   curl "${apiUrl}/gateway/<ACTOR_ID>/api/rivet/health" \\
+   curl "${apiUrl}/gateway/<ACTOR_ID>/health" \\
      -H "x-rivet-token: ${publishableToken}"
    \`\`\`
    This should return ok with a 200 status.
