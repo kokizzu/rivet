@@ -151,12 +151,17 @@ impl CloudClient {
 	}
 }
 
-pub async fn ensure_namespace(
+/// Resolves a namespace by its machine name or display name. First tries a
+/// direct lookup by name, then falls back to listing namespaces and matching
+/// either the machine name or the (case-insensitive) display name. This lets a
+/// user pass a display name like `production` when the real machine name is
+/// something like `production-qvra`. Returns `None` when no namespace matches.
+async fn resolve_namespace(
 	cloud: &CloudClient,
 	project: &str,
 	org: &str,
 	namespace: &str,
-) -> Result<Namespace> {
+) -> Result<Option<Namespace>> {
 	let path = format!(
 		"/projects/{}/namespaces/{}?org={}",
 		encode(project),
@@ -167,19 +172,28 @@ pub async fn ensure_namespace(
 		.request::<NamespaceResponse>(Method::GET, &path, None)
 		.await?
 	{
-		return Ok(response.namespace);
+		return Ok(Some(response.namespace));
 	}
 
-	let list_path = format!(
-		"/projects/{}/namespaces?org={}&limit=100",
-		encode(project),
-		encode(org)
-	);
-	if let Some(response) = cloud
-		.request::<NamespacesResponse>(Method::GET, &list_path, None)
-		.await?
-	{
-		let _next_cursor = response.pagination.and_then(|p| p.cursor);
+	let mut cursor: Option<String> = None;
+	loop {
+		let mut list_path = format!(
+			"/projects/{}/namespaces?org={}&limit=100",
+			encode(project),
+			encode(org)
+		);
+		if let Some(cursor) = &cursor {
+			list_path.push_str(&format!("&cursor={}", encode(cursor)));
+		}
+
+		let Some(response) = cloud
+			.request::<NamespacesResponse>(Method::GET, &list_path, None)
+			.await?
+		else {
+			return Ok(None);
+		};
+
+		let next_cursor = response.pagination.and_then(|p| p.cursor);
 		if let Some(found) = response.namespaces.into_iter().find(|ns| {
 			ns.name == namespace
 				|| ns
@@ -187,8 +201,24 @@ pub async fn ensure_namespace(
 					.as_ref()
 					.is_some_and(|display| display.eq_ignore_ascii_case(namespace))
 		}) {
-			return Ok(found);
+			return Ok(Some(found));
 		}
+
+		match next_cursor {
+			Some(next) => cursor = Some(next),
+			None => return Ok(None),
+		}
+	}
+}
+
+pub async fn ensure_namespace(
+	cloud: &CloudClient,
+	project: &str,
+	org: &str,
+	namespace: &str,
+) -> Result<Namespace> {
+	if let Some(found) = resolve_namespace(cloud, project, org, namespace).await? {
+		return Ok(found);
 	}
 
 	tracing::info!(%namespace, "creating namespace");
@@ -217,17 +247,9 @@ pub async fn get_namespace(
 	org: &str,
 	namespace: &str,
 ) -> Result<Namespace> {
-	let path = format!(
-		"/projects/{}/namespaces/{}?org={}",
-		encode(project),
-		encode(namespace),
-		encode(org)
-	);
-	let response = cloud
-		.request::<NamespaceResponse>(Method::GET, &path, None)
+	resolve_namespace(cloud, project, org, namespace)
 		.await?
-		.with_context(|| format!("namespace not found: {namespace}"))?;
-	Ok(response.namespace)
+		.with_context(|| format!("namespace not found: {namespace}"))
 }
 
 pub async fn create_or_update_pool(
