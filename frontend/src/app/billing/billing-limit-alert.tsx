@@ -1,11 +1,17 @@
 import { faExclamationTriangle, Icon } from "@rivet-gg/icons";
 import { useQuery } from "@tanstack/react-query";
 import { Link, useMatch } from "@tanstack/react-router";
+import { useEffect } from "react";
 import { Button, cn } from "@/components";
 import { useCloudProjectDataProvider } from "@/components/actors";
 import { PLAN_LABELS } from "@/content/billing";
 import { features } from "@/lib/features";
 import { useHighestUsagePercent } from "./hooks";
+
+// Fixed banner height (Tailwind `h-9`). Published as a CSS variable so the
+// settings drawer, a fixed overlay anchored under the top bar, can start below
+// the banner instead of behind it.
+const BANNER_HEIGHT = "2.25rem";
 
 export function BillingLimitAlert() {
 	if (!features.billing) return null;
@@ -35,8 +41,18 @@ function BillingLimitAlertInner() {
 
 	const usagePercent = useHighestUsagePercent();
 	const plan = billingData?.billing.activePlan || "free";
+	const hidden = plan !== "free" || usagePercent < 80;
 
-	if (plan !== "free" || usagePercent < 80) {
+	useEffect(() => {
+		if (hidden) return;
+		const root = document.documentElement;
+		root.style.setProperty("--billing-banner-height", BANNER_HEIGHT);
+		return () => {
+			root.style.removeProperty("--billing-banner-height");
+		};
+	}, [hidden]);
+
+	if (hidden) {
 		return null;
 	}
 
@@ -45,7 +61,7 @@ function BillingLimitAlertInner() {
 	return (
 		<div
 			className={cn(
-				"flex items-center gap-2 border-b px-3 py-1.5 text-xs",
+				"flex h-9 items-center gap-2 border-b px-3 text-xs",
 				atLimit
 					? "border-destructive/60 bg-destructive/15"
 					: "border-warning/60 bg-warning/10",

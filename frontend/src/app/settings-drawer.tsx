@@ -187,7 +187,10 @@ export function SettingsDrawer({
 						"data-[state=open]:animate-in data-[state=closed]:animate-out",
 						"data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0",
 					)}
-					style={{ top: TOP_BAR_OUTER_HEIGHT, bottom: "8px" }}
+					style={{
+						top: `calc(${TOP_BAR_OUTER_HEIGHT} + var(--billing-banner-height, 0px))`,
+						bottom: "8px",
+					}}
 					onInteractOutside={(e) => e.preventDefault()}
 					onPointerDownOutside={(e) => e.preventDefault()}
 					onFocusOutside={(e) => e.preventDefault()}

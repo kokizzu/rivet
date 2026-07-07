@@ -1,5 +1,6 @@
 import {
 	faArrowUpRight,
+	faExclamationTriangle,
 	faMemory,
 	faMicrochip,
 	faServer,
@@ -7,7 +8,7 @@ import {
 	type IconProp,
 } from "@rivet-gg/icons";
 import { Link } from "@tanstack/react-router";
-import { formatCurrency } from "@/components";
+import { cn, formatCurrency } from "@/components";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
 import { COMPUTE } from "@/content/billing";
@@ -42,22 +43,29 @@ function formatRate(rate: number): string {
 const CAPS_NOTE = `Billed per active second. Up to ${COMPUTE.maxVcpu} vCPU (Free plan is limited to ${COMPUTE.freeMaxVcpu} vCPU and capped at $5/month of compute). One vCPU is half a physical core. You can also bring your own compute and run your actors and applications on AWS, Vercel, Railway, or bare metal, paid directly to your provider.`;
 
 interface ComputeUsageCardProps {
-	/**
-	 * Month-to-date compute cost in dollars. When omitted (e.g. the
-	 * project-scoped billing page before its aggregate endpoint exists), the
-	 * card shows pricing only without a usage figure.
-	 */
+	/** Month-to-date compute cost in dollars. Omitted shows pricing only. */
 	monthToDate?: number;
 	isLoading?: boolean;
 	isError?: boolean;
+	/**
+	 * Compute spend as a percentage of the Free plan's $5 budget. Drives the
+	 * over-limit callout. Omitted / 0 on paid plans, which have no compute cap.
+	 */
+	budgetPercent?: number;
 }
 
-/** Full-page compute pricing card, matching the usage cards on the billing page. */
+/** Compute pricing card with month-to-date spend and free-budget warning. */
 export function ComputeUsageCard({
 	monthToDate,
 	isLoading,
 	isError,
+	budgetPercent,
 }: ComputeUsageCardProps = {}) {
+	const overBudget = budgetPercent !== undefined && budgetPercent >= 100;
+	const nearBudget =
+		budgetPercent !== undefined &&
+		budgetPercent >= 80 &&
+		budgetPercent < 100;
 	return (
 		<Card className="w-full border border-border bg-card shadow-sm">
 			<CardHeader className="flex flex-row items-start justify-between space-y-0 pb-4">
@@ -97,6 +105,38 @@ export function ComputeUsageCard({
 				)}
 			</CardHeader>
 			<CardContent className="pt-0">
+				{(overBudget || nearBudget) && (
+					<div
+						className={cn(
+							"mb-4 flex items-start gap-2 rounded-lg border px-4 py-3 text-sm",
+							overBudget
+								? "border-destructive/60 bg-destructive/10 text-destructive"
+								: "border-warning/60 bg-warning/10 text-foreground",
+						)}
+					>
+						<Icon
+							icon={faExclamationTriangle}
+							className={cn(
+								"mt-0.5 shrink-0",
+								overBudget
+									? "text-destructive"
+									: "text-warning",
+							)}
+						/>
+						<div>
+							<p className="font-medium">
+								{overBudget
+									? "Compute over your free limit"
+									: "Approaching your free compute limit"}
+							</p>
+							<p className="text-muted-foreground">
+								{overBudget
+									? `You've used ${monthToDate !== undefined ? formatCurrency(monthToDate) : "over"} of your $5.00 monthly compute allowance. Upgrade your plan to avoid service interruptions.`
+									: `You've used ${Math.round(budgetPercent ?? 0)}% of your $5.00 monthly compute allowance.`}
+							</p>
+						</div>
+					</div>
+				)}
 				<div className="rounded-lg border border-border bg-muted/30 divide-y divide-border">
 					{COMPUTE_RATES.map((rate) => (
 						<div

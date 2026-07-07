@@ -1,13 +1,15 @@
-import { createFileRoute } from "@tanstack/react-router";
-import { BillingPage } from "@/app/billing/billing-page";
-import { RouteLayout } from "@/app/route-layout";
+import { createFileRoute, redirect } from "@tanstack/react-router";
 
 export const Route = createFileRoute(
 	"/_context/orgs/$organization/projects/$project/billing",
 )({
-	component: () => (
-		<RouteLayout>
-			<BillingPage />
-		</RouteLayout>
-	),
+	beforeLoad: async ({ params }) => {
+		const { organization, project } = params;
+
+		throw redirect({
+			to: "/orgs/$organization/projects/$project",
+			params: { organization, project },
+			search: { settings: "billing" },
+		});
+	},
 });

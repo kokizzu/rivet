@@ -143,6 +143,28 @@ export const createGlobalContext = () => {
 				},
 			});
 		},
+		billingUsageQueryOptions({
+			organization,
+			project,
+		}: {
+			organization: string;
+			project: string;
+		}) {
+			return queryOptions({
+				queryKey: [{ organization, project }, "billing-usage"],
+				// The usage query is a slow (~10s) backend scan whose numbers
+				// barely move minute to minute, so serve it from cache rather
+				// than refetch on every mount.
+				staleTime: 5 * 60 * 1000, // 5 minutes
+				gcTime: 5 * 60 * 1000, // 5 minutes
+				queryFn: async () => {
+					const response = await client.billing.usage(project, {
+						org: organization,
+					});
+					return response;
+				},
+			});
+		},
 		managedPoolsQueryOptions(opts: {
 			organization: string;
 			project: string;
@@ -901,6 +923,12 @@ export const createProjectContext = ({
 		},
 		currentProjectBillingDetailsQueryOptions() {
 			return parent.currentOrganizationBillingDetailsQueryOptions({
+				project,
+			});
+		},
+		currentProjectBillingUsageQueryOptions() {
+			return parent.billingUsageQueryOptions({
+				organization,
 				project,
 			});
 		},

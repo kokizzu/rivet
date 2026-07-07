@@ -1,93 +1,3 @@
-import type { Rivet } from "@rivet-gg/cloud";
-import { bigBytes } from "@/utils/bytes";
-
-const ACTOR_AWAKE_PRICE_PER_SECOND =
-	0.05 /
-	1000 /* $0.05 per 1k hours */ /
-	60 /* minutes per hour */ /
-	60 /* seconds per minute */; // ≈ 0.00000001389 dollars per actor-second
-
-/**
- * prices:
- * actor_awake: $0.05 per 1k awake actor-hours
- * kv_storage_used: $0.40 per GiB-month
- * kv_read: $0.20 per million 4KiB units
- * kv_write: $1 per million 4KiB units
- * gateway_egress: $0.15 per GiB
- *
- * measurement units:
- * actor_awake measured in seconds
- * kv_storage_used measured in bytes
- * kv_read measured in bytes (rounded up to 4KiB units)
- * kv_write measured in bytes (rounded up to 4KiB units)
- * gateway_egress measured in bytes
- *
- * included in plans:
- * free:
- *   actor_awake: $5 dollars worth
- *   kv_storage_used: 5 GiB
- *   kv_read: 200M
- *   kv_write: 5M
- *   gateway_egress: 100 GiB
- * pro:
- *   actor_awake: $20 dollars worth
- *   kv_storage_used: 5 GiB
- *   kv_read: 25B
- *   kv_write: 50M
- *   gateway_egress: 1 TiB
- * team:
- *   actor_awake: $20 dollars worth
- *   kv_storage_used: 5 GiB
- *   kv_read: 25B
- *   kv_write: 50M
- *   gateway_egress: 1 TiB
- */
-
-type BilledMetrics = Extract<
-	Rivet.MetricName,
-	| "actor_awake"
-	| "kv_storage_used"
-	| "kv_read"
-	| "kv_write"
-	| "gateway_egress"
->;
-
-export const BILLING = {
-	included: {
-		free: {
-			kv_read: 200_000_000n * bigBytes.KiB(4n), // 200M 4KiB units
-			kv_write: 5_000_000n * bigBytes.KiB(4n), // 5M 4KiB units
-			gateway_egress: bigBytes.GiB(100n), // 100 GiB
-			kv_storage_used: bigBytes.GiB(5n), // 5 GiB
-			actor_awake: BigInt(
-				5_00 /* $5 to cents */ / ACTOR_AWAKE_PRICE_PER_SECOND,
-			),
-		},
-		pro: {
-			kv_read: 25_000_000_000n * bigBytes.KiB(4n), // 25B 4KiB units
-			kv_write: 50_000_000n * bigBytes.KiB(4n), // 50M 4KiB units
-			gateway_egress: bigBytes.TiB(1n), // 1 TiB
-			kv_storage_used: bigBytes.GiB(5n), // 5 GiB
-			actor_awake: BigInt(
-				20_00 /* $20 to cents */ / ACTOR_AWAKE_PRICE_PER_SECOND,
-			),
-		},
-		get team() {
-			return this.pro;
-		},
-	} satisfies Record<
-		Rivet.BillingPlan,
-		Partial<Record<BilledMetrics, bigint>>
-	>,
-	prices: {
-		actor_awake: 14n,
-		kv_storage_used: 400n,
-		kv_read: 49n,
-		kv_write: 244n,
-		gateway_egress: 150n,
-	} satisfies Record<BilledMetrics, bigint>,
-};
-
 /** Human-readable plan names. `pro` is presented as "Hobby". */
 export const PLAN_LABELS: Record<string, string> = {
 	free: "Free",
@@ -95,17 +5,6 @@ export const PLAN_LABELS: Record<string, string> = {
 	team: "Team",
 	enterprise: "Enterprise",
 };
-
-/** Overage charge in cents for usage beyond the plan's included allotment. */
-export function calculateOverageCost(
-	usage: bigint,
-	includedInPlan: bigint | undefined,
-	pricePerBillionUnits: bigint,
-): bigint {
-	if (!includedInPlan) return 0n;
-	const overage = usage > includedInPlan ? usage - includedInPlan : 0n;
-	return (overage * pricePerBillionUnits) / 1_000_000_000n;
-}
 
 /**
  * Rivet Compute pricing. Compute is billed per active second based on each
@@ -121,18 +20,6 @@ export const COMPUTE = {
 	memoryPerGibSecond: 0.0000029,
 	maxVcpu: 8,
 	freeMaxVcpu: 1,
-};
-
-/**
- * Monthly compute spend cap in USD per plan. `null` means no cap (and no
- * progress bar). Only the free plan is capped at $5/month of compute; paid
- * plans have no compute cap.
- */
-export const COMPUTE_MONTHLY_CAP_USD: Record<string, number | null> = {
-	free: 5,
-	pro: null,
-	team: null,
-	enterprise: null,
 };
 
 /** Compute cost in dollars per active second for the given actor config. */
