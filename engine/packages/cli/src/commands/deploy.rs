@@ -67,6 +67,10 @@ pub struct Opts {
 	/// Maximum number of actors to scale to. Range 1 to 500. Defaults to 1 server-side.
 	#[arg(long)]
 	max_scale: Option<u32>,
+	/// Number of concurrent requests each actor instance handles. Range 1 to 500.
+	/// Defaults server-side.
+	#[arg(long)]
+	instance_request_concurrency: Option<u32>,
 }
 
 impl Opts {
@@ -86,6 +90,7 @@ impl Opts {
 			self.memory.as_deref(),
 			self.min_scale,
 			self.max_scale,
+			self.instance_request_concurrency,
 		)?;
 
 		let cloud = CloudClient::new(&self.cloud_api, token.clone())?;

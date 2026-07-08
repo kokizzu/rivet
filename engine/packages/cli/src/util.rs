@@ -37,6 +37,7 @@ pub fn parse_env_vars(vars: &[String]) -> Result<BTreeMap<String, String>> {
 /// schema:
 /// - `min_scale`: integer in `0..=100`
 /// - `max_scale`: integer in `1..=500`
+/// - `instance_request_concurrency`: integer in `1..=500`
 /// - `cpu`: vCPU count in `0.08..=8`; any value in `[0.08, 1)` rounded to two
 ///   decimals, or exactly `1`, `2`, `4`, or `8`
 /// - `memory`: string matching `^(\d+)(Mi|Gi)$` between `512Mi` and `4Gi`
@@ -45,8 +46,14 @@ pub fn build_resources(
 	memory: Option<&str>,
 	min_scale: Option<u32>,
 	max_scale: Option<u32>,
+	instance_request_concurrency: Option<u32>,
 ) -> Result<Option<Value>> {
-	if cpu.is_none() && memory.is_none() && min_scale.is_none() && max_scale.is_none() {
+	if cpu.is_none()
+		&& memory.is_none()
+		&& min_scale.is_none()
+		&& max_scale.is_none()
+		&& instance_request_concurrency.is_none()
+	{
 		return Ok(None);
 	}
 
@@ -64,6 +71,18 @@ pub fn build_resources(
 			bail!("--max-scale must be between 1 and 500, got {max_scale}");
 		}
 		resources.insert("maxScale".to_string(), json!(max_scale));
+	}
+
+	if let Some(instance_request_concurrency) = instance_request_concurrency {
+		if !(1..=500).contains(&instance_request_concurrency) {
+			bail!(
+				"--instance-request-concurrency must be between 1 and 500, got {instance_request_concurrency}"
+			);
+		}
+		resources.insert(
+			"instanceRequestConcurrency".to_string(),
+			json!(instance_request_concurrency),
+		);
 	}
 
 	if let Some(cpu) = cpu {
@@ -203,76 +222,96 @@ mod tests {
 
 	#[test]
 	fn resources_none_when_all_unset() {
-		assert!(build_resources(None, None, None, None).unwrap().is_none());
+		assert!(
+			build_resources(None, None, None, None, None)
+				.unwrap()
+				.is_none()
+		);
 	}
 
 	#[test]
 	fn resources_builds_only_provided_fields() {
-		let resources = build_resources(None, None, Some(2), None).unwrap().unwrap();
+		let resources = build_resources(None, None, Some(2), None, None)
+			.unwrap()
+			.unwrap();
 		assert_eq!(resources, json!({ "minScale": 2 }));
 	}
 
 	#[test]
 	fn resources_builds_full_object() {
-		let resources = build_resources(Some(2.0), Some("1Gi"), Some(1), Some(10))
+		let resources = build_resources(Some(2.0), Some("1Gi"), Some(1), Some(10), Some(50))
 			.unwrap()
 			.unwrap();
 		assert_eq!(
 			resources,
-			json!({ "cpu": 2.0, "memory": "1Gi", "minScale": 1, "maxScale": 10 })
+			json!({
+				"cpu": 2.0,
+				"memory": "1Gi",
+				"minScale": 1,
+				"maxScale": 10,
+				"instanceRequestConcurrency": 50
+			})
 		);
 	}
 
 	#[test]
 	fn min_scale_bounds() {
-		assert!(build_resources(None, None, Some(0), None).is_ok());
-		assert!(build_resources(None, None, Some(100), None).is_ok());
-		assert!(build_resources(None, None, Some(101), None).is_err());
+		assert!(build_resources(None, None, Some(0), None, None).is_ok());
+		assert!(build_resources(None, None, Some(100), None, None).is_ok());
+		assert!(build_resources(None, None, Some(101), None, None).is_err());
 	}
 
 	#[test]
 	fn max_scale_bounds() {
-		assert!(build_resources(None, None, None, Some(0)).is_err());
-		assert!(build_resources(None, None, None, Some(1)).is_ok());
-		assert!(build_resources(None, None, None, Some(500)).is_ok());
-		assert!(build_resources(None, None, None, Some(501)).is_err());
+		assert!(build_resources(None, None, None, Some(0), None).is_err());
+		assert!(build_resources(None, None, None, Some(1), None).is_ok());
+		assert!(build_resources(None, None, None, Some(500), None).is_ok());
+		assert!(build_resources(None, None, None, Some(501), None).is_err());
+	}
+
+	#[test]
+	fn instance_request_concurrency_bounds() {
+		assert!(build_resources(None, None, None, None, Some(0)).is_err());
+		assert!(build_resources(None, None, None, None, Some(1)).is_ok());
+		assert!(build_resources(None, None, None, None, Some(500)).is_ok());
+		assert!(build_resources(None, None, None, None, Some(501)).is_err());
 	}
 
 	#[test]
 	fn cpu_allowed_whole_values() {
 		for cpu in [1.0, 2.0, 4.0, 8.0] {
-			assert!(build_resources(Some(cpu), None, None, None).is_ok());
+			assert!(build_resources(Some(cpu), None, None, None, None).is_ok());
 		}
 	}
 
 	#[test]
 	fn cpu_fractional_values() {
-		assert!(build_resources(Some(0.08), None, None, None).is_ok());
-		assert!(build_resources(Some(0.5), None, None, None).is_ok());
-		assert!(build_resources(Some(0.99), None, None, None).is_ok());
+		assert!(build_resources(Some(0.08), None, None, None, None).is_ok());
+		assert!(build_resources(Some(0.5), None, None, None, None).is_ok());
+		assert!(build_resources(Some(0.99), None, None, None, None).is_ok());
 		// Below the minimum.
-		assert!(build_resources(Some(0.07), None, None, None).is_err());
+		assert!(build_resources(Some(0.07), None, None, None, None).is_err());
 		// More than two decimals.
-		assert!(build_resources(Some(0.123), None, None, None).is_err());
+		assert!(build_resources(Some(0.123), None, None, None, None).is_err());
 		// Above the range.
-		assert!(build_resources(Some(9.0), None, None, None).is_err());
+		assert!(build_resources(Some(9.0), None, None, None, None).is_err());
 		// In range but not an allowed whole value and not below 1.
-		assert!(build_resources(Some(3.0), None, None, None).is_err());
+		assert!(build_resources(Some(3.0), None, None, None, None).is_err());
 	}
 
 	#[test]
 	fn memory_formats_and_bounds() {
-		assert!(build_resources(None, Some("512Mi"), None, None).is_ok());
-		assert!(build_resources(None, Some("4096Mi"), None, None).is_ok());
-		assert!(build_resources(None, Some("1Gi"), None, None).is_ok());
-		assert!(build_resources(None, Some("4Gi"), None, None).is_ok());
+		assert!(build_resources(None, Some("512Mi"), None, None, None).is_ok());
+		assert!(build_resources(None, Some("4096Mi"), None, None, None).is_ok());
+		assert!(build_resources(None, Some("1Gi"), None, None, None).is_ok());
+		assert!(build_resources(None, Some("4Gi"), None, None, None).is_ok());
 		// Below minimum.
-		assert!(build_resources(None, Some("256Mi"), None, None).is_err());
+		assert!(build_resources(None, Some("256Mi"), None, None, None).is_err());
 		// Above maximum.
-		assert!(build_resources(None, Some("5Gi"), None, None).is_err());
+		assert!(build_resources(None, Some("5Gi"), None, None, None).is_err());
 		// Bad format.
-		assert!(build_resources(None, Some("512"), None, None).is_err());
-		assert!(build_resources(None, Some("512MB"), None, None).is_err());
-		assert!(build_resources(None, Some("Mi"), None, None).is_err());
+		assert!(build_resources(None, Some("512"), None, None, None).is_err());
+		assert!(build_resources(None, Some("512MB"), None, None, None).is_err());
+		assert!(build_resources(None, Some("Mi"), None, None, None).is_err());
 	}
 }
