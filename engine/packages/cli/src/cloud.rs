@@ -270,6 +270,18 @@ pub async fn create_or_update_pool(
 	Ok(())
 }
 
+/// Returns whether a managed pool already exists for the namespace. Used by
+/// `--reuse-image` deploys, which must not enable a new pool and instead require
+/// an existing one to reuse its image.
+pub async fn pool_exists(
+	cloud: &CloudClient,
+	project: &str,
+	org: &str,
+	namespace: &str,
+) -> Result<bool> {
+	Ok(get_pool(cloud, project, org, namespace).await?.is_some())
+}
+
 async fn get_pool(
 	cloud: &CloudClient,
 	project: &str,

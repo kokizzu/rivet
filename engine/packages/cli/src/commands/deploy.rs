@@ -9,7 +9,7 @@ use crate::{
 	DEFAULT_CLOUD_API, DEFAULT_NAMESPACE,
 	cloud::{
 		CloudClient, TokenInspectResponse, create_or_update_pool, dashboard_endpoint,
-		ensure_namespace, registry_endpoint, wait_for_pool,
+		ensure_namespace, pool_exists, registry_endpoint, wait_for_pool,
 	},
 	credentials::{resolve_token, write_credentials},
 	util::{
@@ -71,6 +71,11 @@ pub struct Opts {
 	/// Defaults server-side.
 	#[arg(long)]
 	instance_request_concurrency: Option<u32>,
+	/// Reuse the image already deployed to the pool instead of building and
+	/// pushing a new one. Skips the Docker build/push and leaves the pool's image
+	/// unchanged, which is useful for updating resources without a rebuild.
+	#[arg(long)]
+	reuse_image: bool,
 }
 
 impl Opts {
@@ -80,7 +85,7 @@ impl Opts {
 			write_credentials(token)?;
 		}
 
-		if !self.dockerfile.exists() {
+		if !self.reuse_image && !self.dockerfile.exists() {
 			bail!("Dockerfile not found: {}", self.dockerfile.display());
 		}
 
@@ -103,11 +108,7 @@ impl Opts {
 		let organization = self.org.unwrap_or(inspect.organization);
 		let namespace = ensure_namespace(&cloud, &project, &organization, &self.namespace).await?;
 
-		let registry = registry_endpoint(&self.cloud_api)?;
 		let dashboard = dashboard_endpoint(&self.cloud_api)?;
-		let image_name = self.image.unwrap_or_else(|| project.clone());
-		let tag = self.tag.unwrap_or_else(default_image_tag);
-		let image_ref = format!("{registry}/{image_name}:{tag}");
 		let dashboard_url = format!(
 			"{dashboard}/orgs/{}/projects/{}/ns/{}?skipOnboarding=1",
 			encode(&organization),
@@ -120,40 +121,67 @@ impl Opts {
 				context = %self.build_context.display(),
 				%project,
 				namespace = %namespace.name,
-				image = %image_ref,
+				reuse_image = self.reuse_image,
 				"deploying"
 			);
 		}
 
-		tracing::info!("enabling managed pool");
-		create_or_update_pool(
-			&cloud,
-			&project,
-			&organization,
-			&namespace.name,
-			json!({ "displayName": "Default" }),
-		)
-		.await?;
-		wait_for_pool(&cloud, &project, &organization, &namespace.name, false).await?;
+		if self.reuse_image {
+			// Reusing an image requires a pool that already has one; do not enable
+			// a fresh pool here.
+			if !pool_exists(&cloud, &project, &organization, &namespace.name).await? {
+				bail!(
+					"cannot reuse image: no managed pool exists for this namespace, deploy an image first"
+				);
+			}
+		} else {
+			tracing::info!("enabling managed pool");
+			create_or_update_pool(
+				&cloud,
+				&project,
+				&organization,
+				&namespace.name,
+				json!({ "displayName": "Default" }),
+			)
+			.await?;
+			wait_for_pool(&cloud, &project, &organization, &namespace.name, false).await?;
+		}
 
-		tracing::info!("logging in to Rivet registry");
-		docker_login(&registry, &token)?;
+		// Build and push a new image unless reusing the image already deployed to
+		// the pool. When reusing, the `image` field is omitted from the upsert so
+		// the pool keeps its current build. Sending `null` would instead clear it.
+		let image = if self.reuse_image {
+			tracing::info!("reusing existing pool image, skipping build");
+			None
+		} else {
+			let registry = registry_endpoint(&self.cloud_api)?;
+			let image_name = self.image.unwrap_or_else(|| project.clone());
+			let tag = self.tag.unwrap_or_else(default_image_tag);
+			let image_ref = format!("{registry}/{image_name}:{tag}");
 
-		tracing::info!("building Docker image");
-		docker_build(&self.build_context, &self.dockerfile, &image_ref)?;
+			tracing::info!("logging in to Rivet registry");
+			docker_login(&registry, &token)?;
 
-		tracing::info!("pushing Docker image");
-		run_command("docker", &["push", &image_ref], None)?;
+			tracing::info!("building Docker image");
+			docker_build(&self.build_context, &self.dockerfile, &image_ref)?;
+
+			tracing::info!("pushing Docker image");
+			run_command("docker", &["push", &image_ref], None)?;
+
+			Some((image_name, tag))
+		};
 
 		tracing::info!("upserting managed pool");
 		let mut pool_body = json!({
 			"displayName": "Default",
 			"maxConcurrentActors": 1000,
-			"image": {
+		});
+		if let Some((image_name, tag)) = image {
+			pool_body["image"] = json!({
 				"repository": image_name,
 				"tag": tag,
-			},
-		});
+			});
+		}
 		let env_map = parse_env_vars(&self.env_vars)?;
 		if !env_map.is_empty() {
 			pool_body["environment"] = serde_json::to_value(env_map)?;
