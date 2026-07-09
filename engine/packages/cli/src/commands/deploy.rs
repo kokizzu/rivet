@@ -14,7 +14,7 @@ use crate::{
 	credentials::{resolve_token, write_credentials},
 	util::{
 		build_resources, default_image_tag, docker_build, docker_login, encode, parse_env_vars,
-		run_command,
+		resolve_max_concurrent_actors, run_command,
 	},
 };
 
@@ -67,6 +67,10 @@ pub struct Opts {
 	/// Maximum number of actors to scale to. Range 1 to 500. Defaults to 1 server-side.
 	#[arg(long)]
 	max_scale: Option<u32>,
+	/// Maximum number of concurrent actors the pool runs. Range 1 to 50000.
+	/// Defaults to 1000.
+	#[arg(long)]
+	max_concurrent_actors: Option<u32>,
 	/// Number of concurrent requests each actor instance handles. Range 1 to 2000.
 	/// Defaults to 80 server-side.
 	#[arg(long)]
@@ -97,6 +101,7 @@ impl Opts {
 			self.max_scale,
 			self.instance_request_concurrency,
 		)?;
+		let max_concurrent_actors = resolve_max_concurrent_actors(self.max_concurrent_actors)?;
 
 		let cloud = CloudClient::new(&self.cloud_api, token.clone())?;
 		tracing::info!("inspecting Rivet Cloud token");
@@ -174,7 +179,7 @@ impl Opts {
 		tracing::info!("upserting managed pool");
 		let mut pool_body = json!({
 			"displayName": "Default",
-			"maxConcurrentActors": 1000,
+			"maxConcurrentActors": max_concurrent_actors,
 		});
 		if let Some((image_name, tag)) = image {
 			pool_body["image"] = json!({

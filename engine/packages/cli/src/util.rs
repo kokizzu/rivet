@@ -116,6 +116,18 @@ pub fn build_resources(
 	Ok(Some(Value::Object(resources)))
 }
 
+/// Resolves the `maxConcurrentActors` pool-config value, applying the
+/// server-side default of `1000` when unset and validating the accepted range.
+///
+/// Mirrors the server-side schema: an integer in `1..=50000`.
+pub fn resolve_max_concurrent_actors(max_concurrent_actors: Option<u32>) -> Result<u32> {
+	let value = max_concurrent_actors.unwrap_or(1000);
+	if !(1..=50000).contains(&value) {
+		bail!("--max-concurrent-actors must be between 1 and 50000, got {value}");
+	}
+	Ok(value)
+}
+
 /// Parses a memory string of the form `^(\d+)(Mi|Gi)$` into mebibytes.
 fn parse_memory_mib(memory: &str) -> Result<u64> {
 	let (digits, multiplier) = if let Some(digits) = memory.strip_suffix("Mi") {
@@ -297,6 +309,17 @@ mod tests {
 		assert!(build_resources(Some(9.0), None, None, None, None).is_err());
 		// In range but not an allowed whole value and not below 1.
 		assert!(build_resources(Some(3.0), None, None, None, None).is_err());
+	}
+
+	#[test]
+	fn max_concurrent_actors_default_and_bounds() {
+		// Defaults to 1000 when unset.
+		assert_eq!(resolve_max_concurrent_actors(None).unwrap(), 1000);
+		assert_eq!(resolve_max_concurrent_actors(Some(5000)).unwrap(), 5000);
+		assert!(resolve_max_concurrent_actors(Some(1)).is_ok());
+		assert!(resolve_max_concurrent_actors(Some(50000)).is_ok());
+		assert!(resolve_max_concurrent_actors(Some(0)).is_err());
+		assert!(resolve_max_concurrent_actors(Some(50001)).is_err());
 	}
 
 	#[test]
