@@ -50,6 +50,24 @@ export function useHasManagedPool(): boolean {
 	return data ?? false;
 }
 
+/**
+ * Renders the deployment-logs tab. Sourced as its own component so it can read
+ * the current project/namespace from the cloud namespace data provider. The
+ * managed-pools logs endpoint is keyed by both, and this tab only ever renders
+ * in cloud mode (gated by `hasManagedPool`), so the provider is always present.
+ */
+function DeploymentLogsTab({ actorId }: { actorId: ActorId }) {
+	const provider = useCloudNamespaceDataProvider();
+	return (
+		<DeploymentLogs
+			project={provider.project}
+			namespace={provider.cloudNamespace}
+			pool="default"
+			filter={`actorId=${actorId}`}
+		/>
+	);
+}
+
 /** Dashboard-side tab (not part of the inspector iframe contract). */
 export interface CloudTabSpec {
 	id: string;
@@ -82,9 +100,7 @@ export const CLOUD_TABS: readonly CloudTabSpec[] = [
 		label: "Logs",
 		icon: "logs",
 		shouldShow: (ctx) => ctx.hasManagedPool,
-		render: (actorId) => (
-			<DeploymentLogs pool="default" filter={`actorId=${actorId}`} />
-		),
+		render: (actorId) => <DeploymentLogsTab actorId={actorId} />,
 	},
 	{
 		id: "metadata",
