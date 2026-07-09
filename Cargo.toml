@@ -78,7 +78,8 @@ members = [
   "engine/packages/profiling",
   "engine/packages/ups-broadcast",
   "examples/chat-room-rust",
-  "examples/hello-world-rust"
+  "examples/hello-world-rust",
+  "container-runner"
 ]
 
   [workspace.package]

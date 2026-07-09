@@ -1,0 +1,34 @@
+[package]
+name = "rivet-container-runner"
+description = "Rivet serverless runner that hosts one actor by spawning a child game-server process and proxying Rivet's tunneled traffic to it."
+publish = false
+autoexamples = false
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "rivet-container-runner"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+bytes.workspace = true
+clap = { workspace = true, features = ["env"] }
+futures.workspace = true
+futures-util.workspace = true
+http.workspace = true
+nix = { workspace = true, features = ["process"] }
+reqwest = { workspace = true, features = ["stream"] }
+rivet-envoy-client = { workspace = true, features = ["native-transport"] }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tokio-tungstenite.workspace = true
+tokio-util = { workspace = true, features = ["rt"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+url.workspace = true
