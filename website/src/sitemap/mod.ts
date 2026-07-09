@@ -551,6 +551,15 @@ export const sitemap = [
 					},
 				],
 			},
+			{
+				title: "Advanced",
+				pages: [
+					{
+						title: "Container Runner",
+						href: "/docs/deploy/container-runner",
+					},
+				],
+			},
 		],
 	},
 	{
