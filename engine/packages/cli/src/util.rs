@@ -37,7 +37,7 @@ pub fn parse_env_vars(vars: &[String]) -> Result<BTreeMap<String, String>> {
 /// schema:
 /// - `min_scale`: integer in `0..=100`
 /// - `max_scale`: integer in `1..=500`
-/// - `instance_request_concurrency`: integer in `1..=500`
+/// - `instance_request_concurrency`: integer in `1..=2000`
 /// - `cpu`: vCPU count in `0.08..=8`; any value in `[0.08, 1)` rounded to two
 ///   decimals, or exactly `1`, `2`, `4`, or `8`
 /// - `memory`: string matching `^(\d+)(Mi|Gi)$` between `512Mi` and `4Gi`
@@ -74,9 +74,9 @@ pub fn build_resources(
 	}
 
 	if let Some(instance_request_concurrency) = instance_request_concurrency {
-		if !(1..=500).contains(&instance_request_concurrency) {
+		if !(1..=2000).contains(&instance_request_concurrency) {
 			bail!(
-				"--instance-request-concurrency must be between 1 and 500, got {instance_request_concurrency}"
+				"--instance-request-concurrency must be between 1 and 2000, got {instance_request_concurrency}"
 			);
 		}
 		resources.insert(
@@ -273,8 +273,8 @@ mod tests {
 	fn instance_request_concurrency_bounds() {
 		assert!(build_resources(None, None, None, None, Some(0)).is_err());
 		assert!(build_resources(None, None, None, None, Some(1)).is_ok());
-		assert!(build_resources(None, None, None, None, Some(500)).is_ok());
-		assert!(build_resources(None, None, None, None, Some(501)).is_err());
+		assert!(build_resources(None, None, None, None, Some(2000)).is_ok());
+		assert!(build_resources(None, None, None, None, Some(2001)).is_err());
 	}
 
 	#[test]
