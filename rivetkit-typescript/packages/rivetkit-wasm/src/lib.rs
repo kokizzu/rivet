@@ -1863,11 +1863,7 @@ impl WasmQueue {
 
 	#[wasm_bindgen]
 	pub async fn reset(&self) -> Result<(), JsValue> {
-		self.inner
-			.queue()
-			.reset()
-			.await
-			.map_err(anyhow_to_js_error)
+		self.inner.queue().reset().await.map_err(anyhow_to_js_error)
 	}
 
 	#[wasm_bindgen(js_name = inspectMessages)]

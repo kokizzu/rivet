@@ -563,9 +563,8 @@ impl TransactionTask {
 					}
 					return Ok(iter_bytes_to_vec(k));
 				}
-				iter.status().context(
-					"failed to iterate rocksdb for range selector first_greater_than",
-				)?;
+				iter.status()
+					.context("failed to iterate rocksdb for range selector first_greater_than")?;
 				// If no key found, return a key that will make the range empty
 				Ok(vec![0xff; 255])
 			}

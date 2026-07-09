@@ -18,6 +18,5 @@ export const RunnerConfigsServerlessHealthCheckResponse: core.serialization.Sche
 
 export declare namespace RunnerConfigsServerlessHealthCheckResponse {
     export type Raw =
-        | RunnerConfigsServerlessHealthCheckResponseSuccess.Raw
-        | RunnerConfigsServerlessHealthCheckResponseFailure.Raw;
+        RunnerConfigsServerlessHealthCheckResponseSuccess.Raw | RunnerConfigsServerlessHealthCheckResponseFailure.Raw;
 }

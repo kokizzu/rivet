@@ -415,7 +415,11 @@ async fn rocksdb_empty_values() {
 		})
 		.await
 		.unwrap();
-	assert_eq!(forward.len(), 17, "forward range must return all empty-valued keys");
+	assert_eq!(
+		forward.len(),
+		17,
+		"forward range must return all empty-valued keys"
+	);
 	assert!(
 		forward.iter().all(|(_, value)| value.is_empty()),
 		"every value must round-trip as empty"
@@ -449,16 +453,25 @@ async fn rocksdb_empty_values() {
 	let selected = db
 		.txn("selectors", |tx| async move {
 			let geq = tx
-				.get_key(&KeySelector::first_greater_or_equal(vec![1, 2, 3, 5]), Serializable)
+				.get_key(
+					&KeySelector::first_greater_or_equal(vec![1, 2, 3, 5]),
+					Serializable,
+				)
 				.await?;
 			let gt = tx
-				.get_key(&KeySelector::first_greater_than(vec![1, 2, 3, 5]), Serializable)
+				.get_key(
+					&KeySelector::first_greater_than(vec![1, 2, 3, 5]),
+					Serializable,
+				)
 				.await?;
 			let lt = tx
 				.get_key(&KeySelector::last_less_than(vec![1, 2, 3, 5]), Serializable)
 				.await?;
 			let leq = tx
-				.get_key(&KeySelector::last_less_or_equal(vec![1, 2, 3, 5]), Serializable)
+				.get_key(
+					&KeySelector::last_less_or_equal(vec![1, 2, 3, 5]),
+					Serializable,
+				)
 				.await?;
 			Ok((geq.to_vec(), gt.to_vec(), lt.to_vec(), leq.to_vec()))
 		})
@@ -497,5 +510,8 @@ async fn rocksdb_empty_values() {
 		})
 		.await
 		.unwrap();
-	assert_eq!(remaining, 0, "clear_range must delete every key in the range");
+	assert_eq!(
+		remaining, 0,
+		"clear_range must delete every key in the range"
+	);
 }

@@ -18,10 +18,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::actor::config::ActorConfig;
 use crate::actor::context::ActorContext;
-use crate::actor::kv::APPLY_BATCH_CHUNK_SIZE;
 use crate::actor::keys::{
 	QUEUE_MESSAGES_PREFIX, QUEUE_METADATA_KEY, decode_queue_message_key, make_queue_message_key,
 };
+use crate::actor::kv::APPLY_BATCH_CHUNK_SIZE;
 use crate::actor::persist::{
 	decode_latest_with_embedded_version, encode_latest_with_embedded_version,
 };

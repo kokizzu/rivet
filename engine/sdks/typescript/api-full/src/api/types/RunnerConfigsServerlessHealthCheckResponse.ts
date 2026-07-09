@@ -5,5 +5,4 @@
 import * as Rivet from "../index";
 
 export type RunnerConfigsServerlessHealthCheckResponse =
-    | Rivet.RunnerConfigsServerlessHealthCheckResponseSuccess
-    | Rivet.RunnerConfigsServerlessHealthCheckResponseFailure;
+    Rivet.RunnerConfigsServerlessHealthCheckResponseSuccess | Rivet.RunnerConfigsServerlessHealthCheckResponseFailure;
