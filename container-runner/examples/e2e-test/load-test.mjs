@@ -22,6 +22,7 @@
 //   RIVET_TOKEN            Bearer for the engine API (cloud)            (default: none / local)
 //   ENGINE_URL, ENGINE_PUBLIC_URL, RIVET_NAMESPACE, RIVET_ACTOR_NAME, RIVET_RUNNER_NAME — see common.mjs
 import WebSocket from "ws";
+import { encode as cborEncode } from "cbor-x";
 import { ENGINE, ENGINE_PUBLIC, NAMESPACE, ACTOR_NAME, RUNNER_NAME } from "./common.mjs";
 
 // ---- helpers ----
@@ -74,13 +75,18 @@ function latency() {
 // ---- actor lifecycle (engine API) ----
 const actorIds = []; // created actor ids, for shutdown
 let stopped = false;
+let startedAt = Date.now();
+const tstamp = () => `t+${secs(Date.now() - startedAt)}s`;
+// Per-drop forensics: every dropped connection is logged and tallied by close
+// code so a nonzero drop count is attributable, never a shrug.
+const dropCauses = new Map();
 
 async function createActor(i) {
   const input = CHILD_TTL_MS > 0 ? { env: { CRASH_AFTER_MS: String(CHILD_TTL_MS) } } : {};
   const body = {
     name: ACTOR_NAME,
     key: `load-${RUN_ID}-${i}`,
-    input: Buffer.from(JSON.stringify(input)).toString("base64"),
+    input: Buffer.from(cborEncode(input)).toString("base64"),
     runner_name_selector: POOL_PREFIX ? `${POOL_PREFIX}-${i}` : RUNNER_NAME,
     crash_policy: "destroy",
     ...(DATACENTER ? { datacenter: DATACENTER } : {}),
@@ -119,6 +125,7 @@ async function destroyAll() {
 const conns = [];
 class Connection {
   constructor(actorId) {
+    this.actorId = actorId;
     this.seq = 0; this.sentAt = 0; this.timer = null; this.alive = false; this.dead = false;
     conns.push(this);
     try { this.ws = new WebSocket(gatewayWsUrl(actorId), ["rivet"]); }
@@ -134,8 +141,8 @@ class Connection {
         m.pingOk++; recordRtt(Date.now() - this.sentAt); clearTimeout(this.timer); this.#scheduleNext();
       }
     });
-    this.ws.on("error", () => this.#die());
-    this.ws.on("close", () => this.#die());
+    this.ws.on("error", (err) => this.#die("error", null, err?.message));
+    this.ws.on("close", (code, reason) => this.#die("close", code, reason?.toString()));
   }
 
   get live() { return this.alive && !this.dead; }
@@ -144,11 +151,24 @@ class Connection {
   #ping() {
     if (stopped || this.dead || !this.alive) return;
     this.seq++; this.sentAt = Date.now(); m.pingSent++;
-    try { this.ws.send(`ping-${this.seq}`); } catch { this.#die(); return; }
-    this.timer = setTimeout(() => { m.pingFail++; this.#scheduleNext(); }, PING_TIMEOUT_MS);
+    try { this.ws.send(`ping-${this.seq}`); } catch (err) { this.#die("send", null, err?.message); return; }
+    this.timer = setTimeout(() => {
+      m.pingFail++;
+      console.log(`  [ping-timeout] ${tstamp()} actor=${this.actorId} seq=${this.seq}`);
+      this.#scheduleNext();
+    }, PING_TIMEOUT_MS);
   }
   #scheduleNext() { if (!stopped && !this.dead) setTimeout(() => this.#ping(), PING_INTERVAL_MS); }
-  #die() { if (this.dead) return; this.dead = true; clearTimeout(this.timer); if (this.alive && !stopped) m.connDropped++; }
+  #die(source, code, reason) {
+    if (this.dead) return;
+    this.dead = true; clearTimeout(this.timer);
+    if (this.alive && !stopped) {
+      m.connDropped++;
+      const cause = `${source}:${code ?? "-"}`;
+      dropCauses.set(cause, (dropCauses.get(cause) ?? 0) + 1);
+      console.log(`  [drop] ${tstamp()} actor=${this.actorId} source=${source} code=${code ?? "-"} reason=${reason || "-"}`);
+    }
+  }
 }
 
 // ---- run: ramp -> sustain -> shutdown -> report ----
@@ -159,6 +179,7 @@ async function main() {
   console.log(`profile: ramp ${COUNT} @ ${RAMP_RATE}/s -> sustain ${secs(DURATION_MS)}s (ping every ${PING_INTERVAL_MS}ms) -> shut down`);
 
   const started = Date.now();
+  startedAt = started;
   const ticker = setInterval(() => {
     const l = latency();
     const live = conns.filter((c) => c.live).length;
@@ -194,6 +215,14 @@ async function main() {
   const connFailRate = m.connFail / (COUNT || 1);
   const dropRate = m.connDropped / (m.connOpen || 1); // live connections lost mid-run
   const pingFailRate = m.pingFail / (m.pingSent || 1);
+  const stragglers = conns.filter((c) => !c.alive && !c.dead);
+  if (stragglers.length) {
+    console.log(`\n[stragglers] ${stragglers.length} connection(s) never finished connecting:`);
+    for (const c of stragglers) console.log(`  actor=${c.actorId}`);
+  }
+  if (dropCauses.size) {
+    console.log(`\n[drop causes] ${[...dropCauses.entries()].map(([k, v]) => `${k}=${v}`).join("  ")}`);
+  }
   console.log(`\n== summary ==`);
   console.log(`created:    ${actorIds.length}/${COUNT}  (createFail ${m.createFail})`);
   console.log(`connected:  ${m.connOpen}  (connectFail ${m.connFail}, dropped mid-run ${m.connDropped})`);

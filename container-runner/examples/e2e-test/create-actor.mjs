@@ -4,6 +4,7 @@
 // POST /actors?namespace=default   (no auth)
 // The opaque `input` (base64) carries the child launch params decoded by container-runner.
 import { writeFileSync } from "node:fs";
+import { encode as cborEncode } from "cbor-x";
 import {
   ENGINE,
   ENGINE_PUBLIC,
@@ -18,12 +19,13 @@ import {
 const key = process.env.ACTOR_KEY || "match-1";
 const outputJson = process.argv.includes("--json") || process.env.CREATE_ACTOR_OUTPUT === "json";
 
-// container-runner decodes this JSON from ActorConfig.input. Override the whole object
-// via ACTOR_INPUT (JSON) to exercise command/args/env/port; defaults to { port: 7770 }.
+// container-runner decodes this from the actor input as CBOR (the RivetKit wire
+// encoding). Override the whole object via ACTOR_INPUT (JSON) to exercise
+// command/args/env/port; defaults to { port: 7770 }.
 const inputJson = process.env.ACTOR_INPUT
   ? JSON.parse(process.env.ACTOR_INPUT)
   : { port: 7770 };
-const input = Buffer.from(JSON.stringify(inputJson)).toString("base64");
+const input = Buffer.from(cborEncode(inputJson)).toString("base64");
 
 const body = {
   name: ACTOR_NAME,
@@ -59,7 +61,9 @@ if (!actorId) {
   process.exit(1);
 }
 const gatewayPath = actorGatewayPath(actorId);
-const gatewayHttpUrl = actorGatewayHttpUrl(actorId);
+// Raw HTTP reaches the child under the /request/* prefix on the actor surface;
+// WebSockets connect at the bare path.
+const gatewayHttpUrl = actorGatewayHttpUrl(actorId, "/request/");
 const gatewayWsUrl = actorGatewayWsUrl(actorId);
 
 writeFileSync(new URL("./.last-actor-id", import.meta.url), actorId);

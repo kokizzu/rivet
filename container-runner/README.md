@@ -1,9 +1,16 @@
 # Container Runner
 
-`rivet-container-runner` is a Rivet serverless runner that hosts one actor by spawning a
-child game-server process and proxying Rivet's tunneled HTTP/WebSocket traffic to it.
-Wrap any dedicated server (Unity, Godot, a plain Node process) in a container with this
-binary as the entrypoint and Rivet Compute can cold-start and route to it.
+`rivet-container-runner` is a RivetKit (Rust) serverless app that hosts actors by
+spawning a child game-server process per actor and proxying Rivet's tunneled
+HTTP/WebSocket traffic to it. Each child gets its own port; the pool's request
+concurrency decides how many actors share a container (one, in the recommended
+game-server setup), and the process exits when the last actor stops. Wrap any dedicated server (Unity, Godot, a plain Node process) in a
+container with this binary as the entrypoint and Rivet Compute can cold-start and route
+to it.
+
+The actor `input` payload (CBOR-encoded, RivetKit convention) can override the child
+command, args, env, and port per actor. WebSocket clients connect at the bare gateway
+path; raw HTTP reaches the child under the `/request/*` prefix on the actor surface.
 
 `examples/` contains a Unity + FishNet demo project, a lightweight Node test server, and
 an end-to-end test harness. All commands below run from the rivet repo root.

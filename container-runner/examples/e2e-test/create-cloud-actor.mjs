@@ -8,6 +8,7 @@
 // Game clients cannot send an Authorization header (Bayou/browser WebSockets), so the
 // token is moved into the gateway path as `<actor_id>@<token>` instead.
 import { writeFileSync } from "node:fs";
+import { encode as cborEncode } from "cbor-x";
 
 const raw = process.env.RIVET_URL;
 if (!raw) {
@@ -38,8 +39,8 @@ const actorName = process.env.RIVET_ACTOR_NAME || "game";
 // The managed pool the Rivet CLI creates is named `default`, not the actor name.
 const runnerName = process.env.RIVET_RUNNER_NAME || "default";
 
-// container-runner decodes this from ActorConfig.input to launch its child.
-const input = Buffer.from(JSON.stringify({ port: 7770 })).toString("base64");
+// container-runner decodes this from the actor input as CBOR to launch its child.
+const input = Buffer.from(cborEncode({ port: 7770 })).toString("base64");
 
 const res = await fetch(`${origin}/actors?namespace=${encodeURIComponent(namespace)}`, {
   method: "POST",

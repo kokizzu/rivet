@@ -71,12 +71,14 @@ L="$LOGS/s1.log"; start_runner "$L"
 [ -z "${POOL_CONFIGURED:-}" ] && { node "$E2E/configure-serverless.mjs" >/dev/null; POOL_CONFIGURED=1; }
 create_actor "fetch-$$" '{"port":7770}'; wait_ready "$L"
 # The actor becomes guard-routable shortly after it reports ready; retry briefly.
+# rivetkit's actor surface delivers raw HTTP to the child only under the
+# /request/* prefix (stripped before proxying); bare paths are framework routes.
 for _ in $(seq 1 15); do
-  [ "$(curl -s "$ENGINE_URL/gateway/$ACTOR_ID/health")" = "healthy" ] && break; sleep 1
+  [ "$(curl -s "$ENGINE_URL/gateway/$ACTOR_ID/request/health")" = "healthy" ] && break; sleep 1
 done
-H=$(curl -s "$ENGINE_URL/gateway/$ACTOR_ID/health")
-R=$(curl -s "$ENGINE_URL/gateway/$ACTOR_ID/")
-P=$(curl -s -X POST --data 'hello-body' "$ENGINE_URL/gateway/$ACTOR_ID/reflect")
+H=$(curl -s "$ENGINE_URL/gateway/$ACTOR_ID/request/health")
+R=$(curl -s "$ENGINE_URL/gateway/$ACTOR_ID/request/")
+P=$(curl -s -X POST --data 'hello-body' "$ENGINE_URL/gateway/$ACTOR_ID/request/reflect")
 [ "$H" = "healthy" ] && ok "GET /health -> healthy" || bad "GET /health -> '$H'"
 [ "$R" = "ok" ] && ok "GET / -> ok" || bad "GET / -> '$R'"
 echo "$P" | grep -q '"method":"POST"' && ok "POST method proxied" || bad "POST method ('$P')"
@@ -148,7 +150,10 @@ create_actor "shutdown-$$" '{"port":7770}'; wait_ready "$L"
 pgrep -f "$SERVER" >/dev/null && ok "child running before runner shutdown" || bad "child not running"
 stop_runner   # SIGTERM the container-runner
 sleep 2
-check "$L" 'runner: shutdown, stopping 1 child' "runner stopped its child on shutdown"
+# On SIGTERM the runner drains through the engine first, so the child is
+# stopped by the actor's own destroy hook; the bulk "stopping N child(ren)"
+# sweep line only appears if the engine drain fails.
+check "$L" 'sending SIGTERM to pid' "runner stopped its child on shutdown"
 no_orphan "no orphan child after runner shutdown"
 
 # =====================================================================================

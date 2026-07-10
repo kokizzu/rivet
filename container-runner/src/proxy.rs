@@ -1,34 +1,34 @@
 //! Bridges Rivet's decoded tunnel traffic to the child game server's local port.
 //!
-//! The Rivet SDK reassembles tunnel frames into decoded `HttpRequest`s and
-//! `WebSocketMessage` streams (see `EnvoyCallbacks::fetch` / `::websocket`). This
-//! module forwards those to `127.0.0.1:<child_port>` and back — the ~200 lines of
-//! glue the SDK deliberately leaves to the host.
+//! The rivetkit runtime reassembles tunnel frames into decoded `Request`s and
+//! `WebSocket` streams (see `Actor::on_fetch` / `::on_websocket`). This module
+//! forwards those to `127.0.0.1:<child_port>` and back — the glue the runtime
+//! deliberately leaves to the actor.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::Result;
 use futures_util::{SinkExt, StreamExt};
-use tokio::sync::Mutex as TokioMutex;
+use tokio::sync::{Mutex as TokioMutex, mpsc};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 
-use rivet_envoy_client::config::{
-	BoxFuture, HttpRequest, HttpResponse, WebSocketHandler, WebSocketMessage, WebSocketSender,
-};
+use rivetkit::{Request, Response, WebSocket, WsMessage};
 
 /// Proxy a decoded inbound HTTP request to the child and map the response back.
-pub async fn http_proxy(child_port: u16, req: HttpRequest) -> Result<HttpResponse> {
-	let HttpRequest {
-		method,
-		path,
-		headers,
-		body,
-		body_stream: _,
-	} = req;
+///
+/// The rivetkit actor surface delivers `/request/*` paths to `on_fetch` with
+/// the prefix already stripped, so `uri` here is the child-relative path.
+pub async fn http_proxy(child_port: u16, req: Request) -> Result<Response> {
+	let (method, uri, headers, body) = req.to_parts();
 
+	let path = if uri.starts_with('/') {
+		uri
+	} else {
+		format!("/{uri}")
+	};
 	let url = format!("http://127.0.0.1:{child_port}{path}");
 	let method = reqwest::Method::from_bytes(method.as_bytes())?;
 
@@ -41,7 +41,7 @@ pub async fn http_proxy(child_port: u16, req: HttpRequest) -> Result<HttpRespons
 		}
 		rb = rb.header(k, v);
 	}
-	if let Some(body) = body {
+	if !body.is_empty() {
 		rb = rb.body(body);
 	}
 
@@ -65,89 +65,126 @@ pub async fn http_proxy(child_port: u16, req: HttpRequest) -> Result<HttpRespons
 	}
 	let bytes = resp.bytes().await?.to_vec();
 
-	Ok(HttpResponse {
-		status,
-		headers: out_headers,
-		body: Some(bytes),
-		body_stream: None,
-	})
+	Response::from_parts(status, out_headers, bytes)
 }
 
-/// Dial the child's WebSocket endpoint and return a handler that pumps frames in
-/// both directions: child -> Rivet client (via `on_open`) and client -> child
-/// (via `on_message` / `on_close`).
-pub async fn ws_proxy(child_port: u16, path: String) -> Result<WebSocketHandler> {
+/// Client -> child traffic forwarded off the runtime's event callbacks.
+enum ClientEvent {
+	Message(WsMessage),
+	Close(u16, String),
+}
+
+/// Cap on client frames buffered toward a slow child. The old async pump
+/// applied tunnel backpressure by awaiting the child sink; the sync message
+/// callback cannot await, so a bounded queue plus a loud connection failure
+/// on overflow replaces silent unbounded buffering.
+const CLIENT_TO_CHILD_QUEUE: usize = 1024;
+
+/// Dial the child's WebSocket endpoint and pump frames in both directions:
+/// child -> Rivet client via `ws.send`, and client -> child via the
+/// WebSocket's message/close event callbacks.
+pub async fn ws_proxy(child_port: u16, path: String, ws: WebSocket) -> Result<()> {
 	let url = format!("ws://127.0.0.1:{child_port}{path}");
-	let (ws, _resp) = tokio_tungstenite::connect_async(&url).await?;
-	let (sink, mut stream) = ws.split();
+	let (child_ws, _resp) = tokio_tungstenite::connect_async(&url).await?;
+	let (sink, mut stream) = child_ws.split();
 	let sink = Arc::new(TokioMutex::new(sink));
 
-	// child -> client pump, started once the tunnel side opens.
-	let on_open: Box<dyn FnOnce(WebSocketSender) -> BoxFuture<()> + Send> =
-		Box::new(move |client: WebSocketSender| {
-			Box::pin(async move {
-				tokio::spawn(async move {
-					while let Some(msg) = stream.next().await {
-						match msg {
-							Ok(Message::Binary(b)) => client.send(b.to_vec(), true),
-							Ok(Message::Text(t)) => client.send_text(t.as_str()),
-							Ok(Message::Close(cf)) => {
-								let (code, reason) = match cf {
-									Some(c) => {
-										(Some(u16::from(c.code)), Some(c.reason.to_string()))
-									}
-									None => (None, None),
-								};
-								client.close(code, reason);
-								break;
-							}
-							Ok(_) => {} // Ping/Pong/Frame handled by tungstenite
-							Err(e) => {
-								client.close(Some(1011), Some(format!("child ws error: {e}")));
-								break;
-							}
+	// client -> child. The message event callback is synchronous and invoked
+	// from the runtime's envoy pump, so it must never block: enqueue and let a
+	// spawned task own the child sink.
+	let (tx, mut rx) = mpsc::channel::<ClientEvent>(CLIENT_TO_CHILD_QUEUE);
+	{
+		let tx = tx.clone();
+		let ws = ws.clone();
+		ws.clone()
+			.configure_message_event_callback(Some(Arc::new(move |msg, _message_index| {
+				match tx.try_send(ClientEvent::Message(msg)) {
+					Ok(()) => Ok(()),
+					Err(mpsc::error::TrySendError::Full(_)) => {
+						// The child stopped draining; dropping frames would
+						// corrupt the stream, so fail the connection loudly.
+						let ws = ws.clone();
+						tokio::spawn(async move {
+							ws.close(
+								Some(1011),
+								Some("child not draining proxied frames".to_string()),
+							)
+							.await;
+						});
+						Err(anyhow::anyhow!(
+							"client->child queue overflowed ({CLIENT_TO_CHILD_QUEUE} frames); closing"
+						))
+					}
+					Err(mpsc::error::TrySendError::Closed(_)) => {
+						Err(anyhow::anyhow!("client->child pump ended"))
+					}
+				}
+			})));
+	}
+	ws.configure_close_event_callback(Some(Arc::new(move |code, reason, _was_clean| {
+		let tx = tx.clone();
+		Box::pin(async move {
+			// Async context: awaiting the bounded send applies backpressure.
+			tx.send(ClientEvent::Close(code, reason))
+				.await
+				.map_err(|_| anyhow::anyhow!("client->child pump ended"))
+		})
+	})));
+
+	{
+		let sink = sink.clone();
+		tokio::spawn(async move {
+			while let Some(event) = rx.recv().await {
+				match event {
+					ClientEvent::Message(msg) => {
+						let frame = match msg {
+							WsMessage::Binary(b) => Message::Binary(b.into()),
+							WsMessage::Text(t) => Message::Text(t.into()),
+						};
+						let mut s = sink.lock().await;
+						if s.send(frame).await.is_err() {
+							break;
 						}
 					}
-				});
-			})
+					ClientEvent::Close(code, reason) => {
+						let frame = Message::Close(Some(CloseFrame {
+							code: CloseCode::from(code),
+							reason: reason.into(),
+						}));
+						let mut s = sink.lock().await;
+						let _ = s.send(frame).await;
+						let _ = s.close().await;
+						break;
+					}
+				}
+			}
 		});
+	}
 
-	// client -> child
-	let on_message: Box<dyn Fn(WebSocketMessage) -> BoxFuture<()> + Send + Sync> = {
-		let sink = sink.clone();
-		Box::new(move |msg: WebSocketMessage| {
-			let sink = sink.clone();
-			Box::pin(async move {
-				let frame = if msg.binary {
-					Message::Binary(msg.data.into())
-				} else {
-					Message::Text(String::from_utf8_lossy(&msg.data).into_owned().into())
-				};
-				let mut s = sink.lock().await;
-				let _ = s.send(frame).await;
-			})
-		})
-	};
+	// child -> client pump.
+	tokio::spawn(async move {
+		while let Some(msg) = stream.next().await {
+			match msg {
+				Ok(Message::Binary(b)) => ws.send(WsMessage::Binary(b.to_vec())),
+				Ok(Message::Text(t)) => ws.send(WsMessage::Text(t.as_str().to_string())),
+				Ok(Message::Close(cf)) => {
+					let (code, reason) = match cf {
+						Some(c) => (Some(u16::from(c.code)), Some(c.reason.to_string())),
+						None => (None, None),
+					};
+					ws.close(code, reason).await;
+					break;
+				}
+				// Ping/Pong/Frame handled by tungstenite.
+				Ok(_) => {}
+				Err(e) => {
+					ws.close(Some(1011), Some(format!("child ws error: {e}")))
+						.await;
+					break;
+				}
+			}
+		}
+	});
 
-	let on_close: Box<dyn Fn(u16, String) -> BoxFuture<()> + Send + Sync> = {
-		let sink = sink.clone();
-		Box::new(move |code: u16, reason: String| {
-			let sink = sink.clone();
-			Box::pin(async move {
-				let frame = Message::Close(Some(CloseFrame {
-					code: CloseCode::from(code),
-					reason: reason.into(),
-				}));
-				let mut s = sink.lock().await;
-				let _ = s.send(frame).await;
-				let _ = s.close().await;
-			})
-		})
-	};
-
-	Ok(WebSocketHandler {
-		on_message,
-		on_close,
-		on_open: Some(on_open),
-	})
+	Ok(())
 }
