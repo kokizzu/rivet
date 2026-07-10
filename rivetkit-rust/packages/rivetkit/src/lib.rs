@@ -29,6 +29,7 @@ pub use rivetkit_core::metrics_endpoint::RenderedMetrics;
 pub use rivetkit_core::serverless::{
 	CoreServerlessRuntime, ServerlessRequest, ServerlessResponse, ServerlessStreamError,
 };
+pub use rivetkit_core::serverless_http;
 pub use rivetkit_core::{
 	ActorConfig, ActorKey, ActorKeySegment, CanHibernateWebSocket, CompletableQueueMessage,
 	ConnHandle, ConnId, EngineSpawnMode, EnqueueAndWaitOpts, KeepAwakeRegion, Kv, ListOpts,

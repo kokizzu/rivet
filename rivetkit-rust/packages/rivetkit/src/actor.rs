@@ -14,7 +14,7 @@ use crate::queue::QueueSet;
 #[async_trait]
 pub trait Actor: Send + Sync + Sized + 'static {
 	type State: Serialize + DeserializeOwned + Send + Sync + 'static;
-	type Input: DeserializeOwned + Send + 'static;
+	type Input: DeserializeOwned + Default + Send + 'static;
 	type Actions: ActionSet<Self>;
 	type Events: EventSet;
 	type Queue: QueueSet<Self>;

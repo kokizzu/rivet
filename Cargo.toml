@@ -618,6 +618,10 @@ members = [
     path = "engine/packages/depot-client-types"
     version = "=2.3.3-rc.2"
 
+    [workspace.dependencies.rivetkit]
+    path = "rivetkit-rust/packages/rivetkit"
+    version = "=2.3.3-rc.2"
+
     [workspace.dependencies.rivetkit-core]
     path = "rivetkit-rust/packages/rivetkit-core"
     version = "=2.3.3-rc.2"

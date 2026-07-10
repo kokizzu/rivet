@@ -191,7 +191,9 @@ pub async fn run_actor<A: Actor>(start: Start<A>) -> Result<()> {
 
 	let state = match snapshot.decode()? {
 		Some(state) => state,
-		None => A::create_state(&ctx, input.decode()?).await?,
+		// Absent input falls back to the input type's default, matching
+		// rivetkit-typescript where createState receives undefined input.
+		None => A::create_state(&ctx, input.decode_or_default()?).await?,
 	};
 	ctx.set_state(state);
 	ctx.clear_state_dirty();
@@ -647,7 +649,7 @@ mod tests {
 		}
 	}
 
-	#[derive(Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
+	#[derive(Debug, Default, PartialEq, Eq, Serialize, serde::Deserialize)]
 	struct LifecycleInput {
 		count: u32,
 	}
@@ -658,7 +660,7 @@ mod tests {
 		log: Vec<String>,
 	}
 
-	#[derive(Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
+	#[derive(Debug, Default, PartialEq, Eq, Serialize, serde::Deserialize)]
 	struct UnitInput;
 
 	#[derive(Debug, Default, PartialEq, Eq, Serialize, serde::Deserialize)]
@@ -1638,13 +1640,18 @@ mod tests {
 			"local",
 		));
 
+		let is_new = snapshot.is_none();
 		let start = Start {
 			ctx: ctx.clone(),
 			input: Input {
 				bytes: input,
 				_p: PhantomData,
 			},
-			snapshot: Snapshot { bytes: snapshot },
+			is_new,
+			snapshot: Snapshot {
+				is_new,
+				bytes: snapshot,
+			},
 			hibernated: Vec::new(),
 			events: Events {
 				ctx: ctx.clone(),
@@ -1669,13 +1676,18 @@ mod tests {
 			"local",
 		));
 
+		let is_new = snapshot.is_none();
 		Start {
 			ctx: ctx.clone(),
 			input: Input {
 				bytes: input,
 				_p: PhantomData,
 			},
-			snapshot: Snapshot { bytes: snapshot },
+			is_new,
+			snapshot: Snapshot {
+				is_new,
+				bytes: snapshot,
+			},
 			hibernated: Vec::new(),
 			events: Events {
 				ctx,
@@ -1700,7 +1712,11 @@ mod tests {
 				bytes: None,
 				_p: PhantomData,
 			},
-			snapshot: Snapshot { bytes: None },
+			is_new: true,
+			snapshot: Snapshot {
+				is_new: true,
+				bytes: None,
+			},
 			hibernated: Vec::new(),
 			events: Events {
 				ctx,
@@ -1726,7 +1742,11 @@ mod tests {
 				bytes: None,
 				_p: PhantomData,
 			},
-			snapshot: Snapshot { bytes: None },
+			is_new: true,
+			snapshot: Snapshot {
+				is_new: true,
+				bytes: None,
+			},
 			hibernated: Vec::new(),
 			events: Events {
 				ctx,
