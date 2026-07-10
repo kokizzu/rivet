@@ -169,7 +169,11 @@ const defaultContext = {
 	actorsListPaginationQueryOptions(opts: ActorQueryOptions) {
 		return infiniteQueryOptions({
 			...this.actorsQueryOptions(opts),
-			refetchInterval: 5000,
+			// This observer shares its query key with actorsListQueryOptions, so
+			// any refetchInterval here would refetch every page of the shared
+			// infinite query. Polling for new actors is owned by
+			// actorsListPage1PollQueryOptions instead.
+			refetchInterval: false,
 			select: (data) => {
 				return data.pages.flatMap((page) =>
 					page.actors.map((actor) => actor.actorId),
