@@ -67,16 +67,16 @@ pub fn build_resources(
 	}
 
 	if let Some(max_scale) = max_scale {
-		if !(1..=500).contains(&max_scale) {
-			bail!("--max-scale must be between 1 and 500, got {max_scale}");
+		if !(1..=5000).contains(&max_scale) {
+			bail!("--max-scale must be between 1 and 5000, got {max_scale}");
 		}
 		resources.insert("maxScale".to_string(), json!(max_scale));
 	}
 
 	if let Some(instance_request_concurrency) = instance_request_concurrency {
-		if !(1..=2000).contains(&instance_request_concurrency) {
+		if !(1..=500).contains(&instance_request_concurrency) {
 			bail!(
-				"--instance-request-concurrency must be between 1 and 2000, got {instance_request_concurrency}"
+				"--instance-request-concurrency must be between 1 and 500, got {instance_request_concurrency}"
 			);
 		}
 		resources.insert(
