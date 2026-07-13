@@ -13,7 +13,7 @@ container with this binary as the entrypoint and Rivet Compute can cold-start an
 to it.
 
 The actor `input` payload (CBOR-encoded, RivetKit convention) can override the child
-command, args, env, and port per actor. WebSocket clients connect at the bare gateway
+command, args, and env per actor. WebSocket clients connect at the bare gateway
 path; raw HTTP reaches the child under the `/request/*` prefix on the actor surface.
 
 `examples/` contains a Unity + FishNet demo project, a lightweight Node test server, and
