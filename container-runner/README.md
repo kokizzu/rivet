@@ -1,5 +1,9 @@
 # Container Runner
 
+User-facing documentation lives at
+[rivet.dev/docs/deploy/container-runner](https://rivet.dev/docs/deploy/container-runner/).
+This README covers development, the example projects, and the local test harnesses.
+
 `rivet-container-runner` is a RivetKit (Rust) serverless app that hosts actors by
 spawning a child game-server process per actor and proxying Rivet's tunneled
 HTTP/WebSocket traffic to it. Each child gets its own port; the pool's request
