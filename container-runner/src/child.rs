@@ -42,7 +42,7 @@ pub struct SpawnSpec {
 
 impl ChildProcess {
 	/// Spawn the child with piped stdout+stderr, start log-pump tasks that re-emit
-	/// each line to the runner's stdout prefixed with `[actorId=<id> key=<key>]`, start
+	/// each line to the runner's stdout prefixed with `[actor_id=<id> key=<key>]`, start
 	/// a reaper task, and wait until the child's TCP port accepts connections.
 	pub async fn spawn(spec: SpawnSpec, readiness_timeout: Duration) -> Result<Self> {
 		let SpawnSpec {
@@ -224,11 +224,11 @@ where
 	});
 }
 
-/// The per-line log prefix: `[actorId=<id> key=<key>]`. The dashboard filters on the
-/// `actorId=<id>` token, so the field name must be `actorId`, not `actor`.
+/// The per-line log prefix: `[actor_id=<id> key=<key>]`. The dashboard filters on the
+/// `actor_id=<id>` token, so the field name must be `actor_id`, not `actor`.
 pub fn log_prefix(actor_id: &str, key: Option<&str>) -> String {
 	match key {
-		Some(key) => format!("[actorId={actor_id} key={key}]"),
-		None => format!("[actorId={actor_id} key=]"),
+		Some(key) => format!("[actor_id={actor_id} key={key}]"),
+		None => format!("[actor_id={actor_id} key=]"),
 	}
 }

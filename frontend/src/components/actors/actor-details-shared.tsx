@@ -63,7 +63,7 @@ function DeploymentLogsTab({ actorId }: { actorId: ActorId }) {
 			project={provider.project}
 			namespace={provider.cloudNamespace}
 			pool="default"
-			filter={`actorId=${actorId}`}
+			filter={`actor_id=${actorId}`}
 		/>
 	);
 }

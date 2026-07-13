@@ -120,7 +120,7 @@ impl Actor for GameServer {
 
 		tracing::info!(
 			boot_id = crate::boot_id(),
-			actorId = %actor_id,
+			actor_id = %actor_id,
 			child_port,
 			"actor starting on this container instance"
 		);
@@ -178,7 +178,7 @@ impl Actor for GameServer {
 			// policy. The rivetkit wrapper has no errored-stop API yet.
 			if let Err(err) = ctx.destroy() {
 				// The actor may already be stopping if the engine beat us to it.
-				tracing::debug!(error = ?err, actorId = %actor_id, "destroy after child exit failed");
+				tracing::debug!(error = ?err, actor_id = %actor_id, "destroy after child exit failed");
 			}
 		}
 		Ok(())

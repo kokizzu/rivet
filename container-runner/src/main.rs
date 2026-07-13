@@ -172,7 +172,7 @@ pub fn effective_stop_grace() -> Duration {
 /// instead of lingering for the next placement. The runner is PID 1 in the
 /// image, so exiting stops the container and the platform reaps the instance.
 pub fn request_exit(actor_id: &str, reason: &str) {
-	tracing::info!(actorId = %actor_id, reason, "actor finished, exiting container");
+	tracing::info!(actor_id = %actor_id, reason, "actor finished, exiting container");
 	EXIT.cancel();
 }
 
