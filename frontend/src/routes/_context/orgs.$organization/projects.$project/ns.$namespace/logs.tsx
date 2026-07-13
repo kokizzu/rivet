@@ -1,8 +1,8 @@
 import type { Rivet } from "@rivet-gg/cloud";
-import { faCopy, faDownload, faPause, faPlay, Icon } from "@rivet-gg/icons";
+import { faPause, faPlay, Icon } from "@rivet-gg/icons";
 import { useInfiniteQuery, useSuspenseQuery } from "@tanstack/react-query";
 import { createFileRoute, Link, redirect } from "@tanstack/react-router";
-import { startTransition, useCallback, useRef, useState } from "react";
+import { startTransition, useRef, useState } from "react";
 import { z } from "zod";
 import { Content } from "@/app/layout";
 import { Button, H1, Skeleton } from "@/components";
@@ -11,13 +11,10 @@ import {
 	useDataProvider,
 } from "@/components/actors";
 import { RegionSelect } from "@/components/actors/region-select";
-import { DeploymentLogs } from "@/components/deployment-logs";
 import {
-	DropdownMenu,
-	DropdownMenuContent,
-	DropdownMenuItem,
-	DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu";
+	DeploymentLogs,
+	DeploymentLogsExportMenu,
+} from "@/components/deployment-logs";
 import { features } from "@/lib/features";
 
 export const Route = createFileRoute(
@@ -73,31 +70,6 @@ function RouteComponent() {
 	const [isPaused, setIsPaused] = useState(false);
 	const [region, setRegion] = useState<string>("all");
 	const logsRef = useRef<Rivet.LogStreamEvent.Log[]>([]);
-
-	const getLogsText = useCallback(
-		() =>
-			logsRef.current
-				.map(
-					(e) =>
-						`${e.data.timestamp}\t${e.data.region}\t${e.data.message}`,
-				)
-				.join("\n"),
-		[],
-	);
-
-	const handleDownload = useCallback(() => {
-		const blob = new Blob([getLogsText()], { type: "text/plain" });
-		const url = URL.createObjectURL(blob);
-		const a = document.createElement("a");
-		a.href = url;
-		a.download = `deployment-logs-${namespace}.txt`;
-		a.click();
-		URL.revokeObjectURL(url);
-	}, [getLogsText, namespace]);
-
-	const handleCopy = useCallback(() => {
-		navigator.clipboard.writeText(getLogsText());
-	}, [getLogsText]);
 
 	if (!pool) {
 		return (
@@ -165,31 +137,11 @@ function RouteComponent() {
 						>
 							<Icon icon={isPaused ? faPlay : faPause} />
 						</Button>
-						<DropdownMenu>
-							<DropdownMenuTrigger asChild>
-								<Button
-									variant="ghost"
-									size="sm"
-									className="mx-1 h-full rounded-none"
-								>
-									Export
-								</Button>
-							</DropdownMenuTrigger>
-							<DropdownMenuContent align="end">
-								<DropdownMenuItem
-									indicator={<Icon icon={faDownload} />}
-									onClick={handleDownload}
-								>
-									Download
-								</DropdownMenuItem>
-								<DropdownMenuItem
-									indicator={<Icon icon={faCopy} />}
-									onClick={handleCopy}
-								>
-									Copy
-								</DropdownMenuItem>
-							</DropdownMenuContent>
-						</DropdownMenu>
+						<DeploymentLogsExportMenu
+							logsRef={logsRef}
+							filename={`deployment-logs-${namespace}.txt`}
+							className="mx-1 h-full rounded-none"
+						/>
 					</div>
 
 					{pool ? (

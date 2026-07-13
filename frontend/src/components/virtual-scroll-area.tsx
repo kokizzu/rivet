@@ -28,7 +28,7 @@ interface VirtualScrollAreaProps<TItem extends Record<string, any>>
 			VirtualizerOptions<HTMLDivElement, Element>,
 			"estimateSize" | "count"
 		>,
-		Pick<ScrollAreaProps, "viewportProps"> {
+		Pick<ScrollAreaProps, "viewportProps" | "type"> {
 	getRowData: (index: number) => TItem;
 	className?: string;
 	row: FunctionComponent<TItem>;
@@ -48,6 +48,7 @@ export function VirtualScrollArea<TItem extends Record<string, any>>({
 	viewportRef,
 	scrollerProps,
 	children,
+	type,
 	...rowVirtualizerOptions
 }: VirtualScrollAreaProps<TItem>) {
 	const rowVirtualizer = useVirtualizer({
@@ -64,6 +65,7 @@ export function VirtualScrollArea<TItem extends Record<string, any>>({
 			viewportRef={viewportRef}
 			className={className}
 			viewportProps={viewportProps}
+			type={type}
 		>
 			<div
 				{...scrollerProps}

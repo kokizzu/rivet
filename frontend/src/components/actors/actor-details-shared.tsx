@@ -1,6 +1,10 @@
+import type { Rivet } from "@rivet-gg/cloud";
 import { useQuery } from "@tanstack/react-query";
 import { type ReactNode, useLayoutEffect, useRef, useState } from "react";
-import { DeploymentLogs } from "@/components/deployment-logs";
+import {
+	DeploymentLogs,
+	DeploymentLogsExportMenu,
+} from "@/components/deployment-logs";
 import { features } from "@/lib/features";
 import { ActorConfigTab } from "./actor-config-tab";
 import { useCloudNamespaceDataProvider } from "./data-provider";
@@ -58,13 +62,26 @@ export function useHasManagedPool(): boolean {
  */
 function DeploymentLogsTab({ actorId }: { actorId: ActorId }) {
 	const provider = useCloudNamespaceDataProvider();
+	const logsRef = useRef<Rivet.LogStreamEvent.Log[]>([]);
 	return (
-		<DeploymentLogs
-			project={provider.project}
-			namespace={provider.cloudNamespace}
-			pool="default"
-			filter={`actor_id=${actorId}`}
-		/>
+		<div className="flex flex-col h-full">
+			<div className="flex items-center justify-end border-b shrink-0 px-2 py-1">
+				<DeploymentLogsExportMenu
+					logsRef={logsRef}
+					filename={`actor-logs-${actorId}.txt`}
+					className="h-6 text-xs"
+				/>
+			</div>
+			<div className="flex-1 min-h-0 overflow-hidden">
+				<DeploymentLogs
+					project={provider.project}
+					namespace={provider.cloudNamespace}
+					pool="default"
+					filter={`actor_id=${actorId}`}
+					logsRef={logsRef}
+				/>
+			</div>
+		</div>
 	);
 }
 

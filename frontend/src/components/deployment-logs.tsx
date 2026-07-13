@@ -1,5 +1,11 @@
 import type { Rivet } from "@rivet-gg/cloud";
-import { faArrowDown, faTriangleExclamation, Icon } from "@rivet-gg/icons";
+import {
+	faArrowDown,
+	faCopy,
+	faDownload,
+	faTriangleExclamation,
+	Icon,
+} from "@rivet-gg/icons";
 import type { Virtualizer } from "@tanstack/react-virtual";
 import {
 	useCallback,
@@ -12,6 +18,13 @@ import { ErrorDetails } from "@/components/actors";
 import { VirtualScrollArea } from "@/components/virtual-scroll-area";
 import { AnsiText } from "./lib/ansi";
 import { cn } from "./lib/utils";
+import { Button } from "./ui/button";
+import {
+	DropdownMenu,
+	DropdownMenuContent,
+	DropdownMenuItem,
+	DropdownMenuTrigger,
+} from "./ui/dropdown-menu";
 import { ScrollArea } from "./ui/scroll-area";
 import { Skeleton } from "./ui/skeleton";
 import { useDeploymentLogsStream } from "./use-deployment-logs-stream";
@@ -136,6 +149,77 @@ function LogRow({
 				</span>
 			</div>
 		</div>
+	);
+}
+
+interface DeploymentLogsExportMenuProps {
+	/** Ref filled by `DeploymentLogs` via its `logsRef` prop. */
+	logsRef: React.MutableRefObject<Rivet.LogStreamEvent.Log[]>;
+	/** Download filename, e.g. `deployment-logs-my-namespace.txt`. */
+	filename: string;
+	className?: string;
+}
+
+/**
+ * Export dropdown (download / copy) for the log entries currently loaded by a
+ * `DeploymentLogs` instance. Reads through `logsRef` so opening the menu never
+ * re-renders with the log stream.
+ */
+export function DeploymentLogsExportMenu({
+	logsRef,
+	filename,
+	className,
+}: DeploymentLogsExportMenuProps) {
+	const getLogsText = useCallback(
+		() =>
+			logsRef.current
+				.map((e) =>
+					[
+						e.data.timestamp,
+						e.data.region ?? "",
+						e.data.message,
+					].join("\t"),
+				)
+				.join("\n"),
+		[logsRef],
+	);
+
+	const handleDownload = useCallback(() => {
+		const blob = new Blob([getLogsText()], { type: "text/plain" });
+		const url = URL.createObjectURL(blob);
+		const a = document.createElement("a");
+		a.href = url;
+		a.download = filename;
+		a.click();
+		URL.revokeObjectURL(url);
+	}, [getLogsText, filename]);
+
+	const handleCopy = useCallback(() => {
+		navigator.clipboard.writeText(getLogsText());
+	}, [getLogsText]);
+
+	return (
+		<DropdownMenu>
+			<DropdownMenuTrigger asChild>
+				<Button variant="ghost" size="sm" className={className}>
+					Export
+				</Button>
+			</DropdownMenuTrigger>
+			<DropdownMenuContent align="end">
+				<DropdownMenuItem
+					indicator={<Icon icon={faDownload} />}
+					onClick={handleDownload}
+				>
+					Download
+				</DropdownMenuItem>
+				<DropdownMenuItem
+					indicator={<Icon icon={faCopy} />}
+					onClick={handleCopy}
+				>
+					Copy
+				</DropdownMenuItem>
+			</DropdownMenuContent>
+		</DropdownMenu>
 	);
 }
 
@@ -339,6 +423,9 @@ export function DeploymentLogs({
 					onChange={handleScrollChange}
 					count={totalCount}
 					estimateSize={() => 24}
+					// The default hover-only scrollbar gives no visual hint that
+					// the log view scrolls at all. Show it whenever logs overflow.
+					type="auto"
 					className="w-full h-full"
 					scrollerProps={{
 						className: "w-full",
