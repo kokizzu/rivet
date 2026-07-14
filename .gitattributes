@@ -2,6 +2,11 @@
 # without running Git LFS clean filters, so large public assets belong in R2.
 
 * text eol=lf
+
+# Vendored Unity packages ship CRLF upstream and are committed with raw bytes
+# via jj, so keep them out of eol normalization to avoid permanent churn.
+container-runner/examples/unity-demo/Packages/** -text
+
 *.png binary
 *.jpg binary
 *.jpeg binary
