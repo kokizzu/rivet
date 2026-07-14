@@ -5,6 +5,7 @@ import {
 	faClose,
 	faCreditCard,
 	faGear,
+	faRivet,
 	faSliders,
 	faSparkles,
 	Icon,
@@ -19,6 +20,7 @@ import {
 } from "@tanstack/react-router";
 import { type ReactNode, useEffect, useState } from "react";
 import { cn, VisuallyHidden } from "@/components";
+import { useHasManagedPool } from "@/components/actors/actor-details-shared";
 import {
 	useCloudNamespaceDataProvider,
 	useCloudProjectDataProvider,
@@ -26,6 +28,7 @@ import {
 import { features } from "@/lib/features";
 import { BillingUsageGauge } from "./billing/billing-usage-gauge";
 import { BillingPanel } from "./settings-pages/billing-panel";
+import { NamespaceComputeContent } from "./settings-pages/namespace-compute";
 import {
 	NamespaceAdvancedContent,
 	NamespaceSettingsContent,
@@ -38,6 +41,7 @@ import { WhatsNewPanel } from "./settings-pages/whats-new-panel";
 export type SettingsTab =
 	| "profile"
 	| "settings"
+	| "compute"
 	| "advanced"
 	| "billing"
 	| "organization"
@@ -59,6 +63,7 @@ const NAV_SECTIONS: Array<{
 		label: "Namespace",
 		items: [
 			{ key: "settings", label: "Settings", icon: faGear },
+			{ key: "compute", label: "Compute", icon: faRivet },
 			{ key: "advanced", label: "Advanced", icon: faSliders },
 		],
 	},
@@ -88,6 +93,10 @@ const TAB_META: Record<SettingsTab, { title: string; description?: string }> = {
 		title: "Settings",
 		description:
 			"Connect your RivetKit application to Rivet Cloud. Use your cloud of choice to run Rivet Actors.",
+	},
+	compute: {
+		title: "Compute",
+		description: "Manage the Rivet Compute deployment for this namespace.",
 	},
 	advanced: {
 		title: "Advanced",
@@ -197,23 +206,41 @@ export function SettingsDrawer({
 										<div className="px-2 pb-1 text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
 											{section.label}
 										</div>
-										{section.items.map((item) => (
-											<NavItem
-												key={item.key}
-												icon={item.icon}
-												label={item.label}
-												active={activeTab === item.key}
-												onClick={() =>
-													switchTab(item.key)
-												}
-												trailing={
-													item.key === "billing" &&
-													activeTab !== "billing" ? (
-														<NavBillingGauge />
-													) : null
-												}
-											/>
-										))}
+										{section.items.map((item) =>
+											item.key === "compute" ? (
+												<ComputeNavItem
+													key={item.key}
+													icon={item.icon}
+													label={item.label}
+													active={
+														activeTab === item.key
+													}
+													onClick={() =>
+														switchTab(item.key)
+													}
+												/>
+											) : (
+												<NavItem
+													key={item.key}
+													icon={item.icon}
+													label={item.label}
+													active={
+														activeTab === item.key
+													}
+													onClick={() =>
+														switchTab(item.key)
+													}
+													trailing={
+														item.key ===
+															"billing" &&
+														activeTab !==
+															"billing" ? (
+															<NavBillingGauge />
+														) : null
+													}
+												/>
+											),
+										)}
 									</div>
 								))}
 							</nav>
@@ -272,6 +299,34 @@ function NavItem({
 	);
 }
 
+interface ComputeNavItemProps {
+	icon: IconProp;
+	label: string;
+	active: boolean;
+	onClick: () => void;
+}
+
+// The Compute nav item only shows when the current namespace actively uses
+// Rivet Compute. Guarded with `shouldThrow: false` plus a `loaderData` check
+// because the drawer can render while the namespace match tree is
+// mid-transition; the inner managed-pool hooks read the namespace data
+// provider from loader data and would crash on undefined. The outer/inner
+// split keeps hook order stable while the route match changes.
+function ComputeNavItem(props: ComputeNavItemProps) {
+	const match = useMatch({
+		from: "/_context/orgs/$organization/projects/$project/ns/$namespace",
+		shouldThrow: false,
+	});
+	if (!features.compute || !match || !match.loaderData) return null;
+	return <ComputeNavItemInner {...props} />;
+}
+
+function ComputeNavItemInner(props: ComputeNavItemProps) {
+	const hasManagedPool = useHasManagedPool();
+	if (!hasManagedPool) return null;
+	return <NavItem {...props} />;
+}
+
 // Renders the usage gauge next to the Billing nav item. Guarded with
 // `shouldThrow: false` plus a `loaderData` check because the drawer can render
 // while the project match tree is mid-transition; without it the inner billing
@@ -298,6 +353,8 @@ function TabContent({ tab }: { tab: SettingsTab }) {
 			return <BillingPanel />;
 		case "settings":
 			return <SettingsTabBody />;
+		case "compute":
+			return <ComputeTabBody />;
 		case "advanced":
 			return <AdvancedTabBody />;
 		case "organization":
@@ -458,6 +515,66 @@ function AdvancedTabBody() {
 	return <CloudAdvancedTabBody />;
 }
 
+// Rivet Compute is cloud-platform-only, so there is no engine variant. The
+// feature check is a backstop; `settingsParamToTab` already keeps the tab
+// unreachable on flavors without the compute flag.
+function ComputeTabBody() {
+	if (!features.compute) {
+		return null;
+	}
+	return <CloudComputeTabBody />;
+}
+
+function CloudComputeTabBody() {
+	const namespaceMatch = useMatch({
+		from: "/_context/orgs/$organization/projects/$project/ns/$namespace",
+		shouldThrow: false,
+	});
+
+	if (!namespaceMatch) {
+		return (
+			<ResourcePicker
+				title="Pick a namespace"
+				description="Compute settings are scoped to a namespace."
+				settings="compute"
+				target="namespace"
+			/>
+		);
+	}
+	if (!namespaceMatch.loaderData) {
+		return <NamespaceSettingsSkeleton />;
+	}
+	return <CloudComputeTabBodyInner />;
+}
+
+// Deep links can land on the Compute tab for a namespace that does not use
+// Rivet Compute. Redirect to the regular Settings tab once the managed-pool
+// check resolves, and show the skeleton until then.
+function CloudComputeTabBodyInner() {
+	const navigate = useNavigate();
+	const provider = useCloudNamespaceDataProvider();
+	const { data: hasManagedPool, isPending } = useQuery({
+		...provider.currentNamespaceHasManagedPoolQueryOptions(),
+		staleTime: Infinity,
+	});
+
+	useEffect(() => {
+		if (isPending || hasManagedPool) return;
+		navigate({
+			to: ".",
+			search: (old) => ({
+				...(old as Record<string, unknown>),
+				settings: "settings",
+			}),
+		});
+	}, [isPending, hasManagedPool, navigate]);
+
+	if (!hasManagedPool) {
+		return <NamespaceSettingsSkeleton />;
+	}
+	return <NamespaceComputeContent />;
+}
+
 function CloudAdvancedTabBody() {
 	const namespaceMatch = useMatch({
 		from: "/_context/orgs/$organization/projects/$project/ns/$namespace",
@@ -491,6 +608,10 @@ export function settingsParamToTab(
 		case "organization":
 		case "whats-new":
 			return param;
+		// Compute is gated by the compute feature flag; degrade deep links to
+		// the regular Settings tab on flavors without it.
+		case "compute":
+			return features.compute ? "compute" : "settings";
 		// Legacy: members lived in its own tab before being merged into
 		// Organization. Keep the deep link working.
 		case "members":

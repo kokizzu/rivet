@@ -20,6 +20,12 @@ interface FormProps<FormValues extends FieldValues>
 	onSubmit: SubmitHandler<FormValues>;
 	mode?: UseFormProps<FormValues>["mode"];
 	revalidateMode?: UseFormProps<FormValues>["reValidateMode"];
+	/**
+	 * Debounce error display by this many milliseconds. Only useful together
+	 * with an eager `mode` like "onChange", where it batches per-keystroke
+	 * error updates into one.
+	 */
+	delayError?: UseFormProps<FormValues>["delayError"];
 	defaultValues: DefaultValues<FormValues>;
 	errors?: UseFormProps<FormValues>["errors"];
 	values?: FormValues;
@@ -39,6 +45,7 @@ export const createSchemaForm = <Schema extends z.ZodType<any>>(
 			defaultValues,
 			mode,
 			revalidateMode = "onSubmit",
+			delayError,
 			values,
 			children,
 			onSubmit,
@@ -52,6 +59,7 @@ export const createSchemaForm = <Schema extends z.ZodType<any>>(
 				),
 				mode,
 				reValidateMode: revalidateMode,
+				delayError,
 				defaultValues,
 				values,
 				errors,
