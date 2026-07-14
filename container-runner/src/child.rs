@@ -19,6 +19,22 @@ use tokio::process::Command;
 use tokio::sync::watch;
 use tokio::time::{Instant, sleep};
 
+/// Terminal state of a child process.
+#[derive(Clone)]
+pub struct ChildExit {
+	/// True when the child exited on its own with code 0. Signal terminations,
+	/// nonzero exits, and wait errors are all failures.
+	pub success: bool,
+	/// Human-readable status, e.g. "exit status: 1" or "signal: 9 (SIGKILL)".
+	pub status: String,
+}
+
+impl std::fmt::Display for ChildExit {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.write_str(&self.status)
+	}
+}
+
 /// A spawned child process, its listening port, and the actor identity used to
 /// prefix its logs.
 pub struct ChildProcess {
@@ -26,8 +42,8 @@ pub struct ChildProcess {
 	pub key: Option<String>,
 	pub child_port: u16,
 	pid: u32,
-	/// `None` while running, `Some(status_string)` once the child has exited.
-	exited_rx: watch::Receiver<Option<String>>,
+	/// `None` while running, `Some(exit)` once the child has exited.
+	exited_rx: watch::Receiver<Option<ChildExit>>,
 }
 
 /// Everything needed to launch the child.
@@ -100,16 +116,22 @@ impl ChildProcess {
 		println!("{prefix} runner: spawned `{program}` (pid={pid}) on child port {child_port}");
 
 		// Reaper task owns the Child and reports its exit status.
-		let (exited_tx, exited_rx) = watch::channel::<Option<String>>(None);
+		let (exited_tx, exited_rx) = watch::channel::<Option<ChildExit>>(None);
 		{
 			let prefix = prefix.clone();
 			tokio::spawn(async move {
-				let status = match child.wait().await {
-					Ok(status) => status.to_string(),
-					Err(e) => format!("wait error: {e}"),
+				let exit = match child.wait().await {
+					Ok(status) => ChildExit {
+						success: status.success(),
+						status: status.to_string(),
+					},
+					Err(e) => ChildExit {
+						success: false,
+						status: format!("wait error: {e}"),
+					},
 				};
-				println!("{prefix} runner: child process exited (status: {status})");
-				let _ = exited_tx.send(Some(status));
+				println!("{prefix} runner: child process exited (status: {exit})");
+				let _ = exited_tx.send(Some(exit));
 			});
 		}
 
@@ -138,8 +160,8 @@ impl ChildProcess {
 		let addr = (Ipv4Addr::LOCALHOST, self.child_port);
 		let prefix = log_prefix(&self.actor_id, self.key.as_deref());
 		loop {
-			if let Some(status) = self.exited_rx.borrow().clone() {
-				anyhow::bail!("child exited before becoming ready (status: {status})");
+			if let Some(exit) = self.exited_rx.borrow().clone() {
+				anyhow::bail!("child exited before becoming ready (status: {exit})");
 			}
 			if TcpStream::connect(addr).await.is_ok() {
 				println!(
@@ -163,15 +185,18 @@ impl ChildProcess {
 		self.exited_rx.borrow().is_some()
 	}
 
-	/// Wait until the child exits (on its own or via `stop`), returning its status.
-	pub async fn wait_exit(&self) -> String {
+	/// Wait until the child exits (on its own or via `stop`), returning its exit state.
+	pub async fn wait_exit(&self) -> ChildExit {
 		let mut rx = self.exited_rx.clone();
 		loop {
-			if let Some(status) = rx.borrow().clone() {
-				return status;
+			if let Some(exit) = rx.borrow().clone() {
+				return exit;
 			}
 			if rx.changed().await.is_err() {
-				return "reaper task ended".to_string();
+				return ChildExit {
+					success: false,
+					status: "reaper task ended".to_string(),
+				};
 			}
 		}
 	}

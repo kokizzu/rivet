@@ -158,24 +158,29 @@ impl Actor for GameServer {
 
 	/// Watchdog: waits for the child to exit. Deliberate stops remove the
 	/// child from the global registry first, so winning the `remove` race
-	/// means the exit was unexpected and the actor must be torn down.
+	/// means the exit was unexpected and the actor must be torn down. A clean
+	/// exit (code 0) destroys the actor; any other exit returns an error so
+	/// the framework reports an errored stop and the engine records the crash.
 	async fn run(self: Arc<Self>, ctx: Ctx<Self>) -> Result<()> {
 		let Some(child) = self.child.lock().await.clone() else {
 			anyhow::bail!("run: child process was never spawned");
 		};
 
-		let status = child.wait_exit().await;
+		let exit = child.wait_exit().await;
 
 		let actor_id = ctx.actor_id().to_string();
 		if children().remove_async(&actor_id).await.is_some() {
 			release_child_port(child.child_port).await;
 			let prefix = log_prefix(&actor_id, child.key.as_deref());
+			if !exit.success {
+				println!(
+					"{prefix} runner: child exited unexpectedly ({exit}), reporting errored stop"
+				);
+				anyhow::bail!("child exited unexpectedly ({exit})");
+			}
 			println!(
-				"{prefix} runner: child exited unexpectedly ({status}), reporting actor stopped"
+				"{prefix} runner: child exited unexpectedly ({exit}), reporting actor stopped"
 			);
-			// TODO: `ctx.destroy()` reports a clean stop, while the old envoy
-			// path reported an errored stop that fed the engine's crash
-			// policy. The rivetkit wrapper has no errored-stop API yet.
 			if let Err(err) = ctx.destroy() {
 				// The actor may already be stopping if the engine beat us to it.
 				tracing::debug!(error = ?err, actor_id = %actor_id, "destroy after child exit failed");
