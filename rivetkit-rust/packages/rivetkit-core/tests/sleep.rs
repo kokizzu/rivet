@@ -527,6 +527,216 @@ mod moved_tests {
 		assert_eq!(rivet_err.code(), "stopping");
 	}
 
+	#[tokio::test(start_paused = true)]
+	async fn stop_with_error_before_started_errors_with_actor_starting() {
+		let ctx = ActorContext::new_for_sleep_tests("actor-stop-error-before-started");
+
+		let err = ctx
+			.stop_with_error("boom")
+			.expect_err("stop_with_error should fail before started is set");
+		let rivet_err = rivet_error::RivetError::extract(&err);
+		assert_eq!(rivet_err.group(), "actor");
+		assert_eq!(rivet_err.code(), "starting");
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn stop_with_error_after_destroy_errors_with_actor_stopping() {
+		let ctx = ActorContext::new_for_sleep_tests("actor-stop-error-after-destroy");
+		ctx.set_started(true);
+
+		ctx.destroy()
+			.expect("destroy call should be accepted after startup");
+
+		let err = ctx
+			.stop_with_error("boom")
+			.expect_err("stop_with_error should fail once destroy is already requested");
+		let rivet_err = rivet_error::RivetError::extract(&err);
+		assert_eq!(rivet_err.group(), "actor");
+		assert_eq!(rivet_err.code(), "stopping");
+	}
+
+	mod stop_intent {
+		use std::collections::HashMap;
+		use std::sync::Mutex as EnvoySharedMutex;
+		use std::sync::atomic::AtomicBool;
+		use std::time::Duration;
+
+		use rivet_envoy_client::config::{
+			BoxFuture, EnvoyCallbacks, EnvoyConfig, HttpRequest, HttpResponse, WebSocketHandler,
+			WebSocketSender,
+		};
+		use rivet_envoy_client::context::{SharedContext, WsTxMessage};
+		use rivet_envoy_client::envoy::ToEnvoyMessage;
+		use rivet_envoy_client::handle::EnvoyHandle;
+		use rivet_envoy_client::protocol;
+		use tokio::sync::mpsc;
+
+		use std::sync::Arc;
+
+		use crate::actor::context::ActorContext;
+
+		struct IdleEnvoyCallbacks;
+
+		impl EnvoyCallbacks for IdleEnvoyCallbacks {
+			fn on_actor_start(
+				&self,
+				_handle: EnvoyHandle,
+				_actor_id: String,
+				_generation: u32,
+				_config: protocol::ActorConfig,
+				_preloaded_kv: Option<protocol::PreloadedKv>,
+			) -> BoxFuture<anyhow::Result<()>> {
+				Box::pin(async { Ok(()) })
+			}
+
+			fn on_shutdown(&self) {}
+
+			fn fetch(
+				&self,
+				_handle: EnvoyHandle,
+				_actor_id: String,
+				_gateway_id: protocol::GatewayId,
+				_request_id: protocol::RequestId,
+				_request: HttpRequest,
+			) -> BoxFuture<anyhow::Result<HttpResponse>> {
+				Box::pin(async { anyhow::bail!("fetch should not run in sleep tests") })
+			}
+
+			fn websocket(
+				&self,
+				_handle: EnvoyHandle,
+				_actor_id: String,
+				_gateway_id: protocol::GatewayId,
+				_request_id: protocol::RequestId,
+				_request: HttpRequest,
+				_path: String,
+				_headers: HashMap<String, String>,
+				_is_hibernatable: bool,
+				_is_restoring_hibernatable: bool,
+				_sender: WebSocketSender,
+			) -> BoxFuture<anyhow::Result<WebSocketHandler>> {
+				Box::pin(async { anyhow::bail!("websocket should not run in sleep tests") })
+			}
+
+			fn can_hibernate(
+				&self,
+				_actor_id: &str,
+				_gateway_id: &protocol::GatewayId,
+				_request_id: &protocol::RequestId,
+				_request: &HttpRequest,
+			) -> BoxFuture<anyhow::Result<bool>> {
+				Box::pin(async { Ok(false) })
+			}
+		}
+
+		fn test_envoy_handle() -> (EnvoyHandle, mpsc::UnboundedReceiver<ToEnvoyMessage>) {
+			let (envoy_tx, envoy_rx) = mpsc::unbounded_channel();
+			let shared = Arc::new(SharedContext {
+				config: EnvoyConfig {
+					version: 1,
+					endpoint: "http://127.0.0.1:1".to_string(),
+					token: None,
+					namespace: "test".to_string(),
+					pool_name: "test".to_string(),
+					prepopulate_actor_names: HashMap::new(),
+					metadata: None,
+					not_global: true,
+					debug_latency_ms: None,
+					callbacks: Arc::new(IdleEnvoyCallbacks),
+				},
+				envoy_key: "test-envoy".to_string(),
+				envoy_tx,
+				actors: Arc::new(EnvoySharedMutex::new(HashMap::new())),
+				actors_notify: Arc::new(tokio::sync::Notify::new()),
+				live_tunnel_requests: Arc::new(EnvoySharedMutex::new(HashMap::new())),
+				pending_hibernation_restores: Arc::new(EnvoySharedMutex::new(HashMap::new())),
+				ws_tx: Arc::new(tokio::sync::Mutex::new(
+					None::<mpsc::UnboundedSender<WsTxMessage>>,
+				)),
+				protocol_metadata: Arc::new(tokio::sync::Mutex::new(None)),
+				shutting_down: AtomicBool::new(false),
+				last_ping_ts: std::sync::atomic::AtomicI64::new(i64::MAX),
+				stopped_tx: tokio::sync::watch::channel(true).0,
+			});
+
+			(EnvoyHandle::from_shared(shared), envoy_rx)
+		}
+
+		async fn recv_stop_intent(
+			rx: &mut mpsc::UnboundedReceiver<ToEnvoyMessage>,
+			expected_actor_id: &str,
+		) -> Option<String> {
+			let message = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+				.await
+				.expect("timed out waiting for stop intent")
+				.expect("envoy channel closed before stop intent");
+			match message {
+				ToEnvoyMessage::ActorIntent {
+					actor_id,
+					generation,
+					intent: protocol::ActorIntent::ActorIntentStop,
+					error,
+				} => {
+					assert_eq!(actor_id, expected_actor_id);
+					assert_eq!(generation, Some(3));
+					error
+				}
+				_ => panic!("expected stop intent envoy message"),
+			}
+		}
+
+		#[tokio::test(start_paused = true)]
+		async fn destroy_sends_stop_intent_without_error() {
+			let ctx = ActorContext::new_for_sleep_tests("actor-destroy-intent");
+			let (handle, mut rx) = test_envoy_handle();
+			ctx.configure_sleep_envoy(handle, Some(3));
+			ctx.set_started(true);
+
+			ctx.destroy().expect("destroy should succeed after startup");
+
+			let error = recv_stop_intent(&mut rx, "actor-destroy-intent").await;
+			assert_eq!(error, None);
+		}
+
+		#[tokio::test(start_paused = true)]
+		async fn stop_with_error_sends_stop_intent_with_message() {
+			let ctx = ActorContext::new_for_sleep_tests("actor-stop-error-intent");
+			let (handle, mut rx) = test_envoy_handle();
+			ctx.configure_sleep_envoy(handle, Some(3));
+			ctx.set_started(true);
+
+			ctx.stop_with_error("child exited unexpectedly (exit status: 137)")
+				.expect("stop_with_error should succeed after startup");
+
+			let error = recv_stop_intent(&mut rx, "actor-stop-error-intent").await;
+			assert_eq!(
+				error.as_deref(),
+				Some("child exited unexpectedly (exit status: 137)")
+			);
+		}
+
+		#[tokio::test(start_paused = true)]
+		async fn stop_with_error_truncates_long_message() {
+			let ctx = ActorContext::new_for_sleep_tests("actor-stop-error-truncated");
+			let (handle, mut rx) = test_envoy_handle();
+			ctx.configure_sleep_envoy(handle, Some(3));
+			ctx.set_started(true);
+
+			ctx.stop_with_error("x".repeat(1024 * 1024))
+				.expect("stop_with_error should succeed after startup");
+
+			let error = recv_stop_intent(&mut rx, "actor-stop-error-truncated")
+				.await
+				.expect("stop intent should carry the truncated message");
+			assert!(
+				error.len() < 4096,
+				"message must be capped: {}",
+				error.len()
+			);
+			assert!(error.ends_with("... (truncated)"));
+		}
+	}
+
 	// `set_prevent_sleep` is a deprecated no-op kept for NAPI bridge
 	// compatibility. The exhaustive `CanSleep` match below is a build-time
 	// guard against reintroducing a `PreventSleep` enum variant.

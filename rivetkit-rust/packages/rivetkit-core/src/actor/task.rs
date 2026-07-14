@@ -1455,15 +1455,19 @@ impl ActorTask {
 		outcome: std::result::Result<Result<()>, JoinError>,
 	) -> Option<LiveExit> {
 		self.run_handle = None;
-		let clean_exit = match outcome {
-			Ok(Ok(())) => true,
+		let (clean_exit, crash_message) = match outcome {
+			Ok(Ok(())) => (true, None),
 			Ok(Err(error)) => {
 				log_actor_error(&error, "actor run handler failed");
-				false
+				(false, Some(format!("{error:#}")))
 			}
 			Err(error) => {
 				tracing::error!(?error, "actor run handler join failed");
-				false
+				// Deliberate cancellations are not crashes and must not be
+				// reported to the engine as one.
+				let message =
+					(!error.is_cancelled()).then(|| "actor run handler panicked".to_string());
+				(false, message)
 			}
 		};
 
@@ -1476,6 +1480,33 @@ impl ActorTask {
 		}
 
 		if self.lifecycle == LifecycleState::Started {
+			// A failed run handler while `Started` must reach the engine as an
+			// errored stop instead of dying silently until the lost timeout.
+			// Keep the generation alive so the engine's answering `Stop`
+			// command still drives the destroy grace hooks; transitioning to
+			// `Terminated` here would drop the lifecycle inbox before that
+			// command arrives.
+			if let Some(message) = crash_message {
+				match self.ctx.stop_with_error(message.clone()) {
+					Ok(()) => return None,
+					Err(error) => {
+						if self.ctx.destroy_requested() {
+							tracing::debug!(
+								?error,
+								actor_id = %self.ctx.actor_id(),
+								"run handler failed while a stop was already requested"
+							);
+							return None;
+						}
+						tracing::error!(
+							?error,
+							dropped_message = %message,
+							actor_id = %self.ctx.actor_id(),
+							"failed to report run handler error to engine"
+						);
+					}
+				}
+			}
 			self.transition_to(LifecycleState::Terminated);
 		}
 

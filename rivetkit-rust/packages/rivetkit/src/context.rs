@@ -333,6 +333,15 @@ impl<A: Actor> Ctx<A> {
 		self.inner.destroy()
 	}
 
+	/// Requests a stop with an error attached. Behaves like `destroy` locally,
+	/// but the engine records the message as a crash (`StopCode::Error`) and
+	/// applies its crash handling instead of unconditionally destroying the
+	/// actor. Returning an `Err` from `Actor::run` reports the error this way
+	/// automatically.
+	pub fn stop_with_error(&self, message: impl Into<String>) -> Result<()> {
+		self.inner.stop_with_error(message)
+	}
+
 	#[deprecated(note = "no-op: use `keep_awake` or `wait_until` instead")]
 	pub fn set_prevent_sleep(&self, enabled: bool) {
 		#[allow(deprecated)]

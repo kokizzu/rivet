@@ -464,6 +464,19 @@ impl ActorContext {
 	}
 
 	pub fn destroy(&self) -> Result<()> {
+		self.request_stop(None)
+	}
+
+	/// Request a stop with an error attached. Behaves like [`Self::destroy`]
+	/// locally (destroy grace hooks run for this generation), but the envoy
+	/// reports the stop to the engine with `StopCode::Error` and the message,
+	/// so the engine records the crash and applies its crash handling instead
+	/// of unconditionally destroying the actor.
+	pub fn stop_with_error(&self, message: impl Into<String>) -> Result<()> {
+		self.request_stop(Some(truncate_stop_error_message(message.into())))
+	}
+
+	fn request_stop(&self, error: Option<String>) -> Result<()> {
 		// See `sleep` for why the request flags disambiguate `started=false`.
 		// destroy() is allowed after sleep() has been requested because
 		// destroy is a stronger signal that escalates an in-flight sleep.
@@ -477,6 +490,12 @@ impl ActorContext {
 		if self.0.destroy_requested.swap(true, Ordering::SeqCst) {
 			return Err(ActorLifecycleError::Stopping.build())
 				.context("destroy already requested for this generation");
+		}
+		// Winning the swap above makes this the only writer of the error slot
+		// for this generation. The slot is consumed by
+		// `request_destroy_from_envoy` when the stop intent is sent.
+		if error.is_some() {
+			*self.0.sleep.destroy_error.lock() = error;
 		}
 		// Reuse the shared teardown sequence used by the registry shutdown path
 		// so future changes to `mark_destroy_requested` cannot drift.
@@ -1567,6 +1586,24 @@ impl ActorContext {
 			tracing::warn!(operation, "failed to enqueue actor lifecycle event");
 		}
 	}
+}
+
+/// Cap on the stop error message forwarded to the engine. The message is
+/// persisted in engine workflow state and rendered in the dashboard, so
+/// unbounded anyhow chains must be truncated at this boundary.
+const MAX_STOP_ERROR_MESSAGE_LEN: usize = 2048;
+
+fn truncate_stop_error_message(mut message: String) -> String {
+	if message.len() <= MAX_STOP_ERROR_MESSAGE_LEN {
+		return message;
+	}
+	let mut end = MAX_STOP_ERROR_MESSAGE_LEN;
+	while !message.is_char_boundary(end) {
+		end -= 1;
+	}
+	message.truncate(end);
+	message.push_str("... (truncated)");
+	message
 }
 
 fn now_timestamp_ms() -> i64 {

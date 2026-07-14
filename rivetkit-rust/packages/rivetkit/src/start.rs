@@ -1,10 +1,12 @@
 use std::any::{Any, TypeId};
 use std::io::Cursor;
 use std::marker::PhantomData;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use futures::FutureExt;
 use rivetkit_core::actor::ShutdownKind;
 use rivetkit_core::error::{ActorLifecycle, ActorRuntime};
 use rivetkit_core::{ActorEvent, ActorEvents, ActorStart, QueueSendResult, QueueSendStatus, Reply};
@@ -226,11 +228,43 @@ fn spawn_run_task<A: Actor>(
 	cancel: CancellationToken,
 ) -> JoinHandle<Result<()>> {
 	tokio::spawn(async move {
-		tokio::select! {
-			_ = cancel.cancelled() => Ok(()),
-			result = actor.run(ctx) => result,
+		let result = tokio::select! {
+			_ = cancel.cancelled() => return Ok(()),
+			result = AssertUnwindSafe(actor.run(ctx.clone())).catch_unwind() => result,
+		};
+		let result = result.unwrap_or_else(|_| Err(anyhow::anyhow!("actor run handler panicked")));
+		if let Err(error) = &result {
+			report_run_error(&ctx, error);
 		}
+		result
 	})
+}
+
+/// Reports a `run` failure to the engine as an errored stop. The event loop in
+/// `run_actor` does not observe the run task until shutdown, so the report
+/// must happen here for the engine to learn about the crash promptly. Errors
+/// that surface after the abort signal fires are shutdown-induced (cancelled
+/// waits during sleep or destroy) and are not crashes.
+fn report_run_error<A: Actor>(ctx: &Ctx<A>, error: &anyhow::Error) {
+	if ctx.abort_signal().is_cancelled() {
+		tracing::debug!(?error, "actor run task failed during shutdown");
+		return;
+	}
+	if let Err(stop_error) = ctx.stop_with_error(format!("{error:#}")) {
+		if ctx.inner().is_destroy_requested() {
+			tracing::debug!(
+				?stop_error,
+				run_error = ?error,
+				"actor run failed while a stop was already requested"
+			);
+		} else {
+			tracing::error!(
+				?stop_error,
+				run_error = ?error,
+				"failed to report actor run error as errored stop"
+			);
+		}
+	}
 }
 
 async fn stop_run_task<A: Actor>(
@@ -1071,6 +1105,85 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn run_actor_error_requests_errored_stop() {
+		let (tx, rx) = unbounded_channel();
+		let (start, ctx) = unit_start_with_ctx::<FailingRunActor>(rx.into());
+		// The harness has no ActorTask to complete startup, so mark the
+		// lifecycle started directly; stop requests are rejected before then.
+		ctx.inner().set_started(true);
+		let actor = tokio::spawn(run_actor::<FailingRunActor>(start));
+
+		// The errored stop is requested inside the spawned run task right
+		// after `run` returns, so yielding the current-thread runtime drives
+		// it to completion deterministically.
+		for _ in 0..1000 {
+			if ctx.inner().is_destroy_requested() {
+				break;
+			}
+			tokio::task::yield_now().await;
+		}
+		assert!(
+			ctx.inner().is_destroy_requested(),
+			"run error should request an errored stop"
+		);
+
+		drop(tx);
+		let error = actor
+			.await
+			.expect("join run_actor")
+			.expect_err("run_actor should propagate the run error");
+		assert!(format!("{error:#}").contains("boom in run"));
+	}
+
+	#[tokio::test]
+	async fn run_actor_panic_requests_errored_stop() {
+		let (tx, rx) = unbounded_channel();
+		let (start, ctx) = unit_start_with_ctx::<PanickingRunActor>(rx.into());
+		ctx.inner().set_started(true);
+		let actor = tokio::spawn(run_actor::<PanickingRunActor>(start));
+
+		// See run_actor_error_requests_errored_stop for why yielding drives
+		// the spawned run task deterministically.
+		for _ in 0..1000 {
+			if ctx.inner().is_destroy_requested() {
+				break;
+			}
+			tokio::task::yield_now().await;
+		}
+		assert!(
+			ctx.inner().is_destroy_requested(),
+			"run panic should request an errored stop"
+		);
+
+		drop(tx);
+		let error = actor
+			.await
+			.expect("join run_actor")
+			.expect_err("run_actor should propagate the panic as an error");
+		assert!(format!("{error:#}").contains("panicked"));
+	}
+
+	#[tokio::test]
+	async fn run_actor_shutdown_error_is_not_reported_as_crash() {
+		let (tx, rx) = unbounded_channel();
+		let (start, ctx) = unit_start_with_ctx::<ShutdownErrRunActor>(rx.into());
+		ctx.inner().set_started(true);
+		let actor = tokio::spawn(run_actor::<ShutdownErrRunActor>(start));
+
+		// Closing the events channel starts the shutdown join path, which
+		// cancels the abort signal before joining the run task.
+		drop(tx);
+		actor
+			.await
+			.expect("join run_actor")
+			.expect_err("run error should still propagate during shutdown");
+		assert!(
+			!ctx.inner().is_destroy_requested(),
+			"shutdown-induced run errors must not be reported as crashes"
+		);
+	}
+
+	#[tokio::test]
 	async fn run_actor_dispatches_typed_actions_by_arg_shape() {
 		let (tx, rx) = unbounded_channel();
 		let start = action_start(rx.into());
@@ -1612,6 +1725,116 @@ mod tests {
 			ctx.abort_signal().cancelled().await;
 			Ok(())
 		}
+	}
+
+	struct FailingRunActor;
+
+	#[async_trait]
+	impl Actor for FailingRunActor {
+		type State = ();
+		type Input = ();
+		type Actions = ();
+		type Events = ();
+		type Queue = ();
+		type ConnParams = ();
+		type ConnState = ();
+		type Action = action::Raw;
+
+		async fn create_state(_ctx: &Ctx<Self>, (): Self::Input) -> Result<Self::State> {
+			Ok(())
+		}
+
+		async fn create(_ctx: &Ctx<Self>) -> Result<Self> {
+			Ok(Self)
+		}
+
+		async fn run(self: Arc<Self>, _ctx: Ctx<Self>) -> Result<()> {
+			anyhow::bail!("boom in run")
+		}
+	}
+
+	struct PanickingRunActor;
+
+	#[async_trait]
+	impl Actor for PanickingRunActor {
+		type State = ();
+		type Input = ();
+		type Actions = ();
+		type Events = ();
+		type Queue = ();
+		type ConnParams = ();
+		type ConnState = ();
+		type Action = action::Raw;
+
+		async fn create_state(_ctx: &Ctx<Self>, (): Self::Input) -> Result<Self::State> {
+			Ok(())
+		}
+
+		async fn create(_ctx: &Ctx<Self>) -> Result<Self> {
+			Ok(Self)
+		}
+
+		async fn run(self: Arc<Self>, _ctx: Ctx<Self>) -> Result<()> {
+			panic!("run task panic under test");
+		}
+	}
+
+	struct ShutdownErrRunActor;
+
+	#[async_trait]
+	impl Actor for ShutdownErrRunActor {
+		type State = ();
+		type Input = ();
+		type Actions = ();
+		type Events = ();
+		type Queue = ();
+		type ConnParams = ();
+		type ConnState = ();
+		type Action = action::Raw;
+
+		async fn create_state(_ctx: &Ctx<Self>, (): Self::Input) -> Result<Self::State> {
+			Ok(())
+		}
+
+		async fn create(_ctx: &Ctx<Self>) -> Result<Self> {
+			Ok(Self)
+		}
+
+		async fn run(self: Arc<Self>, ctx: Ctx<Self>) -> Result<()> {
+			ctx.abort_signal().cancelled().await;
+			anyhow::bail!("wait cancelled by shutdown")
+		}
+	}
+
+	fn unit_start_with_ctx<A: Actor>(rx: ActorEvents) -> (Start<A>, Ctx<A>) {
+		let ctx = Ctx::new(rivetkit_core::ActorContext::new(
+			"actor-id",
+			"test",
+			Vec::new(),
+			"local",
+		));
+
+		let start = Start {
+			ctx: ctx.clone(),
+			input: Input {
+				bytes: None,
+				_p: PhantomData,
+			},
+			is_new: true,
+			snapshot: Snapshot {
+				is_new: true,
+				bytes: None,
+			},
+			hibernated: Vec::new(),
+			events: Events {
+				ctx: ctx.clone(),
+				rx,
+				_p: PhantomData,
+			},
+			startup_ready: None,
+		};
+
+		(start, ctx)
 	}
 
 	fn cbor<T: Serialize>(value: &T) -> Vec<u8> {

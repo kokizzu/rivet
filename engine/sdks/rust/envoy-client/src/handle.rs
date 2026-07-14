@@ -161,18 +161,6 @@ impl EnvoyHandle {
 		);
 	}
 
-	pub fn destroy_actor(&self, actor_id: String, generation: Option<u32>) {
-		let _ = crate::envoy::send_to_envoy_tx(
-			&self.shared,
-			ToEnvoyMessage::ActorIntent {
-				actor_id,
-				generation,
-				intent: protocol::ActorIntent::ActorIntentStop,
-				error: None,
-			},
-		);
-	}
-
 	pub async fn get_actor(&self, actor_id: &str, generation: Option<u32>) -> Option<ActorInfo> {
 		let (tx, rx) = tokio::sync::oneshot::channel();
 		crate::envoy::send_to_envoy_tx(

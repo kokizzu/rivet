@@ -381,6 +381,55 @@ mod moved_tests {
 		}))
 	}
 
+	fn detached_cleanup_after_failed_run_factory(
+		destroy_count: Arc<AtomicUsize>,
+		run_returned_tx: oneshot::Sender<()>,
+		cleanup_tx: oneshot::Sender<ShutdownKind>,
+	) -> Arc<ActorFactory> {
+		let run_returned_tx = Arc::new(Mutex::new(Some(run_returned_tx)));
+		let cleanup_tx = Arc::new(Mutex::new(Some(cleanup_tx)));
+		Arc::new(ActorFactory::new(ActorConfig::default(), move |start| {
+			let destroy_count = destroy_count.clone();
+			let run_returned_tx = run_returned_tx.clone();
+			let cleanup_tx = cleanup_tx.clone();
+			Box::pin(async move {
+				let mut events = start.events;
+				tokio::spawn(async move {
+					while let Some(event) = events.recv().await {
+						match event {
+							ActorEvent::SerializeState { reply, .. } => {
+								reply.send(Ok(Vec::new()));
+							}
+							ActorEvent::RunGracefulCleanup { reason, reply } => {
+								if matches!(reason, ShutdownKind::Destroy) {
+									destroy_count.fetch_add(1, Ordering::SeqCst);
+								}
+								reply.send(Ok(()));
+								if let Some(tx) = cleanup_tx
+									.lock()
+									.expect("cleanup sender lock poisoned")
+									.take()
+								{
+									let _ = tx.send(reason);
+								}
+								break;
+							}
+							_ => {}
+						}
+					}
+				});
+				if let Some(tx) = run_returned_tx
+					.lock()
+					.expect("run returned sender lock poisoned")
+					.take()
+				{
+					let _ = tx.send(());
+				}
+				anyhow::bail!("run handler failed under test")
+			})
+		}))
+	}
+
 	fn sleep_grace_factory(
 		config: ActorConfig,
 		begin_sleep_count: Arc<AtomicUsize>,
@@ -3480,6 +3529,93 @@ mod moved_tests {
 			panic!("grace should transition to shutdown");
 		};
 		assert_eq!(shutdown_reason, reason);
+		let result = task.run_shutdown(shutdown_reason).await;
+		task.deliver_shutdown_reply(shutdown_reason, &result);
+		task.transition_to(LifecycleState::Terminated);
+		result.expect("shutdown should succeed");
+		stop_rx
+			.await
+			.expect("stop reply should send")
+			.expect("stop should succeed");
+	}
+
+	#[tokio::test]
+	async fn failed_run_exit_requests_errored_stop_and_still_dispatches_cleanup() {
+		let ctx = new_with_kv(
+			"actor-failed-run-stop",
+			"task-failed-run",
+			Vec::new(),
+			"local",
+			new_in_memory(),
+		);
+		let destroy_count = Arc::new(AtomicUsize::new(0));
+		let (run_returned_tx, run_returned_rx) = oneshot::channel();
+		let (cleanup_tx, cleanup_rx) = oneshot::channel();
+		let mut task = new_task_with_factory(
+			ctx.clone(),
+			detached_cleanup_after_failed_run_factory(
+				destroy_count.clone(),
+				run_returned_tx,
+				cleanup_tx,
+			),
+		);
+
+		let (start_tx, start_rx) = oneshot::channel();
+		task.handle_lifecycle(LifecycleCommand::Start { reply: start_tx })
+			.await;
+		start_rx
+			.await
+			.expect("start reply should send")
+			.expect("start should succeed");
+		timeout(Duration::from_secs(2), run_returned_rx)
+			.await
+			.expect("failed run should return")
+			.expect("run returned signal should send");
+
+		let outcome = ActorTask::wait_for_run_handle(task.run_handle.as_mut()).await;
+		assert!(task.handle_run_handle_outcome(outcome).is_none());
+		// The failed run must not terminate the generation locally: the
+		// errored stop request goes to the engine and the answering Stop
+		// command still drives the destroy grace hooks.
+		assert_eq!(task.lifecycle, LifecycleState::Started);
+		assert!(
+			ctx.is_destroy_requested(),
+			"failed run should request an errored stop"
+		);
+
+		let (stop_tx, stop_rx) = oneshot::channel();
+		task.handle_lifecycle(LifecycleCommand::Stop {
+			reason: ShutdownKind::Destroy,
+			reply: stop_tx,
+		})
+		.await;
+		assert_eq!(
+			timeout(Duration::from_secs(2), cleanup_rx)
+				.await
+				.expect("grace cleanup should run after Stop")
+				.expect("cleanup signal should send"),
+			ShutdownKind::Destroy
+		);
+		assert_eq!(destroy_count.load(Ordering::SeqCst), 1);
+
+		timeout(Duration::from_secs(2), async {
+			while ctx.core_dispatched_hook_count() != 0 {
+				yield_now().await;
+			}
+		})
+		.await
+		.expect("core-dispatched cleanup hook should complete");
+
+		let exit = task
+			.try_finish_grace()
+			.expect("grace should finish after cleanup hook completes");
+		let LiveExit::Shutdown {
+			reason: shutdown_reason,
+		} = exit
+		else {
+			panic!("grace should transition to shutdown");
+		};
+		assert_eq!(shutdown_reason, ShutdownKind::Destroy);
 		let result = task.run_shutdown(shutdown_reason).await;
 		task.deliver_shutdown_reply(shutdown_reason, &result);
 		task.transition_to(LifecycleState::Terminated);

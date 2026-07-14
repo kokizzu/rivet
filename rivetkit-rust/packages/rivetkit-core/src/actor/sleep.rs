@@ -47,6 +47,9 @@ pub(crate) struct SleepState {
 	pub(super) envoy_handle: Mutex<Option<EnvoyHandle>>,
 	pub(super) generation: Mutex<Option<u32>>,
 	pub(super) http_request_counter: Mutex<Option<Arc<AsyncCounter>>>,
+	// Forced-sync: written once by whichever caller wins the destroy-request
+	// swap, then consumed when the stop intent is sent to the envoy.
+	pub(super) destroy_error: Mutex<Option<String>>,
 	#[cfg(test)]
 	sleep_request_count: TestAtomicUsize,
 	#[cfg(test)]
@@ -79,6 +82,7 @@ impl SleepState {
 			envoy_handle: Mutex::new(None),
 			generation: Mutex::new(None),
 			http_request_counter: Mutex::new(None),
+			destroy_error: Mutex::new(None),
 			#[cfg(test)]
 			sleep_request_count: TestAtomicUsize::new(0),
 			#[cfg(test)]
@@ -171,8 +175,9 @@ impl ActorContext {
 			.fetch_add(1, Ordering::SeqCst);
 		let envoy_handle = self.0.sleep.envoy_handle.lock().clone();
 		let generation = *self.0.sleep.generation.lock();
+		let error = self.0.sleep.destroy_error.lock().take();
 		if let Some(envoy_handle) = envoy_handle {
-			envoy_handle.destroy_actor(self.actor_id().to_owned(), generation);
+			envoy_handle.stop_actor(self.actor_id().to_owned(), generation, error);
 		}
 	}
 
