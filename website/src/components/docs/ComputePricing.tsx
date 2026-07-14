@@ -22,9 +22,8 @@ export function ComputePricing({ model = defaultModel }: ComputePricingProps) {
 		return (
 			<div className="not-prose rounded-md border border-ink/10 bg-white/55 p-5">
 				<p className="text-sm leading-relaxed text-ink-soft">
-					Rivet Compute is in beta and per-unit rates are being
-					finalized ahead of general availability. You are billed on
-					the resources your running instances use:
+					Per-unit rates for Rivet Compute are being finalized. You
+					are billed on the resources your running instances use:
 				</p>
 				<ul className="mt-3 space-y-1.5 text-sm text-ink-soft">
 					{model.dimensions.map((d) => (
@@ -39,7 +38,7 @@ export function ComputePricing({ model = defaultModel }: ComputePricingProps) {
 				</ul>
 				<p className="mt-3 text-sm leading-relaxed text-ink-soft">
 					{model.billingGranularity} Contact the Rivet team for current
-					beta pricing.
+					pricing.
 				</p>
 			</div>
 		);

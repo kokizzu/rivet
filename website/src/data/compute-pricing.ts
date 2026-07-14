@@ -8,8 +8,8 @@
 //
 // Fill in the real `memoryRate` / `cpuRate` coefficients and any included
 // allotment below, then flip `finalized` to true. While `finalized` is false
-// (or any rate is left null), the docs render a beta notice instead of a rate
-// table so no unverified numbers ship.
+// (or any rate is left null), the docs render a pending-pricing notice instead
+// of a rate table so no unverified numbers ship.
 
 export interface ComputePriceDimension {
 	/** Human-readable dimension name, e.g. "Memory". */
@@ -32,7 +32,8 @@ export interface ComputeIncludedAllotment {
 export interface ComputePricingModel {
 	/**
 	 * Flip to true once every `rate` below is filled in with a real value. While
-	 * false, the docs page renders a beta notice rather than asserting rates.
+	 * false, the docs page renders a pending-pricing notice rather than
+	 * asserting rates.
 	 */
 	finalized: boolean;
 	/** Currency symbol prefixed to rendered rates. */

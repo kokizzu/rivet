@@ -12,9 +12,22 @@ import {
 	faVercel,
 } from "@rivet-gg/icons";
 
+export type Provider =
+	| "rivet"
+	| "vercel"
+	| "cloudflare-workers"
+	| "supabase-functions"
+	| "railway"
+	| "kubernetes"
+	| "aws-ecs"
+	| "gcp-cloud-run"
+	| "hetzner"
+	| "custom"
+	| "custom-platform";
+
 export interface DeployOption {
 	displayName: string;
-	name: string;
+	name: Provider;
 	shortTitle?: string;
 	href: string;
 	description: string;
@@ -24,19 +37,18 @@ export interface DeployOption {
 	specializedPlatform?: boolean;
 }
 
-export const deployOptions = [
+export const deployOptions: DeployOption[] = [
 	{
 		displayName: "Rivet Compute",
-		name: "rivet" as const,
+		name: "rivet",
 		href: "/docs/deploy/rivet-compute",
 		description:
 			"Deploy to Rivet's managed compute platform",
 		icon: faRivet as any,
-		badge: "Beta",
 	},
 	{
 		displayName: "Vercel",
-		name: "vercel" as const,
+		name: "vercel",
 		href: "/docs/deploy/vercel",
 		description: "Deploy Next.js + RivetKit apps to Vercel's edge network",
 		icon: faVercel as any,
@@ -44,7 +56,7 @@ export const deployOptions = [
 	{
 		displayName: "Cloudflare Workers",
 		shortTitle: "Cloudflare",
-		name: "cloudflare-workers" as const,
+		name: "cloudflare-workers",
 		href: "/docs/deploy/cloudflare",
 		description:
 			"Run RivetKit on Cloudflare Workers with the WebAssembly runtime",
@@ -54,7 +66,7 @@ export const deployOptions = [
 	{
 		displayName: "Supabase Functions",
 		shortTitle: "Supabase",
-		name: "supabase-functions" as const,
+		name: "supabase-functions",
 		href: "/docs/deploy/supabase",
 		description:
 			"Run RivetKit on Supabase Edge Functions with the WebAssembly runtime",
@@ -63,14 +75,14 @@ export const deployOptions = [
 	},
 	{
 		displayName: "Railway",
-		name: "railway" as const,
+		name: "railway",
 		href: "/docs/deploy/railway",
 		description: "Deploy containers to Railway's managed infrastructure",
 		icon: faRailway as any,
 	},
 	{
 		displayName: "Kubernetes",
-		name: "kubernetes" as const,
+		name: "kubernetes",
 		href: "/docs/deploy/kubernetes",
 		description: "Deploy to any Kubernetes cluster with container images",
 		icon: faKubernetes as any,
@@ -78,7 +90,7 @@ export const deployOptions = [
 	{
 		displayName: "AWS ECS",
 		shortTitle: "AWS",
-		name: "aws-ecs" as const,
+		name: "aws-ecs",
 		href: "/docs/deploy/aws-ecs",
 		description:
 			"Run containerized workloads on Amazon Elastic Container Service",
@@ -87,21 +99,21 @@ export const deployOptions = [
 	{
 		displayName: "Google Cloud Run",
 		shortTitle: "GCP",
-		name: "gcp-cloud-run" as const,
+		name: "gcp-cloud-run",
 		href: "/docs/deploy/gcp-cloud-run",
 		description: "Deploy containers to Google Cloud Run for auto-scaling",
 		icon: faGoogleCloud,
 	},
 	{
 		displayName: "Hetzner",
-		name: "hetzner" as const,
+		name: "hetzner",
 		href: "/docs/deploy/hetzner",
 		description: "Deploy to Hetzner's cost-effective cloud infrastructure",
 		icon: faHetznerH as any,
 	},
 	{
 		displayName: "VM & Bare Metal",
-		name: "custom" as const,
+		name: "custom",
 		shortTitle: "VM",
 		href: "/docs/deploy/vm-and-bare-metal",
 		description:
@@ -110,12 +122,10 @@ export const deployOptions = [
 	},
 	{
 		displayName: "Custom Platform",
-		name: "custom-platform" as const,
+		name: "custom-platform",
 		href: "/docs/deploy/custom",
 		description:
 			"Integrate RivetKit with any other hosting platform of your choice",
 		icon: faRocket as any,
 	},
-] satisfies DeployOption[];
-
-export type Provider = (typeof deployOptions)[number]["name"];
+];
