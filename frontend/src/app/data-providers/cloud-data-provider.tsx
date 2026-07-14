@@ -30,13 +30,11 @@ function createClient() {
 					delete args.headers?.[key];
 				}
 			});
-			return await fetcher(
-				{
-					...args,
-					maxRetries: 1,
-					withCredentials: true,
-				},
-			);
+			return await fetcher({
+				...args,
+				maxRetries: 1,
+				withCredentials: true,
+			});
 		},
 	});
 }
@@ -1181,6 +1179,41 @@ export const createNamespaceContext = ({
 					);
 					const t = await f;
 					return t.token;
+				},
+			});
+		},
+		createConnectionTokenMutationOptions() {
+			return mutationOptions({
+				mutationKey: [
+					{
+						namespace,
+						project: parent.project,
+						organization: parent.organization,
+					},
+					"tokens",
+					"connection",
+					"create",
+				],
+				mutationFn: async () => {
+					// The pinned cloud SDK does not expose the connection
+					// token endpoint yet, so this calls cloud-api directly
+					// with the session cookie. Replace with
+					// client.namespaces.createConnectionToken once the SDK
+					// ships it.
+					const url = `${cloudEnv().VITE_APP_CLOUD_API_URL}/projects/${encodeURIComponent(parent.project)}/namespaces/${encodeURIComponent(namespace)}/tokens/connection?org=${encodeURIComponent(parent.organization)}`;
+					const response = await fetch(url, {
+						method: "POST",
+						credentials: "include",
+					});
+					if (!response.ok) {
+						throw new Error(
+							`Failed to issue connection token (${response.status})`,
+						);
+					}
+					return (await response.json()) as {
+						token: string;
+						expiresAt?: string;
+					};
 				},
 			});
 		},

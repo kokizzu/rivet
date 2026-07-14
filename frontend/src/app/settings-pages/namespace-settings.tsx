@@ -20,6 +20,7 @@ import { NoProvidersAlert } from "@/components/actors/no-providers-alert";
 import { features } from "@/lib/features";
 import {
 	CloudApiTokens,
+	ConnectionTokens,
 	PublishableToken,
 	SecretToken,
 } from "@/routes/_context/orgs.$organization/projects.$project/ns.$namespace/tokens";
@@ -49,6 +50,7 @@ export function NamespaceAdvancedContent() {
 			<div className="space-y-4">
 				<SecretToken />
 				<PublishableToken />
+				{features.auth ? <ConnectionTokens /> : null}
 				{features.auth ? <CloudApiTokens /> : null}
 				<DatacenterStatus />
 				{features.dangerZone ? <DangerZone /> : null}
