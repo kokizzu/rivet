@@ -359,10 +359,13 @@ registry.startEnvoy();`;
 // The namespace data provider can briefly resolve to `undefined` when the
 // user switches namespace/project from the nav while this drawer is open.
 // The outer/inner split keeps the inner component's hook order stable while
-// the route match changes.
+// the route match changes. The capability check also covers provider
+// instances held in router loader data that predate this card's query
+// options, which happens when a dev hot reload swaps this component without
+// re-running the route loader.
 export function ConnectionTokens() {
 	const dataProvider = useCloudNamespaceDataProvider();
-	if (!dataProvider) {
+	if (!dataProvider?.connectionTokenQueryOptions) {
 		return null;
 	}
 	return <ConnectionTokensInner />;
@@ -371,52 +374,35 @@ export function ConnectionTokens() {
 function ConnectionTokensInner() {
 	const dataProvider = useCloudNamespaceDataProvider();
 
-	const {
-		mutate: issueToken,
-		data,
-		isPending,
-		error,
-	} = useMutation(dataProvider.createConnectionTokenMutationOptions());
+	const { data, isLoading, isError } = useQuery(
+		dataProvider.connectionTokenQueryOptions(),
+	);
 
 	return (
 		<SettingsCard
 			title={
 				<span className="inline-flex items-center gap-2">
-					Connection Tokens
+					Connection Token
 					<Badge variant="secondary">Beta</Badge>
 				</span>
 			}
 			description="Connection tokens can only open connections to existing actors. Use them for clients that must not create actors or manage the namespace."
-			action={
-				<Button
-					className="min-w-32"
-					variant="outline"
-					isLoading={isPending}
-					onClick={() => issueToken()}
-					startIcon={<Icon icon={faPlus} />}
-				>
-					Issue Token
-				</Button>
-			}
 		>
-			{data ? (
-				<div className="space-y-2">
-					<DiscreteInput value={data.token} show />
-					<p className="text-xs text-muted-foreground">
-						{data.expiresAt
-							? `Expires ${new Date(data.expiresAt).toLocaleString()}.`
-							: "Does not expire."}{" "}
-						This token is only shown once, copy it now.
-					</p>
-				</div>
-			) : error ? (
+			{isLoading ? (
+				<Skeleton className="h-10 w-full" />
+			) : isError || !data ? (
 				<p className="text-sm text-destructive">
-					Failed to issue a connection token. {error.message}
+					Failed to load the connection token.
 				</p>
 			) : (
-				<p className="text-sm text-muted-foreground">
-					Issue a token to reveal it here.
-				</p>
+				<div className="space-y-2">
+					<DiscreteInput value={data.token} show />
+					{data.expiresAt ? (
+						<p className="text-xs text-muted-foreground">
+							Expires {new Date(data.expiresAt).toLocaleString()}.
+						</p>
+					) : null}
+				</div>
 			)}
 		</SettingsCard>
 	);

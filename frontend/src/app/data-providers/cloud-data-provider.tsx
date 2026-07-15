@@ -1182,9 +1182,11 @@ export const createNamespaceContext = ({
 				},
 			});
 		},
-		createConnectionTokenMutationOptions() {
-			return mutationOptions({
-				mutationKey: [
+		connectionTokenQueryOptions() {
+			return queryOptions({
+				staleTime: 5 * 60 * 1000, // 5 minutes
+				gcTime: 5 * 60 * 1000, // 5 minutes
+				queryKey: [
 					{
 						namespace,
 						project: parent.project,
@@ -1192,9 +1194,11 @@ export const createNamespaceContext = ({
 					},
 					"tokens",
 					"connection",
-					"create",
 				],
-				mutationFn: async () => {
+				queryFn: async () => {
+					// The endpoint is get-or-create: it returns the
+					// namespace's existing connection token and only mints
+					// one on the first call.
 					return await parent.client.namespaces.createConnectionToken(
 						parent.project,
 						namespace,
