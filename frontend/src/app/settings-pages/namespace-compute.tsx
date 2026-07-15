@@ -574,7 +574,10 @@ function SwitchField({
 // the left of the track, then jumps between the whole vCPU values 1, 2, 4,
 // and 8 as magnetic stops on the right, mirroring the values `rivet deploy`
 // accepts. Positions are integer indices so the fractional zone stays evenly
-// spaced while the whole stops get wider spacing than one step each.
+// spaced while the whole stops get wider spacing than one step each. The
+// value can also be typed directly into the input next to the slider; while
+// a typed value is out of catalog the thumb snaps to the nearest stop and
+// the field shows a validation error.
 const CPU_FRACTIONAL_MAX_INDEX = 92; // (1.00 - 0.08) / 0.01
 const CPU_WHOLE_STOPS = [
 	{ index: 92, cpu: 1 },
@@ -623,13 +626,6 @@ function cpuToSliderIndex(cpu: number): number {
 	return nearest.index;
 }
 
-function formatCpu(cpu: number): string {
-	if (!Number.isFinite(cpu)) {
-		return "1";
-	}
-	return cpu < 1 ? cpu.toFixed(2) : String(cpu);
-}
-
 function CpuField() {
 	const { control, getValues, trigger } = useComputeForm();
 	// An out-of-catalog CPU value from the server cannot be represented by a
@@ -651,20 +647,27 @@ function CpuField() {
 					<FormItem className={FIELD_ITEM_CLASS}>
 						<FormLabel className={FIELD_LABEL_CLASS}>CPU</FormLabel>
 						<div className="flex w-56 flex-col items-end gap-1.5">
-							<span className="font-mono text-sm text-foreground">
-								{formatCpu(cpu)} vCPU
-							</span>
-							<FormControl>
-								<Slider
-									min={0}
-									max={CPU_SLIDER_MAX}
-									step={1}
-									value={[cpuToSliderIndex(cpu)]}
-									onValueChange={([next]) =>
-										field.onChange(sliderIndexToCpu(next))
-									}
-								/>
-							</FormControl>
+							<div className="flex items-center gap-1.5">
+								<FormControl>
+									<Input
+										className="h-8 w-20 text-right font-mono"
+										inputMode="decimal"
+										{...field}
+									/>
+								</FormControl>
+								<span className="text-sm text-muted-foreground">
+									vCPU
+								</span>
+							</div>
+							<Slider
+								min={0}
+								max={CPU_SLIDER_MAX}
+								step={1}
+								value={[cpuToSliderIndex(cpu)]}
+								onValueChange={([next]) =>
+									field.onChange(sliderIndexToCpu(next))
+								}
+							/>
 							<div className="relative h-4 w-full font-mono text-[10px] text-muted-foreground">
 								{CPU_TICKS.map((tick) => (
 									<span
