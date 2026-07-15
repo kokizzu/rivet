@@ -13,8 +13,8 @@ use crate::{
 	},
 	credentials::{resolve_token, write_credentials},
 	util::{
-		build_resources, default_image_tag, docker_build, docker_login, encode, parse_env_vars,
-		resolve_max_concurrent_actors, run_command,
+		build_resources, build_runner_config, default_image_tag, docker_build, docker_login,
+		encode, parse_env_vars, run_command,
 	},
 };
 
@@ -64,14 +64,23 @@ pub struct Opts {
 	/// Minimum number of actors to keep running. Range 0 to 100. Defaults to 0 server-side.
 	#[arg(long)]
 	min_scale: Option<u32>,
-	/// Maximum number of actors to scale to. Range 1 to 500. Defaults to 1 server-side.
+	/// Maximum number of actors to scale to. Range 1 to 5000. Defaults to 1 server-side.
 	#[arg(long)]
 	max_scale: Option<u32>,
 	/// Maximum number of concurrent actors the pool runs. Range 1 to 50000.
-	/// Defaults to 1000.
+	/// Defaults to 1000 server-side.
 	#[arg(long)]
 	max_concurrent_actors: Option<u32>,
-	/// Number of concurrent requests each actor instance handles. Range 1 to 2000.
+	/// Seconds a draining runner instance waits for running actors to finish
+	/// before stopping. Range 5 to 3200. Defaults to 1800 server-side.
+	#[arg(long)]
+	drain_grace_period: Option<u32>,
+	/// Whether deploying a new version drains runner instances on the old
+	/// version. Pass --drain-on-version-upgrade=false to disable. Defaults to
+	/// true server-side.
+	#[arg(long, num_args = 0..=1, default_missing_value = "true")]
+	drain_on_version_upgrade: Option<bool>,
+	/// Number of concurrent requests each actor instance handles. Range 1 to 500.
 	/// Defaults to 80 server-side.
 	#[arg(long)]
 	instance_request_concurrency: Option<u32>,
@@ -101,7 +110,11 @@ impl Opts {
 			self.max_scale,
 			self.instance_request_concurrency,
 		)?;
-		let max_concurrent_actors = resolve_max_concurrent_actors(self.max_concurrent_actors)?;
+		let runner_config = build_runner_config(
+			self.max_concurrent_actors,
+			self.drain_grace_period,
+			self.drain_on_version_upgrade,
+		)?;
 
 		let cloud = CloudClient::new(&self.cloud_api, token.clone())?;
 		tracing::info!("inspecting Rivet Cloud token");
@@ -179,7 +192,6 @@ impl Opts {
 		tracing::info!("upserting managed pool");
 		let mut pool_body = json!({
 			"displayName": "Default",
-			"maxConcurrentActors": max_concurrent_actors,
 		});
 		if let Some((image_name, tag)) = image {
 			pool_body["image"] = json!({
@@ -190,6 +202,9 @@ impl Opts {
 		let env_map = parse_env_vars(&self.env_vars)?;
 		if !env_map.is_empty() {
 			pool_body["environment"] = serde_json::to_value(env_map)?;
+		}
+		if let Some(runner_config) = runner_config {
+			pool_body["runnerConfig"] = runner_config;
 		}
 		if let Some(resources) = resources {
 			pool_body["resources"] = resources;

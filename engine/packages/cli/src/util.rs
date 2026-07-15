@@ -36,8 +36,8 @@ pub fn parse_env_vars(vars: &[String]) -> Result<BTreeMap<String, String>> {
 /// The accepted ranges mirror the server-side `computePoolConfigResources`
 /// schema:
 /// - `min_scale`: integer in `0..=100`
-/// - `max_scale`: integer in `1..=500`
-/// - `instance_request_concurrency`: integer in `1..=2000`
+/// - `max_scale`: integer in `1..=5000`
+/// - `instance_request_concurrency`: integer in `1..=500`
 /// - `cpu`: vCPU count in `0.08..=8`; any value in `[0.08, 1)` rounded to two
 ///   decimals, or exactly `1`, `2`, `4`, or `8`
 /// - `memory`: string matching `^(\d+)(Mi|Gi)$` between `512Mi` and `4Gi`
@@ -116,16 +116,55 @@ pub fn build_resources(
 	Ok(Some(Value::Object(resources)))
 }
 
-/// Resolves the `maxConcurrentActors` pool-config value, applying the
-/// server-side default of `1000` when unset and validating the accepted range.
+/// Validates the optional runner-config flags and builds the `runnerConfig`
+/// object for the managed-pool upsert body. Returns `Ok(None)` when every flag
+/// is unset so the server keeps the pool's current runner config.
 ///
-/// Mirrors the server-side schema: an integer in `1..=50000`.
-pub fn resolve_max_concurrent_actors(max_concurrent_actors: Option<u32>) -> Result<u32> {
-	let value = max_concurrent_actors.unwrap_or(1000);
-	if !(1..=50000).contains(&value) {
-		bail!("--max-concurrent-actors must be between 1 and 50000, got {value}");
+/// The accepted ranges mirror the server-side
+/// `computePoolConfigRunnerConfigOverride` schema:
+/// - `max_concurrent_actors`: integer in `1..=50000`
+/// - `drain_grace_period`: seconds, integer in `5..=3200`
+pub fn build_runner_config(
+	max_concurrent_actors: Option<u32>,
+	drain_grace_period: Option<u32>,
+	drain_on_version_upgrade: Option<bool>,
+) -> Result<Option<Value>> {
+	if max_concurrent_actors.is_none()
+		&& drain_grace_period.is_none()
+		&& drain_on_version_upgrade.is_none()
+	{
+		return Ok(None);
 	}
-	Ok(value)
+
+	let mut runner_config = serde_json::Map::new();
+
+	if let Some(max_concurrent_actors) = max_concurrent_actors {
+		if !(1..=50000).contains(&max_concurrent_actors) {
+			bail!(
+				"--max-concurrent-actors must be between 1 and 50000, got {max_concurrent_actors}"
+			);
+		}
+		runner_config.insert(
+			"maxConcurrentActors".to_string(),
+			json!(max_concurrent_actors),
+		);
+	}
+
+	if let Some(drain_grace_period) = drain_grace_period {
+		if !(5..=3200).contains(&drain_grace_period) {
+			bail!("--drain-grace-period must be between 5 and 3200, got {drain_grace_period}");
+		}
+		runner_config.insert("drainGracePeriod".to_string(), json!(drain_grace_period));
+	}
+
+	if let Some(drain_on_version_upgrade) = drain_on_version_upgrade {
+		runner_config.insert(
+			"drainOnVersionUpgrade".to_string(),
+			json!(drain_on_version_upgrade),
+		);
+	}
+
+	Ok(Some(Value::Object(runner_config)))
 }
 
 /// Parses a memory string of the form `^(\d+)(Mi|Gi)$` into mebibytes.
@@ -277,16 +316,16 @@ mod tests {
 	fn max_scale_bounds() {
 		assert!(build_resources(None, None, None, Some(0), None).is_err());
 		assert!(build_resources(None, None, None, Some(1), None).is_ok());
-		assert!(build_resources(None, None, None, Some(500), None).is_ok());
-		assert!(build_resources(None, None, None, Some(501), None).is_err());
+		assert!(build_resources(None, None, None, Some(5000), None).is_ok());
+		assert!(build_resources(None, None, None, Some(5001), None).is_err());
 	}
 
 	#[test]
 	fn instance_request_concurrency_bounds() {
 		assert!(build_resources(None, None, None, None, Some(0)).is_err());
 		assert!(build_resources(None, None, None, None, Some(1)).is_ok());
-		assert!(build_resources(None, None, None, None, Some(2000)).is_ok());
-		assert!(build_resources(None, None, None, None, Some(2001)).is_err());
+		assert!(build_resources(None, None, None, None, Some(500)).is_ok());
+		assert!(build_resources(None, None, None, None, Some(501)).is_err());
 	}
 
 	#[test]
@@ -312,14 +351,47 @@ mod tests {
 	}
 
 	#[test]
-	fn max_concurrent_actors_default_and_bounds() {
-		// Defaults to 1000 when unset.
-		assert_eq!(resolve_max_concurrent_actors(None).unwrap(), 1000);
-		assert_eq!(resolve_max_concurrent_actors(Some(5000)).unwrap(), 5000);
-		assert!(resolve_max_concurrent_actors(Some(1)).is_ok());
-		assert!(resolve_max_concurrent_actors(Some(50000)).is_ok());
-		assert!(resolve_max_concurrent_actors(Some(0)).is_err());
-		assert!(resolve_max_concurrent_actors(Some(50001)).is_err());
+	fn runner_config_none_when_all_unset() {
+		assert!(build_runner_config(None, None, None).unwrap().is_none());
+	}
+
+	#[test]
+	fn runner_config_builds_only_provided_fields() {
+		let runner_config = build_runner_config(Some(5000), None, None)
+			.unwrap()
+			.unwrap();
+		assert_eq!(runner_config, json!({ "maxConcurrentActors": 5000 }));
+	}
+
+	#[test]
+	fn runner_config_builds_full_object() {
+		let runner_config = build_runner_config(Some(5000), Some(60), Some(false))
+			.unwrap()
+			.unwrap();
+		assert_eq!(
+			runner_config,
+			json!({
+				"maxConcurrentActors": 5000,
+				"drainGracePeriod": 60,
+				"drainOnVersionUpgrade": false
+			})
+		);
+	}
+
+	#[test]
+	fn runner_config_max_concurrent_actors_bounds() {
+		assert!(build_runner_config(Some(0), None, None).is_err());
+		assert!(build_runner_config(Some(1), None, None).is_ok());
+		assert!(build_runner_config(Some(50000), None, None).is_ok());
+		assert!(build_runner_config(Some(50001), None, None).is_err());
+	}
+
+	#[test]
+	fn runner_config_drain_grace_period_bounds() {
+		assert!(build_runner_config(None, Some(4), None).is_err());
+		assert!(build_runner_config(None, Some(5), None).is_ok());
+		assert!(build_runner_config(None, Some(3200), None).is_ok());
+		assert!(build_runner_config(None, Some(3201), None).is_err());
 	}
 
 	#[test]
