@@ -1195,25 +1195,11 @@ export const createNamespaceContext = ({
 					"create",
 				],
 				mutationFn: async () => {
-					// The pinned cloud SDK does not expose the connection
-					// token endpoint yet, so this calls cloud-api directly
-					// with the session cookie. Replace with
-					// client.namespaces.createConnectionToken once the SDK
-					// ships it.
-					const url = `${cloudEnv().VITE_APP_CLOUD_API_URL}/projects/${encodeURIComponent(parent.project)}/namespaces/${encodeURIComponent(namespace)}/tokens/connection?org=${encodeURIComponent(parent.organization)}`;
-					const response = await fetch(url, {
-						method: "POST",
-						credentials: "include",
-					});
-					if (!response.ok) {
-						throw new Error(
-							`Failed to issue connection token (${response.status})`,
-						);
-					}
-					return (await response.json()) as {
-						token: string;
-						expiresAt?: string;
-					};
+					return await parent.client.namespaces.createConnectionToken(
+						parent.project,
+						namespace,
+						{ org: parent.organization },
+					);
 				},
 			});
 		},
