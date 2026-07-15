@@ -1,9 +1,13 @@
 import type { Rivet } from "@rivet-gg/cloud";
+import { faCircleExclamation, Icon } from "@rivet-gg/icons";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { type ReactNode, useEffect } from "react";
 import { useFormState } from "react-hook-form";
 import z from "zod";
 import {
+	Alert,
+	AlertDescription,
+	AlertTitle,
 	Code,
 	cn,
 	createSchemaForm,
@@ -227,16 +231,27 @@ function NamespaceComputeContentInner() {
 
 	if (isError || !pool?.config) {
 		return (
-			<SettingsCard title="Deployment">
-				<SmallText className="text-muted-foreground">
-					Failed to load the Rivet Compute deployment for this
-					namespace.
-				</SmallText>
-			</SettingsCard>
+			<div className="space-y-4">
+				{pool?.status === "error" ? (
+					<PoolErrorAlert error={pool.error} />
+				) : null}
+				<SettingsCard title="Deployment">
+					<SmallText className="text-muted-foreground">
+						Failed to load the Rivet Compute deployment for this
+						namespace.
+					</SmallText>
+				</SettingsCard>
+			</div>
 		);
 	}
 
-	return <ComputeForm config={pool.config} status={pool.status} />;
+	return (
+		<ComputeForm
+			config={pool.config}
+			status={pool.status}
+			error={pool.error}
+		/>
+	);
 }
 
 function isPoolBusy(
@@ -251,12 +266,33 @@ function isPoolBusy(
 	);
 }
 
+// Surfaces the pool's error state at the top of the tab so a failed deploy
+// is visible without opening the CLI or logs.
+function PoolErrorAlert({
+	error,
+}: {
+	error: Rivet.ManagedPoolsGetResponse.ManagedPool.Error_ | undefined;
+}) {
+	return (
+		<Alert variant="destructive">
+			<Icon icon={faCircleExclamation} className="size-4" />
+			<AlertTitle>Deployment failed</AlertTitle>
+			<AlertDescription>
+				{error?.message ??
+					"The compute pool is in an error state. Redeploy to retry."}
+			</AlertDescription>
+		</Alert>
+	);
+}
+
 function ComputeForm({
 	config,
 	status,
+	error,
 }: {
 	config: Rivet.ManagedPoolsGetResponse.ManagedPool.Config;
 	status: Rivet.ManagedPoolsGetResponse.ManagedPool.Status;
+	error: Rivet.ManagedPoolsGetResponse.ManagedPool.Error_ | undefined;
 }) {
 	const dataProvider = useCloudNamespaceDataProvider();
 	const queryClient = useQueryClient();
@@ -351,6 +387,7 @@ function ComputeForm({
 			}}
 		>
 			<div className="space-y-4">
+				{status === "error" ? <PoolErrorAlert error={error} /> : null}
 				<SettingsCard
 					divided
 					title="Deployment"
