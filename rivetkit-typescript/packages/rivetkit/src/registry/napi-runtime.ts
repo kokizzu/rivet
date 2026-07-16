@@ -36,6 +36,7 @@ import type {
 	RuntimeSqlExecuteResult,
 	RuntimeSqlQueryResult,
 	RuntimeSqlRunResult,
+	SqliteTransactionHandle,
 	RuntimeStateDeltaPayload,
 	RuntimeWebSocketEvent,
 	WebSocketHandle,
@@ -45,6 +46,9 @@ import { normalizeRuntimeSqlExecuteResult } from "./runtime";
 type NativeBindings = typeof import("@rivetkit/rivetkit-napi");
 type NapiSqlDatabase = ReturnType<NativeActorContext["sql"]>;
 type NapiSqlBindParams = Parameters<NapiSqlDatabase["execute"]>[1];
+type NapiSqlTransaction = Awaited<
+	ReturnType<NapiSqlDatabase["beginTransaction"]>
+>;
 
 function asNativeRegistry(handle: RegistryHandle): NativeCoreRegistry {
 	return handle as unknown as NativeCoreRegistry;
@@ -64,6 +68,12 @@ function asNativeConn(handle: ConnHandle): NativeConnHandle {
 
 function asNativeWebSocket(handle: WebSocketHandle): NativeWebSocket {
 	return handle as unknown as NativeWebSocket;
+}
+
+function asNativeSqlTransaction(
+	handle: SqliteTransactionHandle,
+): NapiSqlTransaction {
+	return handle as unknown as NapiSqlTransaction;
 }
 
 function asNativeCancellationToken(
@@ -612,6 +622,46 @@ export class NapiCoreRuntime implements CoreRuntime {
 			toNapiSqlBindParams(params),
 		);
 		return normalizeRuntimeSqlExecuteResult(result);
+	}
+
+	async actorSqlBeginTransaction(
+		ctx: ActorContextHandle,
+		timeoutMs?: number,
+	): Promise<SqliteTransactionHandle> {
+		return (await this.#actorSql(ctx).beginTransaction(
+			timeoutMs,
+		)) as unknown as SqliteTransactionHandle;
+	}
+
+	async actorSqlTransactionExec(
+		transaction: SqliteTransactionHandle,
+		sql: string,
+	): Promise<RuntimeSqlExecResult> {
+		return await asNativeSqlTransaction(transaction).exec(sql);
+	}
+
+	async actorSqlTransactionExecute(
+		transaction: SqliteTransactionHandle,
+		sql: string,
+		params?: RuntimeSqlBindParams,
+	): Promise<RuntimeSqlExecuteResult> {
+		const result = await asNativeSqlTransaction(transaction).execute(
+			sql,
+			toNapiSqlBindParams(params),
+		);
+		return normalizeRuntimeSqlExecuteResult(result);
+	}
+
+	async actorSqlTransactionCommit(
+		transaction: SqliteTransactionHandle,
+	): Promise<void> {
+		await asNativeSqlTransaction(transaction).commit();
+	}
+
+	async actorSqlTransactionRollback(
+		transaction: SqliteTransactionHandle,
+	): Promise<void> {
+		await asNativeSqlTransaction(transaction).rollback();
 	}
 
 	async actorSqlQuery(

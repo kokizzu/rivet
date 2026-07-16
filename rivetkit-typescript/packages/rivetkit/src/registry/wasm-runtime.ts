@@ -45,6 +45,7 @@ import type {
 	RuntimeSqlExecuteResult,
 	RuntimeSqlQueryResult,
 	RuntimeSqlRunResult,
+	SqliteTransactionHandle,
 	RuntimeStateDeltaPayload,
 	RuntimeWebSocketEvent,
 	WebSocketHandle,
@@ -699,6 +700,64 @@ export class WasmCoreRuntime implements CoreRuntime {
 			this.#actorSql(ctx).execute(sql, params),
 		);
 		return normalizeRuntimeSqlExecuteResult(result);
+	}
+
+	async actorSqlBeginTransaction(
+		ctx: ActorContextHandle,
+		timeoutMs?: number,
+	): Promise<SqliteTransactionHandle> {
+		return (await callWasm(() =>
+			this.#actorSql(ctx).beginTransaction(timeoutMs),
+		)) as unknown as SqliteTransactionHandle;
+	}
+
+	async actorSqlTransactionExec(
+		transaction: SqliteTransactionHandle,
+		sql: string,
+	): Promise<RuntimeSqlExecResult> {
+		return await callWasm(() =>
+			(
+				transaction as unknown as {
+					exec(sql: string): Promise<RuntimeSqlExecResult>;
+				}
+			).exec(sql),
+		);
+	}
+
+	async actorSqlTransactionExecute(
+		transaction: SqliteTransactionHandle,
+		sql: string,
+		params?: RuntimeSqlBindParams,
+	): Promise<RuntimeSqlExecuteResult> {
+		const result = await callWasm(() =>
+			(
+				transaction as unknown as {
+					execute(
+						sql: string,
+						params?: RuntimeSqlBindParams,
+					): Promise<RuntimeSqlExecuteResult>;
+				}
+			).execute(sql, params),
+		);
+		return normalizeRuntimeSqlExecuteResult(result);
+	}
+
+	async actorSqlTransactionCommit(
+		transaction: SqliteTransactionHandle,
+	): Promise<void> {
+		await callWasm(() =>
+			(transaction as unknown as { commit(): Promise<void> }).commit(),
+		);
+	}
+
+	async actorSqlTransactionRollback(
+		transaction: SqliteTransactionHandle,
+	): Promise<void> {
+		await callWasm(() =>
+			(
+				transaction as unknown as { rollback(): Promise<void> }
+			).rollback(),
+		);
 	}
 
 	async actorSqlQuery(

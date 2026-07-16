@@ -94,6 +94,9 @@ mod moved_tests {
 			ws_tx: Arc::new(tokio::sync::Mutex::new(
 				None::<mpsc::UnboundedSender<WsTxMessage>>,
 			)),
+			connection_session: std::sync::atomic::AtomicU64::new(0),
+			next_connection_session: std::sync::atomic::AtomicU64::new(0),
+			connection_session_tx: tokio::sync::watch::channel(0).0,
 			protocol_metadata: Arc::new(tokio::sync::Mutex::new(None)),
 			shutting_down: AtomicBool::new(false),
 			last_ping_ts: std::sync::atomic::AtomicI64::new(i64::MAX),

@@ -8,8 +8,15 @@ import type {
 	DatabaseProviderContext,
 	RawAccess,
 	SqliteDatabase,
+	SqliteTransactionDatabase,
 } from "@/common/database/config";
-import { toSqliteBindings } from "@/common/database/shared";
+import { getLogger } from "@/common/log";
+import {
+	isManualTransactionControl,
+	MIGRATION_TRANSACTION_TIMEOUT_MS,
+	toSqliteBindings,
+	validateTransactionTimeout,
+} from "@/common/database/shared";
 import { sha256Hex } from "@/utils/crypto";
 
 export type { SQLiteTable } from "drizzle-orm/sqlite-core";
@@ -28,8 +35,16 @@ export {
 } from "drizzle-orm/sqlite-core";
 
 type DrizzleSchema = Record<string, unknown>;
-type DrizzleDatabase<TSchema extends DrizzleSchema> =
-	SqliteRemoteDatabase<TSchema> & RawAccess;
+type DrizzleDatabase<TSchema extends DrizzleSchema> = Omit<
+	SqliteRemoteDatabase<TSchema>,
+	"transaction"
+> &
+	Omit<RawAccess, "transaction"> & {
+		transaction: <T>(
+			callback: (tx: DrizzleDatabase<TSchema>) => Promise<T> | T,
+			options?: { timeout?: number },
+		) => Promise<T>;
+	};
 
 interface DrizzleMigrationJournalEntry {
 	idx: number;
@@ -47,6 +62,7 @@ interface DrizzleDatabaseFactoryConfig<TSchema extends DrizzleSchema> {
 	schema?: TSchema;
 	migrations?: DrizzleMigrations;
 	onMigrate?: (db: DrizzleDatabase<TSchema>) => Promise<void> | void;
+	warnOnManualTransactions?: boolean;
 }
 
 interface DrizzleKitConfig {
@@ -69,6 +85,7 @@ export function db<TSchema extends DrizzleSchema = Record<string, never>>({
 	schema,
 	migrations,
 	onMigrate,
+	warnOnManualTransactions = true,
 }: DrizzleDatabaseFactoryConfig<TSchema> = {}): DatabaseProvider<
 	DrizzleDatabase<TSchema>
 > {
@@ -90,6 +107,7 @@ export function db<TSchema extends DrizzleSchema = Record<string, never>>({
 
 			const nativeDb = await nativeDatabaseProvider.open(ctx.actorId);
 			let closed = false;
+			let manualTransactionWarned = false;
 			const ensureOpen = () => {
 				if (closed) {
 					throw new Error(
@@ -98,107 +116,178 @@ export function db<TSchema extends DrizzleSchema = Record<string, never>>({
 				}
 			};
 
-			const runSql = async (
-				query: string,
-				params: unknown[],
-				method: "run" | "all" | "values" | "get",
-			) => {
-				ensureOpen();
+			const createDrizzleClient = (
+				target: SqliteDatabase | SqliteTransactionDatabase,
+				transactionScoped = false,
+			): DrizzleDatabase<TSchema> => {
+				const runSql = async (
+					query: string,
+					params: unknown[],
+					method: "run" | "all" | "values" | "get",
+				) => {
+					ensureOpen();
+					warnForManualTransaction(query, transactionScoped);
 
-				const start = performance.now();
-				const kvReadsBefore = ctx.metrics?.totalKvReads ?? 0;
-				const kvWritesBefore = ctx.metrics?.totalKvWrites ?? 0;
-				try {
-					const { rows } = await nativeDb.execute(
-						query,
-						toSqliteBindings(params),
-					);
-					if (method === "run") {
-						return { rows: [] };
+					const start = performance.now();
+					const kvReadsBefore = ctx.metrics?.totalKvReads ?? 0;
+					const kvWritesBefore = ctx.metrics?.totalKvWrites ?? 0;
+					try {
+						const { rows } = await target.execute(
+							query,
+							toSqliteBindings(params),
+						);
+						if (method === "run") {
+							return { rows: [] };
+						}
+						if (method === "get") {
+							return { rows: rows[0] };
+						}
+						return { rows };
+					} finally {
+						const durationMs = performance.now() - start;
+						ctx.metrics?.trackSql(query, durationMs);
+						if (ctx.metrics) {
+							ctx.log?.debug({
+								msg: "sql query",
+								query: query.slice(0, 120),
+								durationMs,
+								kvReads:
+									ctx.metrics.totalKvReads - kvReadsBefore,
+								kvWrites:
+									ctx.metrics.totalKvWrites - kvWritesBefore,
+							});
+						}
 					}
-					if (method === "get") {
-						return { rows: rows[0] };
-					}
-					return { rows };
-				} finally {
-					const durationMs = performance.now() - start;
-					ctx.metrics?.trackSql(query, durationMs);
-					if (ctx.metrics) {
-						ctx.log?.debug({
-							msg: "sql query",
-							query: query.slice(0, 120),
-							durationMs,
-							kvReads: ctx.metrics.totalKvReads - kvReadsBefore,
-							kvWrites:
-								ctx.metrics.totalKvWrites - kvWritesBefore,
-						});
-					}
-				}
-			};
+				};
 
-			const callback: RemoteCallback = async (query, params, method) => {
-				return await runSql(query, params, method);
-			};
-
-			const drizzleDb = drizzle(callback, {
-				schema,
-			}) as DrizzleDatabase<TSchema>;
-			drizzleDb.execute = async <
-				TRow extends Record<string, unknown> = Record<string, unknown>,
-			>(
-				query: string,
-				...args: unknown[]
-			): Promise<TRow[]> => {
-				return await executeRaw<TRow>(
-					nativeDb,
-					ctx,
-					ensureOpen,
+				const callback: RemoteCallback = async (
 					query,
-					args,
+					params,
+					method,
+				) => {
+					return await runSql(query, params, method);
+				};
+
+				const drizzleDb = drizzle(callback, {
+					schema,
+				}) as unknown as DrizzleDatabase<TSchema>;
+				drizzleDb.execute = async <
+					TRow extends Record<string, unknown> = Record<
+						string,
+						unknown
+					>,
+				>(
+					query: string,
+					...args: unknown[]
+				): Promise<TRow[]> => {
+					return await executeRaw<TRow>(
+						target,
+						ctx,
+						ensureOpen,
+						query,
+						args,
+						() =>
+							warnForManualTransaction(query, transactionScoped),
+					);
+				};
+				drizzleDb.transaction = async <T>(
+					transactionCallback: (
+						tx: DrizzleDatabase<TSchema>,
+					) => Promise<T> | T,
+					options?: { timeout?: number },
+				): Promise<T> => {
+					validateTransactionTimeout(options?.timeout);
+					const transaction = await nativeDb.beginTransaction(
+						options?.timeout,
+					);
+					const tx = createDrizzleClient(transaction, true);
+					try {
+						const result = await transactionCallback(tx);
+						await transaction.commit();
+						return result;
+					} catch (error) {
+						try {
+							await transaction.rollback();
+						} catch {
+							// Preserve the callback or commit error after expiry cleanup.
+						}
+						throw error;
+					}
+				};
+				drizzleDb.close = async () => {
+					if (!closed) {
+						closed = true;
+						await nativeDb.close();
+					}
+				};
+
+				return drizzleDb;
+			};
+
+			const warnForManualTransaction = (
+				query: string,
+				transactionScoped: boolean,
+			) => {
+				if (
+					transactionScoped ||
+					!warnOnManualTransactions ||
+					manualTransactionWarned ||
+					hasMultipleStatements(query) ||
+					!isManualTransactionControl(query)
+				) {
+					return;
+				}
+				manualTransactionWarned = true;
+				getLogger("database").warn(
+					{ actorId: ctx.actorId },
+					"Manual cross-call SQLite transactions can interleave with other actor work. Use db.transaction() for coordinated transactions. Set warnOnManualTransactions: false in your db(...) configuration to disable this warning.",
 				);
 			};
-			drizzleDb.close = async () => {
-				if (!closed) {
-					closed = true;
-					await nativeDb.close();
-				}
-			};
 
-			return drizzleDb;
+			return createDrizzleClient(nativeDb);
 		},
 		onMigrate: async (client) => {
 			if (!migrations && !onMigrate) {
 				return;
 			}
-			await withMigrationSavepoint(client, async () => {
+			await withMigrationSavepoint(client, async (leased) => {
 				if (migrations) {
-					await runMigrations(client, migrations);
+					await runMigrations(leased, migrations);
 				}
 				if (onMigrate) {
-					await onMigrate(client);
+					await onMigrate(leased);
 				}
 			});
 		},
 	};
 }
 
-async function withMigrationSavepoint<T>(
-	client: RawAccess,
-	callback: () => Promise<T> | T,
+async function withMigrationSavepoint<TSchema extends DrizzleSchema, T>(
+	client: DrizzleDatabase<TSchema>,
+	callback: (leased: DrizzleDatabase<TSchema>) => Promise<T> | T,
 ): Promise<T> {
-	await client.execute("SAVEPOINT __rivet_on_migrate");
-	try {
-		const result = await callback();
-		await client.execute("RELEASE SAVEPOINT __rivet_on_migrate");
-		return result;
-	} catch (error) {
-		try {
-			await client.execute("ROLLBACK TO SAVEPOINT __rivet_on_migrate");
-		} finally {
-			await client.execute("RELEASE SAVEPOINT __rivet_on_migrate");
-		}
-		throw error;
-	}
+	return await client.transaction(
+		async (leased) => {
+			await leased.execute("SAVEPOINT __rivet_on_migrate");
+			try {
+				const result = await callback(leased);
+				await leased.execute("RELEASE SAVEPOINT __rivet_on_migrate");
+				return result;
+			} catch (error) {
+				try {
+					await leased.execute(
+						"ROLLBACK TO SAVEPOINT __rivet_on_migrate",
+					);
+				} finally {
+					await leased.execute(
+						"RELEASE SAVEPOINT __rivet_on_migrate",
+					);
+				}
+				throw error;
+			}
+		},
+		{ timeout: MIGRATION_TRANSACTION_TIMEOUT_MS },
+	);
 }
 
 async function runMigrations<TSchema extends DrizzleSchema>(
@@ -281,13 +370,15 @@ function rowToObject<TRow extends Record<string, unknown>>(
 }
 
 async function executeRaw<TRow extends Record<string, unknown>>(
-	db: SqliteDatabase,
+	db: SqliteDatabase | SqliteTransactionDatabase,
 	ctx: DatabaseProviderContext,
 	ensureOpen: () => void,
 	query: string,
 	args: unknown[],
+	warnForManualTransaction: () => void,
 ): Promise<TRow[]> {
 	ensureOpen();
+	warnForManualTransaction();
 
 	const start = performance.now();
 	const kvReadsBefore = ctx.metrics?.totalKvReads ?? 0;
@@ -302,7 +393,7 @@ async function executeRaw<TRow extends Record<string, unknown>>(
 		}
 
 		if (!hasMultipleStatements(query)) {
-			const { rows, columns } = await db.execute(query);
+			const { rows, columns } = await db.execute(query, undefined);
 			return rows.map((row) => rowToObject<TRow>(row, columns));
 		}
 

@@ -103,6 +103,20 @@ impl EnvoyHandle {
 		self.shared.config.token.as_deref()
 	}
 
+	/// Returns the current WebSocket session ID, or `None` while disconnected.
+	/// This is an internal client-side affinity token; it is never sent over the
+	/// Envoy protocol.
+	#[doc(hidden)]
+	pub fn connection_session(&self) -> Option<u64> {
+		let session = self.shared.connection_session.load(Ordering::Acquire);
+		(session != 0).then_some(session)
+	}
+
+	#[doc(hidden)]
+	pub fn subscribe_connection_session(&self) -> tokio::sync::watch::Receiver<u64> {
+		self.shared.connection_session_tx.subscribe()
+	}
+
 	pub fn namespace(&self) -> &str {
 		&self.shared.config.namespace
 	}
@@ -498,8 +512,9 @@ impl EnvoyHandle {
 		request: protocol::SqliteExecRequest,
 	) -> anyhow::Result<protocol::SqliteExecResponse> {
 		match self
-			.send_remote_sqlite_request(RemoteSqliteRequest::Exec(request))
+			.send_remote_sqlite_request(RemoteSqliteRequest::Exec(request), None)
 			.await?
+			.response
 		{
 			RemoteSqliteResponse::Exec(response) => Ok(response),
 			_ => anyhow::bail!("unexpected remote sqlite exec response type"),
@@ -511,10 +526,45 @@ impl EnvoyHandle {
 		request: protocol::SqliteExecuteRequest,
 	) -> anyhow::Result<protocol::SqliteExecuteResponse> {
 		match self
-			.send_remote_sqlite_request(RemoteSqliteRequest::Execute(request))
+			.send_remote_sqlite_request(RemoteSqliteRequest::Execute(request), None)
 			.await?
+			.response
 		{
 			RemoteSqliteResponse::Execute(response) => Ok(response),
+			_ => anyhow::bail!("unexpected remote sqlite execute response type"),
+		}
+	}
+
+	/// Executes remote SQLite on one exact WebSocket session and returns the
+	/// session that carried the response. Passing `None` allows an unsent request
+	/// to wait for the next connection; passing `Some` fails before sending if
+	/// that session has disconnected.
+	#[doc(hidden)]
+	pub async fn remote_sqlite_exec_with_session(
+		&self,
+		request: protocol::SqliteExecRequest,
+		expected_session: Option<u64>,
+	) -> anyhow::Result<(protocol::SqliteExecResponse, u64)> {
+		let envelope = self
+			.send_remote_sqlite_request(RemoteSqliteRequest::Exec(request), expected_session)
+			.await?;
+		match envelope.response {
+			RemoteSqliteResponse::Exec(response) => Ok((response, envelope.session)),
+			_ => anyhow::bail!("unexpected remote sqlite exec response type"),
+		}
+	}
+
+	#[doc(hidden)]
+	pub async fn remote_sqlite_execute_with_session(
+		&self,
+		request: protocol::SqliteExecuteRequest,
+		expected_session: Option<u64>,
+	) -> anyhow::Result<(protocol::SqliteExecuteResponse, u64)> {
+		let envelope = self
+			.send_remote_sqlite_request(RemoteSqliteRequest::Execute(request), expected_session)
+			.await?;
+		match envelope.response {
+			RemoteSqliteResponse::Execute(response) => Ok((response, envelope.session)),
 			_ => anyhow::bail!("unexpected remote sqlite execute response type"),
 		}
 	}
@@ -699,7 +749,8 @@ impl EnvoyHandle {
 	async fn send_remote_sqlite_request(
 		&self,
 		request: RemoteSqliteRequest,
-	) -> anyhow::Result<RemoteSqliteResponse> {
+		expected_session: Option<u64>,
+	) -> anyhow::Result<crate::sqlite::RemoteSqliteResponseEnvelope> {
 		let kind = request.kind();
 		let total_start = crate::time::Instant::now();
 		let submit_start = crate::time::Instant::now();
@@ -708,6 +759,7 @@ impl EnvoyHandle {
 			&self.shared,
 			ToEnvoyMessage::RemoteSqliteRequest {
 				request,
+				expected_session,
 				response_tx: tx,
 			},
 		)

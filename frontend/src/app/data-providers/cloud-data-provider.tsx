@@ -19,23 +19,77 @@ import {
 } from "./engine-data-provider";
 import { no404Retry } from "./utilities";
 
+type CloudFetchFunction = NonNullable<RivetClient.Options["fetcher"]>;
+type CloudFetchResult = Awaited<ReturnType<CloudFetchFunction>>;
+type CloudRawResponse = CloudFetchResult["rawResponse"];
+
+async function resolveCloudHeaders(
+	headers: Parameters<CloudFetchFunction>[0]["headers"],
+): Promise<Record<string, string | undefined>> {
+	const resolvedHeaders: Record<string, string | undefined> = {};
+	for (const [key, value] of Object.entries(headers ?? {})) {
+		if (key.toLowerCase().startsWith("x-fern-") || value == null) {
+			continue;
+		}
+		const resolved =
+			typeof value === "function" ? await value() : await value;
+		if (resolved != null) {
+			resolvedHeaders[key] = resolved;
+		}
+	}
+	return resolvedHeaders;
+}
+
+function cloudRawResponse(
+	url: string,
+	result: Awaited<ReturnType<typeof fetcher>>,
+): CloudRawResponse {
+	const status = result.ok
+		? 200
+		: result.error.reason === "status-code" ||
+				result.error.reason === "non-json"
+			? result.error.statusCode
+			: result.error.reason === "timeout"
+				? 499
+				: 0;
+	return {
+		headers: new Headers(result.ok ? result.headers : undefined),
+		redirected: false,
+		status,
+		statusText: result.ok ? "OK" : "",
+		type: result.ok ? "basic" : "error",
+		url,
+	};
+}
+
+const cloudFetcher: CloudFetchFunction = async <R = unknown>(
+	args: Parameters<CloudFetchFunction>[0],
+) => {
+	const result = await fetcher<R>({
+		...args,
+		headers: await resolveCloudHeaders(args.headers),
+		queryParameters: args.queryParameters as Parameters<
+			typeof fetcher
+		>[0]["queryParameters"],
+		responseType:
+			args.responseType === "binary-response"
+				? "arrayBuffer"
+				: args.responseType,
+		maxRetries: 1,
+		withCredentials: true,
+	});
+	return {
+		...result,
+		rawResponse: cloudRawResponse(args.url, result),
+	};
+};
+
 function createClient() {
 	return new RivetClient({
 		baseUrl: () => cloudEnv().VITE_APP_CLOUD_API_URL,
 		environment: "",
 		token: async () => "",
-		fetcher: async (args) => {
-			Object.keys(args.headers || {}).forEach((key) => {
-				if (key.toLowerCase().startsWith("x-fern-")) {
-					delete args.headers?.[key];
-				}
-			});
-			return await fetcher({
-				...args,
-				maxRetries: 1,
-				withCredentials: true,
-			});
-		},
+		fetcher: cloudFetcher,
 	});
 }
 

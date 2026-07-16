@@ -25,9 +25,7 @@ export function SandboxMount({
 				title="Mount a sandbox"
 				description="Mount a full sandbox at /sandbox for heavy workloads like browsers or native compilation. agentOS itself stays lightweight; this is optional."
 				selected={value.enabled}
-				onSelect={() =>
-					onChange({ ...value, enabled: !value.enabled })
-				}
+				onSelect={() => onChange({ ...value, enabled: !value.enabled })}
 			/>
 			{value.enabled ? (
 				<div>

@@ -23,6 +23,37 @@ use crate::metrics::METRICS;
 use crate::stringify::stringify_to_envoy;
 use crate::stringify::stringify_to_rivet;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WsSendResult {
+	Sent { session: u64 },
+	Unavailable,
+	StaleSession { current: Option<u64> },
+}
+
+pub(crate) async fn install_connection(
+	shared: &SharedContext,
+	tx: tokio::sync::mpsc::UnboundedSender<WsTxMessage>,
+) -> u64 {
+	let mut guard = shared.ws_tx.lock().await;
+	let session = shared
+		.next_connection_session
+		.fetch_add(1, Ordering::AcqRel)
+		.saturating_add(1);
+	shared.connection_session.store(session, Ordering::Release);
+	*guard = Some(tx);
+	drop(guard);
+	shared.connection_session_tx.send_replace(session);
+	session
+}
+
+pub(crate) async fn remove_connection(shared: &SharedContext) {
+	let mut guard = shared.ws_tx.lock().await;
+	*guard = None;
+	shared.connection_session.store(0, Ordering::Release);
+	drop(guard);
+	shared.connection_session_tx.send_replace(0);
+}
+
 #[cfg(all(feature = "native-transport", feature = "wasm-transport"))]
 compile_error!(
 	"`native-transport` and `wasm-transport` are mutually exclusive. Enable exactly one envoy-client transport."
@@ -106,6 +137,22 @@ async fn forward_to_envoy(shared: &SharedContext, message: protocol::ToEnvoy) {
 
 /// Send a message over the WebSocket. Returns true if the message could not be sent.
 pub async fn ws_send(shared: &SharedContext, message: protocol::ToRivet) -> bool {
+	!matches!(
+		ws_send_for_session(shared, message, None).await,
+		WsSendResult::Sent { .. }
+	)
+}
+
+/// Atomically checks a request's WebSocket affinity and admits it to the
+/// writer. The session comparison deliberately happens while holding the same
+/// mutex used by connect/disconnect. A coordinator-side check alone would have
+/// a race where the old connection disappears immediately before the send and
+/// the transaction statement is accidentally queued for its replacement.
+pub(crate) async fn ws_send_for_session(
+	shared: &SharedContext,
+	message: protocol::ToRivet,
+	expected_session: Option<u64>,
+) -> WsSendResult {
 	if tracing::enabled!(tracing::Level::DEBUG) {
 		tracing::debug!(data = stringify_to_rivet(&message), "sending message");
 	}
@@ -120,6 +167,14 @@ pub async fn ws_send(shared: &SharedContext, message: protocol::ToRivet) -> bool
 		.observe(wait_elapsed.as_secs_f64());
 
 	let hold_start = crate::time::Instant::now();
+	let current = shared.connection_session.load(Ordering::Acquire);
+	if let Some(expected) = expected_session
+		&& current != expected
+	{
+		return WsSendResult::StaleSession {
+			current: (current != 0).then_some(current),
+		};
+	}
 	let Some(tx) = guard.as_ref() else {
 		// Still observe hold duration on the early-return path.
 		METRICS
@@ -127,19 +182,21 @@ pub async fn ws_send(shared: &SharedContext, message: protocol::ToRivet) -> bool
 			.with_label_values(&[message_kind])
 			.observe(hold_start.elapsed().as_secs_f64());
 		tracing::error!("websocket not available for sending");
-		return true;
+		return WsSendResult::Unavailable;
 	};
 
 	let encoded = crate::protocol::versioned::ToRivet::wrap_latest(message)
 		.serialize(protocol::PROTOCOL_VERSION)
 		.expect("failed to encode message");
-	let _ = tx.send(WsTxMessage::Send(encoded));
+	if tx.send(WsTxMessage::Send(encoded)).is_err() {
+		return WsSendResult::Unavailable;
+	}
 	drop(guard);
 	METRICS
 		.ws_tx_lock_hold_duration_seconds
 		.with_label_values(&[message_kind])
 		.observe(hold_start.elapsed().as_secs_f64());
-	false
+	WsSendResult::Sent { session: current }
 }
 
 /// Bounded label set for `ws_tx` send paths.

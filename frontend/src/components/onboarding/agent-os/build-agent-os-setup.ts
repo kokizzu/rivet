@@ -34,7 +34,9 @@ function importName(slug: string): string {
 }
 
 function resolveAgent(slug: string) {
-	const found = AGENTS.find((a) => a.slug === slug && a.status === "available");
+	const found = AGENTS.find(
+		(a) => a.slug === slug && a.status === "available",
+	);
 	// Fall back to the default available agent (Pi) if an unavailable one slips through.
 	return found?.package
 		? found
@@ -164,7 +166,9 @@ function buildPrompt(opts: {
 
 	const softwareList =
 		softwareEntries.length > 0
-			? softwareEntries.map((s) => `- ${s.title} (${s.package})`).join("\n")
+			? softwareEntries
+					.map((s) => `- ${s.title} (${s.package})`)
+					.join("\n")
 			: "- (none beyond the agent)";
 
 	const sandboxSection = sandboxEnabled

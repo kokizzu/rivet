@@ -1,8 +1,10 @@
+use std::time::Duration;
+
 use napi::bindgen_prelude::Buffer;
 use napi_derive::napi;
 use rivetkit_core::sqlite::{
 	BindParam, ColumnValue, ExecuteResult as CoreExecuteResult, QueryResult as CoreQueryResult,
-	SqliteDb as CoreSqliteDb,
+	SqliteDb as CoreSqliteDb, SqliteTransaction as CoreSqliteTransaction,
 };
 
 use crate::{NapiInvalidArgument, napi_anyhow_error};
@@ -11,6 +13,12 @@ use crate::{NapiInvalidArgument, napi_anyhow_error};
 pub struct JsNativeDatabase {
 	db: CoreSqliteDb,
 	actor_id: Option<String>,
+}
+
+#[napi]
+#[derive(Clone)]
+pub struct JsSqliteTransaction {
+	transaction: CoreSqliteTransaction,
 }
 
 impl JsNativeDatabase {
@@ -158,6 +166,83 @@ impl JsNativeDatabase {
 	pub async fn close(&self) -> napi::Result<()> {
 		self.db.close().await.map_err(crate::napi_anyhow_error)
 	}
+
+	#[napi]
+	pub async fn begin_transaction(
+		&self,
+		timeout_ms: Option<f64>,
+	) -> napi::Result<JsSqliteTransaction> {
+		let timeout = timeout_ms.map(transaction_timeout).transpose()?;
+		let transaction = self
+			.db
+			.begin_transaction(timeout)
+			.await
+			.map_err(crate::napi_anyhow_error)?;
+		Ok(JsSqliteTransaction { transaction })
+	}
+}
+
+#[napi]
+impl JsSqliteTransaction {
+	#[napi]
+	pub async fn execute(
+		&self,
+		sql: String,
+		params: Option<Vec<JsBindParam>>,
+	) -> napi::Result<NativeExecuteResult> {
+		let params = params.map(js_bind_params_to_core).transpose()?;
+		self.transaction
+			.execute(sql, params)
+			.await
+			.map(core_execute_result_to_js)
+			.map_err(crate::napi_anyhow_error)
+	}
+
+	#[napi]
+	pub async fn exec(&self, sql: String) -> napi::Result<QueryResult> {
+		self.transaction
+			.exec(sql)
+			.await
+			.map(core_query_result_to_js)
+			.map_err(crate::napi_anyhow_error)
+	}
+
+	#[napi]
+	pub async fn commit(&self) -> napi::Result<()> {
+		self.transaction
+			.commit()
+			.await
+			.map_err(crate::napi_anyhow_error)
+	}
+
+	#[napi]
+	pub async fn rollback(&self) -> napi::Result<()> {
+		self.transaction
+			.rollback()
+			.await
+			.map_err(crate::napi_anyhow_error)
+	}
+}
+
+fn transaction_timeout(timeout_ms: f64) -> napi::Result<Duration> {
+	if !timeout_ms.is_finite() || timeout_ms <= 0.0 {
+		return Err(napi_anyhow_error(
+			NapiInvalidArgument {
+				argument: "timeout".to_owned(),
+				reason: "must be a positive finite number of milliseconds".to_owned(),
+			}
+			.build(),
+		));
+	}
+	Duration::try_from_secs_f64(timeout_ms / 1_000.0).map_err(|_| {
+		napi_anyhow_error(
+			NapiInvalidArgument {
+				argument: "timeout".to_owned(),
+				reason: "is too large to represent".to_owned(),
+			}
+			.build(),
+		)
+	})
 }
 
 fn js_bind_params_to_core(params: Vec<JsBindParam>) -> napi::Result<Vec<BindParam>> {

@@ -30,7 +30,10 @@ function Harness({ initial }: { initial: AgentOsSelections }) {
 						<AgentSelect value={agent} onChange={setAgent} />
 					</Section>
 					<Section title="Software">
-						<SoftwareSelect value={packages} onChange={setPackages} />
+						<SoftwareSelect
+							value={packages}
+							onChange={setPackages}
+						/>
 					</Section>
 					<Section title="Sandbox & mounts">
 						<SandboxMount value={sandbox} onChange={setSandbox} />

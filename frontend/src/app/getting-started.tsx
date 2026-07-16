@@ -599,8 +599,9 @@ function SkipOnboardingHeaderLink() {
 
 function OnboardingProgress({ action }: { action?: ReactNode }) {
 	const s = stepper.useStepper();
-	const { isStepVisible, visibleStepIndex, visibleStepCount } =
-		useContext(StepVisibilityContext);
+	const { isStepVisible, visibleStepIndex, visibleStepCount } = useContext(
+		StepVisibilityContext,
+	);
 	// Count only steps visible for the current path (agentOS adds steps that are
 	// hidden for the actor path), so "Step X of N" and the dots stay accurate.
 	const steps = s.all.filter((step) => isStepVisible(step.id));
@@ -751,7 +752,9 @@ function BuildTargetCard({
 					: "border-border hover:border-muted-foreground/50",
 			)}
 		>
-			<span className="text-muted-foreground mt-0.5 shrink-0">{icon}</span>
+			<span className="text-muted-foreground mt-0.5 shrink-0">
+				{icon}
+			</span>
 			<div className="min-w-0">
 				<div className="flex items-center gap-2">
 					<p className="text-sm font-medium">{label}</p>

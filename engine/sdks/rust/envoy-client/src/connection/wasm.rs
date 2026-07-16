@@ -157,10 +157,7 @@ mod imp {
 		}
 
 		let (ws_tx, mut ws_rx) = mpsc::unbounded_channel::<WsTxMessage>();
-		{
-			let mut guard = shared.ws_tx.lock().await;
-			*guard = Some(ws_tx);
-		}
+		super::super::install_connection(shared, ws_tx).await;
 
 		tracing::info!(
 			endpoint = %shared.config.endpoint,
@@ -234,10 +231,7 @@ mod imp {
 			}
 		}
 
-		{
-			let mut guard = shared.ws_tx.lock().await;
-			*guard = None;
-		}
+		super::super::remove_connection(shared).await;
 
 		close_if_open(&ws);
 		ws.set_onopen(None);

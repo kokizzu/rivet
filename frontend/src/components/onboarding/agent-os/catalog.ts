@@ -49,7 +49,8 @@ export const AGENTS: AgentEntry[] = [
 	{
 		slug: "claude-code",
 		title: "Claude Code",
-		description: "Anthropic's agent with full tool, file, and shell access.",
+		description:
+			"Anthropic's agent with full tool, file, and shell access.",
 		status: "available",
 		// Package not yet documented (docs page 404s); follows the
 		// agent-os-<slug> naming style. Verify before relying on the install.

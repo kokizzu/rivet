@@ -1,11 +1,14 @@
 use rivet_envoy_protocol as protocol;
 use tokio::sync::oneshot;
 
-use crate::connection::ws_send;
+use crate::connection::{WsSendResult, ws_send, ws_send_for_session};
 use crate::envoy::EnvoyContext;
 use crate::kv::KV_EXPIRE_MS;
 use crate::metrics::METRICS;
-use crate::utils::{EnvoyShutdownError, RemoteSqliteIndeterminateResultError};
+use crate::utils::{
+	EnvoyShutdownError, RemoteSqliteConnectionSessionLostError,
+	RemoteSqliteIndeterminateResultError,
+};
 
 #[derive(Clone)]
 pub enum SqliteRequest {
@@ -39,6 +42,12 @@ pub enum RemoteSqliteResponse {
 	Execute(protocol::SqliteExecuteResponse),
 }
 
+#[derive(Debug)]
+pub struct RemoteSqliteResponseEnvelope {
+	pub response: RemoteSqliteResponse,
+	pub session: u64,
+}
+
 impl RemoteSqliteRequest {
 	fn operation(&self) -> &'static str {
 		match self {
@@ -64,7 +73,9 @@ pub struct SqliteRequestEntry {
 
 pub struct RemoteSqliteRequestEntry {
 	pub request: RemoteSqliteRequest,
-	pub response_tx: oneshot::Sender<anyhow::Result<RemoteSqliteResponse>>,
+	pub response_tx: oneshot::Sender<anyhow::Result<RemoteSqliteResponseEnvelope>>,
+	pub expected_session: Option<u64>,
+	pub sent_session: Option<u64>,
 	pub sent: bool,
 	pub timestamp: crate::time::Instant,
 }
@@ -100,7 +111,8 @@ pub async fn handle_sqlite_request(
 pub async fn handle_remote_sqlite_request(
 	ctx: &mut EnvoyContext,
 	request: RemoteSqliteRequest,
-	response_tx: oneshot::Sender<anyhow::Result<RemoteSqliteResponse>>,
+	expected_session: Option<u64>,
+	response_tx: oneshot::Sender<anyhow::Result<RemoteSqliteResponseEnvelope>>,
 ) {
 	let request_id = ctx.next_remote_sqlite_request_id;
 	ctx.next_remote_sqlite_request_id += 1;
@@ -108,6 +120,8 @@ pub async fn handle_remote_sqlite_request(
 	let entry = RemoteSqliteRequestEntry {
 		request,
 		response_tx,
+		expected_session,
+		sent_session: None,
 		sent: false,
 		timestamp: crate::time::Instant::now(),
 	};
@@ -115,14 +129,7 @@ pub async fn handle_remote_sqlite_request(
 	ctx.remote_sqlite_requests.insert(request_id, entry);
 	METRICS.remote_sqlite_requests_inflight.inc();
 
-	let ws_available = {
-		let guard = ctx.shared.ws_tx.lock().await;
-		guard.is_some()
-	};
-
-	if ws_available {
-		send_single_remote_sqlite_request(ctx, request_id).await;
-	}
+	send_single_remote_sqlite_request(ctx, request_id).await;
 }
 
 pub async fn handle_sqlite_get_pages_response(
@@ -203,7 +210,12 @@ fn handle_remote_sqlite_response(
 
 	if let Some(request) = request {
 		METRICS.remote_sqlite_requests_inflight.dec();
-		let _ = request.response_tx.send(Ok(response));
+		let session = request
+			.sent_session
+			.expect("a remote sqlite response must belong to a sent request");
+		let _ = request
+			.response_tx
+			.send(Ok(RemoteSqliteResponseEnvelope { response, session }));
 	} else {
 		tracing::error!(
 			request_id,
@@ -245,14 +257,45 @@ pub async fn send_single_remote_sqlite_request(ctx: &mut EnvoyContext, request_i
 		return;
 	}
 
+	let expected_session = request.expected_session;
 	let message = remote_sqlite_request_to_message(request_id, request.request.clone());
 
-	ws_send(&ctx.shared, message).await;
-
-	if let Some(request) = ctx.remote_sqlite_requests.get_mut(&request_id) {
-		request.sent = true;
-		request.timestamp = crate::time::Instant::now();
+	match ws_send_for_session(&ctx.shared, message, expected_session).await {
+		WsSendResult::Sent { session } => {
+			if let Some(request) = ctx.remote_sqlite_requests.get_mut(&request_id) {
+				request.sent = true;
+				request.sent_session = Some(session);
+				request.timestamp = crate::time::Instant::now();
+			}
+		}
+		WsSendResult::Unavailable if expected_session.is_none() => {
+			// Ordinary requests that have never crossed the socket remain eligible
+			// for replay. A transaction-affine request takes the error branch below.
+		}
+		WsSendResult::Unavailable => {
+			fail_remote_sqlite_session_request(ctx, request_id, None);
+		}
+		WsSendResult::StaleSession { current } => {
+			fail_remote_sqlite_session_request(ctx, request_id, current);
+		}
 	}
+}
+
+fn fail_remote_sqlite_session_request(
+	ctx: &mut EnvoyContext,
+	request_id: u32,
+	current: Option<u64>,
+) {
+	let Some(request) = ctx.remote_sqlite_requests.remove(&request_id) else {
+		return;
+	};
+	METRICS.remote_sqlite_requests_inflight.dec();
+	let expected = request
+		.expected_session
+		.expect("only session-affine requests fail session admission");
+	let _ = request.response_tx.send(Err(anyhow::anyhow!(
+		RemoteSqliteConnectionSessionLostError { expected, current }
+	)));
 }
 
 pub fn remote_sqlite_request_to_message(
@@ -521,6 +564,9 @@ mod tests {
 			ws_tx: Arc::new(tokio::sync::Mutex::new(
 				None::<tokio::sync::mpsc::UnboundedSender<WsTxMessage>>,
 			)),
+			connection_session: std::sync::atomic::AtomicU64::new(0),
+			next_connection_session: std::sync::atomic::AtomicU64::new(0),
+			connection_session_tx: tokio::sync::watch::channel(0).0,
 			protocol_metadata: Arc::new(tokio::sync::Mutex::new(None)),
 			shutting_down: std::sync::atomic::AtomicBool::new(false),
 			last_ping_ts: std::sync::atomic::AtomicI64::new(0),
@@ -568,9 +614,18 @@ mod tests {
 	#[tokio::test]
 	async fn remote_sqlite_exec_response_matches_pending_request() {
 		let mut ctx = new_envoy_context();
+		let (ws_tx, mut ws_rx) = tokio::sync::mpsc::unbounded_channel();
+		let session = crate::connection::install_connection(&ctx.shared, ws_tx).await;
 		let (tx, rx) = oneshot::channel();
 
-		handle_remote_sqlite_request(&mut ctx, RemoteSqliteRequest::Exec(exec_request()), tx).await;
+		handle_remote_sqlite_request(
+			&mut ctx,
+			RemoteSqliteRequest::Exec(exec_request()),
+			None,
+			tx,
+		)
+		.await;
+		assert!(matches!(ws_rx.recv().await, Some(WsTxMessage::Send(_))));
 		assert!(ctx.remote_sqlite_requests.contains_key(&0));
 
 		handle_remote_sqlite_exec_response(
@@ -593,7 +648,8 @@ mod tests {
 			.await
 			.expect("response sender should complete")
 			.expect("response should succeed");
-		match response {
+		assert_eq!(response.session, session);
+		match response.response {
 			RemoteSqliteResponse::Exec(protocol::SqliteExecResponse::SqliteExecOk(ok)) => {
 				assert_eq!(ok.result.columns, vec!["one"]);
 				assert_eq!(ok.result.rows.len(), 1);
@@ -635,6 +691,7 @@ mod tests {
 		handle_remote_sqlite_request(
 			&mut ctx,
 			RemoteSqliteRequest::Execute(execute_request()),
+			None,
 			tx,
 		)
 		.await;
@@ -652,12 +709,13 @@ mod tests {
 	async fn sent_remote_sqlite_request_fails_indeterminate_on_disconnect() {
 		let mut ctx = new_envoy_context();
 		let (ws_tx, mut ws_rx) = tokio::sync::mpsc::unbounded_channel();
-		*ctx.shared.ws_tx.lock().await = Some(ws_tx);
+		crate::connection::install_connection(&ctx.shared, ws_tx).await;
 		let (tx, rx) = oneshot::channel();
 
 		handle_remote_sqlite_request(
 			&mut ctx,
 			RemoteSqliteRequest::Execute(execute_request()),
+			None,
 			tx,
 		)
 		.await;
@@ -690,6 +748,7 @@ mod tests {
 		handle_remote_sqlite_request(
 			&mut ctx,
 			RemoteSqliteRequest::Execute(execute_request()),
+			None,
 			tx,
 		)
 		.await;
@@ -708,7 +767,7 @@ mod tests {
 		assert!(ctx.remote_sqlite_requests.contains_key(&0));
 
 		let (ws_tx, mut ws_rx) = tokio::sync::mpsc::unbounded_channel();
-		*ctx.shared.ws_tx.lock().await = Some(ws_tx);
+		crate::connection::install_connection(&ctx.shared, ws_tx).await;
 		process_unsent_remote_sqlite_requests(&mut ctx).await;
 
 		assert!(matches!(ws_rx.recv().await, Some(WsTxMessage::Send(_))));
@@ -718,5 +777,37 @@ mod tests {
 				.expect("request should still be pending")
 				.sent
 		);
+	}
+
+	#[tokio::test]
+	async fn transaction_request_never_crosses_connection_sessions() {
+		let mut ctx = new_envoy_context();
+		let (first_tx, _first_rx) = tokio::sync::mpsc::unbounded_channel();
+		let first_session = crate::connection::install_connection(&ctx.shared, first_tx).await;
+		crate::connection::remove_connection(&ctx.shared).await;
+		let (second_tx, mut second_rx) = tokio::sync::mpsc::unbounded_channel();
+		let second_session = crate::connection::install_connection(&ctx.shared, second_tx).await;
+		assert_ne!(first_session, second_session);
+
+		let (response_tx, response_rx) = oneshot::channel();
+		handle_remote_sqlite_request(
+			&mut ctx,
+			RemoteSqliteRequest::Execute(execute_request()),
+			Some(first_session),
+			response_tx,
+		)
+		.await;
+
+		let error = response_rx
+			.await
+			.expect("response sender should complete")
+			.expect_err("stale transaction session must fail before send");
+		let lost = error
+			.downcast_ref::<RemoteSqliteConnectionSessionLostError>()
+			.expect("error should identify the stale session");
+		assert_eq!(lost.expected, first_session);
+		assert_eq!(lost.current, Some(second_session));
+		assert!(second_rx.try_recv().is_err(), "stale request was sent");
+		assert!(ctx.remote_sqlite_requests.is_empty());
 	}
 }

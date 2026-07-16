@@ -26,7 +26,7 @@ use crate::kv::{
 };
 use crate::metrics::METRICS;
 use crate::sqlite::{
-	RemoteSqliteRequest, RemoteSqliteRequestEntry, RemoteSqliteResponse, SqliteRequest,
+	RemoteSqliteRequest, RemoteSqliteRequestEntry, RemoteSqliteResponseEnvelope, SqliteRequest,
 	SqliteRequestEntry, SqliteResponse, cleanup_old_remote_sqlite_requests,
 	cleanup_old_sqlite_requests, fail_remote_sqlite_requests_with_shutdown,
 	fail_sent_remote_sqlite_requests_with_indeterminate_result, fail_sqlite_requests_with_shutdown,
@@ -106,7 +106,8 @@ pub enum ToEnvoyMessage {
 	},
 	RemoteSqliteRequest {
 		request: RemoteSqliteRequest,
-		response_tx: oneshot::Sender<anyhow::Result<RemoteSqliteResponse>>,
+		expected_session: Option<u64>,
+		response_tx: oneshot::Sender<anyhow::Result<RemoteSqliteResponseEnvelope>>,
 	},
 	BufferTunnelMsg {
 		msg: protocol::ToRivetTunnelMessage,
@@ -295,6 +296,7 @@ fn start_envoy_sync_inner(config: EnvoyConfig) -> EnvoyHandle {
 	let (envoy_tx, envoy_rx) = mpsc::unbounded_channel::<ToEnvoyMessage>();
 	let (start_tx, start_rx) = tokio::sync::watch::channel(());
 	let (stopped_tx, _stopped_rx) = tokio::sync::watch::channel(false);
+	let (connection_session_tx, _connection_session_rx) = tokio::sync::watch::channel(0);
 
 	let envoy_key = uuid::Uuid::new_v4().to_string();
 	let shared = Arc::new(SharedContext {
@@ -306,6 +308,9 @@ fn start_envoy_sync_inner(config: EnvoyConfig) -> EnvoyHandle {
 		live_tunnel_requests: Arc::new(std::sync::Mutex::new(HashMap::new())),
 		pending_hibernation_restores: Arc::new(std::sync::Mutex::new(HashMap::new())),
 		ws_tx: Arc::new(tokio::sync::Mutex::new(None)),
+		connection_session: std::sync::atomic::AtomicU64::new(0),
+		next_connection_session: std::sync::atomic::AtomicU64::new(0),
+		connection_session_tx,
 		protocol_metadata: Arc::new(tokio::sync::Mutex::new(None)),
 		shutting_down: std::sync::atomic::AtomicBool::new(false),
 		last_ping_ts: std::sync::atomic::AtomicI64::new(0),
@@ -386,8 +391,8 @@ async fn envoy_loop(
 					ToEnvoyMessage::SqliteRequest { request, response_tx } => {
 						handle_sqlite_request(&mut ctx, request, response_tx).await;
 					}
-					ToEnvoyMessage::RemoteSqliteRequest { request, response_tx } => {
-						handle_remote_sqlite_request(&mut ctx, request, response_tx).await;
+					ToEnvoyMessage::RemoteSqliteRequest { request, expected_session, response_tx } => {
+						handle_remote_sqlite_request(&mut ctx, request, expected_session, response_tx).await;
 					}
 					ToEnvoyMessage::BufferTunnelMsg { msg } => {
 						ctx.buffered_messages.push(msg);

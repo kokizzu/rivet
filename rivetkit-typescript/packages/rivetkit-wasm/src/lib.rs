@@ -1998,6 +1998,65 @@ impl WasmSqliteDb {
 	pub async fn close(&self) -> Result<(), JsValue> {
 		self.inner.close().await.map_err(anyhow_to_js_error)
 	}
+
+	#[wasm_bindgen(js_name = beginTransaction)]
+	pub async fn begin_transaction(
+		&self,
+		timeout_ms: Option<f64>,
+	) -> Result<WasmSqliteTransaction, JsValue> {
+		let timeout = timeout_ms.map(transaction_timeout).transpose()?;
+		self.inner
+			.begin_transaction(timeout)
+			.await
+			.map(|inner| WasmSqliteTransaction { inner })
+			.map_err(anyhow_to_js_error)
+	}
+}
+
+#[wasm_bindgen(js_name = SqliteTransaction)]
+pub struct WasmSqliteTransaction {
+	inner: rivetkit_core::SqliteTransaction,
+}
+
+#[wasm_bindgen(js_class = SqliteTransaction)]
+impl WasmSqliteTransaction {
+	#[wasm_bindgen]
+	pub async fn exec(&self, sql: String) -> Result<JsValue, JsValue> {
+		self.inner
+			.exec(sql)
+			.await
+			.map(query_result_to_js)
+			.map_err(anyhow_to_js_error)
+	}
+
+	#[wasm_bindgen]
+	pub async fn execute(&self, sql: String, params: JsValue) -> Result<JsValue, JsValue> {
+		self.inner
+			.execute(sql, bind_params_from_js(params)?)
+			.await
+			.map(execute_result_to_js)
+			.map_err(anyhow_to_js_error)
+	}
+
+	#[wasm_bindgen]
+	pub async fn commit(&self) -> Result<(), JsValue> {
+		self.inner.commit().await.map_err(anyhow_to_js_error)
+	}
+
+	#[wasm_bindgen]
+	pub async fn rollback(&self) -> Result<(), JsValue> {
+		self.inner.rollback().await.map_err(anyhow_to_js_error)
+	}
+}
+
+fn transaction_timeout(timeout_ms: f64) -> Result<std::time::Duration, JsValue> {
+	if !timeout_ms.is_finite() || timeout_ms <= 0.0 {
+		return Err(js_error(
+			"transaction timeout must be a positive finite number of milliseconds",
+		));
+	}
+	std::time::Duration::try_from_secs_f64(timeout_ms / 1_000.0)
+		.map_err(|_| js_error("transaction timeout is too large to represent"))
 }
 
 #[wasm_bindgen(js_name = bridgeRivetErrorPrefix)]

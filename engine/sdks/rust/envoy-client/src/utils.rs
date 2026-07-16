@@ -50,6 +50,26 @@ impl std::fmt::Display for RemoteSqliteIndeterminateResultError {
 
 impl std::error::Error for RemoteSqliteIndeterminateResultError {}
 
+/// Error returned before a transaction-bound remote SQLite request is sent
+/// when its owning WebSocket session is no longer current.
+#[derive(Debug)]
+pub struct RemoteSqliteConnectionSessionLostError {
+	pub expected: u64,
+	pub current: Option<u64>,
+}
+
+impl std::fmt::Display for RemoteSqliteConnectionSessionLostError {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(
+			f,
+			"remote sqlite transaction connection session {} is no longer active",
+			self.expected
+		)
+	}
+}
+
+impl std::error::Error for RemoteSqliteConnectionSessionLostError {}
+
 /// Inject artificial latency for testing.
 pub async fn inject_latency(ms: Option<u64>) {
 	if let Some(ms) = ms {

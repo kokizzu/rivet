@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
-use std::sync::atomic::{AtomicBool, AtomicI64};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64};
 
 use crate::async_counter::AsyncCounter;
 use rivet_envoy_protocol as protocol;
@@ -30,6 +30,15 @@ pub struct SharedContext {
 	pub pending_hibernation_restores:
 		Arc<StdMutex<HashMap<String, Vec<HibernatingWebSocketMetadata>>>>,
 	pub ws_tx: Arc<Mutex<Option<mpsc::UnboundedSender<WsTxMessage>>>>,
+	/// The currently connected WebSocket session, or zero while disconnected.
+	///
+	/// Session IDs are actor-client-local and never cross the wire. Remote SQLite
+	/// transactions use them to prevent a statement from being admitted on a
+	/// replacement WebSocket after the server-side connection (and its SQLite
+	/// handle) has already been torn down.
+	pub connection_session: AtomicU64,
+	pub next_connection_session: AtomicU64,
+	pub connection_session_tx: watch::Sender<u64>,
 	pub protocol_metadata: Arc<Mutex<Option<protocol::ProtocolMetadata>>>,
 	pub shutting_down: AtomicBool,
 	/// Epoch ms timestamp of the most recent ping packet received from the engine. Used by

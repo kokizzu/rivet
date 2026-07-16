@@ -280,10 +280,7 @@ function RunnerStatusBadge(
 				content={`Runner is outdated: version ${runner.version} vs latest version ${runner.latestVersion}`}
 				trigger={
 					<div className="text-center relative size-8 flex items-center justify-center">
-						<Icon
-							icon={faCircleUp}
-							className="text-red-500"
-						/>
+						<Icon icon={faCircleUp} className="text-red-500" />
 					</div>
 				}
 			/>

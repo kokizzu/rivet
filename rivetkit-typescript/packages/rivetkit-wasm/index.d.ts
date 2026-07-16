@@ -149,6 +149,16 @@ export class SqliteDb {
 	close(): Promise<void>;
 	query(sql: string, params: any): Promise<any>;
 	execute(sql: string, params: any): Promise<any>;
+	beginTransaction(timeout_ms?: number | null): Promise<SqliteTransaction>;
+}
+
+export class SqliteTransaction {
+	private constructor();
+	free(): void;
+	exec(sql: string): Promise<any>;
+	execute(sql: string, params: any): Promise<any>;
+	commit(): Promise<void>;
+	rollback(): Promise<void>;
 }
 
 export class WebSocketHandle {

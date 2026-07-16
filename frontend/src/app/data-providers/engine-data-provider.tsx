@@ -383,7 +383,10 @@ export const createNamespaceContext = ({
 					return data;
 				},
 				getNextPageParam: (lastPage) => {
-					if (Object.keys(lastPage.names ?? {}).length < RECORDS_PER_PAGE) {
+					if (
+						Object.keys(lastPage.names ?? {}).length <
+						RECORDS_PER_PAGE
+					) {
 						return undefined;
 					}
 					return lastPage.pagination?.cursor;

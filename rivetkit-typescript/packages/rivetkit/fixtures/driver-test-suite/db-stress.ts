@@ -92,52 +92,52 @@ export const dbStressActor = actor({
 					c.db.execute<Record<string, unknown>>("PRAGMA page_count"),
 				]);
 
-				await c.db.execute("BEGIN");
-				try {
-					await c.db.execute(
+				await c.db.transaction(async (tx) => {
+					await tx.execute(
 						"INSERT INTO stress_data (value, created_at) VALUES (?, ?)",
 						`tx-data-${round}`,
 						now,
 					);
-					await c.db.execute(
+					await tx.execute(
 						"INSERT OR REPLACE INTO stress_payloads (id, tag, payload, updated_at) VALUES (?, ?, ?, ?)",
 						round + 1,
 						`payload-${round}`,
 						"x".repeat(1024 + (round % 5) * 2048),
 						now,
 					);
-					await c.db.execute("SAVEPOINT payload_patch");
-					await c.db.execute(
+					await tx.execute("SAVEPOINT payload_patch");
+					await tx.execute(
 						"UPDATE stress_payloads SET payload = payload || ?, updated_at = ? WHERE id = ?",
 						`-patch-${round}`,
 						now + 1,
 						round + 1,
 					);
-					await c.db.execute("ROLLBACK TO payload_patch");
-					await c.db.execute("RELEASE payload_patch");
-					await c.db.execute(
+					await tx.execute("ROLLBACK TO payload_patch");
+					await tx.execute("RELEASE payload_patch");
+					await tx.execute(
 						"UPDATE stress_meta_kv SET value = ?, updated_at = ? WHERE key = ?",
 						`tx-value-${round}`,
 						now + 2,
 						`parallel-key-${round % 17}`,
 					);
-					await c.db.execute("COMMIT");
-				} catch (error) {
-					await c.db.execute("ROLLBACK");
-					throw error;
-				}
+				});
 
-				await c.db.execute("BEGIN");
+				const intentionalRollback = new Error(
+					"intentional stress rollback",
+				);
 				try {
-					await c.db.execute(
-						"INSERT INTO stress_data (value, created_at) VALUES (?, ?)",
-						`rollback-data-${round}`,
-						now,
-					);
-					await c.db.execute("ROLLBACK");
+					await c.db.transaction(async (tx) => {
+						await tx.execute(
+							"INSERT INTO stress_data (value, created_at) VALUES (?, ?)",
+							`rollback-data-${round}`,
+							now,
+						);
+						throw intentionalRollback;
+					});
 				} catch (error) {
-					await c.db.execute("ROLLBACK");
-					throw error;
+					if (error !== intentionalRollback) {
+						throw error;
+					}
 				}
 
 				if (round % 3 === 0) {

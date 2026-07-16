@@ -512,6 +512,25 @@ function getOrCreateNativeSqlDatabase(
 	const database = wrapJsNativeDatabase({
 		exec: (sql) => runtime.actorSqlExec(ctx, sql),
 		execute: (sql, params) => runtime.actorSqlExecute(ctx, sql, params),
+		beginTransaction: async (timeoutMs) => {
+			const transaction = await runtime.actorSqlBeginTransaction(
+				ctx,
+				timeoutMs,
+			);
+			return {
+				exec: (sql) =>
+					runtime.actorSqlTransactionExec(transaction, sql),
+				execute: (sql, params) =>
+					runtime.actorSqlTransactionExecute(
+						transaction,
+						sql,
+						params,
+					),
+				commit: () => runtime.actorSqlTransactionCommit(transaction),
+				rollback: () =>
+					runtime.actorSqlTransactionRollback(transaction),
+			};
+		},
 		query: (sql, params) => runtime.actorSqlQuery(ctx, sql, params),
 		run: (sql, params) => runtime.actorSqlRun(ctx, sql, params),
 		metrics: () => runtime.actorSqlMetrics(ctx),
@@ -3726,7 +3745,9 @@ export function buildNativeFactory(
 						400,
 					);
 				}
-				const cbor = encodeCborCompat((body.body ?? null) as JsonCompatValue);
+				const cbor = encodeCborCompat(
+					(body.body ?? null) as JsonCompatValue,
+				);
 				const message = await runtime.actorQueueSend(ctx, name, cbor);
 				return jsonResponse({
 					id: message.id().toString(),

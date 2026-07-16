@@ -19,6 +19,15 @@ function deferred<T>() {
 }
 
 class FakeNativeDatabase implements JsNativeDatabaseLike {
+	async beginTransaction() {
+		return {
+			exec: async (_sql: string) => this.exec(),
+			execute: async (sql: string, params?: NativeParams) =>
+				this.execute(sql, params),
+			commit: async () => {},
+			rollback: async () => {},
+		};
+	}
 	active = 0;
 	maxActive = 0;
 	closed = false;

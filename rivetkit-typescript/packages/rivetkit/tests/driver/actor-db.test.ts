@@ -239,6 +239,267 @@ describeDriverMatrix(
 
 						await actor.transactionRollback("rollback");
 						expect(await actor.getCount()).toBe(1);
+						await actor.transactionWithTimeout(120_000);
+						expect(await actor.transactionExec()).toEqual([
+							"commit",
+							"exec-first",
+							"exec-second",
+						]);
+						expect(
+							await actor.transactionAutomaticRollback(),
+						).toEqual([{ id: 2, value: "after" }]);
+					},
+					dbTestTimeout,
+				);
+
+				test(
+					"queues concurrent transactions without interleaving",
+					async (c) => {
+						const { client } = await setupDriverTest(
+							c,
+							driverTestConfig,
+						);
+						const actor = getDbActor(client, variant).getOrCreate([
+							`db-${variant}-tx-fifo-${crypto.randomUUID()}`,
+						]);
+						await actor.reset();
+						const values = await actor.concurrentTransactions();
+						expect(values.slice(0, 2)).toEqual([
+							"first-start",
+							"first-end",
+						]);
+						// FIFO begins at coordinator admission. Calls crossing an async
+						// NAPI/Wasm boundary may be admitted in either source-call order;
+						// both must remain wholly behind the active transaction.
+						expect(values.slice(2).sort()).toEqual([
+							"second",
+							"third",
+						]);
+					},
+					dbTestTimeout,
+				);
+
+				test(
+					"routes Drizzle query builders through transaction handles",
+					async (c) => {
+						const { client } = await setupDriverTest(
+							c,
+							driverTestConfig,
+						);
+						const actor =
+							client.dbActorDrizzleMigration.getOrCreate([
+								`db-drizzle-query-builder-${crypto.randomUUID()}`,
+							]);
+						expect(await actor.queryBuilderTransaction()).toEqual({
+							inside: ["query-builder"],
+							after: [],
+						});
+					},
+					dbTestTimeout,
+				);
+
+				test(
+					"parks ordinary actor SQL behind a transaction",
+					async (c) => {
+						const { client } = await setupDriverTest(
+							c,
+							driverTestConfig,
+						);
+						const actor = getDbActor(client, variant).getOrCreate([
+							`db-${variant}-tx-ordinary-${crypto.randomUUID()}`,
+						]);
+						await actor.reset();
+						expect(
+							await actor.transactionParksOrdinarySql(),
+						).toEqual(["tx-start", "tx-end", "ordinary"]);
+					},
+					dbTestTimeout,
+				);
+
+				test(
+					"times out nested and outer-db transaction deadlocks with diagnostics",
+					async (c) => {
+						const { client } = await setupDriverTest(
+							c,
+							driverTestConfig,
+						);
+						const actor = getDbActor(client, variant).getOrCreate([
+							`db-${variant}-tx-deadlock-${crypto.randomUUID()}`,
+						]);
+						for (const nested of [false, true]) {
+							const message =
+								await actor.transactionDeadlockDiagnostic(
+									nested,
+								);
+							expect(message).toContain("safety backstop");
+							expect(message).toContain("timeout");
+							expect(message).toContain("nested transaction");
+							expect(message).toContain("outer `db`");
+						}
+					},
+					dbTestTimeout,
+				);
+
+				test(
+					"expires transaction handles and rejects parked SQL without execution",
+					async (c) => {
+						const { client } = await setupDriverTest(
+							c,
+							driverTestConfig,
+						);
+						const actor = getDbActor(client, variant).getOrCreate([
+							`db-${variant}-tx-expiry-${crypto.randomUUID()}`,
+						]);
+						await actor.reset();
+						const result =
+							await actor.transactionExpiryDiagnostics();
+						expect(result.ownerMessage).toContain(
+							"expired after 50 ms",
+						);
+						expect(result.leakedMessage).toContain(
+							"expired after 50 ms",
+						);
+						expect(result.parkedResult.status).toBe("rejected");
+						if (result.parkedResult.status === "rejected") {
+							expect(result.parkedResult.message).toContain(
+								"expired after 50 ms",
+							);
+						}
+						expect(result.values).toEqual([]);
+					},
+					dbTestTimeout,
+				);
+
+				test(
+					"rejects completed transaction handles",
+					async (c) => {
+						const { client } = await setupDriverTest(
+							c,
+							driverTestConfig,
+						);
+						const actor = getDbActor(client, variant).getOrCreate([
+							`db-${variant}-tx-terminal-${crypto.randomUUID()}`,
+						]);
+						expect(
+							await actor.terminalTransactionDiagnostic(),
+						).toContain("already committed");
+					},
+					dbTestTimeout,
+				);
+
+				test(
+					"preserves manual cross-call transaction compatibility",
+					async (c) => {
+						const { client } = await setupDriverTest(
+							c,
+							driverTestConfig,
+						);
+						const actor = getDbActor(client, variant).getOrCreate([
+							`db-${variant}-tx-manual-${crypto.randomUUID()}`,
+						]);
+						expect(
+							await actor.manualTransactionCompatibility(),
+						).toBe(1);
+					},
+					dbTestTimeout,
+				);
+
+				test(
+					"warns once per database for manual cross-call transactions",
+					async (c) => {
+						const { client, getRuntimeOutput } =
+							await setupDriverTest(c, driverTestConfig);
+						const actor = getDbActor(client, variant).getOrCreate([
+							`db-${variant}-tx-manual-warning-${crypto.randomUUID()}`,
+						]);
+						const warning =
+							"Manual cross-call SQLite transactions can interleave";
+						const warningCount = () =>
+							getRuntimeOutput().split(warning).length - 1;
+						const baseline = warningCount();
+						await actor.manualTransactionCompatibility();
+						await actor.manualTransactionCompatibility();
+						// Wait until the child runtime flushes the once-per-database warning.
+						await vi.waitFor(() =>
+							expect(warningCount() - baseline).toBe(1),
+						);
+						expect(getRuntimeOutput()).toContain(
+							"Set warnOnManualTransactions: false",
+						);
+					},
+					dbTestTimeout,
+				);
+
+				test(
+					"suppresses the manual transaction warning when configured",
+					async (c) => {
+						const { client, getRuntimeOutput } =
+							await setupDriverTest(c, driverTestConfig);
+						const warning =
+							"Manual cross-call SQLite transactions can interleave";
+						const baseline =
+							getRuntimeOutput().split(warning).length - 1;
+						const marker = `manual-warning-disabled-${crypto.randomUUID()}`;
+						const actor =
+							client.dbActorManualWarningsDisabled.getOrCreate([
+								marker,
+							]);
+						expect(
+							await actor.manualTransactionCompatibility(marker),
+						).toBe(true);
+						// The marker proves stdout has flushed past the point where a warning would run.
+						await vi.waitFor(() =>
+							expect(getRuntimeOutput()).toContain(marker),
+						);
+						expect(
+							getRuntimeOutput().split(warning).length - 1,
+						).toBe(baseline);
+					},
+					dbTestTimeout,
+				);
+
+				test(
+					"commits Drizzle migrations through the coordinator",
+					async (c) => {
+						const { client } = await setupDriverTest(
+							c,
+							driverTestConfig,
+						);
+						const actor =
+							client.dbActorDrizzleMigration.getOrCreate([
+								`db-drizzle-migration-${crypto.randomUUID()}`,
+							]);
+						expect(await actor.migrationCommitted()).toBe(true);
+					},
+					dbTestTimeout,
+				);
+
+				test(
+					"rolls back a failed Drizzle migration before retry",
+					async (c) => {
+						const { client } = await setupDriverTest(
+							c,
+							driverTestConfig,
+						);
+						const key = [
+							`db-drizzle-rollback-${crypto.randomUUID()}`,
+						];
+						let rolledBack: boolean;
+						try {
+							rolledBack =
+								await client.dbActorDrizzleMigrationRollback
+									.getOrCreate(key)
+									.migrationRolledBack();
+						} catch (error) {
+							expect(String(error)).toContain(
+								"intentional drizzle migration failure",
+							);
+							rolledBack =
+								await client.dbActorDrizzleMigrationRollback
+									.getOrCreate(key)
+									.migrationRolledBack();
+						}
+						expect(rolledBack).toBe(true);
 					},
 					dbTestTimeout,
 				);

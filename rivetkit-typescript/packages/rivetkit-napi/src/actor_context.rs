@@ -239,6 +239,9 @@ impl ActorContext {
 	}
 
 	#[napi]
+	// The NAPI bridge intentionally keeps the deprecated KV surface available for
+	// TypeScript compatibility while steering new code to SQLite or actor state.
+	#[allow(deprecated)]
 	pub fn kv(&self) -> Kv {
 		Kv::new(self.inner.kv().clone())
 	}

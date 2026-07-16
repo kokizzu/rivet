@@ -133,6 +133,7 @@ pub use actor::queue::{
 };
 pub use actor::sqlite::{
 	BindParam, ColumnValue, ExecResult, ExecuteResult, QueryResult, SqliteBackend, SqliteDb,
+	SqliteTransaction,
 };
 pub use actor::state::RequestSaveOpts;
 pub use actor::task::{

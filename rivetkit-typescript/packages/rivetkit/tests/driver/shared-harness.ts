@@ -340,6 +340,15 @@ export async function startWasmDriverRuntime(
 
 	await createNamespace(endpoint, namespace);
 	await upsertNormalRunnerConfig(logs, endpoint, namespace, poolName);
+	// The parent test process may need an explicit native engine binary to start
+	// the shared engine. Do not leak that native-only override into the Wasm
+	// runtime, which connects to the already-running endpoint and must never try
+	// to configure an engine child of its own.
+	const {
+		RIVET_ENGINE_BINARY: _engineBinary,
+		RIVET_ENGINE_BINARY_PATH: _engineBinaryPath,
+		...wasmEnv
+	} = process.env;
 
 	const spawnStartedAt = performance.now();
 	const runtime = spawn(
@@ -348,7 +357,7 @@ export async function startWasmDriverRuntime(
 		{
 			cwd: dirname(TEST_DIR),
 			env: {
-				...process.env,
+				...wasmEnv,
 				RIVET_TOKEN: TOKEN,
 				RIVET_NAMESPACE: namespace,
 				RIVETKIT_DRIVER_REGISTRY_PATH: variant.registryPath,

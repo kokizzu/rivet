@@ -4,6 +4,7 @@ import type {
 	SqliteDatabase,
 	SqliteExecuteResult,
 	SqliteNativeMetrics,
+	SqliteTransactionDatabase,
 } from "./config";
 
 type NativeBindNoValues = {
@@ -71,6 +72,7 @@ export interface JsNativeDatabaseLike {
 		sql: string,
 		params?: NativeBindParam[] | null,
 	): Promise<NativeExecuteResult>;
+	beginTransaction(timeoutMs?: number): Promise<JsNativeTransactionLike>;
 	query(
 		sql: string,
 		params?: NativeBindParam[] | null,
@@ -82,6 +84,16 @@ export interface JsNativeDatabaseLike {
 	metrics?(): SqliteNativeMetrics | null;
 	takeLastKvError?(): string | null;
 	close(): Promise<void>;
+}
+
+export interface JsNativeTransactionLike {
+	exec(sql: string): Promise<NativeExecResult>;
+	execute(
+		sql: string,
+		params?: NativeBindParam[] | null,
+	): Promise<NativeExecuteResult>;
+	commit(): Promise<void>;
+	rollback(): Promise<void>;
 }
 
 function shouldAttachNativeKvError(message: string): boolean {
@@ -343,6 +355,24 @@ export function wrapJsNativeDatabase(
 		): Promise<SqliteExecuteResult> {
 			return await executeNative(sql, params);
 		},
+		async beginTransaction(
+			timeoutMs?: number,
+		): Promise<SqliteTransactionDatabase> {
+			const release = gate.enter();
+			let transaction: JsNativeTransactionLike;
+			try {
+				transaction = await database.beginTransaction(timeoutMs);
+			} catch (error) {
+				enrichNativeDatabaseError(database, error);
+			} finally {
+				release();
+			}
+			return wrapTransaction(database, transaction, gate, (result) => {
+				if (result.lastInsertRowId !== undefined) {
+					lastInsertRowId = result.lastInsertRowId;
+				}
+			});
+		},
 		async run(sql: string, params?: SqliteBindings): Promise<void> {
 			await executeNative(sql, params);
 		},
@@ -356,6 +386,65 @@ export function wrapJsNativeDatabase(
 		async close(): Promise<void> {
 			closePromise ??= gate.close(() => database.close());
 			await closePromise;
+		},
+	};
+}
+
+function wrapTransaction(
+	database: JsNativeDatabaseLike,
+	transaction: JsNativeTransactionLike,
+	gate: NativeCloseGate,
+	onExecute: (result: NativeExecuteResult) => void,
+): SqliteTransactionDatabase {
+	return {
+		async exec(sql, callback) {
+			const release = gate.enter();
+			let result: NativeExecResult;
+			try {
+				result = await transaction.exec(sql);
+			} catch (error) {
+				enrichNativeDatabaseError(database, error);
+			} finally {
+				release();
+			}
+			if (callback) {
+				for (const row of result.rows) callback(row, result.columns);
+			}
+		},
+		async execute(sql, params) {
+			const release = gate.enter();
+			try {
+				const result = await transaction.execute(
+					sql,
+					toNativeBindings(sql, params),
+				);
+				onExecute(result);
+				return result;
+			} catch (error) {
+				enrichNativeDatabaseError(database, error);
+			} finally {
+				release();
+			}
+		},
+		async commit() {
+			const release = gate.enter();
+			try {
+				await transaction.commit();
+			} catch (error) {
+				enrichNativeDatabaseError(database, error);
+			} finally {
+				release();
+			}
+		},
+		async rollback() {
+			const release = gate.enter();
+			try {
+				await transaction.rollback();
+			} catch (error) {
+				enrichNativeDatabaseError(database, error);
+			} finally {
+				release();
+			}
 		},
 	};
 }

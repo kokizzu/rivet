@@ -153,95 +153,102 @@ for (const mode of modes) {
 	);
 }
 
-describe("Workflow Engine getVersion per-iteration cutover", { sequential: true }, () => {
-	it("resolves each loop iteration independently across a redeploy", async () => {
-		const driver = new InMemoryDriver();
-		driver.latency = 0;
-		const mode = "yield" as const;
+describe(
+	"Workflow Engine getVersion per-iteration cutover",
+	{ sequential: true },
+	() => {
+		it("resolves each loop iteration independently across a redeploy", async () => {
+			const driver = new InMemoryDriver();
+			driver.latency = 0;
+			const mode = "yield" as const;
 
-		// v1 loop: records a `pre` step before waiting for a message, so an
-		// iteration can be left suspended mid-body with history already present.
-		const v1 = async (ctx: WorkflowContextInterface) => {
-			return await ctx.loop({
-				name: "consume",
-				state: { i: 0, processed: 0 },
-				run: async (lctx, state) => {
-					await lctx.step("pre", async () => `pre-${state.i}`);
-					const msg = await lctx.queue.next<string>("in", {
-						names: ["work"],
-					});
-					await lctx.step("post", async () => `post:${msg.body}`);
-					const processed = state.processed + 1;
-					if (processed >= 3) {
-						return Loop.break(processed);
-					}
-					return Loop.continue({ i: state.i + 1, processed });
-				},
+			// v1 loop: records a `pre` step before waiting for a message, so an
+			// iteration can be left suspended mid-body with history already present.
+			const v1 = async (ctx: WorkflowContextInterface) => {
+				return await ctx.loop({
+					name: "consume",
+					state: { i: 0, processed: 0 },
+					run: async (lctx, state) => {
+						await lctx.step("pre", async () => `pre-${state.i}`);
+						const msg = await lctx.queue.next<string>("in", {
+							names: ["work"],
+						});
+						await lctx.step("post", async () => `post:${msg.body}`);
+						const processed = state.processed + 1;
+						if (processed >= 3) {
+							return Loop.break(processed);
+						}
+						return Loop.continue({ i: state.i + 1, processed });
+					},
+				});
+			};
+
+			// First message is processed in iteration 0; iteration 1 records `pre`
+			// then suspends at queue.next (in-flight under v1).
+			await driver.messageDriver.addMessage({
+				id: "m1",
+				name: "work",
+				data: "one",
+				sentAt: Date.now(),
 			});
-		};
+			const r1 = await runWorkflow("wf-loop", v1, undefined, driver, {
+				mode,
+			}).result;
+			expect(r1.state).toBe("sleeping");
 
-		// First message is processed in iteration 0; iteration 1 records `pre`
-		// then suspends at queue.next (in-flight under v1).
-		await driver.messageDriver.addMessage({
-			id: "m1",
-			name: "work",
-			data: "one",
-			sentAt: Date.now(),
-		});
-		const r1 = await runWorkflow("wf-loop", v1, undefined, driver, { mode })
-			.result;
-		expect(r1.state).toBe("sleeping");
+			// Redeploy v2: adds a gate at the top of the loop body.
+			const seenByIter = new Map<number, number>();
+			const v2 = async (ctx: WorkflowContextInterface) => {
+				return await ctx.loop({
+					name: "consume",
+					state: { i: 0, processed: 0 },
+					run: async (lctx, state) => {
+						const v = await lctx.getVersion("gate", 2);
+						seenByIter.set(state.i, v);
+						await lctx.step("pre", async () => `pre-${state.i}`);
+						const msg = await lctx.queue.next<string>("in", {
+							names: ["work"],
+						});
+						await lctx.step("post", async () => `post:${msg.body}`);
+						const processed = state.processed + 1;
+						if (processed >= 3) {
+							return Loop.break(processed);
+						}
+						return Loop.continue({ i: state.i + 1, processed });
+					},
+				});
+			};
 
-		// Redeploy v2: adds a gate at the top of the loop body.
-		const seenByIter = new Map<number, number>();
-		const v2 = async (ctx: WorkflowContextInterface) => {
-			return await ctx.loop({
-				name: "consume",
-				state: { i: 0, processed: 0 },
-				run: async (lctx, state) => {
-					const v = await lctx.getVersion("gate", 2);
-					seenByIter.set(state.i, v);
-					await lctx.step("pre", async () => `pre-${state.i}`);
-					const msg = await lctx.queue.next<string>("in", {
-						names: ["work"],
-					});
-					await lctx.step("post", async () => `post:${msg.body}`);
-					const processed = state.processed + 1;
-					if (processed >= 3) {
-						return Loop.break(processed);
-					}
-					return Loop.continue({ i: state.i + 1, processed });
-				},
+			// Second message resumes the in-flight iteration 1 (whose `pre` step
+			// predates the gate) and lets iteration 2 begin fresh.
+			await driver.messageDriver.addMessage({
+				id: "m2",
+				name: "work",
+				data: "two",
+				sentAt: Date.now(),
 			});
-		};
+			const r2 = await runWorkflow("wf-loop", v2, undefined, driver, {
+				mode,
+			}).result;
+			expect(r2.state).toBe("sleeping");
 
-		// Second message resumes the in-flight iteration 1 (whose `pre` step
-		// predates the gate) and lets iteration 2 begin fresh.
-		await driver.messageDriver.addMessage({
-			id: "m2",
-			name: "work",
-			data: "two",
-			sentAt: Date.now(),
+			// Third message completes iteration 2.
+			await driver.messageDriver.addMessage({
+				id: "m3",
+				name: "work",
+				data: "three",
+				sentAt: Date.now(),
+			});
+			const r3 = await runWorkflow("wf-loop", v2, undefined, driver, {
+				mode,
+			}).result;
+			expect(r3.state).toBe("completed");
+
+			// Iteration 1 was in-flight under v1 (its `pre` step predates the gate),
+			// so it resolves to floor version 1. Iteration 2 is fresh, so it
+			// resolves to latest (2).
+			expect(seenByIter.get(1)).toBe(1);
+			expect(seenByIter.get(2)).toBe(2);
 		});
-		const r2 = await runWorkflow("wf-loop", v2, undefined, driver, { mode })
-			.result;
-		expect(r2.state).toBe("sleeping");
-
-		// Third message completes iteration 2.
-		await driver.messageDriver.addMessage({
-			id: "m3",
-			name: "work",
-			data: "three",
-			sentAt: Date.now(),
-		});
-		const r3 = await runWorkflow("wf-loop", v2, undefined, driver, { mode })
-			.result;
-		expect(r3.state).toBe("completed");
-
-		// Iteration 1 was in-flight under v1 (its `pre` step predates the gate),
-		// so it resolves to floor version 1. Iteration 2 is fresh, so it
-		// resolves to latest (2).
-		expect(seenByIter.get(1)).toBe(1);
-		expect(seenByIter.get(2)).toBe(2);
-	});
-});
+	},
+);

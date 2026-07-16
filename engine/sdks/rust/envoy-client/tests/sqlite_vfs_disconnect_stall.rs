@@ -134,6 +134,9 @@ fn new_envoy_context() -> EnvoyContext {
 		ws_tx: Arc::new(tokio::sync::Mutex::new(
 			None::<mpsc::UnboundedSender<WsTxMessage>>,
 		)),
+		connection_session: std::sync::atomic::AtomicU64::new(0),
+		next_connection_session: std::sync::atomic::AtomicU64::new(0),
+		connection_session_tx: tokio::sync::watch::channel(0).0,
 		protocol_metadata: Arc::new(tokio::sync::Mutex::new(None)),
 		shutting_down: std::sync::atomic::AtomicBool::new(false),
 		last_ping_ts: std::sync::atomic::AtomicI64::new(0),
@@ -227,6 +230,7 @@ async fn sent_vfs_request_stalls_on_disconnect() {
 	handle_remote_sqlite_request(
 		&mut ctx,
 		RemoteSqliteRequest::Execute(remote_execute_request()),
+		None,
 		remote_tx,
 	)
 	.await;

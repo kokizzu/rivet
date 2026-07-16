@@ -153,7 +153,8 @@ export const COMPUTE_METRICS_CONFIG: ComputeMetricConfig[] = [
 	{
 		name: "cost",
 		title: "Estimated Cost",
-		description: "Estimated compute spend based on active time, CPU, and memory",
+		description:
+			"Estimated compute spend based on active time, CPU, and memory",
 		formatValue: formatUsd,
 	},
 ];

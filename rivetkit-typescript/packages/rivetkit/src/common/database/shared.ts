@@ -1,5 +1,20 @@
 import type { SqliteBindings } from "./config";
 
+/** Migrations may legitimately do substantially more work than request transactions. */
+export const MIGRATION_TRANSACTION_TIMEOUT_MS = 5 * 60_000;
+
+export function isManualTransactionControl(query: string): boolean {
+	return /^\s*(?:BEGIN|SAVEPOINT|COMMIT|END|ROLLBACK)\b/i.test(query);
+}
+
+export function validateTransactionTimeout(timeout: number | undefined): void {
+	if (timeout !== undefined && (!Number.isFinite(timeout) || timeout <= 0)) {
+		throw new Error(
+			"db.transaction() timeout must be a positive finite number of milliseconds",
+		);
+	}
+}
+
 type SqliteBindingObject = Record<string, unknown>;
 
 function isSqliteBindingValue(value: unknown): boolean {

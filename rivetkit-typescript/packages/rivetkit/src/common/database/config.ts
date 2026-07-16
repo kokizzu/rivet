@@ -43,6 +43,7 @@ export interface SqliteDatabase {
 		callback?: (row: unknown[], columns: string[]) => void,
 	): Promise<void>;
 	execute(sql: string, params?: SqliteBindings): Promise<SqliteExecuteResult>;
+	beginTransaction(timeoutMs?: number): Promise<SqliteTransactionDatabase>;
 	run(sql: string, params?: SqliteBindings): Promise<void>;
 	query(sql: string, params?: SqliteBindings): Promise<SqliteQueryResult>;
 	nativeMetrics?():
@@ -50,6 +51,16 @@ export interface SqliteDatabase {
 		| Promise<SqliteNativeMetrics | null>
 		| null;
 	close(): Promise<void>;
+}
+
+export interface SqliteTransactionDatabase {
+	exec(
+		sql: string,
+		callback?: (row: unknown[], columns: string[]) => void,
+	): Promise<void>;
+	execute(sql: string, params?: SqliteBindings): Promise<SqliteExecuteResult>;
+	commit(): Promise<void>;
+	rollback(): Promise<void>;
 }
 
 /**
@@ -143,6 +154,11 @@ export type RawAccess = {
 	 * Executes a raw SQL query.
 	 */
 	execute: ExecuteFunction;
+	/** Runs a callback in an isolated SQLite transaction. */
+	transaction: <T>(
+		callback: (tx: RawAccess) => Promise<T> | T,
+		options?: { timeout?: number },
+	) => Promise<T>;
 	/**
 	 * Returns native SQLite metrics when the active runtime supports them.
 	 */

@@ -11,7 +11,10 @@ pub use depot_client_types::{BindParam, ColumnValue, ExecResult, ExecuteResult, 
 #[cfg(feature = "sqlite-local")]
 use parking_lot::Mutex;
 use rivet_envoy_client::protocol;
-use rivet_envoy_client::{handle::EnvoyHandle, utils::RemoteSqliteIndeterminateResultError};
+use rivet_envoy_client::{
+	handle::EnvoyHandle,
+	utils::{RemoteSqliteConnectionSessionLostError, RemoteSqliteIndeterminateResultError},
+};
 use rivet_error::{ActorSpecifier, RivetError};
 use serde::Serialize;
 use serde_json::{Map as JsonMap, Value as JsonValue};
@@ -22,11 +25,25 @@ use tokio::task::JoinHandle;
 
 #[cfg(feature = "sqlite-local")]
 mod envoy_sqlite_transport;
+mod tx;
+
+pub use tx::{
+	DEFAULT_TRANSACTION_TIMEOUT, SqliteTransaction, TRANSACTION_COORDINATOR_QUEUE_CAPACITY,
+	TransactionConnectionLostError, TransactionCoordinatorClosedError, TransactionExpiredError,
+	TransactionInvalidArgumentError, TransactionQueueFullError, TransactionTerminalError,
+	TransactionUnknownError,
+};
+#[cfg(test)]
+use tx::{
+	TRANSACTION_TERMINAL_CAPACITY, TransactionCoordinatorState, TransactionTerminalState,
+	insert_terminal_state,
+};
+use tx::{TransactionCoordinator, run_detached_transaction_task};
 
 #[cfg(feature = "sqlite-local")]
 use crate::error::ActorLifecycle;
 use crate::error::SqliteRuntimeError;
-#[cfg(feature = "sqlite-local")]
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-local"))]
 use crate::runtime::RuntimeSpawner;
 
 #[cfg(feature = "sqlite-local")]
@@ -66,6 +83,88 @@ pub enum SqliteBackend {
 	Unavailable,
 }
 
+impl SqliteDb {
+	async fn exec_backend(&self, sql: String) -> Result<QueryResult> {
+		match self.backend {
+			SqliteBackend::LocalNative => self.local_exec(sql).await,
+			SqliteBackend::RemoteEnvoy => self.remote_exec(sql).await,
+			SqliteBackend::Unavailable => Err(SqliteRuntimeError::Unavailable.build()),
+		}
+	}
+
+	async fn exec_backend_in_session(
+		&self,
+		sql: String,
+		expected_session: Option<u64>,
+	) -> Result<(QueryResult, Option<u64>)> {
+		match self.backend {
+			SqliteBackend::LocalNative => self.local_exec(sql).await.map(|result| (result, None)),
+			SqliteBackend::RemoteEnvoy => self
+				.remote_exec_with_session(sql, expected_session)
+				.await
+				.map(|(result, session)| (result, Some(session))),
+			SqliteBackend::Unavailable => Err(SqliteRuntimeError::Unavailable.build()),
+		}
+	}
+
+	async fn query_backend(
+		&self,
+		sql: String,
+		params: Option<Vec<BindParam>>,
+	) -> Result<QueryResult> {
+		match self.backend {
+			SqliteBackend::LocalNative => self.local_query(sql, params).await,
+			SqliteBackend::RemoteEnvoy => self
+				.remote_execute(sql, params)
+				.await
+				.map(ExecuteResult::into_query_result),
+			SqliteBackend::Unavailable => Err(SqliteRuntimeError::Unavailable.build()),
+		}
+	}
+
+	async fn run_backend(&self, sql: String, params: Option<Vec<BindParam>>) -> Result<ExecResult> {
+		match self.backend {
+			SqliteBackend::LocalNative => self.local_run(sql, params).await,
+			SqliteBackend::RemoteEnvoy => self
+				.remote_execute(sql, params)
+				.await
+				.map(ExecuteResult::into_exec_result),
+			SqliteBackend::Unavailable => Err(SqliteRuntimeError::Unavailable.build()),
+		}
+	}
+
+	async fn execute_backend(
+		&self,
+		sql: String,
+		params: Option<Vec<BindParam>>,
+	) -> Result<ExecuteResult> {
+		match self.backend {
+			SqliteBackend::LocalNative => self.local_execute(sql, params).await,
+			SqliteBackend::RemoteEnvoy => self.remote_execute(sql, params).await,
+			SqliteBackend::Unavailable => Err(SqliteRuntimeError::Unavailable.build()),
+		}
+	}
+
+	async fn execute_backend_in_session(
+		&self,
+		sql: String,
+		params: Option<Vec<BindParam>>,
+		expected_session: Option<u64>,
+	) -> Result<(ExecuteResult, Option<u64>)> {
+		match self.backend {
+			SqliteBackend::LocalNative => self
+				.local_execute(sql, params)
+				.await
+				.map(|result| (result, None)),
+			SqliteBackend::RemoteEnvoy => self
+				.remote_execute_with_session(sql, params, expected_session)
+				.await
+				.map(|(result, session)| (result, Some(session))),
+			SqliteBackend::Unavailable => Err(SqliteRuntimeError::Unavailable.build()),
+		}
+	}
+}
+
 impl Default for SqliteBackend {
 	fn default() -> Self {
 		Self::Unavailable
@@ -92,6 +191,7 @@ pub struct SqliteDb {
 	#[cfg(feature = "sqlite-local")]
 	worker_failure_task: Arc<Mutex<Option<JoinHandle<()>>>>,
 	worker_fatal_reported: Arc<AtomicBool>,
+	transaction_coordinator: Arc<TransactionCoordinator>,
 	#[cfg(feature = "sqlite-local")]
 	vfs_metrics: Option<Arc<dyn SqliteVfsMetrics>>,
 }
@@ -123,6 +223,7 @@ impl SqliteDb {
 			#[cfg(feature = "sqlite-local")]
 			worker_failure_task: Default::default(),
 			worker_fatal_reported: Default::default(),
+			transaction_coordinator: Default::default(),
 			#[cfg(feature = "sqlite-local")]
 			vfs_metrics: None,
 		}
@@ -267,10 +368,9 @@ impl SqliteDb {
 	pub async fn exec(&self, sql: impl Into<String>) -> Result<QueryResult> {
 		let sql = sql.into();
 		let sql_for_log = sql.clone();
-		let result = match self.backend {
-			SqliteBackend::LocalNative => self.local_exec(sql).await,
-			SqliteBackend::RemoteEnvoy => self.remote_exec(sql).await,
-			SqliteBackend::Unavailable => Err(SqliteRuntimeError::Unavailable.build()),
+		let result = match self.begin_regular_operation().await {
+			Ok(_guard) => self.exec_backend(sql).await,
+			Err(error) => Err(error),
 		};
 		match result {
 			Ok(result) => Ok(result),
@@ -290,13 +390,9 @@ impl SqliteDb {
 		let sql = sql.into();
 		let sql_for_log = sql.clone();
 		let binding_count = bind_param_count(&params);
-		let result = match self.backend {
-			SqliteBackend::LocalNative => self.local_query(sql, params).await,
-			SqliteBackend::RemoteEnvoy => self
-				.remote_execute(sql, params)
-				.await
-				.map(ExecuteResult::into_query_result),
-			SqliteBackend::Unavailable => Err(SqliteRuntimeError::Unavailable.build()),
+		let result = match self.begin_regular_operation().await {
+			Ok(_guard) => self.query_backend(sql, params).await,
+			Err(error) => Err(error),
 		};
 		match result {
 			Ok(result) => Ok(result),
@@ -316,13 +412,9 @@ impl SqliteDb {
 		let sql = sql.into();
 		let sql_for_log = sql.clone();
 		let binding_count = bind_param_count(&params);
-		let result = match self.backend {
-			SqliteBackend::LocalNative => self.local_run(sql, params).await,
-			SqliteBackend::RemoteEnvoy => self
-				.remote_execute(sql, params)
-				.await
-				.map(ExecuteResult::into_exec_result),
-			SqliteBackend::Unavailable => Err(SqliteRuntimeError::Unavailable.build()),
+		let result = match self.begin_regular_operation().await {
+			Ok(_guard) => self.run_backend(sql, params).await,
+			Err(error) => Err(error),
 		};
 		match result {
 			Ok(result) => Ok(result),
@@ -342,10 +434,9 @@ impl SqliteDb {
 		let sql = sql.into();
 		let sql_for_log = sql.clone();
 		let binding_count = bind_param_count(&params);
-		let result = match self.backend {
-			SqliteBackend::LocalNative => self.local_execute(sql, params).await,
-			SqliteBackend::RemoteEnvoy => self.remote_execute(sql, params).await,
-			SqliteBackend::Unavailable => Err(SqliteRuntimeError::Unavailable.build()),
+		let result = match self.begin_regular_operation().await {
+			Ok(_guard) => self.execute_backend(sql, params).await,
+			Err(error) => Err(error),
 		};
 		match result {
 			Ok(result) => Ok(result),
@@ -358,6 +449,18 @@ impl SqliteDb {
 	}
 
 	pub async fn close(&self) -> Result<()> {
+		let db = self.clone();
+		run_detached_transaction_task(
+			async move {
+				let _gate = db.shutdown_transaction_coordinator().await;
+				db.close_backend().await
+			},
+			"sqlite close task failed",
+		)
+		.await
+	}
+
+	async fn close_backend(&self) -> Result<()> {
 		match self.backend {
 			SqliteBackend::LocalNative => {
 				#[cfg(feature = "sqlite-local")]
@@ -563,6 +666,35 @@ impl SqliteDb {
 		}
 	}
 
+	async fn remote_exec_with_session(
+		&self,
+		sql: String,
+		expected_session: Option<u64>,
+	) -> Result<(QueryResult, u64)> {
+		let config = self.remote_config()?;
+		let (response, session) = config
+			.handle
+			.remote_sqlite_exec_with_session(
+				protocol::SqliteExecRequest {
+					namespace_id: config.namespace_id,
+					actor_id: config.actor_id,
+					generation: config.generation,
+					sql,
+				},
+				expected_session,
+			)
+			.await?;
+
+		match response {
+			protocol::SqliteExecResponse::SqliteExecOk(ok) => {
+				Ok((query_result_from_protocol(ok.result), session))
+			}
+			protocol::SqliteExecResponse::SqliteErrorResponse(error) => {
+				Err(self.remote_sqlite_error_response(error))
+			}
+		}
+	}
+
 	async fn remote_execute(
 		&self,
 		sql: String,
@@ -584,6 +716,37 @@ impl SqliteDb {
 		match response {
 			protocol::SqliteExecuteResponse::SqliteExecuteOk(ok) => {
 				Ok(execute_result_from_protocol(ok.result))
+			}
+			protocol::SqliteExecuteResponse::SqliteErrorResponse(error) => {
+				Err(self.remote_sqlite_error_response(error))
+			}
+		}
+	}
+
+	async fn remote_execute_with_session(
+		&self,
+		sql: String,
+		params: Option<Vec<BindParam>>,
+		expected_session: Option<u64>,
+	) -> Result<(ExecuteResult, u64)> {
+		let config = self.remote_config()?;
+		let (response, session) = config
+			.handle
+			.remote_sqlite_execute_with_session(
+				protocol::SqliteExecuteRequest {
+					namespace_id: config.namespace_id,
+					actor_id: config.actor_id,
+					generation: config.generation,
+					sql,
+					params: params.map(protocol_bind_params),
+				},
+				expected_session,
+			)
+			.await?;
+
+		match response {
+			protocol::SqliteExecuteResponse::SqliteExecuteOk(ok) => {
+				Ok((execute_result_from_protocol(ok.result), session))
 			}
 			protocol::SqliteExecuteResponse::SqliteErrorResponse(error) => {
 				Err(self.remote_sqlite_error_response(error))
@@ -1036,5 +1199,5 @@ fn json_type_name(value: &JsonValue) -> &'static str {
 }
 
 #[cfg(test)]
-#[path = "../../tests/sqlite.rs"]
+#[path = "../../../tests/sqlite.rs"]
 mod tests;

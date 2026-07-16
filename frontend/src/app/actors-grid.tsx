@@ -68,7 +68,11 @@ function _GridCard({
 // Header create affordance. With the agentOS feature flag on, the single
 // "Create Actor" button becomes a "Create" menu offering Actor or agentOS;
 // both open the same create dialog, the latter with agentOS-tailored copy.
-function CreateMenu({ buttonVariant }: { buttonVariant: "outline" | "default" }) {
+function CreateMenu({
+	buttonVariant,
+}: {
+	buttonVariant: "outline" | "default";
+}) {
 	const navigate = useNavigate();
 	const openModal = (modal: string) =>
 		navigate({ to: ".", search: (old) => ({ ...old, modal }) });

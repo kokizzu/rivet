@@ -34,6 +34,7 @@ pub use queue::{
 };
 pub use sqlite::{
 	BindParam, ColumnValue, ExecResult, ExecuteResult, QueryResult, SqliteBackend, SqliteDb,
+	SqliteTransaction,
 };
 pub use state::RequestSaveOpts;
 pub use task::{

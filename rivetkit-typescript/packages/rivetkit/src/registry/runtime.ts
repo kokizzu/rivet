@@ -15,6 +15,7 @@ export type ActorContextHandle = OpaqueHandle<"actorContext">;
 export type ConnHandle = OpaqueHandle<"conn">;
 export type WebSocketHandle = OpaqueHandle<"webSocket">;
 export type CancellationTokenHandle = OpaqueHandle<"cancellationToken">;
+export type SqliteTransactionHandle = OpaqueHandle<"sqliteTransaction">;
 
 export type RuntimeBytes = Uint8Array;
 
@@ -191,9 +192,22 @@ export interface RuntimeSqlDatabase {
 		sql: string,
 		params?: RuntimeSqlBindParams,
 	): Promise<RuntimeSqlRunResult>;
+	beginTransaction(
+		timeoutMs?: number,
+	): Promise<RuntimeSqlTransactionDatabase>;
 	metrics?(): SqliteNativeMetrics | null;
 	takeLastKvError?(): string | null;
 	close(): Promise<void>;
+}
+
+export interface RuntimeSqlTransactionDatabase {
+	exec(sql: string): Promise<RuntimeSqlExecResult>;
+	execute(
+		sql: string,
+		params?: RuntimeSqlBindParams,
+	): Promise<RuntimeSqlExecuteResult>;
+	commit(): Promise<void>;
+	rollback(): Promise<void>;
 }
 
 export interface RuntimeActorConfig {
@@ -491,6 +505,25 @@ export interface CoreRuntime {
 		sql: string,
 		params?: RuntimeSqlBindParams,
 	): Promise<RuntimeSqlExecuteResult>;
+	actorSqlBeginTransaction(
+		ctx: ActorContextHandle,
+		timeoutMs?: number,
+	): Promise<SqliteTransactionHandle>;
+	actorSqlTransactionExec(
+		transaction: SqliteTransactionHandle,
+		sql: string,
+	): Promise<RuntimeSqlExecResult>;
+	actorSqlTransactionExecute(
+		transaction: SqliteTransactionHandle,
+		sql: string,
+		params?: RuntimeSqlBindParams,
+	): Promise<RuntimeSqlExecuteResult>;
+	actorSqlTransactionCommit(
+		transaction: SqliteTransactionHandle,
+	): Promise<void>;
+	actorSqlTransactionRollback(
+		transaction: SqliteTransactionHandle,
+	): Promise<void>;
 	actorSqlQuery(
 		ctx: ActorContextHandle,
 		sql: string,

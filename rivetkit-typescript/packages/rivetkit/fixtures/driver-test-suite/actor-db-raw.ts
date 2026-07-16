@@ -201,14 +201,266 @@ export const dbActorRaw = actor({
 			await c.db.execute("DELETE FROM test_data WHERE id = ?", id);
 		},
 		transactionCommit: async (c, value: string) => {
-			await c.db.execute(
-				`BEGIN; INSERT INTO test_data (value, payload, created_at) VALUES ('${value}', '', ${Date.now()}); COMMIT;`,
-			);
+			await c.db.transaction(async (tx) => {
+				await tx.execute(
+					"INSERT INTO test_data (value, payload, created_at) VALUES (?, '', ?)",
+					value,
+					Date.now(),
+				);
+			});
 		},
 		transactionRollback: async (c, value: string) => {
-			await c.db.execute(
-				`BEGIN; INSERT INTO test_data (value, payload, created_at) VALUES ('${value}', '', ${Date.now()}); ROLLBACK;`,
+			try {
+				await c.db.transaction(async (tx) => {
+					await tx.execute(
+						"INSERT INTO test_data (value, payload, created_at) VALUES (?, '', ?)",
+						value,
+						Date.now(),
+					);
+					throw new Error("expected rollback");
+				});
+			} catch (error) {
+				if (
+					!(error instanceof Error) ||
+					error.message !== "expected rollback"
+				) {
+					throw error;
+				}
+			}
+		},
+		transactionWithTimeout: async (c, timeout: number) => {
+			await c.db.transaction(
+				async (tx) => {
+					await tx.execute("SELECT 1");
+				},
+				{ timeout },
 			);
+		},
+		transactionExec: async (c) => {
+			await c.db.transaction(async (tx) => {
+				await tx.execute(`
+					INSERT INTO test_data (value, payload, created_at) VALUES ('exec-first', '', ${Date.now()});
+					INSERT INTO test_data (value, payload, created_at) VALUES ('exec-second', '', ${Date.now()});
+				`);
+			});
+			return (
+				await c.db.execute<{ value: string }>(
+					"SELECT value FROM test_data ORDER BY id",
+				)
+			).map((row) => row.value);
+		},
+		transactionAutomaticRollback: async (c) => {
+			await c.db.execute(`
+				CREATE TABLE IF NOT EXISTS transaction_rollback_probe (
+					id INTEGER PRIMARY KEY,
+					value TEXT NOT NULL
+				);
+				DELETE FROM transaction_rollback_probe;
+			`);
+			try {
+				await c.db.transaction(async (tx) => {
+					await tx.execute(
+						"INSERT INTO transaction_rollback_probe(id, value) VALUES (1, 'first')",
+					);
+					await tx.execute(
+						"INSERT OR ROLLBACK INTO transaction_rollback_probe(id, value) VALUES (1, 'duplicate')",
+					);
+				});
+			} catch {
+				// SQLite's ROLLBACK conflict policy has already ended the transaction.
+			}
+			await c.db.execute(
+				"INSERT INTO transaction_rollback_probe(id, value) VALUES (2, 'after')",
+			);
+			return await c.db.execute<{ id: number; value: string }>(
+				"SELECT id, value FROM transaction_rollback_probe ORDER BY id",
+			);
+		},
+		concurrentTransactions: async (c) => {
+			let markFirstTransactionStarted: (() => void) | undefined;
+			const firstTransactionStarted = new Promise<void>((resolve) => {
+				markFirstTransactionStarted = resolve;
+			});
+			const firstTransaction = c.db.transaction(async (tx) => {
+				await tx.execute(
+					"INSERT INTO test_data (value, payload, created_at) VALUES ('first-start', '', ?)",
+					Date.now(),
+				);
+				markFirstTransactionStarted?.();
+				await new Promise((resolve) => setTimeout(resolve, 20));
+				await tx.execute(
+					"INSERT INTO test_data (value, payload, created_at) VALUES ('first-end', '', ?)",
+					Date.now(),
+				);
+			});
+			await firstTransactionStarted;
+			await Promise.all([
+				firstTransaction,
+				c.db.transaction(async (tx) => {
+					await tx.execute(
+						"INSERT INTO test_data (value, payload, created_at) VALUES ('second', '', ?)",
+						Date.now(),
+					);
+				}),
+				c.db.transaction(async (tx) => {
+					await tx.execute(
+						"INSERT INTO test_data (value, payload, created_at) VALUES ('third', '', ?)",
+						Date.now(),
+					);
+				}),
+			]);
+			return (
+				await c.db.execute<{ value: string }>(
+					"SELECT value FROM test_data ORDER BY id",
+				)
+			).map((row) => row.value);
+		},
+		transactionParksOrdinarySql: async (c) => {
+			let markTransactionStarted: (() => void) | undefined;
+			const transactionStarted = new Promise<void>((resolve) => {
+				markTransactionStarted = resolve;
+			});
+			await Promise.all([
+				c.db.transaction(async (tx) => {
+					await tx.execute(
+						"INSERT INTO test_data (value, payload, created_at) VALUES ('tx-start', '', ?)",
+						Date.now(),
+					);
+					markTransactionStarted?.();
+					await new Promise((resolve) => setTimeout(resolve, 20));
+					await tx.execute(
+						"INSERT INTO test_data (value, payload, created_at) VALUES ('tx-end', '', ?)",
+						Date.now(),
+					);
+				}),
+				transactionStarted.then(() =>
+					c.db.execute(
+						"INSERT INTO test_data (value, payload, created_at) VALUES ('ordinary', '', ?)",
+						Date.now(),
+					),
+				),
+			]);
+			return (
+				await c.db.execute<{ value: string }>(
+					"SELECT value FROM test_data ORDER BY id",
+				)
+			).map((row) => row.value);
+		},
+		transactionDeadlockDiagnostic: async (c, nested: boolean) => {
+			try {
+				await c.db.transaction(
+					async (tx) => {
+						if (nested) {
+							await tx.transaction(async () => {});
+						} else {
+							await c.db.execute("SELECT 1");
+						}
+					},
+					{ timeout: 50 },
+				);
+				return "unexpected success";
+			} catch (error) {
+				return error instanceof Error ? error.message : String(error);
+			}
+		},
+		transactionExpiryDiagnostics: async (c) => {
+			let leakedTransaction: { execute: typeof c.db.execute } | undefined;
+			let parked:
+				| Promise<
+						| { status: "executed" }
+						| { status: "rejected"; message: string }
+				  >
+				| undefined;
+			let ownerMessage = "unexpected success";
+			try {
+				await c.db.transaction(
+					async (tx) => {
+						leakedTransaction = tx;
+						await tx.execute(
+							"INSERT INTO test_data (value, payload, created_at) VALUES ('rolled-back-owner', '', ?)",
+							Date.now(),
+						);
+						parked = c.db
+							.execute(
+								"INSERT INTO test_data (value, payload, created_at) VALUES ('must-not-run', '', ?)",
+								Date.now(),
+							)
+							.then(
+								() => ({ status: "executed" as const }),
+								(error) => ({
+									status: "rejected" as const,
+									message:
+										error instanceof Error
+											? error.message
+											: String(error),
+								}),
+							);
+						await new Promise((resolve) => setTimeout(resolve, 80));
+						await tx.execute("SELECT 1");
+					},
+					{ timeout: 50 },
+				);
+			} catch (error) {
+				ownerMessage =
+					error instanceof Error ? error.message : String(error);
+			}
+
+			const parkedResult = await parked;
+			if (!parkedResult) {
+				throw new Error("parked operation was not submitted");
+			}
+			let leakedMessage = "unexpected success";
+			if (!leakedTransaction) {
+				throw new Error("transaction handle was not captured");
+			}
+			try {
+				await leakedTransaction.execute("SELECT 1");
+			} catch (error) {
+				leakedMessage =
+					error instanceof Error ? error.message : String(error);
+			}
+			const values = (
+				await c.db.execute<{ value: string }>(
+					"SELECT value FROM test_data WHERE value IN ('rolled-back-owner', 'must-not-run') ORDER BY value",
+				)
+			).map((row) => row.value);
+			return { ownerMessage, parkedResult, leakedMessage, values };
+		},
+		terminalTransactionDiagnostic: async (c) => {
+			let completedTransaction:
+				| { execute: typeof c.db.execute }
+				| undefined;
+			await c.db.transaction(async (tx) => {
+				completedTransaction = tx;
+				await tx.execute("SELECT 1");
+			});
+			if (!completedTransaction) {
+				throw new Error("transaction handle was not captured");
+			}
+			try {
+				await completedTransaction.execute("SELECT 1");
+				return "unexpected success";
+			} catch (error) {
+				return error instanceof Error ? error.message : String(error);
+			}
+		},
+		manualTransactionCompatibility: async (c) => {
+			await c.db.execute("BEGIN");
+			try {
+				await c.db.execute(
+					"INSERT INTO test_data (value, payload, created_at) VALUES ('manual-compatible', '', ?)",
+					Date.now(),
+				);
+				await c.db.execute("COMMIT");
+			} catch (error) {
+				await c.db.execute("ROLLBACK");
+				throw error;
+			}
+			return (
+				await c.db.execute<{ count: number }>(
+					"SELECT count(*) AS count FROM test_data WHERE value = 'manual-compatible'",
+				)
+			)[0]?.count;
 		},
 		insertPayloadOfSize: async (c, size: number) => {
 			const payload = "x".repeat(size);
@@ -261,22 +513,17 @@ export const dbActorRaw = actor({
 				return emptyRows;
 			}
 
-			await c.db.execute("BEGIN");
-			try {
+			await c.db.transaction(async (tx) => {
 				for (let i = 0; i < normalizedIterations; i++) {
 					const rowId =
 						normalizedRowIds[i % normalizedRowIds.length] ?? 0;
-					await c.db.execute(
+					await tx.execute(
 						"UPDATE test_data SET value = ? WHERE id = ?",
 						`v-${i}`,
 						rowId,
 					);
 				}
-				await c.db.execute("COMMIT");
-			} catch (error) {
-				await c.db.execute("ROLLBACK");
-				throw error;
-			}
+			});
 
 			return await c.db.execute<{ id: number; value: string }>(
 				`SELECT id, value FROM test_data WHERE id IN (${normalizedRowIds.join(",")}) ORDER BY id`,
@@ -304,11 +551,10 @@ export const dbActorRaw = actor({
 			const normalizedChurnCount = Math.max(0, Math.trunc(churnCount));
 			const now = Date.now();
 
-			await c.db.execute("BEGIN");
-			try {
+			await c.db.transaction(async (tx) => {
 				for (let i = 0; i < normalizedSeedCount; i++) {
 					const payload = makePayload(1024 + (i % 5) * 128);
-					await c.db.execute(
+					await tx.execute(
 						"INSERT OR REPLACE INTO test_data (id, value, payload, created_at) VALUES (?, ?, ?, ?)",
 						i + 1,
 						`seed-${i}`,
@@ -320,13 +566,13 @@ export const dbActorRaw = actor({
 				for (let i = 0; i < normalizedChurnCount; i++) {
 					const id = (i % normalizedSeedCount) + 1;
 					if (i % 9 === 0) {
-						await c.db.execute(
+						await tx.execute(
 							"DELETE FROM test_data WHERE id = ?",
 							id,
 						);
 					} else {
 						const payload = makePayload(768 + (i % 7) * 96);
-						await c.db.execute(
+						await tx.execute(
 							"INSERT OR REPLACE INTO test_data (id, value, payload, created_at) VALUES (?, ?, ?, ?)",
 							id,
 							`upd-${i}`,
@@ -335,12 +581,7 @@ export const dbActorRaw = actor({
 						);
 					}
 				}
-
-				await c.db.execute("COMMIT");
-			} catch (error) {
-				await c.db.execute("ROLLBACK");
-				throw error;
-			}
+			});
 		},
 		repeatUpdate: async (c, id: number, count: number) => {
 			let value = "";
@@ -378,6 +619,24 @@ export const dbActorRaw = actor({
 	options: {
 		actionTimeout: 120_000,
 		sleepTimeout: 100,
+	},
+});
+
+export const dbActorManualWarningsDisabled = actor({
+	db: db({ warnOnManualTransactions: false }),
+	actions: {
+		manualTransactionCompatibility: async (c, marker: string) => {
+			await c.db.execute("BEGIN");
+			try {
+				await c.db.execute("SELECT 1");
+				await c.db.execute("COMMIT");
+			} catch (error) {
+				await c.db.execute("ROLLBACK");
+				throw error;
+			}
+			console.log(marker);
+			return true;
+		},
 	},
 });
 

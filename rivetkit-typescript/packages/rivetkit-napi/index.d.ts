@@ -306,6 +306,13 @@ export declare class JsNativeDatabase {
   execute(sql: string, params?: Array<JsBindParam> | undefined | null): Promise<NativeExecuteResult>
   exec(sql: string): Promise<QueryResult>
   close(): Promise<void>
+  beginTransaction(timeoutMs?: number | undefined | null): Promise<JsSqliteTransaction>
+}
+export declare class JsSqliteTransaction {
+  execute(sql: string, params?: Array<JsBindParam> | undefined | null): Promise<NativeExecuteResult>
+  exec(sql: string): Promise<QueryResult>
+  commit(): Promise<void>
+  rollback(): Promise<void>
 }
 export declare class Kv {
   get(key: Buffer): Promise<Buffer | null>

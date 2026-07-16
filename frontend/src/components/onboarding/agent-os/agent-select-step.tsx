@@ -19,7 +19,9 @@ export function AgentSelect({
 					title={agent.title}
 					description={agent.description}
 					badge={
-						agent.status === "coming-soon" ? "Coming soon" : undefined
+						agent.status === "coming-soon"
+							? "Coming soon"
+							: undefined
 					}
 					selected={value === agent.slug}
 					disabled={agent.status !== "available"}

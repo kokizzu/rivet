@@ -2,7 +2,10 @@
 // from: v3.bare, to: v2.bare
 // Replace each todo!() with the migration semantics, then drop the @generated marker.
 
-#![allow(dead_code, unused_variables)]
+// This generated compatibility scaffold intentionally keeps `todo!()` placeholders until the
+// v2 SQLite migration semantics are defined. Rust 1.97 reports fields following those diverging
+// expressions as unreachable, so keep that lint local to the unfinished generated converter.
+#![allow(dead_code, unreachable_code, unused_variables)]
 
 use anyhow::{Result, bail};
 

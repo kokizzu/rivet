@@ -19,7 +19,15 @@ import {
 	promiseActor,
 	syncActionActor,
 } from "./action-types";
-import { dbActorRaw, dbRemoteLifecycleProbe } from "./actor-db-raw";
+import {
+	dbActorManualWarningsDisabled,
+	dbActorRaw,
+	dbRemoteLifecycleProbe,
+} from "./actor-db-raw";
+import {
+	dbActorDrizzleMigration,
+	dbActorDrizzleMigrationRollback,
+} from "./actor-db-drizzle-transaction";
 import { onStateChangeActor } from "./actor-onstatechange";
 import { connErrorSerializationActor } from "./conn-error-serialization";
 import { counterWithParams } from "./conn-params";
@@ -336,8 +344,12 @@ export const registry = setup({
 		workflowSpawnChildActor,
 		workflowSpawnParentActor,
 		// From actor-db-raw.ts
+		dbActorManualWarningsDisabled,
 		dbActorRaw,
 		dbRemoteLifecycleProbe,
+		// From actor-db-drizzle-transaction.ts
+		dbActorDrizzleMigration,
+		dbActorDrizzleMigrationRollback,
 		// From db-lifecycle.ts
 		dbLifecycle,
 		dbLifecycleFailing,
