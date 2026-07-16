@@ -33,6 +33,7 @@ import {
 	useDataProvider,
 	useDataProviderCheck,
 	useEngineCompatDataProvider,
+	useNamespaceDataProviderReady,
 } from "@/components/actors";
 import { SafeHover } from "@/components/safe-hover";
 import { VisibilitySensor } from "@/components/visibility-sensor";
@@ -963,8 +964,12 @@ function ActorBreadcrumbSegment() {
 	// biome-ignore lint/correctness/useHookAtTopLevel: guarded by the parent only rendering on namespace match
 	const search = useSearch({ strict: false }) as { n?: string[] };
 	const buildId = search.n?.[0];
+	// `n` is a search param, so it is set before the namespace route's loader
+	// resolves. The popover below reads that loader's data provider, so hold the
+	// segment until it lands rather than rendering off the search param alone.
+	const isDataProviderReady = useNamespaceDataProviderReady();
 
-	if (!buildId) return null;
+	if (!buildId || !isDataProviderReady) return null;
 
 	return (
 		<>

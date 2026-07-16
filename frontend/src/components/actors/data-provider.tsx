@@ -1,4 +1,4 @@
-import { useLoaderData, useMatchRoute } from "@tanstack/react-router";
+import { useLoaderData, useMatch, useMatchRoute } from "@tanstack/react-router";
 import { createContext, useContext } from "react";
 import type {
 	createGlobalContext as createGlobalCloudContext,
@@ -122,4 +122,31 @@ export const useEngineCompatDataProvider = () => {
 		from: "/_context/ns/$namespace",
 		select: (d) => d.dataProvider,
 	}) as EngineDataProvider | CloudDataProvider;
+};
+
+/**
+ * Whether `useEngineCompatDataProvider` can currently be read.
+ *
+ * That hook takes its provider from the namespace route's loader, which is
+ * absent while the route is still pending. The namespace route renders the top
+ * bar from its `pendingComponent`, so chrome mounted there can run ahead of the
+ * loader. `useDataProviderCheck` does not cover this: it fuzzy-matches the
+ * *project* route, and matching a route says nothing about whether its loader
+ * has resolved.
+ */
+export const useNamespaceDataProviderReady = () => {
+	const override = useContext(DataProviderContext);
+	const cloudMatch = useMatch({
+		from: "/_context/orgs/$organization/projects/$project/ns/$namespace",
+		shouldThrow: false,
+	});
+	const engineMatch = useMatch({
+		from: "/_context/ns/$namespace",
+		shouldThrow: false,
+	});
+
+	if (override) return true;
+	return !!(features.platform
+		? cloudMatch?.loaderData
+		: engineMatch?.loaderData);
 };
