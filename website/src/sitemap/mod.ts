@@ -68,9 +68,9 @@ import {
 	faGrid,
 	faGrid2,
 	faMailbox,
-    faUsb,
-    faUsbDrive,
-    faSupabase,
+	faUsb,
+	faUsbDrive,
+	faSupabase,
 } from "@rivet-gg/icons";
 import { deployOptions, type DeployOption } from "@rivetkit/shared-data";
 import nextjs from "@/images/vendors/next-js.svg";
@@ -83,7 +83,7 @@ const deploySidebarPages: SidebarItem[] = deployOptions.map(
 		icon,
 		badge,
 	}),
-)
+);
 
 export const sitemap = [
 	{
@@ -142,7 +142,7 @@ export const sitemap = [
 							},
 						],
 					},
-				]
+				],
 			},
 			{
 				title: "Features",
@@ -182,6 +182,11 @@ export const sitemap = [
 						href: "/docs/actors/sqlite",
 						icon: faSqlite,
 					},
+					{
+						title: "Actor Runtime Socket",
+						href: "/docs/actors/actor-runtime-socket",
+						badge: "Experimental",
+					},
 					// {
 					// 	title: "Persistence",
 					// 	collapsible: true,
@@ -205,7 +210,7 @@ export const sitemap = [
 					// 		},
 					// 	]
 					// },
-				]
+				],
 			},
 			{
 				title: "Concepts",
@@ -245,15 +250,15 @@ export const sitemap = [
 							},
 							{
 								title: "Low-Level WebSocket Handler",
-								href: "/docs/actors/websocket-handler"
+								href: "/docs/actors/websocket-handler",
 							},
 							{
 								title: "Low-Level HTTP Handler",
-								href: "/docs/actors/request-handler"
+								href: "/docs/actors/request-handler",
 							},
 							{
 								title: "Vanilla HTTP API",
-								href: "/docs/actors/http-api"
+								href: "/docs/actors/http-api",
 							},
 						],
 					},
@@ -309,7 +314,7 @@ export const sitemap = [
 							},
 							{
 								title: "Errors",
-								href: "/docs/actors/errors"
+								href: "/docs/actors/errors",
 							},
 							{
 								title: "Testing",
@@ -387,8 +392,8 @@ export const sitemap = [
 								href: "/docs/clients/swiftui",
 								icon: faSwift,
 							},
-						]
-					}
+						],
+					},
 				],
 			},
 			{
@@ -443,7 +448,7 @@ export const sitemap = [
 								title: "Endpoints",
 								href: "/docs/general/endpoints",
 							},
-						]
+						],
 					},
 					{
 						title: "API Reference",
@@ -452,22 +457,22 @@ export const sitemap = [
 							{
 								title: "TypeScript API",
 								href: "/typedoc",
-								external: true
+								external: true,
 								// icon: faSquareBinary,
 							},
 							{
 								title: "OpenAPI",
 								href: "https://github.com/rivet-dev/rivet/tree/main/rivetkit-openapi",
-								external: true
+								external: true,
 								// icon: faSquareBinary,
 							},
 							{
 								title: "AsyncAPI",
 								href: "https://github.com/rivet-dev/rivet/tree/main/rivetkit-asyncapi",
-								external: true
+								external: true,
 								// icon: faSquareBinary,
 							},
-						]
+						],
 					},
 					// {
 					// 	title: "Architecture",
@@ -486,7 +491,7 @@ export const sitemap = [
 								title: "Docs for LLMs",
 								href: "/docs/general/docs-for-llms",
 							},
-						]
+						],
 					},
 					// {
 					// 	title: "System Architecture",
@@ -536,7 +541,7 @@ export const sitemap = [
 						href: "/docs/deploy",
 						icon: faSquareInfo,
 					},
-				]
+				],
 			},
 			{
 				title: "Platforms",
@@ -597,7 +602,7 @@ export const sitemap = [
 						title: "Production Checklist",
 						href: "/docs/self-hosting/production-checklist",
 					},
-				]
+				],
 			},
 			{
 				title: "Platforms",
@@ -638,7 +643,7 @@ export const sitemap = [
 					{
 						title: "FoundationDB",
 						href: "/docs/self-hosting/foundationdb",
-						badge: "Enterprise"
+						badge: "Enterprise",
 					},
 				],
 			},

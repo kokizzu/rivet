@@ -153,6 +153,10 @@ export type RuntimeSqlBindParam =
 
 export type RuntimeSqlBindParams = RuntimeSqlBindParam[] | null;
 
+export interface RuntimeActorRuntimeSocketEndpointInfo {
+	path: string;
+}
+
 export interface RuntimeSqlQueryResult {
 	columns: string[];
 	rows: unknown[][];
@@ -215,6 +219,7 @@ export interface RuntimeActorConfig {
 	icon?: string;
 	hasDatabase?: boolean;
 	remoteSqlite?: boolean;
+	enableActorRuntimeSocket?: boolean;
 	hasState?: boolean;
 	canHibernateWebsocket?: boolean;
 	stateSaveIntervalMs?: number;
@@ -537,6 +542,9 @@ export interface CoreRuntime {
 	actorSqlMetrics(ctx: ActorContextHandle): SqliteNativeMetrics | null;
 	actorSqlTakeLastKvError(ctx: ActorContextHandle): string | null;
 	actorSqlClose(ctx: ActorContextHandle): Promise<void>;
+	actorRuntimeSocketProvision(
+		ctx: ActorContextHandle,
+	): Promise<RuntimeActorRuntimeSocketEndpointInfo>;
 
 	actorQueueSend(
 		ctx: ActorContextHandle,

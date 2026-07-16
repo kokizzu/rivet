@@ -2492,6 +2492,12 @@ export class ActorContextHandleAdapter {
 		return this.#sql;
 	}
 
+	async actorRuntimeSocket(): Promise<{ path: string }> {
+		return await callNative(() =>
+			this.#runtime.actorRuntimeSocketProvision(this.#ctx),
+		);
+	}
+
 	get db() {
 		if (!this.#databaseProvider) {
 			throw databaseNotConfiguredError();
@@ -3338,6 +3344,7 @@ function buildActorConfig(
 		remoteSqlite:
 			config.db !== undefined &&
 			sqliteBackendForConfig(registryConfig) === "remote",
+		enableActorRuntimeSocket: options.enableActorRuntimeSocket === true,
 		hasState:
 			config.state !== undefined ||
 			typeof config.createState === "function",

@@ -28,6 +28,8 @@ Design constraints, invariants, and reference commands for the Rivet monorepo. F
 
 When talking about "Rivet Actors" make sure to capitalize "Rivet Actor" as a proper noun and lowercase "actor" as a generic noun.
 
+**Actor Runtime Socket** is the product name for the generic actor-local protocol. SQLite is its first capability and Unix sockets are its current transport; do not use "Actor SQLite UDS API" or "SQLite UDS" as the product name.
+
 ## Commands
 
 ### Build + test
@@ -196,7 +198,7 @@ When the user asks to track something in a note, store it in `~/.agents/notes/` 
 - rivetkit (TypeScript) owns only: workflow engine, agent-os, client library, Zod schema validation for user-defined types, and actor definition types.
 - Errors use universal `RivetError` (group/code/message/metadata) at all boundaries. No custom error classes in TS.
 - CBOR serialization at all cross-language boundaries. JSON only for HTTP inspector endpoints.
-- Pegboard orchestrates actor exclusivity: at most one actor instance for a given actor id may be running or accessing that actor's KV at a time. `pegboard-envoy` and `envoy-client` may rely on this invariant and should not add separate KV concurrency fences for same-actor access; the lost-timeout + ping protocol is responsible for making overlapping actors impossible.
+- Pegboard orchestrates actor exclusivity: at most one actor instance for a given actor id may be running or accessing that actor's storage at a time. This is the actor single-writer invariant: a Rivet Actor is the single writer for both KV and SQLite. `pegboard-envoy`, `envoy-client`, and remote/wasm SQLite may rely on this invariant and must not add envoy-protocol lease keys, engine-side transaction ownership, or separate same-actor concurrency fences. Coordinate LocalNative and remote/wasm transactions through the same actor-local `rivetkit-core` coordinator before backend dispatch. Actor Runtime Socket `leaseKey` values identify connection-local transaction handles and never cross depot, envoy, or engine boundaries. The lost-timeout + ping protocol is responsible for making overlapping actor generations impossible.
 
 ### Monorepo orientation
 
@@ -226,6 +228,7 @@ When the user asks to track something in a note, store it in `~/.agents/notes/` 
 - Treat `envoy <-> pegboard-envoy` as untrusted.
 - Treat traffic inside the engine over `nats`, `fdb`, and other internal backends as trusted.
 - Treat `gateway`, `api`, `pegboard-envoy`, `nats`, `fdb`, and similar engine-internal services as one trusted internal boundary once traffic is inside the engine.
+- Treat a client connected to an actor-local Unix socket as a trusted, application-local peer, not an adversarial security boundary. Socket ownership, permissions, and per-generation lifetime provide isolation. Continue enforcing framing, resource bounds, cancellation, and shutdown behavior for correctness and faulty clients, but do not assign security severity based on malicious local traffic unless this trust model changes.
 - Validate and authorize all client-originated data at the engine edge before it reaches trusted internal systems.
 - Validate and authorize all envoy-originated data at `pegboard-envoy` before it reaches trusted internal systems.
 

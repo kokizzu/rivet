@@ -1845,6 +1845,8 @@ impl ActorTask {
 			step = "wait_for_pending_alarm_writes",
 			"actor shutdown cleanup step completed"
 		);
+		#[cfg(feature = "sqlite-local")]
+		ctx.shutdown_actor_runtime_socket().await;
 		ctx.sql()
 			.cleanup()
 			.await

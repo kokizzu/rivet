@@ -8,6 +8,10 @@ pub fn public_error_status_code(group: &str, code: &str) -> Option<u16> {
 		("actor", "action_not_found") => Some(404),
 		("actor", "action_timed_out") => Some(408),
 		("actor", "aborted") => Some(400),
+		(
+			"actor_runtime_socket",
+			"unsupported" | "not_enabled" | "closed" | "database_unavailable",
+		) => Some(400),
 		("message", "incoming_too_long" | "outgoing_too_long") => Some(400),
 		(
 			"queue",

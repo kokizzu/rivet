@@ -1,6 +1,14 @@
 // @ts-nocheck
 
+import { existsSync } from "node:fs";
+import { createConnection, type Socket } from "node:net";
+import { once } from "node:events";
 import { describe, expect, test, vi } from "vitest";
+import {
+	decodeServerFrame,
+	decodeServerHello,
+	encodeClientFrame,
+} from "../../src/common/bare/generated/actor-runtime-socket-protocol/v1";
 import {
 	describeDriverMatrix,
 	SQLITE_DRIVER_MATRIX_OPTIONS,
@@ -43,6 +51,78 @@ type LifecycleEvent = {
 	event: string;
 	timestamp: number;
 };
+
+const ACTOR_RUNTIME_SOCKET_PROTOCOL_VERSION = Buffer.from([1, 0]);
+
+function writeActorRuntimeSocketFrame(
+	socket: Socket,
+	payload: Uint8Array = new Uint8Array(),
+): void {
+	const versionedPayload = Buffer.concat([
+		ACTOR_RUNTIME_SOCKET_PROTOCOL_VERSION,
+		Buffer.from(payload),
+	]);
+	const header = Buffer.allocUnsafe(4);
+	header.writeUInt32BE(versionedPayload.length);
+	socket.write(Buffer.concat([header, versionedPayload]));
+}
+
+function createActorRuntimeSocketFrameReader(socket: Socket) {
+	const chunks = socket[Symbol.asyncIterator]();
+	let buffered = Buffer.alloc(0);
+
+	return async (): Promise<Buffer> => {
+		while (buffered.length < 4) {
+			const next = await chunks.next();
+			if (next.done) throw new Error("Actor Runtime Socket closed");
+			buffered = Buffer.concat([buffered, Buffer.from(next.value)]);
+		}
+
+		const payloadLength = buffered.readUInt32BE(0);
+		while (buffered.length < 4 + payloadLength) {
+			const next = await chunks.next();
+			if (next.done) throw new Error("Actor Runtime Socket closed");
+			buffered = Buffer.concat([buffered, Buffer.from(next.value)]);
+		}
+
+		const payload = buffered.subarray(4, 4 + payloadLength);
+		buffered = buffered.subarray(4 + payloadLength);
+		return payload;
+	};
+}
+
+async function connectActorRuntimeSocket(path: string): Promise<{
+	socket: Socket;
+	readFrame: () => Promise<Buffer>;
+}> {
+	const socket = createConnection(path);
+	await once(socket, "connect");
+	const readFrame = createActorRuntimeSocketFrameReader(socket);
+
+	writeActorRuntimeSocketFrame(socket);
+	const helloPayload = await readFrame();
+	expect(helloPayload.subarray(0, 2)).toEqual(
+		ACTOR_RUNTIME_SOCKET_PROTOCOL_VERSION,
+	);
+	expect(decodeServerHello(helloPayload.subarray(2)).tag).toBe("HelloOk");
+
+	return { socket, readFrame };
+}
+
+async function sendActorRuntimeSocketRequest(
+	socket: Socket,
+	readFrame: () => Promise<Buffer>,
+	request: Parameters<typeof encodeClientFrame>[0],
+) {
+	writeActorRuntimeSocketFrame(socket, encodeClientFrame(request));
+	const payload = await readFrame();
+	expect(payload.subarray(0, 2)).toEqual(
+		ACTOR_RUNTIME_SOCKET_PROTOCOL_VERSION,
+	);
+	const response = decodeServerFrame(payload.subarray(2));
+	expect(response.tag).toBe("Response");
+	return response;
+}
 
 function isActorStoppingDbError(error: unknown): boolean {
 	return (
@@ -147,6 +227,409 @@ describeDriverMatrix(
 
 		for (const variant of variants) {
 			describe(`Actor Database (${variant}) Tests`, () => {
+				test.skipIf(
+					driverTestConfig.runtime !== "native" ||
+						driverTestConfig.sqliteBackend !== "local",
+				)(
+					"rejects Actor Runtime Socket provisioning when opt-in or SQLite is missing",
+					async (c) => {
+						const { client } = await setupDriverTest(
+							c,
+							driverTestConfig,
+						);
+						const disabled =
+							client.dbActorRuntimeSocketDisabled.getOrCreate([
+								`runtime-socket-disabled-${crypto.randomUUID()}`,
+							]);
+						await expect(
+							disabled.getActorRuntimeSocketPath(),
+						).rejects.toMatchObject({
+							group: "actor_runtime_socket",
+							code: "not_enabled",
+						});
+
+						const withoutDb =
+							client.actorRuntimeSocketWithoutDb.getOrCreate([
+								`runtime-socket-without-db-${crypto.randomUUID()}`,
+							]);
+						await expect(
+							withoutDb.getActorRuntimeSocketPath(),
+						).rejects.toMatchObject({
+							group: "actor_runtime_socket",
+							code: "database_unavailable",
+						});
+					},
+					dbTestTimeout,
+				);
+
+				test.skipIf(
+					driverTestConfig.runtime !== "native" ||
+						driverTestConfig.sqliteBackend !== "remote",
+				)(
+					"rejects Actor Runtime Socket provisioning for a remote SQLite backend",
+					async (c) => {
+						const { client } = await setupDriverTest(
+							c,
+							driverTestConfig,
+						);
+						const actor = getDbActor(client, variant).getOrCreate([
+							`runtime-socket-remote-${crypto.randomUUID()}`,
+						]);
+						await expect(
+							actor.getActorRuntimeSocketPath(),
+						).rejects.toMatchObject({
+							group: "actor_runtime_socket",
+							code: "database_unavailable",
+						});
+					},
+					dbTestTimeout,
+				);
+
+				test.skipIf(driverTestConfig.runtime !== "wasm")(
+					"rejects Actor Runtime Socket provisioning outside the native runtime",
+					async (c) => {
+						const { client } = await setupDriverTest(
+							c,
+							driverTestConfig,
+						);
+						const actor = getDbActor(client, variant).getOrCreate([
+							`db-${variant}-runtime-socket-wasm-${crypto.randomUUID()}`,
+						]);
+						await expect(
+							actor.getActorRuntimeSocketPath(),
+						).rejects.toThrow(
+							"only available on Unix native runtimes",
+						);
+					},
+					dbTestTimeout,
+				);
+
+				test.skipIf(
+					driverTestConfig.runtime !== "native" ||
+						driverTestConfig.sqliteBackend !== "local",
+				)(
+					"provisions the Actor Runtime Socket for the current generation",
+					async (c) => {
+						const { client } = await setupDriverTest(
+							c,
+							driverTestConfig,
+						);
+						const actorKey = [
+							`db-${variant}-runtime-socket-${crypto.randomUUID()}`,
+						];
+						const actor = getDbActor(client, variant).getOrCreate(
+							actorKey,
+						);
+						const firstPath =
+							await actor.getActorRuntimeSocketPath();
+						const { socket, readFrame } =
+							await connectActorRuntimeSocket(firstPath);
+						const actorAwake = actor.holdActorAwake();
+						// Keep this long raw-socket scenario from crossing the actor's normal
+						// idle-sleep boundary while no action response is outstanding.
+						await vi.waitFor(async () => {
+							expect(await actor.isActorAwakeHeld()).toBe(true);
+						});
+
+						const begin = await sendActorRuntimeSocketRequest(
+							socket,
+							readFrame,
+							{
+								tag: "Request",
+								val: {
+									requestId: 1,
+									leaseKey: null,
+									payload: {
+										tag: "SqliteBegin",
+										val: {
+											leaseKey: "driver-transaction",
+											timeoutMs: null,
+										},
+									},
+								},
+							},
+						);
+						expect(begin).toMatchObject({
+							tag: "Response",
+							val: {
+								requestId: 1,
+								payload: { tag: "SqliteBeginOk" },
+							},
+						});
+
+						const insert = await sendActorRuntimeSocketRequest(
+							socket,
+							readFrame,
+							{
+								tag: "Request",
+								val: {
+									requestId: 2,
+									leaseKey: "driver-transaction",
+									payload: {
+										tag: "SqliteQuery",
+										val: {
+											sql: "INSERT INTO test_data (value, payload, created_at) VALUES (?, ?, ?)",
+											params: [
+												{
+													tag: "SqlText",
+													val: "transaction",
+												},
+												{ tag: "SqlText", val: "" },
+												{
+													tag: "SqlInteger",
+													val: BigInt(Date.now()),
+												},
+											],
+										},
+									},
+								},
+							},
+						);
+						expect(insert).toMatchObject({
+							tag: "Response",
+							val: {
+								requestId: 2,
+								payload: { tag: "SqliteQueryOk" },
+							},
+						});
+
+						const actorCount =
+							actor.getCountWithSubmissionBarrier();
+						// Poll the fixture barrier set immediately after c.db.execute returns its
+						// pending promise, proving the operation reached coordinator admission.
+						await vi.waitFor(async () => {
+							expect(await actor.isSqlOperationSubmitted()).toBe(
+								true,
+							);
+						});
+
+						const commit = await sendActorRuntimeSocketRequest(
+							socket,
+							readFrame,
+							{
+								tag: "Request",
+								val: {
+									requestId: 3,
+									leaseKey: null,
+									payload: {
+										tag: "SqliteCommit",
+										val: { leaseKey: "driver-transaction" },
+									},
+								},
+							},
+						);
+						expect(commit).toMatchObject({
+							tag: "Response",
+							val: {
+								requestId: 3,
+								payload: { tag: "SqliteCommitOk" },
+							},
+						});
+						expect(await actorCount).toBe(1);
+
+						const independentInsert =
+							await sendActorRuntimeSocketRequest(
+								socket,
+								readFrame,
+								{
+									tag: "Request",
+									val: {
+										requestId: 4,
+										leaseKey: null,
+										payload: {
+											tag: "SqliteQuery",
+											val: {
+												sql: "INSERT INTO test_data (value, payload, created_at) VALUES (?, ?, ?)",
+												params: [
+													{
+														tag: "SqlText",
+														val: "independent",
+													},
+													{ tag: "SqlText", val: "" },
+													{
+														tag: "SqlInteger",
+														val: BigInt(Date.now()),
+													},
+												],
+											},
+										},
+									},
+								},
+							);
+						expect(independentInsert).toMatchObject({
+							tag: "Response",
+							val: {
+								requestId: 4,
+								payload: { tag: "SqliteQueryOk" },
+							},
+						});
+						expect(await actor.getCount()).toBe(2);
+
+						const heldTransaction = actor.holdTransaction();
+						// Poll until the actor transaction owns the shared coordinator before sending socket SQL.
+						await vi.waitFor(async () => {
+							expect(await actor.isTransactionHolding()).toBe(
+								true,
+							);
+						});
+						const socketSql = sendActorRuntimeSocketRequest(
+							socket,
+							readFrame,
+							{
+								tag: "Request",
+								val: {
+									requestId: 5,
+									leaseKey: null,
+									payload: {
+										tag: "SqliteQuery",
+										val: {
+											sql: "SELECT count(*) FROM test_data",
+											params: [],
+										},
+									},
+								},
+							},
+						);
+						await actor.releaseHeldTransaction();
+						await heldTransaction;
+						expect(await socketSql).toMatchObject({
+							tag: "Response",
+							val: {
+								requestId: 5,
+								payload: { tag: "SqliteQueryOk" },
+							},
+						});
+
+						const expiringBegin =
+							await sendActorRuntimeSocketRequest(
+								socket,
+								readFrame,
+								{
+									tag: "Request",
+									val: {
+										requestId: 6,
+										leaseKey: null,
+										payload: {
+											tag: "SqliteBegin",
+											val: {
+												leaseKey: "expiring",
+												timeoutMs: BigInt(50),
+											},
+										},
+									},
+								},
+							);
+						expect(expiringBegin).toMatchObject({
+							tag: "Response",
+							val: {
+								requestId: 6,
+								payload: { tag: "SqliteBeginOk" },
+							},
+						});
+						await new Promise((resolve) => setTimeout(resolve, 80));
+						for (const requestId of [7, 8]) {
+							const expired = await sendActorRuntimeSocketRequest(
+								socket,
+								readFrame,
+								{
+									tag: "Request",
+									val: {
+										requestId,
+										leaseKey: "expiring",
+										payload: {
+											tag: "SqliteQuery",
+											val: {
+												sql: "SELECT 1",
+												params: [],
+											},
+										},
+									},
+								},
+							);
+							expect(expired).toMatchObject({
+								tag: "Response",
+								val: {
+									requestId,
+									payload: {
+										tag: "LeaseExpired",
+										val: { timeoutMs: 50n },
+									},
+								},
+							});
+							if (expired.tag === "Response") {
+								expect(
+									expired.val.payload.val.message,
+								).toContain("deadlock-safety backstop");
+							}
+						}
+
+						await sendActorRuntimeSocketRequest(socket, readFrame, {
+							tag: "Request",
+							val: {
+								requestId: 9,
+								leaseKey: null,
+								payload: {
+									tag: "SqliteBegin",
+									val: {
+										leaseKey: "disconnect",
+										timeoutMs: null,
+									},
+								},
+							},
+						});
+						await sendActorRuntimeSocketRequest(socket, readFrame, {
+							tag: "Request",
+							val: {
+								requestId: 10,
+								leaseKey: "disconnect",
+								payload: {
+									tag: "SqliteQuery",
+									val: {
+										sql: "INSERT INTO test_data (value, payload, created_at) VALUES ('disconnect-rollback', '', ?)",
+										params: [
+											{
+												tag: "SqlInteger",
+												val: BigInt(Date.now()),
+											},
+										],
+									},
+								},
+							},
+						});
+
+						socket.destroy();
+						await once(socket, "close");
+						await actor.releaseActorAwake();
+						await actorAwake;
+						expect(await actor.getCount()).toBe(2);
+						await actor.destroy();
+						// Poll until destroy cleanup removes the old generation socket.
+						await vi.waitFor(() =>
+							expect(existsSync(firstPath)).toBe(false),
+						);
+
+						const nextActor = getDbActor(
+							client,
+							variant,
+						).getOrCreate(actorKey);
+						const nextPath =
+							await nextActor.getActorRuntimeSocketPath();
+						expect(nextPath).not.toBe(firstPath);
+						expect(existsSync(nextPath)).toBe(true);
+
+						await nextActor.triggerSleep();
+						// Poll until sleep cleanup removes the old generation socket.
+						await vi.waitFor(() =>
+							expect(existsSync(nextPath)).toBe(false),
+						);
+						const afterSleepPath =
+							await nextActor.getActorRuntimeSocketPath();
+						expect(afterSleepPath).not.toBe(nextPath);
+						expect(existsSync(afterSleepPath)).toBe(true);
+					},
+					dbTestTimeout,
+				);
+
 				test(
 					"bootstraps schema on startup",
 					async (c) => {

@@ -1,5 +1,6 @@
 import { actor } from "rivetkit";
 import { db } from "@/common/database/mod";
+import { promiseWithResolvers } from "rivetkit/utils";
 import type { registry } from "./registry-static";
 import { scheduleActorSleep } from "./schedule-sleep";
 
@@ -64,6 +65,7 @@ export const dbActorRaw = actor({
 		disconnectInsertEnabled: false,
 		disconnectInsertDelayMs: 0,
 		lifecycleObserverKey: null as string | null,
+		transactionHolding: false,
 	},
 	db: db({
 		onMigrate: async (db) => {
@@ -77,6 +79,18 @@ export const dbActorRaw = actor({
 			`);
 		},
 	}),
+	createVars: () =>
+		({
+			actorAwakeHeld: false,
+			actorAwakeRelease: undefined,
+			sqlOperationSubmitted: false,
+			transactionRelease: undefined,
+		}) as {
+			actorAwakeHeld: boolean;
+			actorAwakeRelease: PromiseWithResolvers<void> | undefined;
+			sqlOperationSubmitted: boolean;
+			transactionRelease: PromiseWithResolvers<void> | undefined;
+		},
 	onWake: async (c) => {
 		await recordLifecycleEvent(c, "wake");
 	},
@@ -102,6 +116,46 @@ export const dbActorRaw = actor({
 		);
 	},
 	actions: {
+		getActorRuntimeSocketPath: async (c) => {
+			return (await c.actorRuntimeSocket()).path;
+		},
+		holdActorAwake: async (c) => {
+			c.vars.actorAwakeRelease = promiseWithResolvers((reason) =>
+				c.log.warn({
+					msg: "actor wake hold rejected",
+					reason,
+				}),
+			);
+			c.vars.actorAwakeHeld = true;
+			try {
+				await c.vars.actorAwakeRelease.promise;
+			} finally {
+				c.vars.actorAwakeHeld = false;
+				c.vars.actorAwakeRelease = undefined;
+			}
+		},
+		releaseActorAwake: (c) => c.vars.actorAwakeRelease?.resolve(),
+		isActorAwakeHeld: (c) => c.vars.actorAwakeHeld,
+		holdTransaction: async (c) => {
+			await c.db.transaction(async (tx) => {
+				await tx.execute("SELECT 1");
+				c.vars.transactionRelease = promiseWithResolvers((reason) =>
+					c.log.warn({
+						msg: "held transaction release rejected",
+						reason,
+					}),
+				);
+				c.state.transactionHolding = true;
+				try {
+					await c.vars.transactionRelease.promise;
+				} finally {
+					c.state.transactionHolding = false;
+					c.vars.transactionRelease = undefined;
+				}
+			});
+		},
+		releaseHeldTransaction: (c) => c.vars.transactionRelease?.resolve(),
+		isTransactionHolding: (c) => c.state.transactionHolding,
 		configureDisconnectInsert: (c, enabled: boolean, delayMs: number) => {
 			c.state.disconnectInsertEnabled = enabled;
 			c.state.disconnectInsertDelayMs = Math.max(0, Math.floor(delayMs));
@@ -169,6 +223,19 @@ export const dbActorRaw = actor({
 			);
 			return results[0].count;
 		},
+		getCountWithSubmissionBarrier: async (c) => {
+			const pending = c.db.execute<{ count: number }>(
+				`SELECT COUNT(*) as count FROM test_data`,
+			);
+			c.vars.sqlOperationSubmitted = true;
+			try {
+				const results = await pending;
+				return results[0].count;
+			} finally {
+				c.vars.sqlOperationSubmitted = false;
+			}
+		},
+		isSqlOperationSubmitted: (c) => c.vars.sqlOperationSubmitted,
 		rawSelectCount: async (c) => {
 			const results = await c.db.execute<{ count: number }>(
 				`SELECT COUNT(*) as count FROM test_data`,
@@ -618,6 +685,7 @@ export const dbActorRaw = actor({
 	},
 	options: {
 		actionTimeout: 120_000,
+		enableActorRuntimeSocket: true,
 		sleepTimeout: 100,
 	},
 });
@@ -637,6 +705,26 @@ export const dbActorManualWarningsDisabled = actor({
 			console.log(marker);
 			return true;
 		},
+	},
+});
+
+export const dbActorRuntimeSocketDisabled = actor({
+	db: db(),
+	actions: {
+		getActorRuntimeSocketPath: async (c) => {
+			return (await c.actorRuntimeSocket()).path;
+		},
+	},
+});
+
+export const actorRuntimeSocketWithoutDb = actor({
+	actions: {
+		getActorRuntimeSocketPath: async (c) => {
+			return (await c.actorRuntimeSocket()).path;
+		},
+	},
+	options: {
+		enableActorRuntimeSocket: true,
 	},
 });
 

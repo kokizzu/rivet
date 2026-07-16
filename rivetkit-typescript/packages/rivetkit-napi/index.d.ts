@@ -35,6 +35,9 @@ export interface JsInspectorSnapshot {
   queueSize: number
   connectedClients: number
 }
+export interface JsActorRuntimeSocketEndpointInfo {
+  path: string
+}
 export interface JsHttpResponse {
   status?: number
   headers?: Record<string, string>
@@ -72,6 +75,7 @@ export interface JsActorConfig {
   icon?: string
   hasDatabase?: boolean
   remoteSqlite?: boolean
+  enableActorRuntimeSocket?: boolean
   hasState?: boolean
   canHibernateWebsocket?: boolean
   stateSaveIntervalMs?: number
@@ -235,6 +239,7 @@ export declare class ActorContext {
   endOnStateChange(): void
   kv(): Kv
   sql(): JsNativeDatabase
+  provisionActorRuntimeSocket(): Promise<JsActorRuntimeSocketEndpointInfo>
   schedule(): Schedule
   queue(): Queue
   setAlarm(timestampMs?: number | undefined | null): void

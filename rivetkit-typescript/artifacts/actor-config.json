@@ -109,6 +109,10 @@
           "description": "Icon for the actor in the Inspector UI. Can be an emoji (e.g., '🚀') or FontAwesome icon name (e.g., 'rocket').",
           "type": "string"
         },
+        "enableActorRuntimeSocket": {
+          "description": "Enables the experimental Actor Runtime Socket for this actor. Default: false",
+          "type": "boolean"
+        },
         "createVarsTimeout": {
           "description": "Timeout in ms for createVars handler. Default: 5000",
           "type": "number"

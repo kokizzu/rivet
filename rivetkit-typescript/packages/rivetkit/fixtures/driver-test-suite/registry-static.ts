@@ -20,8 +20,10 @@ import {
 	syncActionActor,
 } from "./action-types";
 import {
+	actorRuntimeSocketWithoutDb,
 	dbActorManualWarningsDisabled,
 	dbActorRaw,
+	dbActorRuntimeSocketDisabled,
 	dbRemoteLifecycleProbe,
 } from "./actor-db-raw";
 import {
@@ -345,7 +347,9 @@ export const registry = setup({
 		workflowSpawnParentActor,
 		// From actor-db-raw.ts
 		dbActorManualWarningsDisabled,
+		actorRuntimeSocketWithoutDb,
 		dbActorRaw,
+		dbActorRuntimeSocketDisabled,
 		dbRemoteLifecycleProbe,
 		// From actor-db-drizzle-transaction.ts
 		dbActorDrizzleMigration,

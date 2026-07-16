@@ -20,6 +20,10 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::ActorConfig;
+#[cfg(feature = "sqlite-local")]
+use crate::actor::actor_runtime_socket::{
+	ActorRuntimeSocketEndpoint, ActorRuntimeSocketEndpointInfo,
+};
 use crate::actor::connection::{
 	ConnHandle, ConnHandles, HibernatableConnectionMetadata, PendingHibernationChanges,
 	hibernatable_id_from_slice,
@@ -55,6 +59,8 @@ pub struct ActorContext(pub(crate) Arc<ActorContextInner>);
 pub(crate) struct ActorContextInner {
 	pub(super) kv: Kv,
 	sql: SqliteDb,
+	#[cfg(feature = "sqlite-local")]
+	actor_runtime_socket: ActorRuntimeSocketEndpoint,
 	// Forced-sync: actor state snapshots are exposed through synchronous
 	// accessors and are never held across `.await`.
 	pub(super) current_state: RwLock<Vec<u8>>,
@@ -236,6 +242,9 @@ impl ActorContext {
 		#[cfg(feature = "sqlite-local")]
 		sql.set_vfs_metrics(Arc::new(metrics.clone()));
 		let diagnostics = ActorDiagnostics::new(actor_id.clone());
+		#[cfg(feature = "sqlite-local")]
+		let actor_runtime_socket =
+			ActorRuntimeSocketEndpoint::new(config.enable_actor_runtime_socket, sql.clone());
 		let state_save_interval = config.state_save_interval;
 		let abort_signal = CancellationToken::new();
 		let shutdown_deadline = CancellationToken::new();
@@ -243,6 +252,8 @@ impl ActorContext {
 		let ctx = Self(Arc::new(ActorContextInner {
 			kv,
 			sql,
+			#[cfg(feature = "sqlite-local")]
+			actor_runtime_socket,
 			current_state: RwLock::new(Vec::new()),
 			persisted: RwLock::new(PersistedActor::default()),
 			last_pushed_alarm: RwLock::new(None),
@@ -391,6 +402,16 @@ impl ActorContext {
 
 	pub fn sql(&self) -> &SqliteDb {
 		&self.0.sql
+	}
+
+	#[cfg(feature = "sqlite-local")]
+	pub async fn provision_actor_runtime_socket(&self) -> Result<ActorRuntimeSocketEndpointInfo> {
+		self.0.actor_runtime_socket.provision().await
+	}
+
+	#[cfg(feature = "sqlite-local")]
+	pub(crate) async fn shutdown_actor_runtime_socket(&self) {
+		self.0.actor_runtime_socket.shutdown().await;
 	}
 
 	pub async fn db_exec(&self, sql: &str) -> Result<Vec<u8>> {

@@ -1,4 +1,6 @@
+use std::error::Error;
 use std::ffi::{CStr, CString};
+use std::fmt;
 use std::os::raw::c_char;
 use std::ptr;
 
@@ -10,8 +12,24 @@ use libsqlite3_sys::{
 	sqlite3_bind_int64, sqlite3_bind_null, sqlite3_bind_text, sqlite3_changes, sqlite3_column_blob,
 	sqlite3_column_bytes, sqlite3_column_count, sqlite3_column_double, sqlite3_column_int64,
 	sqlite3_column_name, sqlite3_column_text, sqlite3_column_type, sqlite3_errmsg,
-	sqlite3_finalize, sqlite3_last_insert_rowid, sqlite3_prepare_v2, sqlite3_step,
+	sqlite3_extended_errcode, sqlite3_finalize, sqlite3_last_insert_rowid, sqlite3_prepare_v2,
+	sqlite3_step,
 };
+
+#[derive(Debug)]
+pub struct SqliteStatementError {
+	pub code: i32,
+	pub statement_index: u32,
+	pub message: String,
+}
+
+impl fmt::Display for SqliteStatementError {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		f.write_str(&self.message)
+	}
+}
+
+impl Error for SqliteStatementError {}
 
 pub fn execute_statement(
 	db: *mut sqlite3,
@@ -22,7 +40,7 @@ pub fn execute_statement(
 	let mut stmt = ptr::null_mut();
 	let rc = unsafe { sqlite3_prepare_v2(db, c_sql.as_ptr(), -1, &mut stmt, ptr::null_mut()) };
 	if rc != SQLITE_OK {
-		return Err(sqlite_error(db, "failed to prepare sqlite statement"));
+		return Err(sqlite_error(db, 0, "failed to prepare sqlite statement"));
 	}
 	if stmt.is_null() {
 		return Ok(ExecResult { changes: 0 });
@@ -39,7 +57,7 @@ pub fn execute_statement(
 				break;
 			}
 			if step_rc != SQLITE_ROW {
-				return Err(sqlite_error(db, "failed to execute sqlite statement"));
+				return Err(sqlite_error(db, 0, "failed to execute sqlite statement"));
 			}
 		}
 
@@ -64,7 +82,7 @@ pub fn query_statement(
 	let mut stmt = ptr::null_mut();
 	let rc = unsafe { sqlite3_prepare_v2(db, c_sql.as_ptr(), -1, &mut stmt, ptr::null_mut()) };
 	if rc != SQLITE_OK {
-		return Err(sqlite_error(db, "failed to prepare sqlite query"));
+		return Err(sqlite_error(db, 0, "failed to prepare sqlite query"));
 	}
 	if stmt.is_null() {
 		return Ok(QueryResult {
@@ -87,7 +105,7 @@ pub fn query_statement(
 				break;
 			}
 			if step_rc != SQLITE_ROW {
-				return Err(sqlite_error(db, "failed to step sqlite query"));
+				return Err(sqlite_error(db, 0, "failed to step sqlite query"));
 			}
 
 			let mut row = Vec::with_capacity(columns.len());
@@ -119,6 +137,7 @@ pub fn execute_single_statement(
 	if rc != SQLITE_OK {
 		return Err(sqlite_error(
 			db,
+			0,
 			"failed to prepare sqlite execute statement",
 		));
 	}
@@ -128,7 +147,12 @@ pub fn execute_single_statement(
 				sqlite3_finalize(stmt);
 			}
 		}
-		return Err(anyhow!("sqlite execute only supports a single statement"));
+		return Err(SqliteStatementError {
+			code: -1,
+			statement_index: 0,
+			message: "sqlite execute only supports a single statement".to_owned(),
+		}
+		.into());
 	}
 	if stmt.is_null() {
 		return Ok(ExecuteResult {
@@ -152,7 +176,11 @@ pub fn execute_single_statement(
 				break;
 			}
 			if step_rc != SQLITE_ROW {
-				return Err(sqlite_error(db, "failed to step sqlite execute statement"));
+				return Err(sqlite_error(
+					db,
+					0,
+					"failed to step sqlite execute statement",
+				));
 			}
 
 			let mut row = Vec::with_capacity(columns.len());
@@ -181,6 +209,7 @@ pub fn execute_single_statement(
 pub fn exec_statements(db: *mut sqlite3, sql: &str) -> Result<QueryResult> {
 	let c_sql = CString::new(sql).map_err(|err| anyhow!(err.to_string()))?;
 	let mut remaining = c_sql.as_ptr();
+	let mut statement_index = 0_u32;
 	let mut final_result = QueryResult {
 		columns: Vec::new(),
 		rows: Vec::new(),
@@ -191,7 +220,11 @@ pub fn exec_statements(db: *mut sqlite3, sql: &str) -> Result<QueryResult> {
 		let mut tail = ptr::null();
 		let rc = unsafe { sqlite3_prepare_v2(db, remaining, -1, &mut stmt, &mut tail) };
 		if rc != SQLITE_OK {
-			return Err(sqlite_error(db, "failed to prepare sqlite exec statement"));
+			return Err(sqlite_error(
+				db,
+				statement_index,
+				"failed to prepare sqlite exec statement",
+			));
 		}
 
 		if stmt.is_null() {
@@ -211,7 +244,11 @@ pub fn exec_statements(db: *mut sqlite3, sql: &str) -> Result<QueryResult> {
 					break;
 				}
 				if step_rc != SQLITE_ROW {
-					return Err(sqlite_error(db, "failed to step sqlite exec statement"));
+					return Err(sqlite_error(
+						db,
+						statement_index,
+						"failed to step sqlite exec statement",
+					));
 				}
 
 				let mut row = Vec::with_capacity(columns.len());
@@ -237,6 +274,7 @@ pub fn exec_statements(db: *mut sqlite3, sql: &str) -> Result<QueryResult> {
 			break;
 		}
 		remaining = tail;
+		statement_index = statement_index.saturating_add(1);
 	}
 
 	Ok(final_result)
@@ -274,7 +312,7 @@ fn bind_params(
 		};
 
 		if rc != SQLITE_OK {
-			return Err(sqlite_error(db, "failed to bind sqlite parameter"));
+			return Err(sqlite_error(db, 0, "failed to bind sqlite parameter"));
 		}
 	}
 
@@ -336,17 +374,25 @@ fn has_non_whitespace_tail(tail: *const c_char) -> bool {
 	bytes.iter().any(|byte| !byte.is_ascii_whitespace())
 }
 
-fn sqlite_error(db: *mut sqlite3, context: &str) -> anyhow::Error {
-	let message = unsafe {
+fn sqlite_error(db: *mut sqlite3, statement_index: u32, context: &str) -> anyhow::Error {
+	let (code, detail) = unsafe {
 		if db.is_null() {
-			"unknown sqlite error".to_string()
+			(-1, "unknown sqlite error".to_string())
 		} else {
-			CStr::from_ptr(sqlite3_errmsg(db))
-				.to_string_lossy()
-				.into_owned()
+			(
+				sqlite3_extended_errcode(db),
+				CStr::from_ptr(sqlite3_errmsg(db))
+					.to_string_lossy()
+					.into_owned(),
+			)
 		}
 	};
-	anyhow!("{context}: {message}")
+	SqliteStatementError {
+		code,
+		statement_index,
+		message: format!("{context}: {detail}"),
+	}
+	.into()
 }
 
 #[cfg(test)]
@@ -428,6 +474,25 @@ mod tests {
 
 		assert_eq!(result.columns, vec!["count"]);
 		assert_eq!(result.rows, vec![vec![ColumnValue::Integer(2)]]);
+	}
+
+	#[test]
+	fn exec_reports_the_actual_failing_statement_index() {
+		let db = MemoryDb::open();
+		exec_statements(
+			db.as_ptr(),
+			"CREATE TABLE unique_items(value INTEGER UNIQUE);",
+		)
+		.unwrap();
+
+		let error = exec_statements(
+			db.as_ptr(),
+			"INSERT INTO unique_items VALUES (1); INSERT INTO unique_items VALUES (1);",
+		)
+		.expect_err("the second statement should violate the unique constraint");
+		let typed = error.downcast_ref::<SqliteStatementError>().unwrap();
+		assert_eq!(typed.code, libsqlite3_sys::SQLITE_CONSTRAINT_UNIQUE);
+		assert_eq!(typed.statement_index, 1);
 	}
 
 	#[test]
@@ -524,6 +589,27 @@ mod tests {
 			err.to_string().contains("single statement"),
 			"unexpected error: {err:#}"
 		);
+		let typed = err.downcast_ref::<SqliteStatementError>().unwrap();
+		assert_eq!(typed.code, -1);
+		assert_eq!(typed.statement_index, 0);
+	}
+
+	#[test]
+	fn execute_single_statement_reports_extended_result_code() {
+		let db = MemoryDb::open();
+		exec_statements(
+			db.as_ptr(),
+			"CREATE TABLE unique_items(value TEXT UNIQUE); INSERT INTO unique_items VALUES ('same');",
+		)
+		.unwrap();
+		let err = execute_single_statement(
+			db.as_ptr(),
+			"INSERT INTO unique_items VALUES ('same')",
+			None,
+		)
+		.expect_err("unique constraint should fail");
+		let typed = err.downcast_ref::<SqliteStatementError>().unwrap();
+		assert_eq!(typed.code, libsqlite3_sys::SQLITE_CONSTRAINT_UNIQUE);
 	}
 
 	#[test]

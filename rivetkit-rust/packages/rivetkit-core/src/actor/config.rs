@@ -61,6 +61,8 @@ pub struct ActorConfig {
 	/// on the TS side). Gates the inspector database tab.
 	pub has_database: bool,
 	pub remote_sqlite: bool,
+	/// Enables the experimental Actor Runtime Socket.
+	pub enable_actor_runtime_socket: bool,
 	/// Whether the user declared actor state (`state: ...` or `createState`).
 	/// Gates the inspector state tab and state-subscription messages.
 	pub has_state: bool,
@@ -98,6 +100,7 @@ pub struct ActorConfigInput {
 	pub icon: Option<String>,
 	pub has_database: Option<bool>,
 	pub remote_sqlite: Option<bool>,
+	pub enable_actor_runtime_socket: Option<bool>,
 	pub has_state: Option<bool>,
 	pub can_hibernate_websocket: Option<bool>,
 	pub state_save_interval_ms: Option<u32>,
@@ -129,6 +132,7 @@ impl ActorConfig {
 			icon: config.icon,
 			has_database: config.has_database.unwrap_or(false),
 			remote_sqlite: config.remote_sqlite.unwrap_or(false),
+			enable_actor_runtime_socket: config.enable_actor_runtime_socket.unwrap_or(false),
 			has_state: config.has_state.unwrap_or(false),
 			..Self::default()
 		};
@@ -226,6 +230,7 @@ impl Default for ActorConfig {
 			icon: None,
 			has_database: false,
 			remote_sqlite: false,
+			enable_actor_runtime_socket: false,
 			has_state: false,
 			can_hibernate_websocket: CanHibernateWebSocket::default(),
 			state_save_interval: DEFAULT_STATE_SAVE_INTERVAL,

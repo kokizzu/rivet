@@ -321,6 +321,8 @@ export interface ActorContext<
 	readonly name: string;
 	readonly key: string[];
 	readonly region: string;
+	/** Provisions the experimental Actor Runtime Socket for this actor generation. */
+	actorRuntimeSocket(): Promise<{ path: string }>;
 	readonly conns: Map<
 		string,
 		Conn<
@@ -956,6 +958,8 @@ const GlobalActorOptionsBaseSchema = z
 		name: z.string().optional(),
 		/** Icon for the actor in the Inspector UI. Can be an emoji or FontAwesome icon name. */
 		icon: z.string().optional(),
+		/** Enables the experimental Actor Runtime Socket for this actor. */
+		enableActorRuntimeSocket: z.boolean().default(false),
 		/**
 		 * Can hibernate WebSockets for onWebSocket.
 		 *
@@ -1866,6 +1870,12 @@ export const DocActorOptionsSchema = z
 			.optional()
 			.describe(
 				"Icon for the actor in the Inspector UI. Can be an emoji (e.g., '🚀') or FontAwesome icon name (e.g., 'rocket').",
+			),
+		enableActorRuntimeSocket: z
+			.boolean()
+			.optional()
+			.describe(
+				"Enables the experimental Actor Runtime Socket for this actor. Default: false",
 			),
 		createVarsTimeout: z
 			.number()

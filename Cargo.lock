@@ -4950,6 +4950,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rivet-actor-runtime-socket-protocol"
+version = "2.3.4"
+dependencies = [
+ "anyhow",
+ "rivet-vbare-compiler",
+ "serde",
+ "serde_bare",
+ "vbare",
+]
+
+[[package]]
 name = "rivet-api-builder"
 version = "2.3.4"
 dependencies = [
@@ -6130,6 +6141,7 @@ dependencies = [
  "portpicker",
  "rand 0.8.5",
  "reqwest 0.12.22",
+ "rivet-actor-runtime-socket-protocol",
  "rivet-depot-client",
  "rivet-depot-client-types",
  "rivet-envoy-client",
@@ -6140,6 +6152,7 @@ dependencies = [
  "rivetkit-engine-process",
  "rivetkit-inspector-protocol",
  "rivetkit-shared-types",
+ "rusqlite",
  "scc",
  "serde",
  "serde_bare",
