@@ -22,6 +22,7 @@ import {
 	useRef,
 	useState,
 } from "react";
+import { toast } from "sonner";
 import { useLocalStorage } from "usehooks-ts";
 import { RECORDS_PER_PAGE } from "@/app/data-providers/default-data-provider";
 import {
@@ -200,31 +201,58 @@ function InstanceSearchDialog({
 	const [value, setValue] = useState("");
 	const [isPending, setIsPending] = useState(false);
 
+	const goToActor = (actorId: string) => {
+		void navigate({
+			to: ".",
+			search: (prev) => ({ ...prev, actorId }),
+		});
+	};
+
 	const handleSubmit = async () => {
 		const trimmed = value.trim();
 		if (!trimmed) return;
 		setIsPending(true);
 		try {
-			await queryClient.fetchQuery(
-				dataProvider.actorQueryOptions(trimmed),
-			);
-			void navigate({
-				to: ".",
-				search: (prev) => ({
-					...prev,
-					actorId: trimmed,
-					actorKey: undefined,
-				}),
-			});
-		} catch {
-			void navigate({
-				to: ".",
-				search: (prev) => ({
-					...prev,
-					actorKey: trimmed,
-					actorId: undefined,
-				}),
-			});
+			try {
+				await queryClient.fetchQuery({
+					...dataProvider.actorQueryOptions(trimmed),
+					retry: false,
+				});
+				goToActor(trimmed);
+				return;
+			} catch {}
+
+			// The input wasn't an instance ID, so treat it as a key. Keys are
+			// only unique within a build, so every build name has to be probed.
+			// Providers that can't list builds (e.g. the inspector) just leave
+			// the lookup unresolved.
+			const resolved = await (async () => {
+				const builds = await queryClient.fetchInfiniteQuery(
+					dataProvider.buildsQueryOptions(),
+				);
+				const buildNames = builds.pages.flatMap((page) =>
+					Object.keys(page.names ?? {}),
+				);
+
+				return Promise.any(
+					buildNames.map((name) =>
+						queryClient.fetchQuery({
+							...dataProvider.actorQueryOptions({
+								key: trimmed,
+								name,
+							}),
+							retry: false,
+						}),
+					),
+				);
+			})().catch(() => null);
+
+			if (resolved) {
+				goToActor(resolved.actorId);
+				return;
+			}
+
+			toast.error(`No Actor found with ID or key "${trimmed}"`);
 		} finally {
 			setValue("");
 			setIsPending(false);

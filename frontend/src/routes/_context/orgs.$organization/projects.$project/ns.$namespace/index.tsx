@@ -78,16 +78,10 @@ export const Route = createFileRoute(
 export function RouteComponent() {
 	const search = Route.useSearch() as Record<string, unknown>;
 	const actorId = search.actorId as string | undefined;
-	const actorKey = search.actorKey as string | undefined;
 	const n = search.n as string[] | undefined;
-	const hasSelection = !!(actorId || actorKey || n?.length);
+	const hasSelection = !!(actorId || n?.length);
 
-	return (
-		<NamespaceContent
-			hasSelection={hasSelection}
-			actorId={actorKey ?? actorId}
-		/>
-	);
+	return <NamespaceContent hasSelection={hasSelection} actorId={actorId} />;
 }
 
 function NamespaceContent({
@@ -114,14 +108,8 @@ function NamespaceContent({
 function PendingComponent() {
 	const search = Route.useSearch() as Record<string, unknown>;
 	const actorId = search.actorId as string | undefined;
-	const actorKey = search.actorKey as string | undefined;
 	const n = search.n as string[] | undefined;
-	const hasSelection = !!(actorId || actorKey || n?.length);
+	const hasSelection = !!(actorId || n?.length);
 
-	return (
-		<NamespaceContent
-			hasSelection={hasSelection}
-			actorId={actorKey ?? actorId}
-		/>
-	);
+	return <NamespaceContent hasSelection={hasSelection} actorId={actorId} />;
 }
