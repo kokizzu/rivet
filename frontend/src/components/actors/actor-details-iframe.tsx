@@ -53,6 +53,11 @@ interface ActorDetailsProps {
 // in default test setups; override via MSW to verify the iframe path.
 export const IFRAME_INSPECTOR_MIN_VERSION = "2.3.0";
 
+// A terminal actor never becomes reachable again, so its inspector can't
+// connect and its inspector token is no longer readable.
+const isActorTerminal = (status: ActorStatus | undefined) =>
+	status === "stopped" || status === "crashed" || status === "crash-loop";
+
 /**
  * Dashboard right panel for a selected actor.
  *
@@ -154,8 +159,11 @@ export const ActorsActorDetails = memo(function ActorsActorDetails({
 
 	// The inspector token is required by both inspector renderers and by the
 	// cloud tabs' lifecycle actions, so wait for credentials before mounting
-	// anything.
-	if (!credentials) {
+	// anything. A terminal actor is the exception: its token lives in the
+	// actor's own KV, which is unreadable once it's gone, so waiting would sit
+	// on a skeleton forever and never surface why. Neither the terminal state
+	// nor the Metadata tab needs the token.
+	if (!credentials && !isActorTerminal(status)) {
 		return (
 			<div className="flex flex-col h-full flex-1 min-h-0">
 				<ActorDetailsSkeleton shimmer />
@@ -187,8 +195,8 @@ export const ActorsActorDetails = memo(function ActorsActorDetails({
 				actorId={actorId}
 				tab={tab}
 				onTabChange={onTabChange}
-				inspectorToken={credentials.inspectorToken}
-				rivetToken={credentials.token}
+				inspectorToken={credentials?.inspectorToken ?? ""}
+				rivetToken={rivetToken}
 				status={status}
 				onFallbackToLegacy={() => setForceLegacy(true)}
 			/>
@@ -196,9 +204,9 @@ export const ActorsActorDetails = memo(function ActorsActorDetails({
 	}
 
 	// Reaching here means the runtime is too old for the iframe (or the user
-	// forced legacy). The legacy renderer needs the resolved version, so keep
-	// the skeleton until metadata lands.
-	if (!metadataQuery.data) {
+	// forced legacy). The legacy renderer needs both the token and the resolved
+	// version, so keep the skeleton until they land.
+	if (!credentials || !metadataQuery.data) {
 		return (
 			<div className="flex flex-col h-full flex-1 min-h-0">
 				<ActorDetailsSkeleton shimmer />
@@ -528,8 +536,7 @@ function ActorDetailsIframePath({
 	// forever. Detect the terminal states from the engine status query and
 	// reuse the existing status/error UI instead of an indefinite spinner. The
 	// Metadata tab stays available with the full lifecycle and restart actions.
-	const isActorTerminal =
-		status === "stopped" || status === "crashed" || status === "crash-loop";
+	const isTerminal = isActorTerminal(status);
 
 	const { ref: tabListRef, showLabels } = useShowTabLabels();
 
@@ -588,25 +595,27 @@ function ActorDetailsIframePath({
 						</TabsList>
 					</div>
 				</div>
-				{inSkeletonMode && (
+				{inSkeletonMode && !isTerminal && (
 					<ShimmerLine className="absolute bottom-0 left-0 right-0" />
 				)}
 			</div>
 			<div className="relative flex-1 min-h-0">
-				<iframe
-					ref={iframeRef}
-					src={src}
-					sandbox="allow-scripts allow-same-origin"
-					className="absolute inset-0 w-full h-full border-0 bg-card"
-					style={{
-						visibility:
-							showIframe && iframeListening && !isActorTerminal
-								? "visible"
-								: "hidden",
-					}}
-					title={`Inspector for actor ${actorId}`}
-				/>
-				{showIframe && isActorTerminal && (
+				{!isTerminal && (
+					<iframe
+						ref={iframeRef}
+						src={src}
+						sandbox="allow-scripts allow-same-origin"
+						className="absolute inset-0 w-full h-full border-0 bg-card"
+						style={{
+							visibility:
+								showIframe && iframeListening
+									? "visible"
+									: "hidden",
+						}}
+						title={`Inspector for actor ${actorId}`}
+					/>
+				)}
+				{showIframe && isTerminal && (
 					<div className="absolute inset-0 flex flex-col items-center justify-center bg-card gap-3 px-6 text-center">
 						<Icon
 							icon={faTriangleExclamation}
@@ -627,7 +636,7 @@ function ActorDetailsIframePath({
 						</Button>
 					</div>
 				)}
-				{showIframe && !isActorTerminal && !iframeListening && (
+				{showIframe && !isTerminal && !iframeListening && (
 					<div className="absolute inset-0 flex flex-col items-center justify-center bg-card text-sm text-muted-foreground gap-2 px-4 text-center">
 						{bootTimedOut ? (
 							<div className="flex max-w-sm flex-col items-center gap-3">
