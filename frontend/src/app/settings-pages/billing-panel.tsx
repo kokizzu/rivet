@@ -31,9 +31,14 @@ import {
 	WithTooltip,
 } from "@/components";
 import { useCloudProjectDataProvider } from "@/components/actors";
-import { features } from "@/lib/features";
 import { TwinklingSparkles } from "@/components/twinkling-sparkles";
-import { BILLING, COMPUTE_MONTHLY_CAP_USD } from "@/content/billing";
+import {
+	BILLING,
+	COMPUTE_MONTHLY_CAP_USD,
+	calculateOverageCost,
+	PLAN_LABELS,
+} from "@/content/billing";
+import { features } from "@/lib/features";
 import { ResourcePicker } from "./resource-picker";
 import { SettingsCard } from "./settings-card";
 
@@ -85,13 +90,6 @@ const USAGE_METRICS: UsageMetricConfig[] = [
 	},
 ];
 
-const PLAN_LABEL: Record<string, string> = {
-	free: "Free",
-	pro: "Hobby",
-	team: "Team",
-	enterprise: "Enterprise",
-};
-
 const PLAN_PRICE: Record<string, string> = {
 	free: "$0/mo",
 	pro: "$20/mo",
@@ -105,16 +103,6 @@ const PLAN_BLURB: Record<string, string> = {
 	team: "For teams shipping production workloads.",
 	enterprise: "Dedicated infrastructure and support.",
 };
-
-function calculateOverageCost(
-	usage: bigint,
-	includedInPlan: bigint | undefined,
-	pricePerBillionUnits: bigint,
-): bigint {
-	if (!includedInPlan) return 0n;
-	const overage = usage > includedInPlan ? usage - includedInPlan : 0n;
-	return (overage * pricePerBillionUnits) / 1_000_000_000n;
-}
 
 export function BillingPanel() {
 	// Use `useMatch` with `shouldThrow: false` instead of `useMatchRoute` so we
@@ -298,7 +286,7 @@ function CurrentPlanCard({
 	plan: string;
 	onUpgrade: () => void;
 }) {
-	const label = PLAN_LABEL[plan] ?? "Free";
+	const label = PLAN_LABELS[plan] ?? "Free";
 	const price = PLAN_PRICE[plan] ?? "$0/mo";
 	const blurb = PLAN_BLURB[plan] ?? PLAN_BLURB.free;
 	return (
@@ -497,11 +485,17 @@ function ComputeUsageRow({
 				</div>
 			</div>
 			<div className="text-sm tabular-nums text-foreground">
-				{loading ? <Skeleton className="h-4 w-12" /> : formatCurrency(cost)}
+				{loading ? (
+					<Skeleton className="h-4 w-12" />
+				) : (
+					formatCurrency(cost)
+				)}
 			</div>
 			<div className="min-w-0">
 				<div className="text-xs text-muted-foreground">
-					{capUsd != null ? `of ${formatCurrency(capUsd)}` : "No limit"}
+					{capUsd != null
+						? `of ${formatCurrency(capUsd)}`
+						: "No limit"}
 				</div>
 				{capUsd != null ? (
 					<div className="relative h-1 rounded-full bg-foreground/10 mt-1">

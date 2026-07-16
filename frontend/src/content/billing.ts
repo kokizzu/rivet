@@ -88,6 +88,25 @@ export const BILLING = {
 	} satisfies Record<BilledMetrics, bigint>,
 };
 
+/** Human-readable plan names. `pro` is presented as "Hobby". */
+export const PLAN_LABELS: Record<string, string> = {
+	free: "Free",
+	pro: "Hobby",
+	team: "Team",
+	enterprise: "Enterprise",
+};
+
+/** Overage charge in cents for usage beyond the plan's included allotment. */
+export function calculateOverageCost(
+	usage: bigint,
+	includedInPlan: bigint | undefined,
+	pricePerBillionUnits: bigint,
+): bigint {
+	if (!includedInPlan) return 0n;
+	const overage = usage > includedInPlan ? usage - includedInPlan : 0n;
+	return (overage * pricePerBillionUnits) / 1_000_000_000n;
+}
+
 /**
  * Rivet Compute pricing. Compute is billed per active second based on each
  * actor's configured CPU and memory.

@@ -59,7 +59,11 @@ export function BillingUsageGauge() {
 			trigger={
 				<div
 					className={cn(
-						"rounded-full border size-6 flex items-center justify-center",
+						// Sized and margined to match `Badge`, which sits next to it
+						// in the billing row. Badge is 22px tall (text-xs leading +
+						// py-0.5 + border), so `size-6` made the circle read as
+						// oversized against it.
+						"rounded-full border size-[22px] my-px flex items-center justify-center",
 						progressColors[progressVariant].border,
 						progressColors[progressVariant].background,
 					)}
@@ -71,7 +75,7 @@ export function BillingUsageGauge() {
 						/>
 					) : (
 						<svg
-							className="h-6 w-6"
+							className="size-full"
 							viewBox="0 0 24 24"
 							fill="none"
 							strokeWidth="3"

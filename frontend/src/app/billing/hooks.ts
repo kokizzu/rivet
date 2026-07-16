@@ -1,11 +1,11 @@
 import type { Rivet } from "@rivet-gg/cloud";
 import { useQuery } from "@tanstack/react-query";
 import { endOfMonth, startOfMonth } from "date-fns";
+import { sumComputeCost } from "@/app/metrics/compute-cost";
+import { COMPUTE_METRICS } from "@/app/metrics/constants";
 import { useCloudProjectDataProvider } from "@/components/actors";
 import { BILLING } from "@/content/billing";
 import { features } from "@/lib/features";
-import { COMPUTE_METRICS } from "@/app/metrics/constants";
-import { sumComputeCost } from "@/app/metrics/compute-cost";
 
 // Bucket size (seconds) for the month-to-date compute cost query. Cost is an
 // active-time-weighted sum, so the total is correct at any resolution; this
@@ -92,11 +92,12 @@ export function useHighestUsagePercent(): number {
 
 	const aggregated = useBilledMetrics();
 	const plan = billingData?.billing.activePlan || "free";
+	const planIncluded = BILLING.included[plan] ?? BILLING.included.free;
 
 	let highestPercent = 0;
 	for (const key of BILLED_METRICS) {
 		const current = aggregated?.[key] || 0n;
-		const included = BILLING.included[plan][key];
+		const included = planIncluded[key];
 		if (included && included > 0n) {
 			const percent = Number((current * 100n) / included);
 			if (percent > highestPercent) {

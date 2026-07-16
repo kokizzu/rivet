@@ -57,7 +57,6 @@ import { ensureTrailingSlash } from "@/lib/utils";
 import type { RivetActorError } from "@/queries/types";
 import { TEST_IDS } from "@/utils/test-ids";
 import { ActorBuildsList } from "./actor-builds-list";
-import { BillingLimitAlert } from "./billing/billing-limit-alert";
 import { BillingPlanBadge } from "./billing/billing-plan-badge";
 import { BillingUsageGauge } from "./billing/billing-usage-gauge";
 import { Changelog } from "./changelog";
@@ -663,7 +662,6 @@ function CloudSidebarContentInner() {
 		<div className="flex gap-0.5 flex-col">
 			{hasDataProvider && hasQuery ? (
 				<div className="w-full pt-1.5">
-					<BillingLimitAlert />
 					<div className="flex gap-0.5 mb-2 flex-col">
 						{matchRoute({
 							to: "/orgs/$organization/projects/$project/ns/$namespace",

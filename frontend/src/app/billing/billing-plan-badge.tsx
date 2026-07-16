@@ -6,13 +6,7 @@ import {
 	useCloudProjectDataProvider,
 } from "@/components/actors";
 import { VisibilitySensor } from "@/components/visibility-sensor";
-
-const planLabels: Record<string, string> = {
-	free: "Free",
-	pro: "Hobby",
-	team: "Team",
-	enterprise: "Enterprise",
-};
+import { PLAN_LABELS } from "@/content/billing";
 
 const getPlanVariant = (
 	plan: string | undefined,
@@ -39,7 +33,7 @@ export function BillingPlanBadge() {
 			variant={getPlanVariant(plan)}
 			className="min-w-12 justify-center my-px"
 		>
-			{planLabels[plan]}
+			{PLAN_LABELS[plan]}
 		</Badge>
 	);
 }
@@ -71,7 +65,7 @@ export function LazyBillingPlanBadge({
 					variant={getPlanVariant(plan)}
 					className={cn("min-w-12 justify-center my-px", className)}
 				>
-					{planLabels[plan]}
+					{PLAN_LABELS[plan]}
 				</Badge>
 			)}
 			<VisibilitySensor onChange={() => setIsVisible(true)} />

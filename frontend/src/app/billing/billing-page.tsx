@@ -20,8 +20,8 @@ import { type MetricType, UsageCard } from "@/app/billing/usage-card";
 import { HelpDropdown } from "@/app/help-dropdown";
 import { Button, H1 } from "@/components";
 import { useCloudProjectDataProvider } from "@/components/actors";
+import { BILLING, calculateOverageCost } from "@/content/billing";
 import { features } from "@/lib/features";
-import { BILLING } from "@/content/billing";
 import { Content } from "../layout";
 
 type BilledMetric = keyof typeof BILLING.prices;
@@ -73,16 +73,6 @@ const USAGE_METRICS: UsageMetricConfig[] = [
 		metricType: "bytes",
 	},
 ];
-
-function calculateOverageCost(
-	usage: bigint,
-	includedInPlan: bigint | undefined,
-	pricePerBillionUnits: bigint,
-): bigint {
-	if (!includedInPlan) return 0n;
-	const overage = usage > includedInPlan ? usage - includedInPlan : 0n;
-	return (overage * pricePerBillionUnits) / 1_000_000_000n;
-}
 
 /**
  * Namespace billing page. Billing is always project-scoped, so this renders the
