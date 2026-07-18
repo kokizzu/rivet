@@ -50,7 +50,6 @@ export const workflowCounterActor = actor({
 			// Using a finished step context outside its step should throw.
 			if (leakedCtx) {
 				try {
-					// biome-ignore lint/style/noUnusedExpressions: intentionally checking accessor.
 					leakedCtx.state;
 				} catch {}
 			}
@@ -409,7 +408,6 @@ export const workflowAccessActor = actor({
 			let outsideDbError: string | null = null;
 			let outsideClientError: string | null = null;
 			try {
-				// biome-ignore lint/style/noUnusedExpressions: intentionally checking accessor.
 				leakedCtx?.db;
 			} catch (error) {
 				outsideDbError =
@@ -517,7 +515,7 @@ export const workflowTryActor = actor({
 	},
 });
 
-export const workflowStepRollbackActor = actor({
+export const workflowStepRollForwardActor = actor({
 	state: {
 		failedStateWrites: 0,
 		recoveryStateWrites: 0,
@@ -531,10 +529,14 @@ export const workflowStepRollbackActor = actor({
 		const stepResult = await ctx.try(
 			"recover-failed-step",
 			async (tryCtx) => {
-				await tryCtx.step("failing-step", async (c) => {
-					c.state.failedStateWrites += 1;
-					c.vars.failedVarsWrites += 1;
-					throw new Error("step rollback");
+				await tryCtx.step({
+					name: "failing-step",
+					maxRetries: 0,
+					run: async (c) => {
+						c.state.failedStateWrites += 1;
+						c.vars.failedVarsWrites += 1;
+						throw new Error("step roll forward");
+					},
 				});
 			},
 		);
@@ -820,7 +822,7 @@ export const workflowRunningStepActor = actor({
 		finishedAt: null as number | null,
 	},
 	run: workflow(async (ctx) => {
-		await ctx.step("prepare", async (ctx) => {});
+		await ctx.step("prepare", async (_ctx) => {});
 		await ctx.step("block", async (c) => {
 			const deferred = createWorkflowRunningStepDeferred();
 			workflowRunningStepDeferreds.set(c.actorId, deferred);

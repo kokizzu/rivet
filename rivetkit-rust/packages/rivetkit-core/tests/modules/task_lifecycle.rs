@@ -5,11 +5,11 @@ mod moved_tests {
 
 	use tokio::sync::{mpsc, oneshot};
 	use tokio::task::yield_now;
-	use tokio::time::advance;
+	use tokio::time::{advance, pause, resume};
 
+	use crate::actor::keys::PERSIST_DATA_KEY;
 	use crate::actor::messages::{ActorEvent, StateDelta};
-	use crate::actor::preload::PreloadedPersistedActor;
-	use crate::actor::state::PersistedActor;
+	use crate::actor::state::{PersistedActor, encode_persisted_actor};
 	use crate::actor::task::{ActorTask, LifecycleCommand};
 	use crate::actor::task_types::ShutdownKind;
 	use crate::{ActorConfig, ActorContext, ActorFactory};
@@ -26,7 +26,6 @@ mod moved_tests {
 			events_rx,
 			factory,
 			ctx,
-			None,
 			None,
 		)
 	}
@@ -48,13 +47,26 @@ mod moved_tests {
 	}
 
 	#[tokio::test]
-	async fn startup_loads_preloaded_state_and_input_before_run_handler() {
-		let ctx = crate::actor::context::tests::new_with_kv(
+	async fn startup_imports_legacy_state_and_uses_start_input_before_run_handler() {
+		let kv = crate::kv::tests::new_in_memory();
+		kv.put(
+			PERSIST_DATA_KEY,
+			&encode_persisted_actor(&PersistedActor {
+				input: Some(vec![1, 2, 3]),
+				has_initialized: false,
+				state: vec![9, 8, 7],
+				scheduled_events: Vec::new(),
+			})
+			.expect("persisted actor should encode"),
+		)
+		.await
+		.expect("legacy actor state should seed");
+		let ctx = crate::actor::task::tests::moved_tests::new_with_kv(
 			"actor-preloaded-startup",
 			"task-lifecycle",
 			Vec::new(),
 			"local",
-			crate::kv::tests::new_in_memory(),
+			kv,
 		);
 		let (observed_send, observed_rx) = oneshot::channel();
 		let observed_tx = Arc::new(Mutex::new(Some(observed_send)));
@@ -100,14 +112,7 @@ mod moved_tests {
 			factory,
 			ctx.clone(),
 			Some(vec![7, 7, 7]),
-			None,
-		)
-		.with_preloaded_persisted_actor(PreloadedPersistedActor::Some(PersistedActor {
-			input: Some(vec![1, 2, 3]),
-			has_initialized: false,
-			state: vec![9, 8, 7],
-			scheduled_events: Vec::new(),
-		}));
+		);
 
 		let (start_tx, start_rx) = oneshot::channel();
 		task.handle_lifecycle(LifecycleCommand::Start { reply: start_tx })
@@ -130,7 +135,7 @@ mod moved_tests {
 		let _ = run_handle.await;
 	}
 
-	#[tokio::test(start_paused = true)]
+	#[tokio::test]
 	async fn sleep_shutdown_aborts_stuck_run_handler_at_grace_deadline() {
 		let ctx = crate::actor::context::tests::new_with_kv(
 			"actor-stuck-run-grace",
@@ -177,6 +182,7 @@ mod moved_tests {
 			.expect("start should succeed");
 		yield_now().await;
 		assert_eq!(dropped_count.load(Ordering::SeqCst), 1);
+		pause();
 
 		let stop = tokio::spawn(async move { task.handle_stop(ShutdownKind::Sleep).await });
 		yield_now().await;
@@ -193,6 +199,7 @@ mod moved_tests {
 		);
 
 		advance(Duration::from_millis(1)).await;
+		resume();
 		stop.await
 			.expect("sleep stop join should succeed")
 			.expect("sleep stop should succeed after grace timeout");

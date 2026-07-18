@@ -1,5 +1,5 @@
-import { stringifyError } from "@/common/utils";
 import type { SqliteNativeMetrics } from "@/common/database/config";
+import { stringifyError } from "@/common/utils";
 import type { RegistryConfig } from "./config";
 import { logger } from "./log";
 
@@ -45,6 +45,11 @@ export interface RuntimeStateDeltaPayload {
 		bytes: RuntimeBytes;
 	}>;
 	connHibernationRemoved: string[];
+}
+
+export interface RuntimeWorkflowKvWrite {
+	key: RuntimeBytes;
+	value: RuntimeBytes;
 }
 
 export interface RuntimeRequestSaveOpts {
@@ -169,6 +174,11 @@ export interface RuntimeSqlExecuteResult extends RuntimeSqlQueryResult {
 	lastInsertRowId?: number | null;
 }
 
+export interface RuntimeSqlBatchStatement {
+	sql: string;
+	params?: RuntimeSqlBindParams;
+}
+
 export function normalizeRuntimeSqlExecuteResult(
 	result: RuntimeSqlQueryResult & {
 		changes: number;
@@ -188,6 +198,9 @@ export interface RuntimeSqlDatabase {
 		sql: string,
 		params?: RuntimeSqlBindParams,
 	): Promise<RuntimeSqlExecuteResult>;
+	executeBatch(
+		statements: RuntimeSqlBatchStatement[],
+	): Promise<RuntimeSqlExecuteResult[]>;
 	query(
 		sql: string,
 		params?: RuntimeSqlBindParams,
@@ -429,6 +442,10 @@ export interface CoreRuntime {
 		ctx: ActorContextHandle,
 		payload: RuntimeStateDeltaPayload,
 	): Promise<void>;
+	actorSaveStateAndWorkflowBatch(
+		ctx: ActorContextHandle,
+		writes: RuntimeWorkflowKvWrite[],
+	): Promise<void>;
 	actorId(ctx: ActorContextHandle): string;
 	actorName(ctx: ActorContextHandle): string;
 	actorKey(ctx: ActorContextHandle): RuntimeActorKeySegment[];
@@ -510,6 +527,10 @@ export interface CoreRuntime {
 		sql: string,
 		params?: RuntimeSqlBindParams,
 	): Promise<RuntimeSqlExecuteResult>;
+	actorSqlExecuteBatch(
+		ctx: ActorContextHandle,
+		statements: RuntimeSqlBatchStatement[],
+	): Promise<RuntimeSqlExecuteResult[]>;
 	actorSqlBeginTransaction(
 		ctx: ActorContextHandle,
 		timeoutMs?: number,

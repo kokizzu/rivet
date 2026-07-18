@@ -76,11 +76,16 @@ pub struct SqliteRuntimeConfig {
 	pub generation: Option<u64>,
 }
 
+#[derive(Clone, Debug)]
+pub struct SqliteBatchStatement {
+	pub sql: String,
+	pub params: Option<Vec<BindParam>>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SqliteBackend {
 	LocalNative,
 	RemoteEnvoy,
-	Unavailable,
 }
 
 impl SqliteDb {
@@ -88,7 +93,6 @@ impl SqliteDb {
 		match self.backend {
 			SqliteBackend::LocalNative => self.local_exec(sql).await,
 			SqliteBackend::RemoteEnvoy => self.remote_exec(sql).await,
-			SqliteBackend::Unavailable => Err(SqliteRuntimeError::Unavailable.build()),
 		}
 	}
 
@@ -103,7 +107,6 @@ impl SqliteDb {
 				.remote_exec_with_session(sql, expected_session)
 				.await
 				.map(|(result, session)| (result, Some(session))),
-			SqliteBackend::Unavailable => Err(SqliteRuntimeError::Unavailable.build()),
 		}
 	}
 
@@ -118,7 +121,6 @@ impl SqliteDb {
 				.remote_execute(sql, params)
 				.await
 				.map(ExecuteResult::into_query_result),
-			SqliteBackend::Unavailable => Err(SqliteRuntimeError::Unavailable.build()),
 		}
 	}
 
@@ -129,7 +131,6 @@ impl SqliteDb {
 				.remote_execute(sql, params)
 				.await
 				.map(ExecuteResult::into_exec_result),
-			SqliteBackend::Unavailable => Err(SqliteRuntimeError::Unavailable.build()),
 		}
 	}
 
@@ -141,7 +142,6 @@ impl SqliteDb {
 		match self.backend {
 			SqliteBackend::LocalNative => self.local_execute(sql, params).await,
 			SqliteBackend::RemoteEnvoy => self.remote_execute(sql, params).await,
-			SqliteBackend::Unavailable => Err(SqliteRuntimeError::Unavailable.build()),
 		}
 	}
 
@@ -160,18 +160,11 @@ impl SqliteDb {
 				.remote_execute_with_session(sql, params, expected_session)
 				.await
 				.map(|(result, session)| (result, Some(session))),
-			SqliteBackend::Unavailable => Err(SqliteRuntimeError::Unavailable.build()),
 		}
 	}
 }
 
-impl Default for SqliteBackend {
-	fn default() -> Self {
-		Self::Unavailable
-	}
-}
-
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct SqliteDb {
 	handle: Option<EnvoyHandle>,
 	actor_id: Option<String>,
@@ -197,7 +190,7 @@ pub struct SqliteDb {
 }
 
 impl SqliteDb {
-	pub fn new(handle: EnvoyHandle, actor_id: impl Into<String>, enabled: bool) -> Self {
+	pub fn new(handle: EnvoyHandle, actor_id: impl Into<String>, enabled: bool) -> Result<Self> {
 		Self::new_with_remote_sqlite(handle, actor_id, None, None, enabled, false)
 	}
 
@@ -208,13 +201,13 @@ impl SqliteDb {
 		generation: Option<u64>,
 		enabled: bool,
 		remote_sqlite: bool,
-	) -> Self {
-		Self {
+	) -> Result<Self> {
+		Ok(Self {
 			handle: Some(handle),
 			actor_id: Some(actor_id.into()),
 			actor_key,
 			generation,
-			backend: select_sqlite_backend(enabled, remote_sqlite),
+			backend: select_sqlite_backend(remote_sqlite)?,
 			enabled,
 			#[cfg(feature = "sqlite-local")]
 			db: Default::default(),
@@ -226,7 +219,7 @@ impl SqliteDb {
 			transaction_coordinator: Default::default(),
 			#[cfg(feature = "sqlite-local")]
 			vfs_metrics: None,
-		}
+		})
 	}
 
 	#[cfg(feature = "sqlite-local")]
@@ -301,7 +294,6 @@ impl SqliteDb {
 				self.remote_config()?;
 				Ok(())
 			}
-			SqliteBackend::Unavailable => Err(SqliteRuntimeError::Unavailable.build()),
 		}
 	}
 
@@ -448,6 +440,57 @@ impl SqliteDb {
 		}
 	}
 
+	pub async fn execute_batch(
+		&self,
+		statements: Vec<SqliteBatchStatement>,
+	) -> Result<Vec<ExecuteResult>> {
+		let statement_count = statements.len();
+		let binding_count = statements
+			.iter()
+			.map(|statement| bind_param_count(&statement.params))
+			.sum();
+		let result = async {
+			let transaction = self.begin_transaction(None).await?;
+			let mut results = Vec::with_capacity(statements.len());
+			for statement in statements {
+				match transaction.execute(statement.sql, statement.params).await {
+					Ok(result) => results.push(result),
+					Err(error) => {
+						return match transaction.rollback().await {
+							Ok(()) => Err(error.context("execute sqlite batch statement")),
+							Err(rollback_error) => {
+								Err(error.context("execute sqlite batch statement").context(
+									rollback_error.context("rollback sqlite batch transaction"),
+								))
+							}
+						};
+					}
+				}
+			}
+			transaction
+				.commit()
+				.await
+				.context("commit sqlite batch transaction")?;
+			Ok(results)
+		}
+		.await;
+
+		match result {
+			Ok(results) => Ok(results),
+			Err(error) => {
+				let error = self.attach_actor(error);
+				self.log_operation_error_with_count(
+					"execute_batch",
+					"<batch>",
+					binding_count,
+					statement_count,
+					&error,
+				);
+				Err(error)
+			}
+		}
+	}
+
 	pub async fn close(&self) -> Result<()> {
 		let db = self.clone();
 		run_detached_transaction_task(
@@ -477,12 +520,34 @@ impl SqliteDb {
 				}
 				Ok(())
 			}
-			SqliteBackend::RemoteEnvoy | SqliteBackend::Unavailable => Ok(()),
+			SqliteBackend::RemoteEnvoy => Ok(()),
 		}
 	}
 
-	pub(crate) async fn cleanup(&self) -> Result<()> {
+	pub(crate) async fn cleanup_for_shutdown(&self, reusable: bool) -> Result<()> {
+		// A remote database has no actor-local resources to release. Keep its
+		// coordinator usable across a sleep/wake cycle on the same ActorTask.
+		if reusable && self.backend == SqliteBackend::RemoteEnvoy {
+			return Ok(());
+		}
 		self.close().await
+	}
+
+	#[cfg(test)]
+	pub(crate) fn fresh_remote_for_test(&self) -> Self {
+		Self::new_with_remote_sqlite(
+			self.handle
+				.clone()
+				.expect("remote sqlite test database should have an envoy handle"),
+			self.actor_id
+				.clone()
+				.expect("remote sqlite test database should have an actor id"),
+			self.actor_key.clone(),
+			self.generation,
+			self.enabled,
+			true,
+		)
+		.expect("remote sqlite test database should be configured")
 	}
 
 	pub fn take_last_kv_error(&self) -> Option<String> {
@@ -597,6 +662,17 @@ impl SqliteDb {
 		binding_count: usize,
 		error: &anyhow::Error,
 	) {
+		self.log_operation_error_with_count(operation, sql, binding_count, 1, error);
+	}
+
+	fn log_operation_error_with_count(
+		&self,
+		operation: &'static str,
+		sql: &str,
+		binding_count: usize,
+		statement_count: usize,
+		error: &anyhow::Error,
+	) {
 		let structured = RivetError::extract(error);
 		let error_chain = error.chain().map(ToString::to_string).collect::<Vec<_>>();
 		tracing::error!(
@@ -606,6 +682,7 @@ impl SqliteDb {
 			operation,
 			sql,
 			binding_count,
+			statement_count,
 			group = structured.group(),
 			code = structured.code(),
 			error_message = %structured.message(),
@@ -832,19 +909,19 @@ struct RemoteSqliteConfig {
 	generation: u64,
 }
 
-fn select_sqlite_backend(enabled: bool, remote_sqlite: bool) -> SqliteBackend {
-	if enabled && remote_sqlite {
-		return SqliteBackend::RemoteEnvoy;
+fn select_sqlite_backend(remote_sqlite: bool) -> Result<SqliteBackend> {
+	if remote_sqlite {
+		return Ok(SqliteBackend::RemoteEnvoy);
 	}
 
 	#[cfg(feature = "sqlite-local")]
 	{
-		SqliteBackend::LocalNative
+		Ok(SqliteBackend::LocalNative)
 	}
 
 	#[cfg(not(feature = "sqlite-local"))]
 	{
-		SqliteBackend::Unavailable
+		Err(SqliteRuntimeError::Unavailable.build())
 	}
 }
 

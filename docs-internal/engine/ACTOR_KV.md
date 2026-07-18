@@ -1,6 +1,10 @@
 # Actor KV Storage
 
-Each actor has its own private KV store which can be manipulated or accessed with the various provided KV operations.
+Each actor has its own private KV store which can be manipulated or accessed with the engine KV operations.
+
+For current RivetKit actors, runtime persistence no longer uses this store directly. State, connections, queues, workflow storage, alarms, and deprecated user `c.kv` data live in internal SQLite tables after the first wake on the migrated runtime. Legacy actor KV data remains as a frozen downgrade snapshot, and the inspector token is mirrored to KV for dashboard compatibility.
+
+The first-wake import fails closed if a legacy queue record contains retry, delay, or in-flight delivery metadata. The SQLite queue model cannot preserve those fields, so silently importing or dropping them would change delivery semantics. The startup error identifies the record; operators must inspect and resolve that legacy queue entry before retrying the actor.
 
 ## Keys and Values
 

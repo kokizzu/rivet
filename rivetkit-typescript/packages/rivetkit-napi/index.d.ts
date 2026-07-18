@@ -23,10 +23,16 @@ export interface StateDeltaPayload {
   connHibernation: Array<StateDeltaConnHibernationEntry>
   connHibernationRemoved: Array<string>
 }
+export interface WorkflowKvWritePayload {
+  key: Buffer
+  value: Buffer
+}
 export interface JsRequestSaveOpts {
   immediate?: boolean
   maxWaitMs?: number
 }
+export declare function decodeInspectorRequest(bytes: Buffer, advertisedVersion: number): Buffer
+export declare function encodeInspectorResponse(bytes: Buffer, targetVersion: number): Buffer
 export interface JsInspectorSnapshot {
   stateRevision: number
   connectionsRevision: number
@@ -99,8 +105,6 @@ export interface JsActorConfig {
   maxQueueMessageSize?: number
   maxIncomingMessageSize?: number
   maxOutgoingMessageSize?: number
-  preloadMaxWorkflowBytes?: number
-  preloadMaxConnectionsBytes?: number
   actions?: Array<JsActionDefinition>
   inspectorTabs?: Array<JsInspectorTabEntry>
 }
@@ -123,6 +127,10 @@ export interface NativeExecuteResult {
   rows: Array<Array<any>>
   changes: number
   lastInsertRowId?: number
+}
+export interface JsSqliteBatchStatement {
+  sql: string
+  params?: Array<JsBindParam>
 }
 export interface JsSqliteVfsMetrics {
   requestBuildNs: number
@@ -233,7 +241,6 @@ export interface JsKvEntry {
 }
 /** N-API wrapper around `rivetkit-core::ActorContext`. */
 export declare class ActorContext {
-  constructor(actorId: string, name: string, region: string)
   state(): Buffer
   beginOnStateChange(): void
   endOnStateChange(): void
@@ -254,6 +261,7 @@ export declare class ActorContext {
   takePendingHibernationChanges(): Array<string>
   dirtyHibernatableConns(): Array<ConnHandle>
   saveState(payload: StateDeltaPayload): Promise<void>
+  saveStateAndWorkflowBatch(writes: Array<WorkflowKvWritePayload>): Promise<void>
   actorId(): string
   name(): string
   key(): Array<JsActorKeySegment>
@@ -309,6 +317,7 @@ export declare class JsNativeDatabase {
   run(sql: string, params?: Array<JsBindParam> | undefined | null): Promise<ExecuteResult>
   query(sql: string, params?: Array<JsBindParam> | undefined | null): Promise<QueryResult>
   execute(sql: string, params?: Array<JsBindParam> | undefined | null): Promise<NativeExecuteResult>
+  executeBatch(statements: Array<JsSqliteBatchStatement>): Promise<Array<NativeExecuteResult>>
   exec(sql: string): Promise<QueryResult>
   close(): Promise<void>
   beginTransaction(timeoutMs?: number | undefined | null): Promise<JsSqliteTransaction>

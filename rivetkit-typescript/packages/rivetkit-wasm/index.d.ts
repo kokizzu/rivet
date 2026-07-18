@@ -8,6 +8,9 @@ export class ActorContext {
 	free(): void;
 	keepAwake(promise: Promise<any>): void;
 	saveState(payload: any): Promise<void>;
+	saveStateAndWorkflowBatch(
+		writes: Array<{ key: Uint8Array; value: Uint8Array }>,
+	): Promise<void>;
 	waitUntil(promise: Promise<any>): void;
 	abortSignal(): any;
 	connectConn(params: Uint8Array, request: any): Promise<ConnHandle>;
@@ -149,6 +152,7 @@ export class SqliteDb {
 	close(): Promise<void>;
 	query(sql: string, params: any): Promise<any>;
 	execute(sql: string, params: any): Promise<any>;
+	executeBatch(statements: Array<any>): Promise<Array<any>>;
 	beginTransaction(timeout_ms?: number | null): Promise<SqliteTransaction>;
 }
 

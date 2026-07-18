@@ -30,15 +30,17 @@ import type {
 	RuntimeServerlessRequest,
 	RuntimeServerlessResponseHead,
 	RuntimeServerlessStreamCallback,
+	RuntimeSqlBatchStatement,
 	RuntimeSqlBindParam,
 	RuntimeSqlBindParams,
 	RuntimeSqlExecResult,
 	RuntimeSqlExecuteResult,
 	RuntimeSqlQueryResult,
 	RuntimeSqlRunResult,
-	SqliteTransactionHandle,
 	RuntimeStateDeltaPayload,
 	RuntimeWebSocketEvent,
+	RuntimeWorkflowKvWrite,
+	SqliteTransactionHandle,
 	WebSocketHandle,
 } from "./runtime";
 import { normalizeRuntimeSqlExecuteResult } from "./runtime";
@@ -46,6 +48,9 @@ import { normalizeRuntimeSqlExecuteResult } from "./runtime";
 type NativeBindings = typeof import("@rivetkit/rivetkit-napi");
 type NapiSqlDatabase = ReturnType<NativeActorContext["sql"]>;
 type NapiSqlBindParams = Parameters<NapiSqlDatabase["execute"]>[1];
+type NapiSqlBatchStatement = Parameters<
+	NapiSqlDatabase["executeBatch"]
+>[0][number];
 type NapiSqlTransaction = Awaited<
 	ReturnType<NapiSqlDatabase["beginTransaction"]>
 >;
@@ -112,6 +117,15 @@ function toNapiSqlBindParams(params?: RuntimeSqlBindParams): NapiSqlBindParams {
 		return params;
 	}
 	return params.map((param) => toNapiSqlBindParam(param));
+}
+
+function toNapiSqlBatchStatement(
+	statement: RuntimeSqlBatchStatement,
+): NapiSqlBatchStatement {
+	return {
+		sql: statement.sql,
+		params: toNapiSqlBindParams(statement.params) ?? undefined,
+	};
 }
 
 function toNapiBuffer(value: RuntimeBytes): Buffer {
@@ -298,16 +312,24 @@ export class NapiCoreRuntime implements CoreRuntime {
 		return new this.#bindings.CancellationToken() as unknown as CancellationTokenHandle;
 	}
 
-	createTestActorContext(
-		actorId: string,
-		name: string,
-		region: string,
-	): ActorContextHandle {
-		return new this.#bindings.ActorContext(
-			actorId,
-			name,
-			region,
-		) as unknown as ActorContextHandle;
+	decodeInspectorRequest(
+		bytes: RuntimeBytes,
+		advertisedVersion: number,
+	): RuntimeBytes {
+		return this.#bindings.decodeInspectorRequest(
+			toNapiBuffer(bytes),
+			advertisedVersion,
+		);
+	}
+
+	encodeInspectorResponse(
+		bytes: RuntimeBytes,
+		targetVersion: number,
+	): RuntimeBytes {
+		return this.#bindings.encodeInspectorResponse(
+			toNapiBuffer(bytes),
+			targetVersion,
+		);
 	}
 
 	cancellationTokenAborted(token: CancellationTokenHandle): boolean {
@@ -414,6 +436,18 @@ export class NapiCoreRuntime implements CoreRuntime {
 	): Promise<void> {
 		await asNativeActorContext(ctx).saveState(
 			toNapiStateDeltaPayload(payload),
+		);
+	}
+
+	async actorSaveStateAndWorkflowBatch(
+		ctx: ActorContextHandle,
+		writes: RuntimeWorkflowKvWrite[],
+	): Promise<void> {
+		await asNativeActorContext(ctx).saveStateAndWorkflowBatch(
+			writes.map((write) => ({
+				key: toNapiBuffer(write.key),
+				value: toNapiBuffer(write.value),
+			})),
 		);
 	}
 
@@ -622,6 +656,16 @@ export class NapiCoreRuntime implements CoreRuntime {
 			toNapiSqlBindParams(params),
 		);
 		return normalizeRuntimeSqlExecuteResult(result);
+	}
+
+	async actorSqlExecuteBatch(
+		ctx: ActorContextHandle,
+		statements: RuntimeSqlBatchStatement[],
+	): Promise<RuntimeSqlExecuteResult[]> {
+		const results = await this.#actorSql(ctx).executeBatch(
+			statements.map(toNapiSqlBatchStatement),
+		);
+		return results.map(normalizeRuntimeSqlExecuteResult);
 	}
 
 	async actorSqlBeginTransaction(

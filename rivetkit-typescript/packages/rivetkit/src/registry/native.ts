@@ -512,6 +512,8 @@ function getOrCreateNativeSqlDatabase(
 	const database = wrapJsNativeDatabase({
 		exec: (sql) => runtime.actorSqlExec(ctx, sql),
 		execute: (sql, params) => runtime.actorSqlExecute(ctx, sql, params),
+		executeBatch: (statements) =>
+			runtime.actorSqlExecuteBatch(ctx, statements),
 		beginTransaction: async (timeoutMs) => {
 			const transaction = await runtime.actorSqlBeginTransaction(
 				ctx,
@@ -749,13 +751,6 @@ function callNativeSync<T>(invoke: () => T): T {
 	} catch (error) {
 		throw normalizeNativeBridgeError(error);
 	}
-}
-
-function actorAbortedError(): Error & { group: string; code: string } {
-	return Object.assign(new Error("Actor aborted"), {
-		group: "actor",
-		code: "aborted",
-	});
 }
 
 type NativeWorkflowInspectorConfig = WorkflowInspectorConfig<ArrayBuffer> & {
@@ -2821,6 +2816,14 @@ export class ActorContextHandleAdapter {
 		);
 	}
 
+	async saveStateAndWorkflowBatch(
+		writes: Array<{ key: Uint8Array; value: Uint8Array }>,
+	): Promise<void> {
+		await callNative(() =>
+			this.#runtime.actorSaveStateAndWorkflowBatch(this.#ctx, writes),
+		);
+	}
+
 	serializeForTick(reason: SerializeStateReason): RuntimeStateDeltaPayload {
 		void reason;
 		const actorState = getNativePersistState(this.#runtime, this.#ctx);
@@ -3175,6 +3178,9 @@ class NativeWorkflowRuntimeAdapter {
 			immediate?: boolean;
 			maxWait?: number;
 		}) => Promise<void>;
+		saveStateAndWorkflowBatch: (
+			writes: Array<{ key: Uint8Array; value: Uint8Array }>,
+		) => Promise<void>;
 	};
 
 	constructor(ctx: ActorContextHandleAdapter) {
@@ -3249,6 +3255,9 @@ class NativeWorkflowRuntimeAdapter {
 		this.stateManager = {
 			saveState: async (opts) => {
 				await this.#ctx.saveState(opts);
+			},
+			saveStateAndWorkflowBatch: async (writes) => {
+				await this.#ctx.saveStateAndWorkflowBatch(writes);
 			},
 		};
 	}
@@ -3336,14 +3345,14 @@ function buildActorConfig(
 	const config = definition.config as unknown as Record<string, unknown>;
 	const options = (config.options ?? {}) as Record<string, unknown>;
 	const canHibernate = options.canHibernateWebSocket;
+	const usesRemoteSqlite =
+		sqliteBackendForConfig(registryConfig) === "remote";
 
 	return {
 		name: options.name as string | undefined,
 		icon: options.icon as string | undefined,
-		hasDatabase: config.db !== undefined,
-		remoteSqlite:
-			config.db !== undefined &&
-			sqliteBackendForConfig(registryConfig) === "remote",
+		hasDatabase: config.db !== undefined || usesRemoteSqlite,
+		remoteSqlite: usesRemoteSqlite,
 		enableActorRuntimeSocket: options.enableActorRuntimeSocket === true,
 		hasState:
 			config.state !== undefined ||

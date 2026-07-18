@@ -10,11 +10,13 @@ use std::sync::OnceLock;
 use subtle::ConstantTimeEq;
 
 use crate::ActorContext;
+use crate::actor::internal_storage;
 use crate::actor::keys::INSPECTOR_TOKEN_KEY;
-use crate::actor::preload::PreloadedKv;
 
-/// Test-only override. Not a public/production auth mechanism; production
-/// inspector auth goes through the per-actor KV token.
+/// Test-only override. Not a public/production auth mechanism. Production
+/// inspector auth verifies the bearer token against the token stored in
+/// internal SQLite. The legacy KV entry is a write-only mirror kept for
+/// dashboard compatibility and is not consulted for auth.
 const INSPECTOR_TOKEN_ENV: &str = "_RIVET_TEST_INSPECTOR_TOKEN";
 const INSPECTOR_TOKEN_BYTES: usize = 32;
 
@@ -57,54 +59,49 @@ impl InspectorAuth {
 			return verify_token_bytes(bearer_token.as_bytes(), configured_token.as_bytes());
 		}
 
-		let stored_token = ctx
-			.kv_internal()
-			.get(&INSPECTOR_TOKEN_KEY)
+		let stored_token = internal_storage::load_inspector_token(ctx.sql())
 			.await
 			.ok()
 			.flatten()
+			.map(String::into_bytes)
 			.ok_or_else(|| InspectorUnauthorized.build())?;
 
 		verify_token_bytes(bearer_token.as_bytes(), &stored_token)
 	}
 }
 
-/// Ensures the actor has an inspector token persisted in KV so the
-/// engine-facing KV API can serve the token to the dashboard inspector.
-/// Skips the write when the token already exists. No-ops when the
+/// Ensures the actor has an inspector token persisted in SQLite and, for now,
+/// mirrored in KV so the engine-facing KV API can serve it to the dashboard.
+/// Skips writes when the token already exists. No-ops when the
 /// `_RIVET_TEST_INSPECTOR_TOKEN` env override is set, since that takes
-/// precedence over any KV-stored token and we do not want to pin a per-actor
-/// token that will never be consulted.
+/// precedence over any stored token and we do not want to pin a per-actor token
+/// that will never be consulted.
 pub async fn init_inspector_token(ctx: &ActorContext) -> Result<()> {
-	init_inspector_token_with_preload(ctx, None).await
-}
-
-pub(crate) async fn init_inspector_token_with_preload(
-	ctx: &ActorContext,
-	preloaded_kv: Option<&PreloadedKv>,
-) -> Result<()> {
 	if configured_test_token().is_some() {
 		return Ok(());
 	}
 
-	let existing =
-		match preloaded_kv.and_then(|preloaded| preloaded.key_entry(&INSPECTOR_TOKEN_KEY)) {
-			Some(existing) => existing,
-			None => ctx
-				.kv_internal()
-				.get(&INSPECTOR_TOKEN_KEY)
-				.await
-				.context("load inspector token")?,
-		};
+	let existing = internal_storage::load_inspector_token(ctx.sql())
+		.await
+		.context("load inspector token from sqlite")?
+		.map(String::into_bytes);
 	if existing.is_some() {
+		// Token creation and legacy import both leave the compatibility mirror in
+		// KV, so an existing SQLite token does not need another startup write.
 		return Ok(());
 	}
 
 	let token = generate_inspector_token();
-	ctx.kv_internal()
+	internal_storage::persist_inspector_token(ctx.sql(), &token)
+		.await
+		.context("persist inspector token to sqlite")?;
+	// The dashboard reads the token through the engine's public actor-KV
+	// endpoint. Keep this sole KV write until the dashboard fetches inspector
+	// tokens another way; see ~/.agents/specs/kv-to-sqlite-internal-storage.md.
+	ctx.legacy_kv()
 		.put(&INSPECTOR_TOKEN_KEY, token.as_bytes())
 		.await
-		.context("persist inspector token")?;
+		.context("persist inspector token mirror to kv")?;
 	tracing::debug!(actor_id = %ctx.actor_id(), "generated new inspector token");
 	Ok(())
 }

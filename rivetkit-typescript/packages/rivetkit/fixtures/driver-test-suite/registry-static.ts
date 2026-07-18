@@ -20,16 +20,16 @@ import {
 	syncActionActor,
 } from "./action-types";
 import {
+	dbActorDrizzleMigration,
+	dbActorDrizzleMigrationRollback,
+} from "./actor-db-drizzle-transaction";
+import {
 	actorRuntimeSocketWithoutDb,
 	dbActorManualWarningsDisabled,
 	dbActorRaw,
 	dbActorRuntimeSocketDisabled,
 	dbRemoteLifecycleProbe,
 } from "./actor-db-raw";
-import {
-	dbActorDrizzleMigration,
-	dbActorDrizzleMigrationRollback,
-} from "./actor-db-drizzle-transaction";
 import { onStateChangeActor } from "./actor-onstatechange";
 import { connErrorSerializationActor } from "./conn-error-serialization";
 import { counterWithParams } from "./conn-params";
@@ -176,7 +176,7 @@ import {
 	workflowSleepActor,
 	workflowSpawnChildActor,
 	workflowSpawnParentActor,
-	workflowStepRollbackActor,
+	workflowStepRollForwardActor,
 	workflowStopTeardownActor,
 	workflowTryActor,
 } from "./workflow";
@@ -333,7 +333,7 @@ export const registry = setup({
 		workflowRunningStepActor,
 		workflowReplayActor,
 		workflowSleepActor,
-		workflowStepRollbackActor,
+		workflowStepRollForwardActor,
 		workflowTryActor,
 		warmupActor,
 		workflowStopTeardownActor,

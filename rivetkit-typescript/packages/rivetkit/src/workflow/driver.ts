@@ -8,8 +8,14 @@ import type {
 import type { RunContext } from "@/actor/config";
 import type { AnyStaticActorInstance } from "@/actor/definition";
 import { makeWorkflowKey, workflowStoragePrefix } from "@/actor/keys";
+import type { SqliteDatabase } from "@/common/database/config";
 
 const WORKFLOW_STORAGE_PREFIX = workflowStoragePrefix();
+// Keep workflow flushes below depot's 320-dirty-page commit ceiling. The
+// former actor-KV transport allowed 976 KiB batches; SQLite also dirties table
+// and index pages, so it needs the same conservative budget as core imports.
+const WORKFLOW_SQLITE_MAX_BATCH_ROWS = 128;
+const WORKFLOW_SQLITE_MAX_BATCH_BYTES = 512 * 1024;
 
 // Mirrors the element shape returned by `queueManager.receive`. The actor
 // instance is reached through a loose type here, so the call's result is
@@ -22,8 +28,6 @@ interface ReceivedQueueMessage {
 	complete?: (response?: unknown) => Promise<void>;
 }
 
-// `kvListPrefix` returns key/value tuples, but the loose actor type erases that
-// so the tuple destructures need an explicit annotation.
 type KVEntryTuple = [Uint8Array, Uint8Array];
 
 function stripWorkflowKey(prefixed: Uint8Array): Uint8Array {
@@ -39,6 +43,206 @@ function computeUpperBound(prefix: Uint8Array): Uint8Array | null {
 		}
 	}
 	return null;
+}
+
+function normalizeSqlBlob(value: unknown): Uint8Array {
+	if (value instanceof Uint8Array) {
+		return value;
+	}
+	if (value instanceof ArrayBuffer) {
+		return new Uint8Array(value);
+	}
+	if (ArrayBuffer.isView(value)) {
+		return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+	}
+	if (Array.isArray(value)) {
+		const bytes = new Uint8Array(value.length);
+		for (const [i, item] of value.entries()) {
+			if (!Number.isInteger(item) || item < 0 || item > 255) {
+				throw new Error("workflow sqlite value was not a byte array");
+			}
+			bytes[i] = item;
+		}
+		return bytes;
+	}
+	throw new Error("workflow sqlite value was not a blob");
+}
+
+function runtimeSqlFromContext(
+	runCtx?: RunContext<any, any, any, any, any, any, any, any>,
+): SqliteDatabase | undefined {
+	const sql = (runCtx as unknown as { sql?: unknown } | undefined)?.sql;
+	if (
+		sql &&
+		typeof sql === "object" &&
+		"query" in sql &&
+		"execute" in sql &&
+		"executeBatch" in sql &&
+		"run" in sql
+	) {
+		return sql as SqliteDatabase;
+	}
+	return undefined;
+}
+
+type WorkflowSqliteDatabase = SqliteDatabase &
+	Required<Pick<SqliteDatabase, "executeBatch">>;
+
+class WorkflowStorage {
+	#sql: WorkflowSqliteDatabase;
+
+	constructor(sql?: SqliteDatabase) {
+		if (!sql) {
+			throw new Error(
+				"workflow storage requires embedded SQLite; actor KV workflow storage is no longer supported",
+			);
+		}
+		if (!sql.executeBatch) {
+			throw new Error(
+				"workflow storage requires a SQLite database with executeBatch support",
+			);
+		}
+		this.#sql = sql as WorkflowSqliteDatabase;
+	}
+
+	async get(key: Uint8Array): Promise<Uint8Array | null> {
+		const prefixed = makeWorkflowKey(key);
+		const result = await this.#sql.query(
+			"SELECT value FROM _rivet_wf_kv WHERE key = ?",
+			[prefixed],
+		);
+		return result.rows[0]?.[0] == null
+			? null
+			: normalizeSqlBlob(result.rows[0][0]);
+	}
+
+	async set(key: Uint8Array, value: Uint8Array): Promise<void> {
+		await this.batch([{ key, value }]);
+	}
+
+	async delete(key: Uint8Array): Promise<void> {
+		const prefixed = makeWorkflowKey(key);
+		await this.#sql.run("DELETE FROM _rivet_wf_kv WHERE key = ?", [
+			prefixed,
+		]);
+	}
+
+	async deletePrefix(prefix: Uint8Array): Promise<void> {
+		const start = makeWorkflowKey(prefix);
+		const end = computeUpperBound(start);
+		if (end) {
+			await this.#sql.run(
+				"DELETE FROM _rivet_wf_kv WHERE key >= ? AND key < ?",
+				[start, end],
+			);
+			return;
+		}
+		const entries = await this.listRaw(start);
+		await this.deleteRawKeys(
+			entries
+				.filter(([key]) => keyStartsWith(key, start))
+				.map(([key]) => key),
+		);
+	}
+
+	async deleteRange(start: Uint8Array, end: Uint8Array): Promise<void> {
+		const prefixedStart = makeWorkflowKey(start);
+		const prefixedEnd = makeWorkflowKey(end);
+		await this.#sql.run(
+			"DELETE FROM _rivet_wf_kv WHERE key >= ? AND key < ?",
+			[prefixedStart, prefixedEnd],
+		);
+	}
+
+	async list(prefix: Uint8Array): Promise<KVEntry[]> {
+		const prefixed = makeWorkflowKey(prefix);
+		const entries = await this.listRaw(prefixed);
+		return entries
+			.filter(([key]) => keyStartsWith(key, prefixed))
+			.map(([key, value]: KVEntryTuple) => ({
+				key: stripWorkflowKey(key),
+				value,
+			}));
+	}
+
+	async batch(writes: KVWrite[]): Promise<void> {
+		if (writes.length === 0) return;
+		for (const chunk of chunkWorkflowWrites(writes)) {
+			await this.#sql.executeBatch(
+				chunk.map(({ key, value }) => ({
+					sql: "INSERT INTO _rivet_wf_kv (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+					params: [makeWorkflowKey(key), value],
+				})),
+			);
+		}
+	}
+
+	async listRaw(prefix: Uint8Array): Promise<KVEntryTuple[]> {
+		const end = computeUpperBound(prefix);
+		const result = end
+			? await this.#sql.query(
+					"SELECT key, value FROM _rivet_wf_kv WHERE key >= ? AND key < ? ORDER BY key ASC",
+					[prefix, end],
+				)
+			: await this.#sql.query(
+					"SELECT key, value FROM _rivet_wf_kv WHERE key >= ? ORDER BY key ASC",
+					[prefix],
+				);
+		return result.rows.map((row) => [
+			normalizeSqlBlob(row[0]),
+			normalizeSqlBlob(row[1]),
+		]);
+	}
+
+	async deleteRawKeys(keys: Uint8Array[]): Promise<void> {
+		for (
+			let start = 0;
+			start < keys.length;
+			start += WORKFLOW_SQLITE_MAX_BATCH_ROWS
+		) {
+			await this.#sql.executeBatch(
+				keys
+					.slice(start, start + WORKFLOW_SQLITE_MAX_BATCH_ROWS)
+					.map((key) => ({
+						sql: "DELETE FROM _rivet_wf_kv WHERE key = ?",
+						params: [key],
+					})),
+			);
+		}
+	}
+}
+
+export function chunkWorkflowWrites(writes: KVWrite[]): KVWrite[][] {
+	const chunks: KVWrite[][] = [];
+	let chunk: KVWrite[] = [];
+	let chunkBytes = 0;
+	for (const write of writes) {
+		const writeBytes =
+			WORKFLOW_STORAGE_PREFIX.length +
+			write.key.length +
+			write.value.length;
+		if (
+			chunk.length > 0 &&
+			(chunk.length >= WORKFLOW_SQLITE_MAX_BATCH_ROWS ||
+				chunkBytes + writeBytes > WORKFLOW_SQLITE_MAX_BATCH_BYTES)
+		) {
+			chunks.push(chunk);
+			chunk = [];
+			chunkBytes = 0;
+		}
+		chunk.push(write);
+		chunkBytes += writeBytes;
+	}
+	if (chunk.length > 0) chunks.push(chunk);
+	return chunks;
+}
+
+function keyStartsWith(key: Uint8Array, prefix: Uint8Array): boolean {
+	if (key.length < prefix.length) return false;
+	for (let i = 0; i < prefix.length; i++) {
+		if (key[i] !== prefix[i]) return false;
+	}
+	return true;
 }
 
 class ActorWorkflowMessageDriver implements WorkflowMessageDriver {
@@ -113,10 +317,12 @@ class ActorWorkflowMessageDriver implements WorkflowMessageDriver {
 }
 
 export class ActorWorkflowDriver implements EngineDriver {
+	readonly atomicBatch = true;
 	readonly workerPollInterval = 100;
 	readonly messageDriver: WorkflowMessageDriver;
 	#actor: AnyStaticActorInstance;
 	#runCtx: RunContext<any, any, any, any, any, any, any, any>;
+	#storage: WorkflowStorage;
 
 	constructor(
 		actor: AnyStaticActorInstance,
@@ -125,97 +331,42 @@ export class ActorWorkflowDriver implements EngineDriver {
 		this.#actor = actor;
 		this.#runCtx = runCtx;
 		this.messageDriver = new ActorWorkflowMessageDriver(actor, runCtx);
+		this.#storage = new WorkflowStorage(runtimeSqlFromContext(runCtx));
 	}
 
 	async get(key: Uint8Array): Promise<Uint8Array | null> {
-		const [value] = await this.#runCtx.internalKeepAwake(
-			this.#actor.driver.kvBatchGet(this.#actor.id, [
-				makeWorkflowKey(key),
-			]),
-		);
-		return value ?? null;
+		return await this.#runCtx.internalKeepAwake(this.#storage.get(key));
 	}
 
 	async set(key: Uint8Array, value: Uint8Array): Promise<void> {
-		await this.#runCtx.internalKeepAwake(
-			this.#actor.driver.kvBatchPut(this.#actor.id, [
-				[makeWorkflowKey(key), value],
-			]),
-		);
+		await this.#runCtx.internalKeepAwake(this.#storage.set(key, value));
 	}
 
 	async delete(key: Uint8Array): Promise<void> {
-		await this.#runCtx.internalKeepAwake(
-			this.#actor.driver.kvBatchDelete(this.#actor.id, [
-				makeWorkflowKey(key),
-			]),
-		);
+		await this.#runCtx.internalKeepAwake(this.#storage.delete(key));
 	}
 
 	async deletePrefix(prefix: Uint8Array): Promise<void> {
-		const start = makeWorkflowKey(prefix);
-		const end = computeUpperBound(start);
-		if (end) {
-			await this.#runCtx.internalKeepAwake(
-				this.#actor.driver.kvDeleteRange(this.#actor.id, start, end),
-			);
-		} else {
-			const entries = await this.#runCtx.internalKeepAwake(
-				this.#actor.driver.kvListPrefix(this.#actor.id, start),
-			);
-			if (entries.length === 0) {
-				return;
-			}
-			await this.#runCtx.internalKeepAwake(
-				this.#actor.driver.kvBatchDelete(
-					this.#actor.id,
-					entries.map(([key]: KVEntryTuple) => key),
-				),
-			);
-		}
+		await this.#runCtx.internalKeepAwake(
+			this.#storage.deletePrefix(prefix),
+		);
 	}
 
 	async deleteRange(start: Uint8Array, end: Uint8Array): Promise<void> {
 		await this.#runCtx.internalKeepAwake(
-			this.#actor.driver.kvDeleteRange(
-				this.#actor.id,
-				makeWorkflowKey(start),
-				makeWorkflowKey(end),
-			),
+			this.#storage.deleteRange(start, end),
 		);
 	}
 
 	async list(prefix: Uint8Array): Promise<KVEntry[]> {
-		const entries = await this.#runCtx.internalKeepAwake(
-			this.#actor.driver.kvListPrefix(
-				this.#actor.id,
-				makeWorkflowKey(prefix),
-			),
-		);
-		return entries.map(([key, value]: KVEntryTuple) => ({
-			key: stripWorkflowKey(key),
-			value,
-		}));
+		return await this.#runCtx.internalKeepAwake(this.#storage.list(prefix));
 	}
 
 	async batch(writes: KVWrite[]): Promise<void> {
 		if (writes.length === 0) return;
 
-		// Flush actor state together with workflow state to ensure atomicity.
-		// If the server crashes after workflow flush, actor state must also be persisted.
 		await this.#runCtx.internalKeepAwake(
-			Promise.all([
-				this.#actor.driver.kvBatchPut(
-					this.#actor.id,
-					writes.map(({ key, value }) => [
-						makeWorkflowKey(key),
-						value,
-					]),
-				),
-				this.#actor.stateManager.saveState({
-					immediate: true,
-				}),
-			]),
+			this.#actor.stateManager.saveStateAndWorkflowBatch(writes),
 		);
 	}
 
@@ -267,68 +418,38 @@ export class ActorWorkflowControlDriver implements EngineDriver {
 	readonly messageDriver: WorkflowMessageDriver =
 		new NoopWorkflowMessageDriver();
 	#actor: AnyStaticActorInstance;
+	#storage: WorkflowStorage;
 
-	constructor(actor: AnyStaticActorInstance) {
+	constructor(
+		actor: AnyStaticActorInstance,
+		runCtx?: RunContext<any, any, any, any, any, any, any, any>,
+	) {
 		this.#actor = actor;
+		this.#storage = new WorkflowStorage(runtimeSqlFromContext(runCtx));
 	}
 
 	async get(key: Uint8Array): Promise<Uint8Array | null> {
-		const [value] = await this.#actor.driver.kvBatchGet(this.#actor.id, [
-			makeWorkflowKey(key),
-		]);
-		return value ?? null;
+		return await this.#storage.get(key);
 	}
 
 	async set(key: Uint8Array, value: Uint8Array): Promise<void> {
-		await this.#actor.driver.kvBatchPut(this.#actor.id, [
-			[makeWorkflowKey(key), value],
-		]);
+		await this.#storage.set(key, value);
 	}
 
 	async delete(key: Uint8Array): Promise<void> {
-		await this.#actor.driver.kvBatchDelete(this.#actor.id, [
-			makeWorkflowKey(key),
-		]);
+		await this.#storage.delete(key);
 	}
 
 	async deletePrefix(prefix: Uint8Array): Promise<void> {
-		const start = makeWorkflowKey(prefix);
-		const end = computeUpperBound(start);
-		if (end) {
-			await this.#actor.driver.kvDeleteRange(this.#actor.id, start, end);
-			return;
-		}
-
-		const entries = await this.#actor.driver.kvListPrefix(
-			this.#actor.id,
-			start,
-		);
-		if (entries.length === 0) {
-			return;
-		}
-		await this.#actor.driver.kvBatchDelete(
-			this.#actor.id,
-			entries.map(([key]: KVEntryTuple) => key),
-		);
+		await this.#storage.deletePrefix(prefix);
 	}
 
 	async deleteRange(start: Uint8Array, end: Uint8Array): Promise<void> {
-		await this.#actor.driver.kvDeleteRange(
-			this.#actor.id,
-			makeWorkflowKey(start),
-			makeWorkflowKey(end),
-		);
+		await this.#storage.deleteRange(start, end);
 	}
 
 	async list(prefix: Uint8Array): Promise<KVEntry[]> {
-		const entries = await this.#actor.driver.kvListPrefix(
-			this.#actor.id,
-			makeWorkflowKey(prefix),
-		);
-		return entries.map(([key, value]: KVEntryTuple) => ({
-			key: stripWorkflowKey(key),
-			value,
-		}));
+		return await this.#storage.list(prefix);
 	}
 
 	async batch(writes: KVWrite[]): Promise<void> {
@@ -336,10 +457,7 @@ export class ActorWorkflowControlDriver implements EngineDriver {
 			return;
 		}
 
-		await this.#actor.driver.kvBatchPut(
-			this.#actor.id,
-			writes.map(({ key, value }) => [makeWorkflowKey(key), value]),
-		);
+		await this.#storage.batch(writes);
 	}
 
 	async setAlarm(_workflowId: string, wakeAt: number): Promise<void> {

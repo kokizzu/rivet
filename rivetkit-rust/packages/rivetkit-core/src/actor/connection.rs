@@ -17,18 +17,16 @@ use tokio::sync::oneshot;
 
 use crate::actor::config::ActorConfig;
 use crate::actor::context::ActorContext;
-use crate::actor::keys::CONN_PREFIX;
+use crate::actor::internal_storage;
 use crate::actor::lifecycle_hooks::Reply;
 use crate::actor::messages::{ActorEvent, Request};
 use crate::actor::persist::{
 	decode_latest_with_embedded_version, encode_latest_with_embedded_version,
 };
-use crate::actor::preload::PreloadedKv;
 use crate::actor::state::RequestSaveOpts;
 use crate::error::ActorRuntime;
 use crate::time::timeout;
 use crate::types::ConnId;
-use crate::types::ListOpts;
 
 pub(crate) type EventSendCallback = Arc<dyn Fn(OutgoingEvent) -> Result<()> + Send + Sync>;
 pub(crate) type DisconnectCallback =
@@ -723,44 +721,22 @@ impl ActorContext {
 		encode_persisted_connection(&persisted).context("encode persisted connection")
 	}
 
-	pub(crate) async fn restore_persisted(
-		&self,
-		preloaded_kv: Option<&PreloadedKv>,
-	) -> Result<Vec<ConnHandle>> {
-		let entries =
-			if let Some(entries) = preloaded_kv.and_then(|kv| kv.prefix_entries(&CONN_PREFIX)) {
-				entries
-			} else {
-				self.0
-					.kv
-					.list_prefix(
-						&CONN_PREFIX,
-						ListOpts {
-							reverse: false,
-							limit: None,
-						},
-					)
-					.await?
-			};
+	pub(crate) async fn restore_persisted(&self) -> Result<Vec<ConnHandle>> {
+		let persisted_connections = internal_storage::load_connections(self.sql())
+			.await
+			.context("load hibernatable connections from sqlite")?;
 		let mut restored = Vec::new();
 
-		for (_key, value) in entries {
-			match decode_persisted_connection(&value) {
-				Ok(persisted) => {
-					let conn = ConnHandle::from_persisted(persisted);
-					self.prepare_managed_conn(&conn);
-					self.insert_existing(conn.clone());
-					tracing::debug!(
-						actor_id = %self.actor_id(),
-						conn_id = conn.id(),
-						"hibernatable connection restored"
-					);
-					restored.push(conn);
-				}
-				Err(error) => {
-					tracing::error!(?error, "failed to decode persisted connection");
-				}
-			}
+		for persisted in persisted_connections {
+			let conn = ConnHandle::from_persisted(persisted);
+			self.prepare_managed_conn(&conn);
+			self.insert_existing(conn.clone());
+			tracing::debug!(
+				actor_id = %self.actor_id(),
+				conn_id = conn.id(),
+				"hibernatable connection restored"
+			);
+			restored.push(conn);
 		}
 
 		Ok(restored)

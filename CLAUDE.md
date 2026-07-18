@@ -138,7 +138,7 @@ docker-compose up -d
 
 ### RivetKit Test Fixtures
 
-- Core tests that touch the `_RIVET_TEST_INSPECTOR_TOKEN` env override must share a process-wide lock with startup tests that assert inspector-token initialization side effects; otherwise parallel `cargo test` runs can flip `init_inspector_token(...)` between the env-override no-op path and the KV-backed path.
+- Core tests that touch the `_RIVET_TEST_INSPECTOR_TOKEN` env override must share a process-wide lock with startup tests that assert inspector-token initialization side effects; otherwise parallel `cargo test` runs can flip `init_inspector_token(...)` between the env-override no-op path and the stored-token initialization path.
 - For the fast static/http/bare driver verifier, pass only the files listed under `## Fast Tests` in `~/.agents/notes/driver-test-progress.md`; `tests/driver/*.test.ts` also pulls in slow-suite files and gives bogus gate failures.
 - Wasm host smoke tests can drive `buildNativeFactory` through `WasmCoreRuntime` fake bindings to cover actor callbacks, KV, state serialization, remote SQLite routing, and NAPI import boundaries without checked-in wasm-pack output.
 - When moving Rust inline tests out of `src/`, keep a tiny source-owned `#[cfg(test)] #[path = "..."] mod tests;` shim so the moved file still has private module access without widening runtime visibility. Prefer a dedicated moved-test file per source module; reusing stale shared `tests/modules/*.rs` files can silently rot against private APIs and explode once you wire them back in.

@@ -46,14 +46,13 @@ use crate::actor::action::ActionDispatchError;
 use crate::actor::connection::ConnHandle;
 use crate::actor::context::ActorContext;
 use crate::actor::factory::ActorFactory;
-use crate::actor::keys::{LAST_PUSHED_ALARM_KEY, PERSIST_DATA_KEY};
 use crate::actor::lifecycle_hooks::{ActorEvents, ActorStart, Reply};
 use crate::actor::messages::{
 	ActorEvent, QueueSendResult, Request, Response, SerializeStateReason, StateDelta,
+	WorkflowKvWrite,
 };
 use crate::actor::metrics::startup_phase::StartupPhase;
-use crate::actor::preload::{PreloadedKv, PreloadedPersistedActor};
-use crate::actor::state::{PersistedActor, decode_last_pushed_alarm, decode_persisted_actor};
+use crate::actor::state::PersistedActor;
 use crate::actor::task_types::ShutdownKind;
 use crate::actor::work_registry::ActorWorkKind;
 use crate::error::{ActorLifecycle as ActorLifecycleError, ActorRuntime};
@@ -255,9 +254,15 @@ pub(crate) fn try_send_dispatch_command(
 		.map_err(|_| ActorLifecycleError::NotReady.build())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum LifecycleEvent {
-	SaveRequested { immediate: bool },
+	SaveRequested {
+		immediate: bool,
+	},
+	WorkflowFlushRequested {
+		writes: Vec<WorkflowKvWrite>,
+		reply: Reply<()>,
+	},
 	InspectorSerializeRequested,
 	InspectorAttachmentsChanged,
 	SleepTick,
@@ -267,12 +272,37 @@ impl LifecycleEvent {
 	fn kind(&self) -> &'static str {
 		match self {
 			Self::SaveRequested { .. } => "save_requested",
+			Self::WorkflowFlushRequested { .. } => "workflow_flush_requested",
 			Self::InspectorSerializeRequested => "inspector_serialize_requested",
 			Self::InspectorAttachmentsChanged => "inspector_attachments_changed",
 			Self::SleepTick => "sleep_tick",
 		}
 	}
 }
+
+impl PartialEq for LifecycleEvent {
+	fn eq(&self, other: &Self) -> bool {
+		match self {
+			Self::SaveRequested { immediate: left } => {
+				if let Self::SaveRequested { immediate: right } = other {
+					left == right
+				} else {
+					false
+				}
+			}
+			Self::WorkflowFlushRequested { .. } => false,
+			Self::InspectorSerializeRequested => {
+				matches!(other, Self::InspectorSerializeRequested)
+			}
+			Self::InspectorAttachmentsChanged => {
+				matches!(other, Self::InspectorAttachmentsChanged)
+			}
+			Self::SleepTick => matches!(other, Self::SleepTick),
+		}
+	}
+}
+
+impl Eq for LifecycleEvent {}
 
 enum LiveExit {
 	Shutdown { reason: ShutdownKind },
@@ -320,15 +350,6 @@ pub struct ActorTask {
 
 	// === STARTUP ===
 	pub start_input: Option<Vec<u8>>,
-	/// Optional persisted snapshot supplied by the registry to skip the
-	/// initial KV fetch. Tri-state: `NoBundle` falls back to KV,
-	/// `BundleExistsButEmpty` means fresh actor defaults, `Some` decodes
-	/// the persisted actor.
-	preload_persisted_actor: PreloadedPersistedActor,
-	/// Optional preloaded KV entries (e.g. `[1]`, `[2] + conn_id`,
-	/// `[5, 1, *]`) supplied alongside `preload_persisted_actor` so startup
-	/// avoids extra round trips.
-	preloaded_kv: Option<PreloadedKv>,
 
 	// === USER RUNTIME BRIDGE ===
 	/// Sends `ActorEvent`s from core subsystems and `ActorTask` to the
@@ -380,7 +401,6 @@ impl ActorTask {
 		factory: Arc<ActorFactory>,
 		ctx: ActorContext,
 		start_input: Option<Vec<u8>>,
-		preload_persisted_actor: Option<PersistedActor>,
 	) -> Self {
 		let (actor_event_tx, actor_event_rx) = mpsc::unbounded_channel();
 		let (inspector_overlay_tx, _) = broadcast::channel(INSPECTOR_OVERLAY_CHANNEL_CAPACITY);
@@ -408,8 +428,6 @@ impl ActorTask {
 			factory,
 			ctx,
 			start_input,
-			preload_persisted_actor: preload_persisted_actor.into(),
-			preloaded_kv: None,
 			actor_event_tx: Some(actor_event_tx),
 			actor_event_rx: Some(actor_event_rx),
 			run_handle: None,
@@ -421,19 +439,6 @@ impl ActorTask {
 			shutdown_reply: None,
 			sleep_grace: None,
 		}
-	}
-
-	pub(crate) fn with_preloaded_kv(mut self, preloaded_kv: Option<PreloadedKv>) -> Self {
-		self.preloaded_kv = preloaded_kv;
-		self
-	}
-
-	pub(crate) fn with_preloaded_persisted_actor(
-		mut self,
-		preload_persisted_actor: PreloadedPersistedActor,
-	) -> Self {
-		self.preload_persisted_actor = preload_persisted_actor;
-		self
 	}
 
 	#[tracing::instrument(
@@ -830,6 +835,9 @@ impl ActorTask {
 				self.schedule_state_save(immediate);
 				self.sync_inspector_serialize_deadline();
 			}
+			LifecycleEvent::WorkflowFlushRequested { writes, reply } => {
+				reply.send(self.flush_workflow_state(writes).await);
+			}
 			LifecycleEvent::InspectorSerializeRequested
 			| LifecycleEvent::InspectorAttachmentsChanged => {
 				self.sync_inspector_serialize_deadline();
@@ -838,6 +846,30 @@ impl ActorTask {
 				self.on_sleep_tick().await;
 			}
 		}
+	}
+
+	async fn flush_workflow_state(&mut self, writes: Vec<WorkflowKvWrite>) -> Result<()> {
+		if !matches!(
+			self.lifecycle,
+			LifecycleState::Started | LifecycleState::SleepGrace
+		) {
+			return Err(ActorLifecycleError::NotReady.build());
+		}
+		let save_request_revision = self.ctx.save_request_revision();
+		let (reply_tx, reply_rx) = oneshot::channel();
+		self.send_actor_event(
+			"workflow_flush_serialize_state",
+			ActorEvent::SerializeState {
+				reason: SerializeStateReason::Save,
+				reply: Reply::from(reply_tx),
+			},
+		)?;
+		let deltas = reply_rx
+			.await
+			.context("receive workflow flush serialize-state reply")??;
+		self.ctx
+			.save_state_and_workflow_batch_with_revision(deltas, writes, save_request_revision)
+			.await
 	}
 
 	async fn handle_dispatch(&mut self, command: DispatchCommand) {
@@ -1113,7 +1145,16 @@ impl ActorTask {
 		}
 		self.ensure_actor_event_channel();
 		self.ctx.configure_actor_events(self.actor_event_tx.clone());
-		self.ctx.configure_queue_preload(self.preloaded_kv.clone());
+
+		let schema_started_at = Instant::now();
+		crate::actor::internal_schema::ensure_internal_schema(self.ctx.sql())
+			.await
+			.context("initialize internal sqlite schema")?;
+		tracing::debug!(
+			actor_id = %actor_id,
+			duration_ms = duration_ms_f64(schema_started_at.elapsed()),
+			"perf internal: initInternalSqliteSchemaMs"
+		);
 
 		let load_state_started_at = Instant::now();
 		let load_state_result = self.load_persisted_startup().await;
@@ -1147,19 +1188,16 @@ impl ActorTask {
 					.context("persist actor initialization")?;
 			}
 			let init_inspector_token_started_at = Instant::now();
-			crate::inspector::auth::init_inspector_token_with_preload(
-				&self.ctx,
-				self.preloaded_kv.as_ref(),
-			)
-			.await
-			.context("initialize inspector token")?;
+			crate::inspector::auth::init_inspector_token(&self.ctx)
+				.await
+				.context("initialize inspector token")?;
 			tracing::debug!(
 				actor_id = %actor_id,
 				duration_ms = duration_ms_f64(init_inspector_token_started_at.elapsed()),
 				"perf internal: initInspectorTokenMs"
 			);
 			self.ctx
-				.restore_hibernatable_connections_with_preload(self.preloaded_kv.as_ref())
+				.restore_hibernatable_connections()
 				.await
 				.context("restore hibernatable connections")?;
 			Self::settle_hibernated_connections(self.ctx.clone())
@@ -1228,101 +1266,25 @@ impl ActorTask {
 	}
 
 	async fn load_persisted_startup(&mut self) -> Result<PersistedStartup> {
-		match std::mem::take(&mut self.preload_persisted_actor) {
-			PreloadedPersistedActor::Some(preloaded) => {
-				let last_pushed_alarm = self.load_startup_last_pushed_alarm().await?;
-				return Ok(PersistedStartup {
-					actor: preloaded,
-					last_pushed_alarm,
-				});
-			}
-			PreloadedPersistedActor::BundleExistsButEmpty => {
-				return Ok(PersistedStartup {
-					actor: PersistedActor {
-						input: self.start_input.clone(),
-						..PersistedActor::default()
-					},
-					last_pushed_alarm: None,
-				});
-			}
-			PreloadedPersistedActor::NoBundle => {}
-		}
-
-		if self.preloaded_kv.is_some() {
-			let actor = self
-				.decode_persisted_actor_startup(self.load_startup_key(PERSIST_DATA_KEY).await?)?;
-			let last_pushed_alarm = self.load_startup_last_pushed_alarm().await?;
+		crate::actor::migrate_kv_to_sqlite::import_core_state_if_needed(&self.ctx)
+			.await
+			.context("import legacy core actor storage to sqlite")?;
+		if let Some(snapshot) = crate::actor::internal_storage::load_actor_snapshot(self.ctx.sql())
+			.await
+			.context("load persisted actor startup data from sqlite")?
+		{
 			return Ok(PersistedStartup {
-				actor,
-				last_pushed_alarm,
+				actor: snapshot.actor,
+				last_pushed_alarm: snapshot.last_pushed_alarm,
 			});
 		}
-
-		let mut values = self
-			.ctx
-			.kv_internal()
-			.batch_get(&[PERSIST_DATA_KEY, LAST_PUSHED_ALARM_KEY])
-			.await
-			.context("load persisted actor startup data")?
-			.into_iter();
-		let actor = match values.next().flatten() {
-			Some(bytes) => {
-				decode_persisted_actor(&bytes).context("decode persisted actor startup data")
-			}
-			None => Ok(PersistedActor {
-				input: self.start_input.clone(),
-				..PersistedActor::default()
-			}),
-		}?;
-		let last_pushed_alarm = values
-			.next()
-			.flatten()
-			.map(|bytes| decode_last_pushed_alarm(&bytes))
-			.transpose()
-			.context("decode persisted last pushed alarm")?
-			.flatten();
-
 		Ok(PersistedStartup {
-			actor,
-			last_pushed_alarm,
-		})
-	}
-
-	async fn load_startup_key(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-		if let Some(entry) = self
-			.preloaded_kv
-			.as_ref()
-			.and_then(|preloaded| preloaded.key_entry(key))
-		{
-			return Ok(entry);
-		}
-
-		self.ctx
-			.kv_internal()
-			.get(key)
-			.await
-			.context("load persisted actor startup key")
-	}
-
-	async fn load_startup_last_pushed_alarm(&self) -> Result<Option<i64>> {
-		self.load_startup_key(LAST_PUSHED_ALARM_KEY)
-			.await?
-			.map(|bytes| decode_last_pushed_alarm(&bytes))
-			.transpose()
-			.context("decode persisted last pushed alarm")
-			.map(Option::flatten)
-	}
-
-	fn decode_persisted_actor_startup(&self, encoded: Option<Vec<u8>>) -> Result<PersistedActor> {
-		match encoded {
-			Some(bytes) => {
-				decode_persisted_actor(&bytes).context("decode persisted actor startup data")
-			}
-			None => Ok(PersistedActor {
+			actor: PersistedActor {
 				input: self.start_input.clone(),
 				..PersistedActor::default()
-			}),
-		}
+			},
+			last_pushed_alarm: None,
+		})
 	}
 
 	fn ensure_actor_event_channel(&mut self) {
@@ -1848,7 +1810,7 @@ impl ActorTask {
 		#[cfg(feature = "sqlite-local")]
 		ctx.shutdown_actor_runtime_socket().await;
 		ctx.sql()
-			.cleanup()
+			.cleanup_for_shutdown(reason == ShutdownKind::Sleep)
 			.await
 			.with_context(|| format!("cleanup sqlite during {reason_label} shutdown"))?;
 		trim_native_allocator_after_shutdown(&actor_id, reason_label);

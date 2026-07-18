@@ -39,15 +39,17 @@ import type {
 	RuntimeServerlessRequest,
 	RuntimeServerlessResponseHead,
 	RuntimeServerlessStreamCallback,
+	RuntimeSqlBatchStatement,
 	RuntimeSqlBindParams,
 	RuntimeSqlDatabase,
 	RuntimeSqlExecResult,
 	RuntimeSqlExecuteResult,
 	RuntimeSqlQueryResult,
 	RuntimeSqlRunResult,
-	SqliteTransactionHandle,
 	RuntimeStateDeltaPayload,
 	RuntimeWebSocketEvent,
+	RuntimeWorkflowKvWrite,
+	SqliteTransactionHandle,
 	WebSocketHandle,
 } from "./runtime";
 import { normalizeRuntimeSqlExecuteResult } from "./runtime";
@@ -465,6 +467,17 @@ export class WasmCoreRuntime implements CoreRuntime {
 		await callHandleAsync(asWasmActorContext(ctx), "saveState", payload);
 	}
 
+	async actorSaveStateAndWorkflowBatch(
+		ctx: ActorContextHandle,
+		writes: RuntimeWorkflowKvWrite[],
+	): Promise<void> {
+		await callHandleAsync(
+			asWasmActorContext(ctx),
+			"saveStateAndWorkflowBatch",
+			writes,
+		);
+	}
+
 	actorId(ctx: ActorContextHandle): string {
 		return callHandle(asWasmActorContext(ctx), "actorId");
 	}
@@ -700,6 +713,16 @@ export class WasmCoreRuntime implements CoreRuntime {
 			this.#actorSql(ctx).execute(sql, params),
 		);
 		return normalizeRuntimeSqlExecuteResult(result);
+	}
+
+	async actorSqlExecuteBatch(
+		ctx: ActorContextHandle,
+		statements: RuntimeSqlBatchStatement[],
+	): Promise<RuntimeSqlExecuteResult[]> {
+		const results = await callWasm(() =>
+			this.#actorSql(ctx).executeBatch(statements),
+		);
+		return results.map(normalizeRuntimeSqlExecuteResult);
 	}
 
 	async actorSqlBeginTransaction(

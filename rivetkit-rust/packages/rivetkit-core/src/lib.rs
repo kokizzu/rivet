@@ -15,6 +15,8 @@ pub mod runtime;
 pub mod serverless;
 #[cfg(feature = "native-runtime")]
 pub mod serverless_http;
+#[cfg(any(test, feature = "test-support"))]
+pub mod testing;
 pub(crate) mod time {
 	use std::fmt;
 	use std::future::Future;
@@ -119,21 +121,22 @@ pub use actor::config::{
 	ActionDefinition, ActorConfig, ActorConfigInput, ActorConfigOverrides, CanHibernateWebSocket,
 };
 pub use actor::connection::ConnHandle;
-pub use actor::context::{ActorContext, ActorWorkRegion, KeepAwakeRegion, WebSocketCallbackRegion};
+pub use actor::context::{
+	ActorContext, ActorKv, ActorWorkRegion, KeepAwakeRegion, WebSocketCallbackRegion,
+};
 pub use actor::factory::{ActorEntryFn, ActorFactory};
-pub use actor::kv::Kv;
 pub use actor::lifecycle_hooks::{ActorEvents, ActorStart, Reply};
 pub use actor::messages::{
 	ActorEvent, QueueSendResult, QueueSendStatus, Request, Response, SerializeStateReason,
-	StateDelta,
+	StateDelta, WorkflowKvWrite,
 };
 pub use actor::queue::{
 	CompletableQueueMessage, EnqueueAndWaitOpts, QueueMessage, QueueNextBatchOpts, QueueNextOpts,
 	QueueTryNextBatchOpts, QueueTryNextOpts, QueueWaitOpts,
 };
 pub use actor::sqlite::{
-	BindParam, ColumnValue, ExecResult, ExecuteResult, QueryResult, SqliteBackend, SqliteDb,
-	SqliteTransaction,
+	BindParam, ColumnValue, ExecResult, ExecuteResult, QueryResult, SqliteBackend,
+	SqliteBatchStatement, SqliteDb, SqliteTransaction,
 };
 pub use actor::state::RequestSaveOpts;
 pub use actor::task::{

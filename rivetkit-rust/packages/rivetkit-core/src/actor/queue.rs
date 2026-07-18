@@ -18,18 +18,13 @@ use tokio_util::sync::CancellationToken;
 
 use crate::actor::config::ActorConfig;
 use crate::actor::context::ActorContext;
-use crate::actor::keys::{
-	QUEUE_MESSAGES_PREFIX, QUEUE_METADATA_KEY, decode_queue_message_key, make_queue_message_key,
-};
-use crate::actor::kv::APPLY_BATCH_CHUNK_SIZE;
+use crate::actor::internal_storage;
 use crate::actor::persist::{
 	decode_latest_with_embedded_version, encode_latest_with_embedded_version,
 };
-use crate::actor::preload::PreloadedKv;
 use crate::actor::task_types::UserTaskKind;
 #[cfg(target_arch = "wasm32")]
 use crate::error::ActorRuntime;
-use crate::types::ListOpts;
 
 #[derive(Clone, Debug, Default)]
 pub struct QueueNextOpts {
@@ -126,10 +121,11 @@ struct CompletionHandleInner {
 	completed: std::sync::atomic::AtomicBool,
 }
 
-pub(super) type QueueMetadata = persist_v4::QueueMetadata;
-type PersistedQueueMessage = persist_v4::QueueMessage;
+pub(crate) type QueueMetadata = persist_v4::QueueMetadata;
+pub(crate) type PersistedQueueMessage = persist_v4::QueueMessage;
 
-fn encode_queue_metadata(metadata: &QueueMetadata) -> Result<Vec<u8>> {
+#[cfg(test)]
+pub(crate) fn encode_queue_metadata(metadata: &QueueMetadata) -> Result<Vec<u8>> {
 	encode_latest_with_embedded_version::<persist_versioned::QueueMetadata>(
 		metadata.clone(),
 		rivetkit_actor_persist::CURRENT_VERSION,
@@ -137,7 +133,7 @@ fn encode_queue_metadata(metadata: &QueueMetadata) -> Result<Vec<u8>> {
 	)
 }
 
-fn decode_queue_metadata(payload: &[u8]) -> Result<QueueMetadata> {
+pub(crate) fn decode_queue_metadata(payload: &[u8]) -> Result<QueueMetadata> {
 	let metadata = decode_latest_with_embedded_version::<persist_versioned::QueueMetadata>(
 		payload,
 		"queue metadata",
@@ -145,7 +141,7 @@ fn decode_queue_metadata(payload: &[u8]) -> Result<QueueMetadata> {
 	Ok(metadata)
 }
 
-fn encode_queue_message(message: &PersistedQueueMessage) -> Result<Vec<u8>> {
+pub(crate) fn encode_queue_message(message: &PersistedQueueMessage) -> Result<Vec<u8>> {
 	encode_latest_with_embedded_version::<persist_versioned::QueueMessage>(
 		message.clone(),
 		rivetkit_actor_persist::CURRENT_VERSION,
@@ -153,7 +149,7 @@ fn encode_queue_message(message: &PersistedQueueMessage) -> Result<Vec<u8>> {
 	)
 }
 
-fn decode_queue_message(payload: &[u8]) -> Result<PersistedQueueMessage> {
+pub(crate) fn decode_queue_message(payload: &[u8]) -> Result<PersistedQueueMessage> {
 	let message = decode_latest_with_embedded_version::<persist_versioned::QueueMessage>(
 		payload,
 		"queue message",
@@ -272,7 +268,6 @@ impl ActorContext {
 			in_flight_at: None,
 		};
 		let encoded_message = encode_queue_message(&persisted).context("encode queue message")?;
-		self.clear_preloaded_messages();
 
 		let config = self.config();
 		if encoded_message.len() > config.max_queue_message_size as usize {
@@ -298,8 +293,6 @@ impl ActorContext {
 		};
 		metadata.next_id = id.saturating_add(1);
 		metadata.size = metadata.size.saturating_add(1);
-		let encoded_metadata = encode_queue_metadata(&metadata).context("encode queue metadata")?;
-
 		let registered_completion_waiter = if let Some(waiter) = completion_waiter {
 			if self
 				.0
@@ -317,18 +310,11 @@ impl ActorContext {
 			false
 		};
 
-		if let Err(error) = self
-			.0
-			.kv
-			.batch_put(&[
-				(
-					make_queue_message_key(id).as_slice(),
-					encoded_message.as_slice(),
-				),
-				(QUEUE_METADATA_KEY.as_slice(), encoded_metadata.as_slice()),
-			])
-			.await
-		{
+		let persist_result =
+			internal_storage::persist_queue_message(self.sql(), id, metadata.next_id, &persisted)
+				.await;
+
+		if let Err(error) = persist_result {
 			metadata.next_id = id;
 			metadata.size = metadata.size.saturating_sub(1);
 			if registered_completion_waiter {
@@ -540,37 +526,17 @@ impl ActorContext {
 	pub async fn reset(&self) -> Result<()> {
 		self.ensure_initialized().await?;
 
-		// Serialize against receivers before touching metadata. try_receive_batch
-		// holds this lock across its list-then-dequeue, and list_messages
-		// reconciles metadata.size from a lockless KV scan. Without holding it
-		// here, a receiver mid-scan could deliver a message this reset deletes and
-		// overwrite size=0 with its stale pre-delete count. Lock order matches
+		// Serialize against receivers before touching metadata. Lock order matches
 		// try_receive_batch (receive lock then metadata) so there is no deadlock.
 		let _receive_guard = self.0.queue_receive_lock.lock().await;
 
 		let mut metadata = self.0.queue_metadata.lock().await;
 
-		// List and delete all message keys. The engine rejects KV deletes above
-		// APPLY_BATCH_CHUNK_SIZE keys per call, and the queue can hold up to
-		// max_queue_size messages, so delete in chunks.
-		let entries = self.list_message_entries().await?;
-		for chunk in entries.chunks(APPLY_BATCH_CHUNK_SIZE) {
-			let key_refs: Vec<&[u8]> = chunk.iter().map(|(k, _)| k.as_slice()).collect();
-			self.0
-				.kv
-				.batch_delete(&key_refs)
-				.await
-				.context("delete all queue messages")?;
-		}
+		internal_storage::reset_queue(self.sql())
+			.await
+			.context("delete all sqlite queue messages")?;
 
 		metadata.size = 0;
-		let encoded_metadata =
-			encode_queue_metadata(&metadata).context("encode reset queue metadata")?;
-		self.0
-			.kv
-			.put(&QUEUE_METADATA_KEY, &encoded_metadata)
-			.await
-			.context("persist reset queue metadata")?;
 
 		self.0.queue_completion_waiters.clear_async().await;
 
@@ -585,11 +551,6 @@ impl ActorContext {
 
 	pub(crate) fn configure_queue(&self, config: ActorConfig) {
 		*self.0.queue_config.lock() = config;
-	}
-
-	pub(crate) fn configure_preload(&self, preloaded_kv: Option<PreloadedKv>) {
-		*self.0.queue_preloaded_kv.lock() = preloaded_kv;
-		*self.0.queue_preloaded_message_entries.lock() = None;
 	}
 
 	pub(crate) fn set_wait_activity_callback(&self, callback: Option<Arc<dyn Fn() + Send + Sync>>) {
@@ -607,17 +568,9 @@ impl ActorContext {
 		self.0
 			.queue_initialize
 			.get_or_try_init(|| async {
-				let preload = self.0.queue_preloaded_kv.lock().take();
-				let metadata = if let Some(preloaded) = preload.as_ref() {
-					self.configure_preloaded_messages(preloaded);
-					if let Some(metadata) = self.load_metadata_from_preload(preloaded).await? {
-						metadata
-					} else {
-						self.load_or_create_metadata().await?
-					}
-				} else {
-					self.load_or_create_metadata().await?
-				};
+				let metadata = internal_storage::load_queue_metadata(self.sql())
+					.await
+					.context("load queue metadata from sqlite")?;
 				let mut state = self.0.queue_metadata.lock().await;
 				*state = metadata;
 				self.0.metrics.set_queue_depth(state.size);
@@ -625,85 +578,6 @@ impl ActorContext {
 			})
 			.await
 			.map(|_| ())
-	}
-
-	fn configure_preloaded_messages(&self, preloaded: &PreloadedKv) {
-		if let Some(entries) = preloaded.prefix_entries(&QUEUE_MESSAGES_PREFIX) {
-			*self.0.queue_preloaded_message_entries.lock() = Some(entries);
-		}
-	}
-
-	async fn load_metadata_from_preload(
-		&self,
-		preloaded: &PreloadedKv,
-	) -> Result<Option<QueueMetadata>> {
-		match preloaded.key_entry(&QUEUE_METADATA_KEY) {
-			Some(Some(encoded)) => match decode_queue_metadata(&encoded) {
-				Ok(metadata) => Ok(Some(metadata)),
-				Err(error) => {
-					tracing::warn!(
-						?error,
-						"failed to decode preloaded queue metadata, rebuilding"
-					);
-					Ok(self.metadata_from_preloaded_messages())
-				}
-			},
-			Some(None) => Ok(self.metadata_from_preloaded_messages()),
-			None => Ok(None),
-		}
-	}
-
-	fn metadata_from_preloaded_messages(&self) -> Option<QueueMetadata> {
-		let entries = self.0.queue_preloaded_message_entries.lock().clone()?;
-		Some(metadata_from_queue_messages(decode_queue_message_entries(
-			entries,
-		)))
-	}
-
-	async fn load_or_create_metadata(&self) -> Result<QueueMetadata> {
-		let Some(encoded) = self.0.kv.get(&QUEUE_METADATA_KEY).await? else {
-			let metadata = QueueMetadata {
-				next_id: 1,
-				size: 0,
-			};
-			self.0
-				.kv
-				.put(
-					&QUEUE_METADATA_KEY,
-					&encode_queue_metadata(&metadata).context("encode default queue metadata")?,
-				)
-				.await
-				.context("persist default queue metadata")?;
-			return Ok(metadata);
-		};
-
-		match decode_queue_metadata(&encoded) {
-			Ok(metadata) => Ok(metadata),
-			Err(error) => {
-				tracing::warn!(?error, "failed to decode queue metadata, rebuilding");
-				self.rebuild_metadata().await
-			}
-		}
-	}
-
-	async fn rebuild_metadata(&self) -> Result<QueueMetadata> {
-		let messages = self.list_messages().await?;
-		let metadata = metadata_from_queue_messages(messages);
-		self.persist_metadata(&metadata)
-			.await
-			.context("persist rebuilt queue metadata")?;
-		Ok(metadata)
-	}
-
-	async fn persist_metadata(&self, metadata: &QueueMetadata) -> Result<()> {
-		let encoded = encode_queue_metadata(metadata).context("encode queue metadata")?;
-		self.0
-			.kv
-			.put(&QUEUE_METADATA_KEY, &encoded)
-			.await
-			.context("persist queue metadata")?;
-		self.notify_inspector_update(metadata.size);
-		Ok(())
 	}
 
 	async fn try_receive_batch(
@@ -755,7 +629,18 @@ impl ActorContext {
 	}
 
 	async fn list_messages(&self) -> Result<Vec<QueueMessage>> {
-		let messages = decode_queue_message_entries(self.list_message_entries().await?);
+		let messages: Vec<QueueMessage> = internal_storage::load_queue_messages(self.sql())
+			.await
+			.context("list sqlite queue messages")?
+			.into_iter()
+			.map(|row| QueueMessage {
+				id: row.id,
+				name: row.message.name,
+				body: row.message.body,
+				created_at: row.message.created_at,
+				completion: None,
+			})
+			.collect();
 
 		let actual_size = messages.len().try_into().unwrap_or(u32::MAX);
 		let mut metadata = self.0.queue_metadata.lock().await;
@@ -772,28 +657,6 @@ impl ActorContext {
 		Ok(messages)
 	}
 
-	async fn list_message_entries(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-		if let Some(entries) = self.0.queue_preloaded_message_entries.lock().take() {
-			return Ok(entries);
-		}
-
-		self.0
-			.kv
-			.list_prefix(
-				&QUEUE_MESSAGES_PREFIX,
-				ListOpts {
-					reverse: false,
-					limit: None,
-				},
-			)
-			.await
-			.context("list queue messages")
-	}
-
-	fn clear_preloaded_messages(&self) {
-		self.0.queue_preloaded_message_entries.lock().take();
-	}
-
 	fn attach_completion(&self, mut message: QueueMessage) -> QueueMessage {
 		message.completion = Some(CompletionHandle::new(self.clone(), message.id));
 		message
@@ -804,33 +667,16 @@ impl ActorContext {
 			return Ok(());
 		}
 
-		let keys: Vec<Vec<u8>> = message_ids
-			.into_iter()
-			.map(make_queue_message_key)
-			.collect();
-		let key_refs: Vec<&[u8]> = keys.iter().map(Vec::as_slice).collect();
-
-		self.0
-			.kv
-			.batch_delete(&key_refs)
+		let deleted_count = message_ids.len();
+		internal_storage::delete_queue_messages(self.sql(), &message_ids)
 			.await
-			.context("delete queue messages")?;
+			.context("delete sqlite queue messages")?;
 
-		let encoded_metadata = {
+		let queue_size = {
 			let mut metadata = self.0.queue_metadata.lock().await;
-			metadata.size = metadata.size.saturating_sub(key_refs.len() as u32);
-			let queue_size = metadata.size;
-			encode_queue_metadata(&metadata)
-				.context("encode queue metadata after delete")
-				.map(|encoded| (encoded, queue_size))?
+			metadata.size = metadata.size.saturating_sub(deleted_count as u32);
+			metadata.size
 		};
-		let (encoded_metadata, queue_size) = encoded_metadata;
-
-		self.0
-			.kv
-			.put(&QUEUE_METADATA_KEY, &encoded_metadata)
-			.await
-			.context("persist queue metadata after delete")?;
 		self.0
 			.metrics
 			.set_queue_depth(self.0.queue_metadata.lock().await.size);
@@ -1142,50 +988,6 @@ fn normalize_names(names: Option<Vec<String>>) -> Option<BTreeSet<String>> {
 			Some(normalized)
 		}
 	})
-}
-
-fn decode_queue_message_entries(entries: Vec<(Vec<u8>, Vec<u8>)>) -> Vec<QueueMessage> {
-	let mut messages = Vec::with_capacity(entries.len());
-	for (key, value) in entries {
-		let id = match decode_queue_message_key(&key) {
-			Ok(id) => id,
-			Err(error) => {
-				tracing::warn!(?error, "failed to decode queue message key");
-				continue;
-			}
-		};
-
-		match decode_queue_message(&value) {
-			Ok(message) => messages.push(QueueMessage {
-				id,
-				name: message.name,
-				body: message.body,
-				created_at: message.created_at,
-				completion: None,
-			}),
-			Err(error) => {
-				tracing::warn!(
-					?error,
-					queue_message_id = id,
-					"failed to decode queue message"
-				);
-			}
-		}
-	}
-
-	messages.sort_by_key(|message| message.id);
-	messages
-}
-
-fn metadata_from_queue_messages(messages: Vec<QueueMessage>) -> QueueMetadata {
-	let next_id = messages
-		.last()
-		.map(|message| message.id.saturating_add(1))
-		.unwrap_or(1);
-	QueueMetadata {
-		next_id,
-		size: messages.len().try_into().unwrap_or(u32::MAX),
-	}
 }
 
 fn current_timestamp_ms() -> Result<i64> {

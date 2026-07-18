@@ -6,8 +6,8 @@ import {
 	RaceError,
 	RollbackCheckpointError,
 	RollbackError,
-	replayWorkflowFromStep,
 	type RunWorkflowOptions,
+	replayWorkflowFromStep,
 	runWorkflow,
 	StepExhaustedError,
 	type WorkflowErrorEvent,
@@ -201,7 +201,7 @@ export function workflow<
 		const workflowInspector = getWorkflowInspector(actor.id);
 
 		const driver = new ActorWorkflowDriver(actor, runCtx);
-		const controlDriver = new ActorWorkflowControlDriver(actor);
+		const controlDriver = new ActorWorkflowControlDriver(actor, runCtx);
 		workflowInspector.setReplayFromStep(async (entryId) => {
 			const workflowState = await workflowInspector.adapter.getState();
 			if (
@@ -212,7 +212,7 @@ export function workflow<
 				throw workflowReplayInFlightError();
 			}
 
-			let snapshot;
+			let snapshot: Awaited<ReturnType<typeof replayWorkflowFromStep>>;
 			try {
 				snapshot = await replayWorkflowFromStep(
 					actor.id,

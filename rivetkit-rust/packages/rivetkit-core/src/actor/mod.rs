@@ -9,13 +9,15 @@ pub mod connection;
 pub mod context;
 pub(crate) mod diagnostics;
 pub mod factory;
+pub(crate) mod internal_schema;
+pub(crate) mod internal_storage;
 pub(crate) mod keys;
 pub mod kv;
 pub mod lifecycle_hooks;
 pub mod messages;
 pub mod metrics;
+pub(crate) mod migrate_kv_to_sqlite;
 pub mod persist;
-pub(crate) mod preload;
 pub mod queue;
 pub mod schedule;
 pub mod sleep;
@@ -32,16 +34,17 @@ pub use config::{ActionDefinition, ActorConfig, ActorConfigOverrides, CanHiberna
 pub use connection::ConnHandle;
 pub use context::{ActorContext, ActorWorkRegion, KeepAwakeRegion, WebSocketCallbackRegion};
 pub use factory::{ActorEntryFn, ActorFactory};
-pub use kv::Kv;
 pub use lifecycle_hooks::{ActorEvents, ActorStart, Reply};
-pub use messages::{ActorEvent, QueueSendResult, QueueSendStatus, Request, Response, StateDelta};
+pub use messages::{
+	ActorEvent, QueueSendResult, QueueSendStatus, Request, Response, StateDelta, WorkflowKvWrite,
+};
 pub use queue::{
 	CompletableQueueMessage, EnqueueAndWaitOpts, QueueMessage, QueueNextBatchOpts, QueueNextOpts,
 	QueueTryNextBatchOpts, QueueTryNextOpts, QueueWaitOpts,
 };
 pub use sqlite::{
-	BindParam, ColumnValue, ExecResult, ExecuteResult, QueryResult, SqliteBackend, SqliteDb,
-	SqliteTransaction,
+	BindParam, ColumnValue, ExecResult, ExecuteResult, QueryResult, SqliteBackend,
+	SqliteBatchStatement, SqliteDb, SqliteTransaction,
 };
 pub use state::RequestSaveOpts;
 pub use task::{

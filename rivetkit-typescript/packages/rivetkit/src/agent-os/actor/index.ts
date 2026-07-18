@@ -1,6 +1,6 @@
 import type { AgentOsOptions, MountConfig } from "@rivet-dev/agent-os-core";
 import { AgentOs, createInMemoryFileSystem } from "@rivet-dev/agent-os-core";
-import { actor, event, type ActorDefinition } from "@/actor/mod";
+import { type ActorDefinition, actor, event } from "@/actor/mod";
 import type { DatabaseProvider, RawAccess } from "@/common/database/config";
 import { db } from "@/common/database/mod";
 import {
@@ -80,7 +80,7 @@ function buildVmOptions(userOptions?: AgentOsOptions): AgentOsOptions {
 		return userOptions ?? {};
 	}
 
-	// TODO: Reimplement with persistent backend (actor KV-backed metadata +
+	// TODO: Reimplement with persistent backend (SQLite-backed metadata and
 	// actor storage-backed blocks) so VM filesystem state survives sleep/wake.
 	const memMount: MountConfig = {
 		path: "/home/user",

@@ -9,19 +9,20 @@ use anyhow::{Context, Result};
 use rivetkit_actor_persist::{generated::v4 as persist_v4, versioned as persist_versioned};
 #[cfg(not(feature = "wasm-runtime"))]
 use tokio::runtime::Handle;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 #[cfg(test)]
 use tokio::time::timeout;
 use tracing::Instrument;
 
+use crate::actor::connection::{PersistedConnection, decode_persisted_connection};
 use crate::actor::context::ActorContext;
-use crate::actor::keys::{LAST_PUSHED_ALARM_KEY, PERSIST_DATA_KEY, make_connection_key};
-use crate::actor::kv::APPLY_BATCH_CHUNK_SIZE;
-use crate::actor::messages::StateDelta;
-use crate::actor::persist::{
-	decode_latest_with_embedded_version, encode_latest_with_embedded_version,
-};
+use crate::actor::internal_storage;
+use crate::actor::lifecycle_hooks::Reply;
+use crate::actor::messages::{StateDelta, WorkflowKvWrite};
+use crate::actor::persist::decode_latest_with_embedded_version;
+#[cfg(test)]
+use crate::actor::persist::encode_latest_with_embedded_version;
 use crate::actor::task::LifecycleEvent;
 use crate::actor::task_types::StateMutationReason;
 use crate::error::ActorRuntime;
@@ -29,11 +30,13 @@ use crate::error::ActorRuntime;
 use crate::runtime::RuntimeSpawner;
 use crate::types::SaveStateOpts;
 
+#[cfg(test)]
 const LAST_PUSHED_ALARM_VERSION: u16 = 1;
 
 pub type PersistedScheduleEvent = persist_v4::ScheduleEvent;
 pub type PersistedActor = persist_v4::Actor;
 
+#[cfg(test)]
 pub(crate) fn encode_persisted_actor(actor: &PersistedActor) -> Result<Vec<u8>> {
 	encode_latest_with_embedded_version::<persist_versioned::Actor>(
 		actor.clone(),
@@ -50,6 +53,7 @@ pub(crate) fn decode_persisted_actor(payload: &[u8]) -> Result<PersistedActor> {
 	Ok(actor)
 }
 
+#[cfg(test)]
 pub(crate) fn encode_last_pushed_alarm(alarm_ts: Option<i64>) -> Result<Vec<u8>> {
 	encode_latest_with_embedded_version::<persist_versioned::LastPushedAlarm>(
 		alarm_ts,
@@ -193,6 +197,52 @@ impl ActorContext {
 			.await
 	}
 
+	/// Requests one logical workflow-engine flush. The actor lifecycle owns
+	/// serializing actor state and committing both sides in one SQLite transaction.
+	pub async fn save_state_and_workflow_batch(
+		&self,
+		workflow_writes: Vec<WorkflowKvWrite>,
+	) -> Result<()> {
+		let Some(sender) = self.lifecycle_event_sender() else {
+			return Err(ActorRuntime::NotConfigured {
+				component: "lifecycle events".to_owned(),
+			}
+			.build());
+		};
+		let (reply_tx, reply_rx) = oneshot::channel();
+		sender
+			.send(LifecycleEvent::WorkflowFlushRequested {
+				writes: workflow_writes,
+				reply: Reply::from(reply_tx),
+			})
+			.map_err(|_| {
+				ActorRuntime::NotConfigured {
+					component: "lifecycle events".to_owned(),
+				}
+				.build()
+			})?;
+		reply_rx
+			.await
+			.context("receive workflow flush lifecycle reply")?
+	}
+
+	/// Commits an already serialized snapshot and workflow flush atomically for
+	/// storage-level fault tests. Runtime bridges must use the lifecycle-owned API.
+	#[cfg(test)]
+	pub(crate) async fn commit_serialized_state_and_workflow_batch(
+		&self,
+		deltas: Vec<StateDelta>,
+		workflow_writes: Vec<WorkflowKvWrite>,
+	) -> Result<()> {
+		let save_request_revision = self.save_request_revision();
+		self.save_state_and_workflow_batch_with_revision(
+			deltas,
+			workflow_writes,
+			save_request_revision,
+		)
+		.await
+	}
+
 	pub(crate) fn request_save_with_revision(&self, opts: RequestSaveOpts) -> Result<u64> {
 		let immediate = opts.immediate;
 		let save_request_revision = self.0.save_request_revision.fetch_add(1, Ordering::SeqCst) + 1;
@@ -283,8 +333,29 @@ impl ActorContext {
 		deltas: Vec<StateDelta>,
 		save_request_revision: u64,
 	) -> Result<()> {
+		self.apply_state_deltas_inner(deltas, None, save_request_revision)
+			.await
+	}
+
+	pub(crate) async fn apply_state_deltas_and_workflow(
+		&self,
+		deltas: Vec<StateDelta>,
+		workflow_writes: Vec<WorkflowKvWrite>,
+		save_request_revision: u64,
+	) -> Result<()> {
+		self.apply_state_deltas_inner(deltas, Some(workflow_writes), save_request_revision)
+			.await
+	}
+
+	async fn apply_state_deltas_inner(
+		&self,
+		deltas: Vec<StateDelta>,
+		workflow_writes: Option<Vec<WorkflowKvWrite>>,
+		save_request_revision: u64,
+	) -> Result<()> {
 		let delta_count = deltas.len();
 		let delta_bytes: usize = deltas.iter().map(StateDelta::payload_len).sum();
+		let workflow_write_count = workflow_writes.as_ref().map_or(0, Vec::len);
 		let current_revision = self.0.state_revision.load(Ordering::SeqCst);
 		tracing::debug!(
 			delta_count,
@@ -295,7 +366,7 @@ impl ActorContext {
 		);
 		self.clear_pending_save();
 
-		if deltas.is_empty() {
+		if deltas.is_empty() && workflow_write_count == 0 {
 			self.mark_save_request_completed(save_request_revision);
 			self.finish_save_request(save_request_revision);
 			tracing::debug!(
@@ -307,13 +378,21 @@ impl ActorContext {
 			return Ok(());
 		}
 
-		let (puts, deletes, next_state, revision, _write_guard) = {
+		let (
+			next_state,
+			actor_to_persist,
+			connections_to_persist,
+			connections_to_delete,
+			revision,
+			_write_guard,
+		) = {
 			let _save_guard = self.0.save_guard.lock().await;
 			let revision = self.0.state_revision.load(Ordering::SeqCst);
 			let mut persisted = self.persisted();
 			let mut next_state = None;
-			let mut puts = Vec::new();
-			let mut deletes = Vec::new();
+			let mut actor_to_persist = None;
+			let mut connections_to_persist: Vec<PersistedConnection> = Vec::new();
+			let mut connections_to_delete = Vec::new();
 
 			for delta in deltas {
 				match delta {
@@ -321,43 +400,64 @@ impl ActorContext {
 						next_state = Some(bytes.clone());
 						persisted.state = bytes;
 					}
-					StateDelta::ConnHibernation { conn, bytes } => {
-						puts.push((make_connection_key(&conn), bytes));
+					StateDelta::ConnHibernation { conn: _, bytes } => {
+						connections_to_persist.push(
+							decode_persisted_connection(&bytes)
+								.context("decode hibernatable connection state delta")?,
+						);
 					}
 					StateDelta::ConnHibernationRemoved(conn) => {
-						deletes.push(make_connection_key(&conn));
+						connections_to_delete.push(conn);
 					}
 				}
 			}
 
 			if next_state.is_some() {
-				let encoded =
-					encode_persisted_actor(&persisted).context("encode persisted actor state")?;
-				puts.push((PERSIST_DATA_KEY.to_vec(), encoded));
-				*self.0.persisted.write() = persisted;
+				actor_to_persist = Some(persisted.clone());
 			}
 
-			(puts, deletes, next_state, revision, self.begin_write())
+			(
+				next_state,
+				actor_to_persist,
+				connections_to_persist,
+				connections_to_delete,
+				revision,
+				self.begin_write(),
+			)
 		};
 
-		// TODO: Make this atomic. The ideal path is to store these deltas in SQLite.
-		let mut put_chunks = puts.chunks(APPLY_BATCH_CHUNK_SIZE);
-		let mut delete_chunks = deletes.chunks(APPLY_BATCH_CHUNK_SIZE);
-		loop {
-			let put_chunk = put_chunks.next().unwrap_or(&[]);
-			let delete_chunk = delete_chunks.next().unwrap_or(&[]);
-			if put_chunk.is_empty() && delete_chunk.is_empty() {
-				break;
-			}
-			self.0
-				.kv
-				.apply_batch(put_chunk, delete_chunk)
-				.await
-				.context("persist actor state deltas to kv")?;
+		if let Some(workflow_writes) = workflow_writes.as_deref() {
+			internal_storage::persist_actor_core_connections_and_workflow(
+				self.sql(),
+				actor_to_persist.as_ref(),
+				&connections_to_persist,
+				&connections_to_delete,
+				workflow_writes,
+			)
+			.await
+			.context("atomically persist actor state, connection deltas, and workflow kv")?;
+		} else if actor_to_persist.is_some()
+			|| !connections_to_persist.is_empty()
+			|| !connections_to_delete.is_empty()
+		{
+			internal_storage::persist_actor_core_and_connections(
+				self.sql(),
+				actor_to_persist.as_ref(),
+				&connections_to_persist,
+				&connections_to_delete,
+			)
+			.await
+			.context("persist actor state and connection deltas to sqlite")?;
 		}
 
 		if let Some(state) = next_state {
+			self.0.persisted.write().state = state.clone();
 			*self.0.current_state.write() = state;
+		}
+		for connection in &connections_to_persist {
+			if let Some(handle) = self.connection(&connection.id) {
+				handle.set_state_initial(connection.state.clone());
+			}
 		}
 
 		*self.0.last_save_at.lock() = Some(StdInstant::now());
@@ -371,6 +471,7 @@ impl ActorContext {
 		tracing::debug!(
 			delta_count,
 			delta_bytes,
+			workflow_write_count,
 			state_revision = self.0.state_revision.load(Ordering::SeqCst),
 			save_request_revision,
 			"actor state deltas applied"
@@ -490,12 +591,9 @@ impl ActorContext {
 	}
 
 	pub(crate) async fn persist_last_pushed_alarm(&self, alarm_ts: Option<i64>) -> Result<()> {
-		let encoded = encode_last_pushed_alarm(alarm_ts).context("encode last pushed alarm")?;
-		self.0
-			.kv
-			.put(LAST_PUSHED_ALARM_KEY, &encoded)
+		internal_storage::persist_last_pushed_alarm(self.sql(), alarm_ts)
 			.await
-			.context("persist last pushed alarm to kv")?;
+			.context("persist last pushed alarm to sqlite")?;
 		self.load_last_pushed_alarm(alarm_ts);
 		Ok(())
 	}
@@ -716,7 +814,7 @@ impl ActorContext {
 			return Ok(());
 		}
 
-		let (revision, encoded, _write_guard) = {
+		let (revision, actor_to_persist, _write_guard) = {
 			let _save_guard = self.0.save_guard.lock().await;
 			if !self.is_dirty() {
 				return Ok(());
@@ -724,17 +822,12 @@ impl ActorContext {
 
 			let revision = self.0.state_revision.load(Ordering::SeqCst);
 			let persisted = self.persisted();
-			let encoded =
-				encode_persisted_actor(&persisted).context("encode persisted actor state")?;
-
-			(revision, encoded, self.begin_write())
+			(revision, persisted, self.begin_write())
 		};
 
-		self.0
-			.kv
-			.put(PERSIST_DATA_KEY, &encoded)
+		internal_storage::persist_actor_snapshot(self.sql(), &actor_to_persist)
 			.await
-			.context("persist actor state to kv")?;
+			.context("persist actor state to sqlite")?;
 
 		*self.0.last_save_at.lock() = Some(StdInstant::now());
 

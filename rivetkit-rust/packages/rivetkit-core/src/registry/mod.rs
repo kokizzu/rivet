@@ -38,11 +38,9 @@ use crate::actor::config::CanHibernateWebSocket;
 use crate::actor::connection::{ConnHandle, HibernatableConnectionMetadata};
 use crate::actor::context::{ActorContext, InspectorAttachGuard};
 use crate::actor::factory::ActorFactory;
-use crate::actor::keys::PERSIST_DATA_KEY;
+use crate::actor::kv::LegacyActorKv;
 use crate::actor::lifecycle_hooks::Reply;
 use crate::actor::messages::{ActorEvent, QueueSendResult, Request, Response, StateDelta};
-use crate::actor::preload::{PreloadedKv, PreloadedPersistedActor};
-use crate::actor::state::decode_persisted_actor;
 use crate::actor::task::{
 	ActorTask, DispatchCommand, LifecycleCommand, try_send_dispatch_command,
 	try_send_lifecycle_command,
@@ -55,7 +53,6 @@ use crate::inspector::protocol::{
 	self as inspector_protocol, ServerMessage as InspectorServerMessage,
 };
 use crate::inspector::{Inspector, InspectorAuth, InspectorSignal, InspectorSubscription};
-use crate::kv::Kv;
 use crate::runtime::RuntimeSpawner;
 use crate::sqlite::SqliteDb;
 use crate::types::{ActorKey, ActorKeySegment, WsMessage, format_actor_key};
@@ -176,8 +173,6 @@ struct StartActorRequest {
 	generation: u32,
 	actor_name: String,
 	input: Option<Vec<u8>>,
-	preload_persisted_actor: PreloadedPersistedActor,
-	preloaded_kv: Option<PreloadedKv>,
 	ctx: ActorContext,
 }
 
@@ -748,34 +743,6 @@ fn build_actor_metadata_map_from_factories(
 			if let Some(name) = &config.name {
 				metadata.insert("name".to_owned(), json!(name));
 			}
-			metadata.insert(
-				"preload".to_owned(),
-				json!({
-					"keys": [
-						[1],
-						[3],
-						[5, 1, 1],
-						[6],
-					],
-					"prefixes": [
-						{
-							"prefix": [6, 1],
-							"maxBytes": config.preload_max_workflow_bytes.unwrap_or(131_072),
-							"partial": false,
-						},
-						{
-							"prefix": [2],
-							"maxBytes": config.preload_max_connections_bytes.unwrap_or(65_536),
-							"partial": false,
-						},
-						{
-							"prefix": [5, 1, 2],
-							"maxBytes": 65_536,
-							"partial": false,
-						},
-					],
-				}),
-			);
 			(actor_name.clone(), JsonValue::Object(metadata))
 		})
 		.collect()
@@ -831,10 +798,7 @@ impl RegistryDispatcher {
 			factory.clone(),
 			request.ctx.clone(),
 			request.input,
-			None,
-		)
-		.with_preloaded_persisted_actor(request.preload_persisted_actor)
-		.with_preloaded_kv(request.preloaded_kv);
+		);
 		let join = RuntimeSpawner::spawn(task.run());
 
 		let (start_tx, start_rx) = oneshot::channel();
@@ -1223,7 +1187,7 @@ impl RegistryDispatcher {
 		actor_name: &str,
 		key: ActorKey,
 		factory: &ActorFactory,
-	) -> ActorContext {
+	) -> Result<ActorContext> {
 		let formatted_key = format_actor_key(&key);
 		let ctx = ActorContext::build(
 			actor_id.to_owned(),
@@ -1233,7 +1197,7 @@ impl RegistryDispatcher {
 			Some(generation),
 			handle.get_envoy_key().to_owned(),
 			factory.config().clone(),
-			Kv::new(handle.clone(), actor_id.to_owned()),
+			LegacyActorKv::new(handle.clone(), actor_id.to_owned()),
 			SqliteDb::new_with_remote_sqlite(
 				handle.clone(),
 				actor_id.to_owned(),
@@ -1241,10 +1205,10 @@ impl RegistryDispatcher {
 				Some(generation as u64),
 				factory.config().has_database,
 				factory.config().remote_sqlite,
-			),
+			)?,
 		);
 		ctx.configure_envoy(handle, Some(generation));
-		ctx
+		Ok(ctx)
 	}
 }
 
@@ -1268,3 +1232,8 @@ fn map_envoy_stop_reason(reason: &protocol::StopActorReason) -> ShutdownKind {
 		protocol::StopActorReason::Destroy => ShutdownKind::Destroy,
 	}
 }
+
+// Test shim keeps moved tests in crate-root tests/ with private-module access.
+#[cfg(test)]
+#[path = "../../tests/registry.rs"]
+pub(crate) mod tests;

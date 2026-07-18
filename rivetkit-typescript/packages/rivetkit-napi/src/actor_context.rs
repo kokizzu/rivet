@@ -19,7 +19,7 @@ use parking_lot::Mutex;
 use rivetkit_core::types::ActorKeySegment;
 use rivetkit_core::{
 	ActorContext as CoreActorContext, ActorWorkKind, ConnHandle as CoreConnHandle, KeepAwakeRegion,
-	Request as CoreRequest, RequestSaveOpts, StateDelta, WebSocketCallbackRegion,
+	Request as CoreRequest, RequestSaveOpts, StateDelta, WebSocketCallbackRegion, WorkflowKvWrite,
 };
 use scc::HashMap as SccHashMap;
 use tokio::sync::mpsc::UnboundedSender;
@@ -101,9 +101,33 @@ pub struct StateDeltaPayload {
 }
 
 #[napi(object)]
+pub struct WorkflowKvWritePayload {
+	pub key: Buffer,
+	pub value: Buffer,
+}
+
+#[napi(object)]
 pub struct JsRequestSaveOpts {
 	pub immediate: Option<bool>,
 	pub max_wait_ms: Option<u32>,
+}
+
+#[napi]
+pub fn decode_inspector_request(bytes: Buffer, advertised_version: u32) -> napi::Result<Buffer> {
+	let advertised_version = u16::try_from(advertised_version)
+		.map_err(|_| inspector_version_error("advertisedVersion"))?;
+	rivetkit_core::inspector::decode_request_payload(bytes.as_ref(), advertised_version)
+		.map(Buffer::from)
+		.map_err(napi_anyhow_error)
+}
+
+#[napi]
+pub fn encode_inspector_response(bytes: Buffer, target_version: u32) -> napi::Result<Buffer> {
+	let target_version =
+		u16::try_from(target_version).map_err(|_| inspector_version_error("targetVersion"))?;
+	rivetkit_core::inspector::encode_response_payload(bytes.as_ref(), target_version)
+		.map(Buffer::from)
+		.map_err(napi_anyhow_error)
 }
 
 #[napi(object)]
@@ -223,11 +247,6 @@ impl ActorContext {
 
 #[napi]
 impl ActorContext {
-	#[napi(constructor)]
-	pub fn constructor(actor_id: String, name: String, region: String) -> Self {
-		Self::new(CoreActorContext::new(actor_id, name, Vec::new(), region))
-	}
-
 	#[napi]
 	pub fn state(&self) -> Buffer {
 		Buffer::from(self.inner.state())
@@ -248,7 +267,7 @@ impl ActorContext {
 	// TypeScript compatibility while steering new code to SQLite or actor state.
 	#[allow(deprecated)]
 	pub fn kv(&self) -> Kv {
-		Kv::new(self.inner.kv().clone())
+		Kv::new(self.inner.clone())
 	}
 
 	#[napi]
@@ -321,11 +340,7 @@ impl ActorContext {
 		bytes: Buffer,
 		advertised_version: u32,
 	) -> napi::Result<Buffer> {
-		let advertised_version = u16::try_from(advertised_version)
-			.map_err(|_| inspector_version_error("advertisedVersion"))?;
-		rivetkit_core::inspector::decode_request_payload(bytes.as_ref(), advertised_version)
-			.map(Buffer::from)
-			.map_err(napi_anyhow_error)
+		decode_inspector_request(bytes, advertised_version)
 	}
 
 	#[napi]
@@ -334,11 +349,7 @@ impl ActorContext {
 		bytes: Buffer,
 		target_version: u32,
 	) -> napi::Result<Buffer> {
-		let target_version =
-			u16::try_from(target_version).map_err(|_| inspector_version_error("targetVersion"))?;
-		rivetkit_core::inspector::encode_response_payload(bytes.as_ref(), target_version)
-			.map(Buffer::from)
-			.map_err(napi_anyhow_error)
+		encode_inspector_response(bytes, target_version)
 	}
 
 	#[napi]
@@ -398,6 +409,25 @@ impl ActorContext {
 	pub async fn save_state(&self, payload: StateDeltaPayload) -> napi::Result<()> {
 		self.inner
 			.save_state(state_deltas_from_payload(payload))
+			.await
+			.map_err(napi_anyhow_error)
+	}
+
+	#[napi]
+	pub async fn save_state_and_workflow_batch(
+		&self,
+		writes: Vec<WorkflowKvWritePayload>,
+	) -> napi::Result<()> {
+		self.inner
+			.save_state_and_workflow_batch(
+				writes
+					.into_iter()
+					.map(|write| WorkflowKvWrite {
+						key: write.key.to_vec(),
+						value: write.value.to_vec(),
+					})
+					.collect(),
+			)
 			.await
 			.map_err(napi_anyhow_error)
 	}
