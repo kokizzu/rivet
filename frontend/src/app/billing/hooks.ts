@@ -11,15 +11,8 @@ import { features } from "@/lib/features";
 export type BillingUsage = Rivet.BillingUsageResponse;
 export type BilledMetricUsage = Rivet.BilledMetricUsage;
 
-// `computeBudgetPercent` is served by the usage endpoint but not yet in the
-// published `@rivet-gg/cloud` SDK types. The cast has no compile-time safety, so
-// a field rename would silently read 0.
-// TODO(engine-ee#468): drop this cast and read `usage.computeBudgetPercent`
-// directly once the SDK regenerates with the field.
 export function computeBudgetPercent(usage: BillingUsage): number {
-	return (
-		(usage as { computeBudgetPercent?: number }).computeBudgetPercent ?? 0
-	);
+	return usage.computeBudgetPercent;
 }
 
 // Bucket size (seconds) for the month-to-date compute cost query. Cost is an
