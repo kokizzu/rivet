@@ -116,6 +116,7 @@ pub(crate) struct ActorContextInner {
 	pub(super) schedule_dirty_since_push: AtomicBool,
 	pub(super) schedule_mutation_lock: AsyncMutex<()>,
 	pub(super) schedule_running: SccHashSet<String>,
+	pub(super) schedule_history_insert_count: AtomicUsize,
 	pub(super) max_schedules: u32,
 	#[cfg(any(test, feature = "test-support"))]
 	pub(super) schedule_now_override: AtomicI64,
@@ -331,6 +332,7 @@ impl ActorContext {
 			schedule_dirty_since_push: AtomicBool::new(true),
 			schedule_mutation_lock: AsyncMutex::new(()),
 			schedule_running: SccHashSet::new(),
+			schedule_history_insert_count: AtomicUsize::new(0),
 			max_schedules,
 			#[cfg(any(test, feature = "test-support"))]
 			schedule_now_override: AtomicI64::new(i64::MIN),

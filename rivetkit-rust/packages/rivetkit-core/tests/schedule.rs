@@ -14,7 +14,9 @@ mod moved_tests {
 
 	use super::*;
 	use crate::ActorConfig;
-	use crate::actor::schedule::{DEFAULT_MAX_HISTORY, MIN_INTERVAL_MS};
+	use crate::actor::schedule::{
+		DEFAULT_MAX_HISTORY, GLOBAL_HISTORY_PRUNE_INTERVAL, MIN_INTERVAL_MS,
+	};
 	use crate::testing::{ActorContextHarness, actor_context};
 
 	const BASE_TIME: i64 = 1_700_000_000_000;
@@ -292,6 +294,19 @@ mod moved_tests {
 		assert_eq!(dispatches[0].event_id, event_id);
 		assert_eq!(dispatches[0].args, vec![7]);
 		assert!(ctx.get_scheduled_event(&event_id).await.unwrap().is_none());
+	}
+
+	#[tokio::test]
+	async fn due_one_shots_are_claimed_across_batch_boundaries() {
+		let ctx = context("actor-one-shot-claim-batches");
+		for index in 0..129 {
+			ctx.at(BASE_TIME, "tick", &[index]).await.unwrap();
+		}
+
+		let dispatches = ctx.take_due_schedule_dispatches().await.unwrap();
+		assert_eq!(dispatches.len(), 129);
+		assert!(ctx.list_scheduled_events().await.unwrap().is_empty());
+		assert!(ctx.take_due_schedule_dispatches().await.unwrap().is_empty());
 	}
 
 	#[tokio::test]
@@ -598,7 +613,7 @@ mod moved_tests {
 			.unwrap();
 		assert_eq!(
 			count.rows,
-			vec![vec![crate::sqlite::ColumnValue::Integer(10_000)]]
+			vec![vec![crate::sqlite::ColumnValue::Integer(9_900)]]
 		);
 		let range = ctx
 			.sql()
@@ -611,10 +626,20 @@ mod moved_tests {
 		assert_eq!(
 			range.rows,
 			vec![vec![
-				crate::sqlite::ColumnValue::Integer(3),
+				crate::sqlite::ColumnValue::Integer(103),
 				crate::sqlite::ColumnValue::Integer(BASE_TIME + 5_000),
 			]]
 		);
+	}
+
+	#[tokio::test]
+	async fn global_history_pruning_is_periodic() {
+		let ctx = context("actor-periodic-global-history-prune");
+		assert!(ctx.should_prune_global_history());
+		for _ in 1..GLOBAL_HISTORY_PRUNE_INTERVAL {
+			assert!(!ctx.should_prune_global_history());
+		}
+		assert!(ctx.should_prune_global_history());
 	}
 
 	#[tokio::test]
