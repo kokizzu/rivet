@@ -64,7 +64,17 @@ export function IconPicker({
 			<PopoverTrigger asChild>
 				{trigger ?? <DefaultTrigger iconName={value ?? null} />}
 			</PopoverTrigger>
-			<PopoverContent className={cn("w-80 p-0", className)} align="start">
+			<PopoverContent
+				className={cn("w-80 p-0", className)}
+				align="start"
+				// https://github.com/radix-ui/primitives/issues/1159
+				onWheel={(e) => {
+					e.stopPropagation();
+				}}
+				onTouchMove={(e) => {
+					e.stopPropagation();
+				}}
+			>
 				{open ? (
 					<IconPickerBody
 						value={value ?? null}
