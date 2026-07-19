@@ -593,23 +593,6 @@ export const actorWakeUpMutationOptions = () =>
 		},
 	});
 
-export const actorWakeUpQueryOptions = ({
-	actorId,
-	credentials,
-}: {
-	actorId: ActorId;
-	credentials: { url: string; token: string };
-}) =>
-	queryOptions({
-		queryKey: ["actor", actorId, "wake-up"],
-		queryFn: async () => {
-			return actorWakeUpMutationOptions().mutationFn?.({
-				actorId,
-				credentials,
-			});
-		},
-	});
-
 const getActorMetadata = async ({
 	actorId,
 	credentials,

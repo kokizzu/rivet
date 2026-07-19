@@ -1,5 +1,10 @@
-import { faSpinnerThird, faTriangleExclamation, Icon } from "@rivet-gg/icons";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+	faMoon,
+	faSpinnerThird,
+	faTriangleExclamation,
+	Icon,
+} from "@rivet-gg/icons";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { z } from "zod";
 import {
@@ -24,12 +29,14 @@ import {
 import { ActorDetailsSkeleton } from "./actor-details-skeleton";
 import {
 	actorMetadataQueryOptions,
+	actorWakeUpMutationOptions,
 	isVersionAtLeast,
 } from "./actor-inspector-context";
 import {
 	resumeAutoWake,
 	useAutoWakeSuppression,
 } from "./auto-wake-suppression";
+import { useFiltersValue } from "./actor-filters-context";
 import { useDataProvider } from "./data-provider";
 import { resolveInspectorTabIcon } from "./inspector-tab-icons";
 import type { InspectorTabDescriptor } from "./inspector-tab-registry";
@@ -89,10 +96,38 @@ export const ActorsActorDetails = memo(function ActorsActorDetails({
 	const suppression = useAutoWakeSuppression(actorId);
 	const isSuppressed = suppression === "sleep";
 
+	// Opening the inspector connection (/metadata polling and websocket) wakes a
+	// sleeping actor, so "Auto-wake actors on select" gates that connection.
+	const filters = useFiltersValue();
+	const autoWakeOnSelect = filters.wakeOnSelect?.value.includes("1") ?? true;
+
+	// Per-mount opt-in to wake one sleeping actor without changing the setting.
+	// Reset per actor so each selection re-evaluates the setting.
+	const [manualWake, setManualWake] = useState(false);
+	useEffect(() => {
+		setManualWake(false);
+	}, [actorId]);
+
+	// Hitting /health wakes the actor directly, giving the button pending/error
+	// state, then manualWake mounts the inspector. Needs only the rivet token.
+	const wakeMutation = useMutation({
+		...actorWakeUpMutationOptions(),
+		onSuccess: () => setManualWake(true),
+	});
+
 	const { data: status } = useQuery({
 		...useDataProvider().actorStatusQueryOptions(actorId),
 		refetchInterval: 1000,
 	});
+
+	// Hold the inspector while a sleeping actor stays asleep. Status is undefined
+	// during the initial load, so hold then too rather than racing the connection
+	// open before the actor's state is known.
+	const wakeBlocked = !autoWakeOnSelect && !manualWake;
+	const showSleepingPrompt = wakeBlocked && status === "sleeping";
+	const holdForSleep =
+		wakeBlocked && (status === "sleeping" || status === undefined);
+	const holdInspector = isSuppressed || holdForSleep;
 
 	// Resume auto-wake on the rising edge into running, clearing suppression set
 	// by an explicit sleep once the actor is back up. A rising edge is used
@@ -109,7 +144,7 @@ export const ActorsActorDetails = memo(function ActorsActorDetails({
 
 	const inspectorTokenQuery = useQuery({
 		...useDataProvider().actorInspectorTokenQueryOptions(actorId),
-		enabled: !isSuppressed,
+		enabled: !holdInspector,
 	});
 
 	const credentials = useMemo(
@@ -130,7 +165,7 @@ export const ActorsActorDetails = memo(function ActorsActorDetails({
 			// biome-ignore lint/style/noNonNullAssertion: gated by enabled
 			credentials: credentials!,
 		}),
-		enabled: !!credentials && !isSuppressed,
+		enabled: !!credentials && !holdInspector,
 		// The host only reads the version to pick the inspector renderer, which
 		// never changes for a running actor generation. The shared query
 		// options poll every second (the iframe SPA relies on that for its own
@@ -153,6 +188,42 @@ export const ActorsActorDetails = memo(function ActorsActorDetails({
 			<div className="flex flex-col h-full flex-1 min-h-0 items-center justify-center bg-card gap-2 text-sm text-muted-foreground">
 				<Icon icon={faSpinnerThird} className="animate-spin" />
 				<span>Updating actor…</span>
+			</div>
+		);
+	}
+
+	if (showSleepingPrompt) {
+		return (
+			<div className="flex flex-col h-full flex-1 min-h-0 items-center justify-center bg-card gap-3 px-6 text-center">
+				<Icon icon={faMoon} className="text-lg text-muted-foreground" />
+				<div className="text-sm font-medium">Actor is sleeping</div>
+				<div className="max-w-sm text-xs text-muted-foreground">
+					Auto-wake on select is off, so opening this actor won't wake
+					it. Wake it to connect the inspector.
+				</div>
+				<Button
+					size="sm"
+					variant="outline"
+					isLoading={wakeMutation.isPending}
+					startIcon={<Icon icon={faMoon} />}
+					onClick={() =>
+						wakeMutation.mutate({
+							actorId,
+							credentials: {
+								url: engineUrl,
+								token: rivetToken,
+							},
+						})
+					}
+				>
+					Wake actor
+				</Button>
+				{wakeMutation.isError && (
+					<div className="max-w-sm text-xs text-destructive">
+						Couldn't wake the actor. Check that it's reachable and
+						try again.
+					</div>
+				)}
 			</div>
 		);
 	}
