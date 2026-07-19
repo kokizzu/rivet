@@ -1,6 +1,7 @@
 import { faExclamationTriangle, Icon } from "@rivet-gg/icons";
 import { useQuery } from "@tanstack/react-query";
 import { Link, useMatch } from "@tanstack/react-router";
+import { AnimatePresence, motion } from "framer-motion";
 import { useEffect } from "react";
 import { Button, cn } from "@/components";
 import { useCloudProjectDataProvider } from "@/components/actors";
@@ -52,51 +53,59 @@ function BillingLimitAlertInner() {
 		};
 	}, [hidden]);
 
-	if (hidden) {
-		return null;
-	}
-
 	const atLimit = usagePercent >= 100;
 
+	// The usage figure comes from a slow backend scan, so the banner appears well
+	// after the page loads. Expanding it in keeps the content below from jumping.
 	return (
-		<div
-			className={cn(
-				"flex h-9 items-center gap-2 border-b px-3 text-xs",
-				atLimit
-					? "border-destructive/60 bg-destructive/15"
-					: "border-warning/60 bg-warning/10",
-			)}
-		>
-			<Icon
-				icon={faExclamationTriangle}
-				className={cn(
-					"shrink-0",
-					atLimit ? "text-destructive" : "text-warning",
-				)}
-			/>
-			<p className="text-foreground font-medium">
-				{atLimit
-					? `${PLAN_LABELS[plan] ?? "Plan"} plan limit reached`
-					: "Approaching your plan limit"}
-			</p>
-			<p className="text-muted-foreground min-w-0 truncate">
-				{atLimit
-					? "Upgrade your plan to avoid service interruptions."
-					: `You have used ${usagePercent}% of your plan's free usage.`}
-			</p>
-			<Button
-				size="sm"
-				variant="ghost"
-				className="ml-auto h-6 shrink-0 text-xs"
-				asChild
-			>
-				<Link
-					from="/orgs/$organization/projects/$project"
-					to="/orgs/$organization/projects/$project/billing"
+		<AnimatePresence>
+			{!hidden ? (
+				<motion.div
+					initial={{ height: 0, opacity: 0 }}
+					animate={{ height: BANNER_HEIGHT, opacity: 1 }}
+					exit={{ height: 0, opacity: 0 }}
+					transition={{ duration: 0.25, ease: "easeOut" }}
+					className={cn(
+						"overflow-hidden border-b",
+						atLimit
+							? "border-destructive/60 bg-destructive/15"
+							: "border-warning/60 bg-warning/10",
+					)}
 				>
-					Upgrade
-				</Link>
-			</Button>
-		</div>
+					<div className="flex h-9 items-center gap-2 px-3 text-xs">
+						<Icon
+							icon={faExclamationTriangle}
+							className={cn(
+								"shrink-0",
+								atLimit ? "text-destructive" : "text-warning",
+							)}
+						/>
+						<p className="text-foreground font-medium">
+							{atLimit
+								? `${PLAN_LABELS[plan] ?? "Plan"} plan limit reached`
+								: "Approaching your plan limit"}
+						</p>
+						<p className="text-muted-foreground min-w-0 truncate">
+							{atLimit
+								? "Upgrade your plan to avoid service interruptions."
+								: `You have used ${usagePercent}% of your plan's free usage.`}
+						</p>
+						<Button
+							size="sm"
+							variant="ghost"
+							className="ml-auto h-6 shrink-0 text-xs"
+							asChild
+						>
+							<Link
+								from="/orgs/$organization/projects/$project"
+								to="/orgs/$organization/projects/$project/billing"
+							>
+								Upgrade
+							</Link>
+						</Button>
+					</div>
+				</motion.div>
+			) : null}
+		</AnimatePresence>
 	);
 }
