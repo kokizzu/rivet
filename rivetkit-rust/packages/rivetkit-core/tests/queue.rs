@@ -71,6 +71,37 @@ mod moved_tests {
 		);
 	}
 
+	#[tokio::test]
+	async fn next_batch_supports_large_name_filters_without_sql_bind_expansion() {
+		let queue = test_queue();
+		crate::actor::internal_storage::schema::ensure_internal_schema(queue.sql())
+			.await
+			.expect("initialize queue storage");
+		let target = format!("queue-{:04}-{}", 1_099, "x".repeat(112));
+		queue
+			.send(&target, b"selected")
+			.await
+			.expect("send queue message");
+		let names = (0..1_100)
+			.map(|index| format!("queue-{index:04}-{}", "x".repeat(112)))
+			.collect();
+
+		let selected = queue
+			.next_batch(QueueNextBatchOpts {
+				names: Some(names),
+				count: 1,
+				timeout: None,
+				signal: None,
+				completable: false,
+			})
+			.await
+			.expect("receive from large name filter");
+
+		assert_eq!(selected.len(), 1);
+		assert_eq!(selected[0].name, target);
+		assert_eq!(selected[0].body, b"selected");
+	}
+
 	#[test]
 	fn queue_message_keys_are_big_endian() {
 		let first = make_queue_message_key(1);

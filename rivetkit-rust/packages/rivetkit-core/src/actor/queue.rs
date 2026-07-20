@@ -450,10 +450,9 @@ impl ActorContext {
 		let names = normalize_names(Some(names));
 
 		loop {
-			if !self
-				.list_messages_matching(names.as_ref(), 1)
-				.await?
-				.is_empty()
+			if internal_storage::has_queue_messages(self.sql(), names.as_ref())
+				.await
+				.context("check for matching sqlite queue messages")?
 			{
 				return Ok(());
 			}

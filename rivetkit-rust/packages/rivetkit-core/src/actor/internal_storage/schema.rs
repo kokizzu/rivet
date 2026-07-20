@@ -123,7 +123,7 @@ CREATE TABLE _rivet_conn_state (
     subscriptions        BLOB NOT NULL
 ) STRICT, WITHOUT ROWID
 "#,
-		// W[per enqueue plus queue_next_id; batch DELETE on receive/ack | append/delete, never rewritten | body <=256 KiB | INTEGER PK avoids hidden index]
+		// W[per enqueue plus queue_next_id; batch DELETE on receive/ack | append/delete + named FIFO lookup | body <=256 KiB | INTEGER PK plus compact (name, id) index keeps bodies out of name scans]
 		r#"
 CREATE TABLE _rivet_queue (
     id         INTEGER PRIMARY KEY,
@@ -131,6 +131,10 @@ CREATE TABLE _rivet_queue (
     body       BLOB NOT NULL,
     created_at INTEGER NOT NULL
 ) STRICT
+"#,
+		r#"
+CREATE INDEX _rivet_queue_name_id
+    ON _rivet_queue (name, id)
 "#,
 		// W[per workflow step flush | keyed upsert + range delete | values <=256 KiB | verbatim fdb-tuple keys in one clustered tree]
 		r#"

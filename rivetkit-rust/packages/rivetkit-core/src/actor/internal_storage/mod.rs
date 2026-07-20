@@ -25,6 +25,8 @@ const USER_KV_VALUE_LIMIT: usize = 128 * 1024;
 /// keeps holding for SQLite-backed user KV.
 const USER_KV_KEY_LIMIT: usize = 2048;
 pub(crate) const USER_KV_BATCH_GET_MAX_KEYS: usize = 128;
+const QUEUE_METADATA_PAGE_ROWS: usize = 128;
+const QUEUE_MESSAGE_IDS_PER_QUERY: usize = 128;
 const WORKFLOW_KV_VALUE_LIMIT: usize = 256 * 1024;
 
 /// Depot rejects SQLite commits that dirty more than `MAX_COMMIT_RAW_DIRTY_BYTES`
@@ -480,19 +482,125 @@ pub(crate) async fn load_queue_messages_matching(
 	names: Option<&BTreeSet<String>>,
 	limit: u32,
 ) -> Result<Vec<QueueMessageRow>> {
-	let mut params = names
-		.into_iter()
-		.flat_map(|names| names.iter().cloned().map(BindParam::Text))
-		.collect::<Vec<_>>();
-	params.push(BindParam::Integer(i64::from(limit)));
-	let result = db
-		.query(
-			load_queue_messages_matching_sql(names.map_or(0, BTreeSet::len)),
-			Some(params),
-		)
+	if limit == 0 {
+		return Ok(Vec::new());
+	}
+
+	let Some(names) = names else {
+		let result = db
+			.query(
+				LOAD_QUEUE_MESSAGES_LIMITED_SQL,
+				Some(vec![BindParam::Integer(i64::from(limit))]),
+			)
+			.await
+			.context("load internal queue messages in enqueue order")?;
+		return decode_queue_message_rows(&result.rows);
+	};
+
+	if names.len() == 1 {
+		let result = db
+			.query(
+				LOAD_QUEUE_MESSAGES_FOR_NAME_SQL,
+				Some(vec![
+					BindParam::Text(names.first().expect("one queue name").clone()),
+					BindParam::Integer(i64::from(limit)),
+				]),
+			)
+			.await
+			.context("load internal queue messages for name")?;
+		return decode_queue_message_rows(&result.rows);
+	}
+
+	let ids = load_queue_message_ids_for_names(db, names, limit).await?;
+	load_queue_messages_by_ids(db, &ids).await
+}
+
+pub(crate) async fn has_queue_messages(
+	db: &SqliteDb,
+	names: Option<&BTreeSet<String>>,
+) -> Result<bool> {
+	let Some(names) = names else {
+		return db
+			.query(HAS_QUEUE_MESSAGES_SQL, None)
+			.await
+			.context("check for internal queue messages")
+			.map(|result| !result.rows.is_empty());
+	};
+
+	if names.len() == 1 {
+		return db
+			.query(
+				HAS_QUEUE_MESSAGES_FOR_NAME_SQL,
+				Some(vec![BindParam::Text(
+					names.first().expect("one queue name").clone(),
+				)]),
+			)
+			.await
+			.context("check for named internal queue messages")
+			.map(|result| !result.rows.is_empty());
+	}
+
+	load_queue_message_ids_for_names(db, names, 1)
 		.await
-		.context("load matching internal queue messages")?;
-	decode_queue_message_rows(&result.rows)
+		.map(|ids| !ids.is_empty())
+}
+
+async fn load_queue_message_ids_for_names(
+	db: &SqliteDb,
+	names: &BTreeSet<String>,
+	limit: u32,
+) -> Result<Vec<u64>> {
+	let mut ids = Vec::new();
+	let mut after_id = -1_i64;
+	loop {
+		let result = db
+			.query(
+				LOAD_QUEUE_MESSAGE_METADATA_PAGE_SQL,
+				Some(vec![
+					BindParam::Integer(after_id),
+					BindParam::Integer(QUEUE_METADATA_PAGE_ROWS as i64),
+				]),
+			)
+			.await
+			.context("load internal queue message metadata page")?;
+		if result.rows.is_empty() {
+			break;
+		}
+		for row in &result.rows {
+			after_id = read_i64(row, 0, "queue message id")?;
+			let name = read_text(row, 1, "queue message name")?;
+			if names.contains(&name) {
+				ids.push(u64::try_from(after_id).context("invalid queue message id")?);
+				if ids.len() >= limit as usize {
+					return Ok(ids);
+				}
+			}
+		}
+		if result.rows.len() < QUEUE_METADATA_PAGE_ROWS {
+			break;
+		}
+	}
+	Ok(ids)
+}
+
+async fn load_queue_messages_by_ids(db: &SqliteDb, ids: &[u64]) -> Result<Vec<QueueMessageRow>> {
+	let mut messages = Vec::with_capacity(ids.len());
+	for ids in ids.chunks(QUEUE_MESSAGE_IDS_PER_QUERY) {
+		let params = ids
+			.iter()
+			.map(|id| {
+				Ok(BindParam::Integer(
+					i64::try_from(*id).context("queue message id exceeds sqlite integer range")?,
+				))
+			})
+			.collect::<Result<Vec<_>>>()?;
+		let result = db
+			.query(load_queue_messages_by_ids_sql(ids.len()), Some(params))
+			.await
+			.context("load internal queue messages by id")?;
+		messages.extend(decode_queue_message_rows(&result.rows)?);
+	}
+	Ok(messages)
 }
 
 fn decode_queue_message_rows(rows: &[Vec<ColumnValue>]) -> Result<Vec<QueueMessageRow>> {

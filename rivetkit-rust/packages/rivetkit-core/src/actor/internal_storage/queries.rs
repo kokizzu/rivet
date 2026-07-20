@@ -60,16 +60,22 @@ pub(crate) const LOAD_QUEUE_NEXT_ID_SQL: &str =
 pub(crate) const LOAD_QUEUE_STATS_SQL: &str = "SELECT COUNT(*), MAX(id) FROM _rivet_queue";
 pub(crate) const LOAD_QUEUE_MESSAGES_SQL: &str =
 	"SELECT id, name, body, created_at FROM _rivet_queue ORDER BY id";
-pub(crate) fn load_queue_messages_matching_sql(name_count: usize) -> String {
-	let filter = if name_count == 0 {
-		String::new()
-	} else {
-		let placeholders = std::iter::repeat_n("?", name_count)
-			.collect::<Vec<_>>()
-			.join(", ");
-		format!(" WHERE name IN ({placeholders})")
-	};
-	format!("SELECT id, name, body, created_at FROM _rivet_queue{filter} ORDER BY id LIMIT ?")
+pub(crate) const LOAD_QUEUE_MESSAGES_LIMITED_SQL: &str =
+	"SELECT id, name, body, created_at FROM _rivet_queue ORDER BY id LIMIT ?";
+pub(crate) const LOAD_QUEUE_MESSAGES_FOR_NAME_SQL: &str =
+	"SELECT id, name, body, created_at FROM _rivet_queue INDEXED BY _rivet_queue_name_id WHERE name = ? ORDER BY id LIMIT ?";
+pub(crate) const HAS_QUEUE_MESSAGES_SQL: &str = "SELECT 1 FROM _rivet_queue LIMIT 1";
+pub(crate) const HAS_QUEUE_MESSAGES_FOR_NAME_SQL: &str =
+	"SELECT 1 FROM _rivet_queue INDEXED BY _rivet_queue_name_id WHERE name = ? LIMIT 1";
+pub(crate) const LOAD_QUEUE_MESSAGE_METADATA_PAGE_SQL: &str =
+	"SELECT id, name FROM _rivet_queue WHERE id > ? ORDER BY id LIMIT ?";
+pub(crate) fn load_queue_messages_by_ids_sql(id_count: usize) -> String {
+	let placeholders = std::iter::repeat_n("?", id_count)
+		.collect::<Vec<_>>()
+		.join(", ");
+	format!(
+		"SELECT id, name, body, created_at FROM _rivet_queue WHERE id IN ({placeholders}) ORDER BY id"
+	)
 }
 pub(crate) const INSERT_QUEUE_MESSAGE_SQL: &str =
 	"INSERT OR REPLACE INTO _rivet_queue (id, name, body, created_at) VALUES (?, ?, ?, ?)";
