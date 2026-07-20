@@ -247,12 +247,12 @@ impl From<CoreCronFire> for JsCronFire {
 			fired_at: value.fired_at,
 			finished_at: value.finished_at,
 			result: value.result,
-				error: value.error.map(|error| JsScheduleErrorInfo {
-					group: error.group,
-					code: error.code,
-					message: error.message,
-					metadata: error.metadata,
-				}),
+			error: value.error.map(|error| JsScheduleErrorInfo {
+				group: error.group,
+				code: error.code,
+				message: error.message,
+				metadata: error.metadata,
+			}),
 		}
 	}
 }

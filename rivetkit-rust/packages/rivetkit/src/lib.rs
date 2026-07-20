@@ -14,8 +14,8 @@ pub use crate::{
 	action::{Action, ActionEntry, ActionSet, Handles, Raw},
 	actor::Actor,
 	context::{
-		ConnCtx, ConnIter, Cron, CronEveryOptions, CronJobInfo, CronSetOptions, Ctx, Schedule, StateMut,
-		StateRef,
+		ConnCtx, ConnIter, Cron, CronEveryOptions, CronJobInfo, CronSetOptions, Ctx, Schedule,
+		StateMut, StateRef,
 	},
 	event::{
 		ActionCall, ConnClosed, ConnOpen, Destroy, Event, EventEntry, EventSet, HttpCall,

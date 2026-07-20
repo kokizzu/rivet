@@ -22,8 +22,8 @@ use tokio::sync::{Mutex as AsyncMutex, mpsc};
 
 use crate::actor::connection::{PersistedConnection, encode_persisted_connection};
 use crate::actor::context::ActorContext;
-use crate::actor::internal_storage::{self, InternalActorSnapshot};
 use crate::actor::internal_storage::schema as internal_schema;
+use crate::actor::internal_storage::{self, InternalActorSnapshot};
 use crate::actor::keys::{
 	INSPECTOR_TOKEN_KEY, KV_PREFIX, LAST_PUSHED_ALARM_KEY, PERSIST_DATA_KEY, QUEUE_METADATA_KEY,
 	make_connection_key, make_prefixed_key, make_queue_message_key, make_traces_key,
@@ -405,7 +405,11 @@ fn execute_remote_batch(
 		return batch_sqlite_error("core", "internal_error", error.to_string());
 	}
 	if fail_after_apply {
-		return batch_sqlite_error("test", "indeterminate_result", "injected lost commit response");
+		return batch_sqlite_error(
+			"test",
+			"indeterminate_result",
+			"injected lost commit response",
+		);
 	}
 	protocol::SqliteExecuteBatchResponse::SqliteExecuteBatchOk(protocol::SqliteExecuteBatchOk {
 		results,

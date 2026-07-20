@@ -23,7 +23,6 @@ use rivet_envoy_client::sqlite::{
 use rusqlite::types::{Value as TestSqliteValue, ValueRef as TestSqliteValueRef};
 use tokio::sync::mpsc;
 
-
 struct TestIdleEnvoyCallbacks;
 
 impl TestEnvoyCallbacks for TestIdleEnvoyCallbacks {
@@ -257,7 +256,9 @@ fn spawn_test_remote_sqlite_on(
 								.expect("write gate semaphore should stay open")
 								.forget();
 						}
-						TestRemoteSqliteResponse::ExecuteBatch(execute_test_sqlite_batch(&conn, request))
+						TestRemoteSqliteResponse::ExecuteBatch(execute_test_sqlite_batch(
+							&conn, request,
+						))
 					}
 					TestRemoteSqliteRequest::Exec(_) => continue,
 				};

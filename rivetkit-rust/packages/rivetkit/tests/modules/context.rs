@@ -227,14 +227,23 @@ async fn scheduling_surface_matches_typescript_api() {
 	assert_eq!(after.action, "afterAction");
 	assert_eq!(after.args, args);
 	assert_eq!(after.run_at, BASE_TIME + 5_000);
-	assert_eq!(ctx.schedule().list().await.expect("list one-shots").len(), 2);
-	assert!(ctx.schedule().cancel(&at_id).await.expect("cancel one-shot"));
-	assert!(ctx
-		.schedule()
-		.get(&at_id)
-		.await
-		.expect("get cancelled one-shot")
-		.is_none());
+	assert_eq!(
+		ctx.schedule().list().await.expect("list one-shots").len(),
+		2
+	);
+	assert!(
+		ctx.schedule()
+			.cancel(&at_id)
+			.await
+			.expect("cancel one-shot")
+	);
+	assert!(
+		ctx.schedule()
+			.get(&at_id)
+			.await
+			.expect("get cancelled one-shot")
+			.is_none()
+	);
 
 	ctx.cron()
 		.set(CronSetOptions {
@@ -278,20 +287,30 @@ async fn scheduling_surface_matches_typescript_api() {
 	assert_eq!(frequent.kind, ScheduleKind::Every);
 	assert_eq!(frequent.interval, Some(Duration::from_secs(5)));
 	assert_eq!(frequent.max_history, 100);
-	assert_eq!(ctx.cron().list().await.expect("list recurring jobs").len(), 2);
-	assert!(ctx
-		.schedule()
-		.after(Duration::from_secs(20), "overLimit", &[])
-		.await
-		.is_err());
-	assert!(ctx
-		.cron()
-		.history("daily", Some(10))
-		.await
-		.expect("read cron history")
-		.is_empty());
+	assert_eq!(
+		ctx.cron().list().await.expect("list recurring jobs").len(),
+		2
+	);
+	assert!(
+		ctx.schedule()
+			.after(Duration::from_secs(20), "overLimit", &[])
+			.await
+			.is_err()
+	);
+	assert!(
+		ctx.cron()
+			.history("daily", Some(10))
+			.await
+			.expect("read cron history")
+			.is_empty()
+	);
 	assert!(ctx.cron().delete("daily").await.expect("delete cron job"));
-	assert!(ctx.cron().delete("frequent").await.expect("delete interval job"));
+	assert!(
+		ctx.cron()
+			.delete("frequent")
+			.await
+			.expect("delete interval job")
+	);
 }
 
 #[test]

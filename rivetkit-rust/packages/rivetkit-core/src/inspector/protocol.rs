@@ -7,9 +7,9 @@ use rivetkit_inspector_protocol::{self as wire, versioned};
 pub(crate) use wire::{
 	ActionResponse, Connection as ConnectionDetails, ConnectionsResponse, ConnectionsUpdated,
 	DatabaseSchemaResponse, DatabaseTableRowsResponse, Error as ErrorMessage, Init as InitMessage,
-	QueueMessageSummary, QueueResponse, QueueStatus, QueueUpdated, RpcsListResponse, StateResponse,
-	Schedule, ScheduleDeleteResponse, ScheduleError, ScheduleFire, ScheduleHistoryResponse,
-	SchedulesResponse, SchedulesUpdated, StateUpdated, TabConfigEntry,
+	QueueMessageSummary, QueueResponse, QueueStatus, QueueUpdated, RpcsListResponse, Schedule,
+	ScheduleDeleteResponse, ScheduleError, ScheduleFire, ScheduleHistoryResponse,
+	SchedulesResponse, SchedulesUpdated, StateResponse, StateUpdated, TabConfigEntry,
 	ToClientBody as ServerMessage, ToServerBody as ClientMessage, TraceQueryResponse,
 	WorkflowHistoryResponse, WorkflowHistoryUpdated, WorkflowReplayResponse,
 };
@@ -76,15 +76,15 @@ mod tests {
 	#[test]
 	fn negotiated_frames_use_the_out_of_band_version() {
 		let encoded = encode_server_payload(&error_message(), PROTOCOL_VERSION).unwrap();
-		let decoded = <versioned::ToClient as OwnedVersionedData>::deserialize(
-			&encoded,
-			PROTOCOL_VERSION,
-		)
-		.unwrap();
+		let decoded =
+			<versioned::ToClient as OwnedVersionedData>::deserialize(&encoded, PROTOCOL_VERSION)
+				.unwrap();
 		assert!(matches!(decoded.body, ServerMessage::Error(_)));
 		assert!(
-			<versioned::ToClient as OwnedVersionedData>::deserialize_with_embedded_version(&encoded)
-				.is_err(),
+			<versioned::ToClient as OwnedVersionedData>::deserialize_with_embedded_version(
+				&encoded
+			)
+			.is_err(),
 			"negotiated frames must not repeat the version in every packet"
 		);
 	}
@@ -93,8 +93,10 @@ mod tests {
 	fn legacy_frames_remain_embedded_v5() {
 		let encoded = encode_server_message_embedded(&error_message(), 5).unwrap();
 		let decoded =
-			<versioned::ToClient as OwnedVersionedData>::deserialize_with_embedded_version(&encoded)
-				.unwrap();
+			<versioned::ToClient as OwnedVersionedData>::deserialize_with_embedded_version(
+				&encoded,
+			)
+			.unwrap();
 		assert!(matches!(decoded.body, ServerMessage::Error(_)));
 	}
 }

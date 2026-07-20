@@ -1,6 +1,6 @@
 {
 	"name": "@rivetkit/cloudflare-workers",
-	"version": "2.3.4",
+	"version": "2.3.5-rc.1",
 	"description": "Cloudflare Workers integration for RivetKit actors",
 	"license": "Apache-2.0",
 	"keywords": [

@@ -6183,12 +6183,8 @@ fn partial_status_index_reduces_storage_and_cold_page_fetches() {
 	let relaxed = std::sync::atomic::Ordering::Relaxed;
 
 	let measure = |actor_id: &str, index_sql: &str| {
-		let db = harness.open_db_on_engine(
-			&runtime,
-			engine.clone(),
-			actor_id,
-			VfsConfig::default(),
-		);
+		let db =
+			harness.open_db_on_engine(&runtime, engine.clone(), actor_id, VfsConfig::default());
 		sqlite_exec(
 			db.as_ptr(),
 			"CREATE TABLE history (id INTEGER PRIMARY KEY, result INTEGER NOT NULL, payload BLOB NOT NULL);",
@@ -6200,16 +6196,12 @@ fn partial_status_index_reduces_storage_and_cold_page_fetches() {
 			"WITH RECURSIVE seq(id) AS (SELECT 1 UNION ALL SELECT id + 1 FROM seq WHERE id < 4000) INSERT INTO history (id, result, payload) SELECT id, CASE WHEN id = 1 THEN 0 ELSE 1 END, randomblob(256) FROM seq;",
 		)
 		.expect("populate history table");
-		let page_count = sqlite_query_i64(db.as_ptr(), "PRAGMA page_count;")
-			.expect("read database page count");
+		let page_count =
+			sqlite_query_i64(db.as_ptr(), "PRAGMA page_count;").expect("read database page count");
 		drop(db);
 
-		let reopened = harness.open_db_on_engine(
-			&runtime,
-			engine.clone(),
-			actor_id,
-			VfsConfig::default(),
-		);
+		let reopened =
+			harness.open_db_on_engine(&runtime, engine.clone(), actor_id, VfsConfig::default());
 		let ctx = direct_vfs_ctx(&reopened);
 		ctx.resolve_pages_fetches.store(0, relaxed);
 		ctx.pages_fetched_total.store(0, relaxed);
@@ -6234,7 +6226,10 @@ fn partial_status_index_reduces_storage_and_cold_page_fetches() {
 		"CREATE INDEX history_running ON history (result) WHERE result = 0;",
 	);
 
-	assert!(partial.0 < full.0, "partial index should persist fewer pages");
+	assert!(
+		partial.0 < full.0,
+		"partial index should persist fewer pages"
+	);
 	assert!(partial.1 > 0, "cold update should fetch pages from storage");
 	assert!(
 		partial.1 <= full.1,

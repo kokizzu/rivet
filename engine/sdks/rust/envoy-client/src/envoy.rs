@@ -31,9 +31,9 @@ use crate::sqlite::{
 	cleanup_old_sqlite_requests, fail_remote_sqlite_requests_with_shutdown,
 	fail_sent_remote_sqlite_requests_with_indeterminate_result, fail_sqlite_requests_with_shutdown,
 	handle_remote_sqlite_exec_response, handle_remote_sqlite_execute_batch_response,
-	handle_remote_sqlite_execute_response,
-	handle_remote_sqlite_request, handle_sqlite_commit_response, handle_sqlite_get_pages_response,
-	handle_sqlite_request, process_unsent_remote_sqlite_requests, process_unsent_sqlite_requests,
+	handle_remote_sqlite_execute_response, handle_remote_sqlite_request,
+	handle_sqlite_commit_response, handle_sqlite_get_pages_response, handle_sqlite_request,
+	process_unsent_remote_sqlite_requests, process_unsent_sqlite_requests,
 };
 use crate::tunnel::{
 	handle_tunnel_message, resend_buffered_tunnel_messages, send_hibernatable_ws_message_ack,

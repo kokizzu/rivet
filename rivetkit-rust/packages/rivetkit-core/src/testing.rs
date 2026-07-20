@@ -163,9 +163,7 @@ impl EnvoyCallbacks for IdleEnvoyCallbacks {
 	}
 }
 
-fn test_envoy_handle(
-	endpoint: String,
-) -> (EnvoyHandle, mpsc::UnboundedReceiver<ToEnvoyMessage>) {
+fn test_envoy_handle(endpoint: String) -> (EnvoyHandle, mpsc::UnboundedReceiver<ToEnvoyMessage>) {
 	let (envoy_tx, envoy_rx) = mpsc::unbounded_channel();
 	let shared = Arc::new(SharedContext {
 		config: EnvoyConfig {
@@ -372,4 +370,3 @@ fn sqlite_column_value(value: ValueRef<'_>) -> protocol::SqliteColumnValue {
 		}
 	}
 }
-

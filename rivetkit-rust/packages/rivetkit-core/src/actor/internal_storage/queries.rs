@@ -10,12 +10,10 @@ pub(crate) const UPSERT_ACTOR_STATE_SQL: &str = "INSERT INTO _rivet_actor_state 
 pub(crate) const LOAD_CONNECTIONS_SQL: &str = "SELECT c.conn_id, c.parameters, s.state, s.subscriptions, c.gateway_id, c.request_id, s.server_message_index, s.client_message_index, c.request_path, c.request_headers FROM _rivet_conns c JOIN _rivet_conn_state s ON s.conn_id = c.conn_id ORDER BY c.conn_id";
 pub(crate) const INSERT_CONNECTION_SQL: &str = "INSERT OR IGNORE INTO _rivet_conns (conn_id, parameters, gateway_id, request_id, request_path, request_headers) VALUES (?, ?, ?, ?, ?, ?)";
 pub(crate) const UPSERT_CONNECTION_STATE_SQL: &str = "INSERT INTO _rivet_conn_state (conn_id, state, server_message_index, client_message_index, subscriptions) VALUES (?, ?, ?, ?, ?) ON CONFLICT(conn_id) DO UPDATE SET state = excluded.state, server_message_index = excluded.server_message_index, client_message_index = excluded.client_message_index, subscriptions = excluded.subscriptions";
-pub(crate) const DELETE_CONN_STATE_SQL: &str =
-	"DELETE FROM _rivet_conn_state WHERE conn_id = ?";
+pub(crate) const DELETE_CONN_STATE_SQL: &str = "DELETE FROM _rivet_conn_state WHERE conn_id = ?";
 pub(crate) const DELETE_CONN_SQL: &str = "DELETE FROM _rivet_conns WHERE conn_id = ?";
 
-pub(crate) const RESET_SCHEDULES_FOR_LEGACY_IMPORT_SQL: &str =
-	"DELETE FROM _rivet_schedule_events";
+pub(crate) const RESET_SCHEDULES_FOR_LEGACY_IMPORT_SQL: &str = "DELETE FROM _rivet_schedule_events";
 pub(crate) const INSERT_SCHEDULE_EVENT_SQL: &str = "INSERT INTO _rivet_schedule_events (event_id, trigger_at, action, args, kind, cron_expression, timezone, interval_ms, last_started_at, max_history) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
 pub(crate) const UPSERT_RECURRING_SCHEDULE_SQL: &str = "INSERT INTO _rivet_schedule_events (event_id, trigger_at, action, args, kind, cron_expression, timezone, interval_ms, last_started_at, max_history) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(event_id) DO UPDATE SET trigger_at = excluded.trigger_at, action = excluded.action, args = excluded.args, kind = excluded.kind, cron_expression = excluded.cron_expression, timezone = excluded.timezone, interval_ms = excluded.interval_ms, max_history = excluded.max_history";
 pub(crate) const CANCEL_SCHEDULE_SQL: &str =
@@ -41,8 +39,7 @@ pub(crate) const FINISH_HISTORY_SQL: &str = "UPDATE _rivet_schedule_history SET 
 pub(crate) const RECOVER_HISTORY_SQL: &str = "UPDATE _rivet_schedule_history SET finished_at = ?, result = ?, error_group = ?, error_code = ?, error_message = ?, error_metadata = ? WHERE result = 0";
 pub(crate) const NEXT_FUTURE_SCHEDULE_SQL: &str =
 	"SELECT MIN(trigger_at) FROM _rivet_schedule_events WHERE trigger_at > ?";
-pub(crate) const NEXT_SCHEDULE_SQL: &str =
-	"SELECT MIN(trigger_at) FROM _rivet_schedule_events";
+pub(crate) const NEXT_SCHEDULE_SQL: &str = "SELECT MIN(trigger_at) FROM _rivet_schedule_events";
 pub(crate) const PRUNE_SCHEDULE_HISTORY_SQL: &str = "DELETE FROM _rivet_schedule_history WHERE id IN (SELECT id FROM _rivet_schedule_history WHERE schedule_id = ? ORDER BY fired_at DESC, id DESC LIMIT -1 OFFSET ?)";
 pub(crate) const PRUNE_GLOBAL_HISTORY_SQL: &str = "DELETE FROM _rivet_schedule_history WHERE id IN (SELECT id FROM _rivet_schedule_history ORDER BY fired_at DESC, id DESC LIMIT -1 OFFSET ?)";
 
@@ -62,8 +59,7 @@ pub(crate) const LOAD_QUEUE_MESSAGES_SQL: &str =
 	"SELECT id, name, body, created_at FROM _rivet_queue ORDER BY id";
 pub(crate) const LOAD_QUEUE_MESSAGES_LIMITED_SQL: &str =
 	"SELECT id, name, body, created_at FROM _rivet_queue ORDER BY id LIMIT ?";
-pub(crate) const LOAD_QUEUE_MESSAGES_FOR_NAME_SQL: &str =
-	"SELECT id, name, body, created_at FROM _rivet_queue INDEXED BY _rivet_queue_name_id WHERE name = ? ORDER BY id LIMIT ?";
+pub(crate) const LOAD_QUEUE_MESSAGES_FOR_NAME_SQL: &str = "SELECT id, name, body, created_at FROM _rivet_queue INDEXED BY _rivet_queue_name_id WHERE name = ? ORDER BY id LIMIT ?";
 pub(crate) const HAS_QUEUE_MESSAGES_SQL: &str = "SELECT 1 FROM _rivet_queue LIMIT 1";
 pub(crate) const HAS_QUEUE_MESSAGES_FOR_NAME_SQL: &str =
 	"SELECT 1 FROM _rivet_queue INDEXED BY _rivet_queue_name_id WHERE name = ? LIMIT 1";

@@ -589,9 +589,9 @@ async fn load_queue_messages_by_ids(db: &SqliteDb, ids: &[u64]) -> Result<Vec<Qu
 		let params = ids
 			.iter()
 			.map(|id| {
-				Ok(BindParam::Integer(
-					i64::try_from(*id).context("queue message id exceeds sqlite integer range")?,
-				))
+				Ok(BindParam::Integer(i64::try_from(*id).context(
+					"queue message id exceeds sqlite integer range",
+				)?))
 			})
 			.collect::<Result<Vec<_>>>()?;
 		let result = db
@@ -1105,12 +1105,7 @@ async fn clear_table_bounded(
 	loop {
 		let rows = db
 			.query(
-				clear_table_select_sql(
-					table,
-					key_column,
-					size_expression,
-					KV_TX_MAX_ROWS,
-				),
+				clear_table_select_sql(table, key_column, size_expression, KV_TX_MAX_ROWS),
 				None,
 			)
 			.await?;

@@ -582,10 +582,22 @@ mod moved_tests {
 			)
 			.await
 			.unwrap();
-		assert!(matches!(row.rows[0][0], crate::sqlite::ColumnValue::Text(_)));
-		assert!(matches!(row.rows[0][1], crate::sqlite::ColumnValue::Text(_)));
-		assert!(matches!(row.rows[0][2], crate::sqlite::ColumnValue::Text(_)));
-		assert!(matches!(row.rows[0][3], crate::sqlite::ColumnValue::Blob(_)));
+		assert!(matches!(
+			row.rows[0][0],
+			crate::sqlite::ColumnValue::Text(_)
+		));
+		assert!(matches!(
+			row.rows[0][1],
+			crate::sqlite::ColumnValue::Text(_)
+		));
+		assert!(matches!(
+			row.rows[0][2],
+			crate::sqlite::ColumnValue::Text(_)
+		));
+		assert!(matches!(
+			row.rows[0][3],
+			crate::sqlite::ColumnValue::Blob(_)
+		));
 	}
 
 	#[tokio::test]

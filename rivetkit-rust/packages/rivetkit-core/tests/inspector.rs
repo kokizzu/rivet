@@ -311,8 +311,7 @@ mod moved_tests {
 			InspectorSignal::SchedulesUpdated => {
 				schedule_updates_clone.fetch_add(1, Ordering::SeqCst);
 			}
-			InspectorSignal::ConnectionsUpdated
-			| InspectorSignal::WorkflowHistoryUpdated => {}
+			InspectorSignal::ConnectionsUpdated | InspectorSignal::WorkflowHistoryUpdated => {}
 		}));
 
 		assert_eq!(inspector.snapshot().connected_clients, 1);

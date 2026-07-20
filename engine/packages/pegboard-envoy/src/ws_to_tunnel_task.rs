@@ -724,10 +724,8 @@ async fn dispatch_message(
 		protocol::ToRivet::ToRivetSqliteExecuteBatchRequest(req) => {
 			let key =
 				actor_remote_sqlite_task::Key::new(req.data.actor_id.clone(), req.data.generation);
-			task_manager.enqueue_remote_sqlite(
-				key,
-				actor_remote_sqlite_task::Message::ExecuteBatch(req),
-			)?;
+			task_manager
+				.enqueue_remote_sqlite(key, actor_remote_sqlite_task::Message::ExecuteBatch(req))?;
 		}
 		protocol::ToRivet::ToRivetTunnelMessage(tunnel_msg) => {
 			let inner_data_len = tunnel_message_inner_data_len(&tunnel_msg.message_kind);
@@ -1761,9 +1759,9 @@ async fn handle_remote_sqlite_execute_batch(
 	if let Err(error) = database.exec("COMMIT".to_owned()).await {
 		return match database.exec("ROLLBACK".to_owned()).await {
 			Ok(_) => Err(error.context("commit remote sqlite batch")),
-			Err(rollback_error) => Err(error
-				.context("commit remote sqlite batch")
-				.context(rollback_error.context("rollback remote sqlite batch after failed commit"))),
+			Err(rollback_error) => Err(error.context("commit remote sqlite batch").context(
+				rollback_error.context("rollback remote sqlite batch after failed commit"),
+			)),
 		};
 	}
 	Ok(results)

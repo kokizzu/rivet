@@ -36,7 +36,10 @@ fn unpublished_schema_has_explicit_values_and_minimal_constraints() {
 		.collect::<Vec<_>>()
 		.join("\n")
 		.to_ascii_lowercase();
-	assert!(!sql.contains(" default "), "internal columns must not use defaults");
+	assert!(
+		!sql.contains(" default "),
+		"internal columns must not use defaults"
+	);
 	assert!(
 		!sql.replace("check (id = 1)", "").contains("check"),
 		"only the singleton id constraint is allowed"
@@ -49,6 +52,9 @@ fn unpublished_schema_has_explicit_values_and_minimal_constraints() {
 		.flat_map(|migration| migration.iter().copied())
 		.filter(|statement| statement.trim_start().starts_with("CREATE TABLE"))
 	{
-		assert!(statement.contains("STRICT"), "table is not STRICT: {statement}");
+		assert!(
+			statement.contains("STRICT"),
+			"table is not STRICT: {statement}"
+		);
 	}
 }

@@ -462,7 +462,9 @@ pub(crate) mod moved_tests {
 							RemoteSqliteResponse::Execute(execute_test_sqlite(&conn, request))
 						}
 						RemoteSqliteRequest::ExecuteBatch(request) => {
-							RemoteSqliteResponse::ExecuteBatch(execute_test_sqlite_batch(&conn, request))
+							RemoteSqliteResponse::ExecuteBatch(execute_test_sqlite_batch(
+								&conn, request,
+							))
 						}
 						RemoteSqliteRequest::Exec(_) => continue,
 					}
@@ -2585,7 +2587,10 @@ pub(crate) mod moved_tests {
 		assert!(!observed_rx.await.expect("runtime should observe startup"));
 		assert!(load_persisted_actor(&retry_ctx).await.has_initialized);
 
-		let run_handle = retry_task.run_handle.take().expect("run handle should exist");
+		let run_handle = retry_task
+			.run_handle
+			.take()
+			.expect("run handle should exist");
 		run_handle.abort();
 		let _ = run_handle.await;
 	}

@@ -173,7 +173,11 @@ impl RegistryDispatcher {
 		let wire_mode = match inspector_wire_mode(request) {
 			Ok(wire_mode) => wire_mode,
 			Err(error) => {
-				tracing::warn!(actor_id, ?error, "rejecting invalid inspector protocol version");
+				tracing::warn!(
+					actor_id,
+					?error,
+					"rejecting invalid inspector protocol version"
+				);
 				return Ok(closing_websocket_handler(
 					1002,
 					"inspector.invalid_protocol_version",
@@ -438,7 +442,9 @@ impl RegistryDispatcher {
 			InspectorWireMode::Negotiated { version } => {
 				inspector_protocol::decode_client_payload(payload, version)
 			}
-			InspectorWireMode::LegacyEmbeddedV5 => inspector_protocol::decode_client_message(payload),
+			InspectorWireMode::LegacyEmbeddedV5 => {
+				inspector_protocol::decode_client_message(payload)
+			}
 		};
 		let response = match decoded {
 			Ok(message) => {
@@ -635,14 +641,12 @@ impl RegistryDispatcher {
 					},
 				)))
 			}
-			inspector_protocol::ClientMessage::SchedulesRequest(request) => {
-				Ok(Some(InspectorServerMessage::SchedulesResponse(
-					inspector_protocol::SchedulesResponse {
-						rid: request.id,
-						schedules: self.inspector_schedules(instance).await?,
-					},
-				)))
-			}
+			inspector_protocol::ClientMessage::SchedulesRequest(request) => Ok(Some(
+				InspectorServerMessage::SchedulesResponse(inspector_protocol::SchedulesResponse {
+					rid: request.id,
+					schedules: self.inspector_schedules(instance).await?,
+				}),
+			)),
 			inspector_protocol::ClientMessage::ScheduleHistoryRequest(request) => {
 				let limit = request.limit.0.clamp(1, 1_000) as i64;
 				let history = instance
@@ -783,26 +787,21 @@ impl RegistryDispatcher {
 				max_history: None,
 			})
 			.collect::<Vec<_>>();
-		schedules.extend(
-			instance
-				.ctx
-				.cron_list()
-				.await?
-				.into_iter()
-				.map(|schedule| inspector_protocol::Schedule {
-					id: schedule.name.clone(),
-					name: Some(schedule.name),
-					kind: schedule.kind.as_str().to_owned(),
-					action: schedule.action,
-					args: schedule.args,
-					next_run_at: timestamp_to_uint(schedule.next_run_at),
-					last_run_at: schedule.last_run_at.map(timestamp_to_uint),
-					expression: schedule.expression,
-					timezone: schedule.timezone,
-					interval_ms: schedule.interval_ms.map(timestamp_to_uint),
-					max_history: Some(timestamp_to_uint(schedule.max_history)),
-				}),
-		);
+		schedules.extend(instance.ctx.cron_list().await?.into_iter().map(|schedule| {
+			inspector_protocol::Schedule {
+				id: schedule.name.clone(),
+				name: Some(schedule.name),
+				kind: schedule.kind.as_str().to_owned(),
+				action: schedule.action,
+				args: schedule.args,
+				next_run_at: timestamp_to_uint(schedule.next_run_at),
+				last_run_at: schedule.last_run_at.map(timestamp_to_uint),
+				expression: schedule.expression,
+				timezone: schedule.timezone,
+				interval_ms: schedule.interval_ms.map(timestamp_to_uint),
+				max_history: Some(timestamp_to_uint(schedule.max_history)),
+			}
+		}));
 		schedules.sort_by(|left, right| {
 			left.next_run_at
 				.cmp(&right.next_run_at)

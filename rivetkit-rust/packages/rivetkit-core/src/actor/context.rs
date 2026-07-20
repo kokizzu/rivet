@@ -1660,7 +1660,8 @@ impl ActorContext {
 			if let (Some(name), Some(error)) = (recurring_name, dispatch_error.as_ref()) {
 				let structured = rivet_error::RivetError::extract(error);
 				if structured.group() == "actor" && structured.code() == "action_not_found" {
-					if let Err(delete_error) = ctx.cron_delete_if_action(&name, &action_name).await {
+					if let Err(delete_error) = ctx.cron_delete_if_action(&name, &action_name).await
+					{
 						tracing::error!(
 							?delete_error,
 							%name,

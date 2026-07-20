@@ -741,7 +741,9 @@ impl ActorContext {
 					optional_owned_text_param(error.as_ref().map(|error| error.group.clone())),
 					optional_owned_text_param(error.as_ref().map(|error| error.code.clone())),
 					optional_owned_text_param(error.as_ref().map(|error| error.message.clone())),
-					error_metadata.map(BindParam::Blob).unwrap_or(BindParam::Null),
+					error_metadata
+						.map(BindParam::Blob)
+						.unwrap_or(BindParam::Null),
 					BindParam::Integer(history_id),
 					BindParam::Integer(HISTORY_RUNNING),
 				]),
@@ -789,10 +791,7 @@ impl ActorContext {
 	}
 
 	fn should_prune_global_history(&self) -> bool {
-		self.0
-			.schedule_history_insert_count
-			.load(Ordering::Relaxed)
-			% GLOBAL_HISTORY_PRUNE_INTERVAL
+		self.0.schedule_history_insert_count.load(Ordering::Relaxed) % GLOBAL_HISTORY_PRUNE_INTERVAL
 			== 0
 	}
 
@@ -1321,7 +1320,8 @@ fn sanitize_error(error: &anyhow::Error) -> ScheduleErrorInfo {
 
 fn encode_error_metadata(metadata: &serde_json::Value) -> Result<Vec<u8>> {
 	let mut output = Vec::new();
-	ciborium::into_writer(metadata, &mut output).context("encode schedule history error metadata")?;
+	ciborium::into_writer(metadata, &mut output)
+		.context("encode schedule history error metadata")?;
 	Ok(output)
 }
 

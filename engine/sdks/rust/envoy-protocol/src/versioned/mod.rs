@@ -898,13 +898,17 @@ impl ActorCommandKeyData {
 	}
 	fn v5_to_v6(self) -> Result<Self> {
 		match self {
-			Self::V5(x) => Ok(Self::V6(v5_to_v6::convert_actor_command_key_data_v5_to_v6(x)?)),
+			Self::V5(x) => Ok(Self::V6(v5_to_v6::convert_actor_command_key_data_v5_to_v6(
+				x,
+			)?)),
 			_ => bail!("unexpected version"),
 		}
 	}
 	fn v6_to_v5(self) -> Result<Self> {
 		match self {
-			Self::V6(x) => Ok(Self::V5(v6_to_v5::convert_actor_command_key_data_v6_to_v5(x)?)),
+			Self::V6(x) => Ok(Self::V5(v6_to_v5::convert_actor_command_key_data_v6_to_v5(
+				x,
+			)?)),
 			_ => bail!("unexpected version"),
 		}
 	}

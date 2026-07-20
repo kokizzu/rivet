@@ -170,9 +170,7 @@ impl ToServer {
 				v5::ToServerBody::ConnectionsRequest(req.into())
 			}
 			v6::ToServerBody::ActionRequest(req) => v5::ToServerBody::ActionRequest(req.into()),
-			v6::ToServerBody::RpcsListRequest(req) => {
-				v5::ToServerBody::RpcsListRequest(req.into())
-			}
+			v6::ToServerBody::RpcsListRequest(req) => v5::ToServerBody::RpcsListRequest(req.into()),
 			v6::ToServerBody::TraceQueryRequest(req) => {
 				v5::ToServerBody::TraceQueryRequest(req.into())
 			}
@@ -522,9 +520,7 @@ impl ToClient {
 			v5::ToClientBody::ConnectionsResponse(resp) => {
 				v6::ToClientBody::ConnectionsResponse(resp.into())
 			}
-			v5::ToClientBody::ActionResponse(resp) => {
-				v6::ToClientBody::ActionResponse(resp.into())
-			}
+			v5::ToClientBody::ActionResponse(resp) => v6::ToClientBody::ActionResponse(resp.into()),
 			v5::ToClientBody::ConnectionsUpdated(update) => {
 				v6::ToClientBody::ConnectionsUpdated(update.into())
 			}
@@ -580,9 +576,7 @@ impl ToClient {
 			v6::ToClientBody::ConnectionsResponse(resp) => {
 				v5::ToClientBody::ConnectionsResponse(resp.into())
 			}
-			v6::ToClientBody::ActionResponse(resp) => {
-				v5::ToClientBody::ActionResponse(resp.into())
-			}
+			v6::ToClientBody::ActionResponse(resp) => v5::ToClientBody::ActionResponse(resp.into()),
 			v6::ToClientBody::ConnectionsUpdated(update) => {
 				v5::ToClientBody::ConnectionsUpdated(update.into())
 			}
@@ -625,11 +619,9 @@ impl ToClient {
 			v6::ToClientBody::SchedulesUpdated(_)
 			| v6::ToClientBody::SchedulesResponse(_)
 			| v6::ToClientBody::ScheduleHistoryResponse(_)
-			| v6::ToClientBody::ScheduleDeleteResponse(_) => {
-				v5::ToClientBody::Error(v5::Error {
-					message: SCHEDULES_DROPPED_ERROR.to_owned(),
-				})
-			}
+			| v6::ToClientBody::ScheduleDeleteResponse(_) => v5::ToClientBody::Error(v5::Error {
+				message: SCHEDULES_DROPPED_ERROR.to_owned(),
+			}),
 		};
 
 		Ok(Self::V5(v5::ToClient { body }))
@@ -1069,7 +1061,16 @@ impl_database_pair!(v5, v6);
 // v5 <-> v6 differ in `Init` and v6 adds schedule messages. Shared types are
 // converted field-by-field; schedule-only messages are handled by the v6
 // converter above so older clients receive a structured dropped-feature error.
-impl_same_fields_pair!(v5, v6, TabConfigEntry { id, label, icon, hidden });
+impl_same_fields_pair!(
+	v5,
+	v6,
+	TabConfigEntry {
+		id,
+		label,
+		icon,
+		hidden
+	}
+);
 impl_same_fields_pair!(
 	v5,
 	v6,
@@ -1129,12 +1130,8 @@ impl From<v5::ToServerBody> for v6::ToServerBody {
 			v5::ToServerBody::WorkflowHistoryRequest(req) => {
 				Self::WorkflowHistoryRequest(req.into())
 			}
-			v5::ToServerBody::WorkflowReplayRequest(req) => {
-				Self::WorkflowReplayRequest(req.into())
-			}
-			v5::ToServerBody::DatabaseSchemaRequest(req) => {
-				Self::DatabaseSchemaRequest(req.into())
-			}
+			v5::ToServerBody::WorkflowReplayRequest(req) => Self::WorkflowReplayRequest(req.into()),
+			v5::ToServerBody::DatabaseSchemaRequest(req) => Self::DatabaseSchemaRequest(req.into()),
 			v5::ToServerBody::DatabaseTableRowsRequest(req) => {
 				Self::DatabaseTableRowsRequest(req.into())
 			}
@@ -1417,9 +1414,7 @@ mod tests {
 			body: v5::ToClientBody::Init(original.clone()),
 		}))
 		.unwrap();
-		let encoded = latest
-		.serialize_with_embedded_version(5)
-		.unwrap();
+		let encoded = latest.serialize_with_embedded_version(5).unwrap();
 
 		// `deserialize_with_embedded_version` upgrades to and returns the latest
 		// wire type (v6::ToClient), not the versioned enum.

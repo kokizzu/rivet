@@ -464,11 +464,11 @@ impl SqliteDb {
 						Err(error) => {
 							return match transaction.rollback().await {
 								Ok(()) => Err(error.context("execute sqlite batch statement")),
-								Err(rollback_error) => Err(error
-									.context("execute sqlite batch statement")
-									.context(
+								Err(rollback_error) => {
+									Err(error.context("execute sqlite batch statement").context(
 										rollback_error.context("rollback sqlite batch transaction"),
-									)),
+									))
+								}
 							};
 						}
 					}
