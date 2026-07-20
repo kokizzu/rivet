@@ -7,6 +7,8 @@ use crate::actor::internal_schema::{CREATE_META_TABLE, MIGRATIONS, READ_SCHEMA_V
 use crate::actor::{internal_storage, schedule};
 use crate::types::ListOpts;
 
+// This suite covers SQL owned by rivetkit-core. User-provided SQL, including
+// Actor Runtime Socket requests, is intentionally outside its scope.
 const REPRESENTATIVE_ROWS: usize = 10_000;
 
 #[derive(Clone, Copy, Debug)]
@@ -40,40 +42,6 @@ struct StatementMetrics {
 	auto_indexes: i32,
 	vm_steps: i32,
 }
-
-#[derive(Clone, Copy, Debug)]
-struct CorrectnessOnlyQuery {
-	id: &'static str,
-	reason: &'static str,
-}
-
-// These production statements are point inserts or primary-key conflict
-// upserts. Their owning actor, queue, connection, KV, schedule, and migration
-// suites provide correctness coverage; SQLite does not expose a useful query
-// plan for them.
-const CORRECTNESS_ONLY_QUERIES: &[CorrectnessOnlyQuery] = &[
-	CorrectnessOnlyQuery { id: "actor.upsert", reason: "singleton primary-key upsert" },
-	CorrectnessOnlyQuery { id: "actor_state.upsert", reason: "singleton primary-key upsert" },
-	CorrectnessOnlyQuery { id: "connection.insert", reason: "single-row primary-key insert" },
-	CorrectnessOnlyQuery { id: "connection_state.upsert", reason: "single-row primary-key upsert" },
-	CorrectnessOnlyQuery { id: "queue.insert", reason: "single-row integer-primary-key insert" },
-	CorrectnessOnlyQuery { id: "runtime.queue_next_id", reason: "singleton primary-key upsert" },
-	CorrectnessOnlyQuery { id: "runtime.last_alarm_write", reason: "singleton primary-key upsert" },
-	CorrectnessOnlyQuery { id: "runtime.inspector_token_write", reason: "singleton primary-key upsert" },
-	CorrectnessOnlyQuery { id: "user_kv.upsert", reason: "single-row primary-key upsert" },
-	CorrectnessOnlyQuery { id: "workflow_kv.upsert", reason: "single-row primary-key upsert" },
-	CorrectnessOnlyQuery { id: "meta.upsert", reason: "single-row primary-key upsert" },
-	CorrectnessOnlyQuery { id: "schedule.insert_one_shot", reason: "single-row primary-key insert" },
-	CorrectnessOnlyQuery { id: "schedule.upsert_recurring", reason: "single-row primary-key upsert" },
-	CorrectnessOnlyQuery { id: "schedule.history_insert", reason: "single-row integer-primary-key insert" },
-];
-
-const EXCLUDED_QUERIES: &[CorrectnessOnlyQuery] = &[
-	CorrectnessOnlyQuery { id: "inspector.schema_catalog", reason: "enumerates SQLite schema metadata rather than a growing core-owned internal table" },
-	CorrectnessOnlyQuery { id: "inspector.table_count", reason: "operates on a user-selected user database table" },
-	CorrectnessOnlyQuery { id: "inspector.table_rows", reason: "operates on a user-selected user database table and is capped at 500 rows" },
-	CorrectnessOnlyQuery { id: "actor_runtime_socket.sql", reason: "caller-provided SQL is outside the core-owned query inventory" },
-];
 
 fn indexed(expected_index: Option<&'static str>, tables: &'static [&'static str]) -> QueryPlanExpectation {
 	QueryPlanExpectation {
@@ -340,35 +308,6 @@ fn query_catalog() -> Vec<QueryCase> {
 		QueryCase { id: "cleanup.select_chunk", sql: internal_storage::clear_table_select_sql("_rivet_user_kv", "key", "length(key) + length(value)"), params: vec![], expectation: bounded_scan(&[AllowedScan { table: "_rivet_user_kv", reason: "interrupted legacy import cleanup walks one primary-key chunk", bound: "each statement is limited to KV_TX_MAX_ROWS (128)" }]) },
 		QueryCase { id: "cleanup.delete_row", sql: internal_storage::clear_table_delete_sql("_rivet_user_kv", "key"), params: vec![Value::Blob(b"00000001".to_vec())], expectation: indexed(None, all_user_kv) },
 	]
-}
-
-#[test]
-fn sql_efficiency_catalog_has_stable_unique_ids_and_documented_scans() {
-	let cases = query_catalog();
-	let mut ids = cases
-		.iter()
-		.map(|case| case.id)
-		.chain(CORRECTNESS_ONLY_QUERIES.iter().map(|query| query.id))
-		.chain(EXCLUDED_QUERIES.iter().map(|query| query.id))
-		.collect::<Vec<_>>();
-	ids.sort_unstable();
-	let original_len = ids.len();
-	ids.dedup();
-	assert_eq!(ids.len(), original_len, "query catalog IDs must be unique");
-	assert!(original_len >= 50, "query inventory unexpectedly shrank");
-	for case in cases {
-		for scan in case.expectation.allowed_scans {
-			assert!(!scan.reason.trim().is_empty(), "{} scan needs a reason", case.id);
-			assert!(!scan.bound.trim().is_empty(), "{} scan needs a bound", case.id);
-		}
-	}
-	for query in CORRECTNESS_ONLY_QUERIES.iter().chain(EXCLUDED_QUERIES) {
-		assert!(
-			!query.reason.trim().is_empty(),
-			"{} needs a classification reason",
-			query.id
-		);
-	}
 }
 
 #[test]

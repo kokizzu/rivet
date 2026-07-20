@@ -1016,6 +1016,9 @@ async fn clear_table_bounded(
 	key_column: &str,
 	size_expression: &str,
 ) -> Result<()> {
+	// An interrupted legacy import can leave enough data that one `DELETE FROM`
+	// exceeds depot's dirty-page commit limit. Delete estimated-size chunks in
+	// separate transactions so cleanup can always make progress.
 	let mut cleared_rows = 0usize;
 	let mut cleared_bytes = 0usize;
 	let mut last_logged_rows = 0usize;
