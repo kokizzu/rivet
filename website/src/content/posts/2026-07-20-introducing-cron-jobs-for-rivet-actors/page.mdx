@@ -1,0 +1,61 @@
+---
+author: nathan-flurry
+published: "2026-07-20"
+category: changelog
+image: true
+keywords:
+    ["cron", "scheduled jobs", "actors", "durable", "timezone", "typescript"]
+title: "Introducing Durable Cron Jobs for Rivet Actors"
+description: "Durable, timezone-aware Cron jobs that wake actors on schedule and survive sleep, restarts, deploys, and crashes."
+---
+
+Cron jobs are now built into Rivet Actors. Schedules wake actors on demand and survive sleep, restarts, deploys, and crashes. Use standard five-field expressions with an optional timezone, and inspect recent runs from the Rivet Inspector.
+
+## Schedule with Crontab and a Timezone
+
+Use `c.cron.set` with a standard five-field crontab expression. Add an IANA timezone when the schedule should follow local time.
+
+```ts
+await c.cron.set({
+	name: "daily-report",
+	expression: "0 9 * * *",
+	timezone: "America/Los_Angeles",
+	action: "runReport",
+	maxHistory: 20,
+});
+```
+
+## Schedule at Fixed Intervals
+
+Use `c.cron.every` for jobs that repeat after a fixed interval.
+
+```ts
+await c.cron.every({
+	name: "refresh-cache",
+	interval: 60_000,
+	action: "refreshCache",
+});
+```
+
+## Inspect Run History
+
+Use `c.cron.history` to inspect recent runs for a named job.
+
+```ts
+const runs = await c.cron.history("daily-report", { limit: 10 });
+```
+
+## Run One-off Jobs
+
+The existing `c.schedule.at` and `c.schedule.after` APIs run an action once at an exact timestamp or after a delay.
+
+```ts
+await c.schedule.at(Date.parse("2026-08-01T09:00:00Z"), "openSale", "summer");
+await c.schedule.after(30_000, "sendReminder", "reminder-123");
+```
+
+## More Links
+
+- [Schedule & Cron documentation](/docs/actors/schedule)
+- [GitHub](https://github.com/rivet-dev/rivet)
+- [Discord](https://rivet.dev/discord)
