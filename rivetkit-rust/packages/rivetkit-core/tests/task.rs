@@ -433,7 +433,7 @@ pub(crate) mod moved_tests {
 			.or_insert_with(|| {
 				let conn = rusqlite::Connection::open_in_memory()
 					.expect("test sqlite connection should open");
-				conn.execute_batch(crate::actor::context::tests::TEST_INTERNAL_SCHEMA_SQL)
+				crate::actor::internal_storage::schema::initialize_test_schema(&conn)
 					.expect("test sqlite internal schema should initialize");
 				Arc::new(Mutex::new(conn))
 			})

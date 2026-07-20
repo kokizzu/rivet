@@ -1,12 +1,11 @@
 use anyhow::{Context, Result, bail};
 
+use super::queries::{LOAD_META_TEXT_SQL, UPSERT_META_TEXT_SQL};
 use crate::sqlite::{BindParam, ColumnValue, SqliteBatchStatement, SqliteDb};
 
 pub(crate) const INTERNAL_SCHEMA_VERSION: i64 = 6;
 
 const SCHEMA_VERSION_KEY: &str = "schema_version";
-pub(crate) const READ_SCHEMA_VERSION_SQL: &str =
-	"SELECT value FROM _rivet_meta WHERE key = ?";
 
 // `_rivet_meta` is the bootstrap root created before the numbered migrations.
 // `schema_version` cannot live in a table created by those migrations, and
@@ -209,7 +208,7 @@ fn migration_statements(from_version: i64, to_version: i64) -> Result<Vec<Sqlite
 		}
 	}
 	statements.push(SqliteBatchStatement {
-		sql: "INSERT INTO _rivet_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value".to_owned(),
+		sql: UPSERT_META_TEXT_SQL.to_owned(),
 		params: Some(vec![
 			BindParam::Text(SCHEMA_VERSION_KEY.to_owned()),
 			BindParam::Blob(encode_schema_version(to_version)),
@@ -221,7 +220,7 @@ fn migration_statements(from_version: i64, to_version: i64) -> Result<Vec<Sqlite
 async fn read_schema_version(db: &SqliteDb) -> Result<i64> {
 	let result = db
 		.query(
-			READ_SCHEMA_VERSION_SQL,
+			LOAD_META_TEXT_SQL,
 			Some(vec![BindParam::Text(SCHEMA_VERSION_KEY.to_owned())]),
 		)
 		.await
@@ -253,7 +252,28 @@ fn is_commit_too_large(error: &anyhow::Error) -> bool {
 		.any(|cause| cause.to_string().contains("commit_too_large"))
 }
 
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn initialize_test_schema(conn: &rusqlite::Connection) -> Result<()> {
+	conn.execute_batch(CREATE_META_TABLE)
+		.context("create test internal schema metadata table")?;
+	for migration in MIGRATIONS {
+		for sql in *migration {
+			conn.execute_batch(sql)
+				.context("apply test internal schema migration")?;
+		}
+	}
+	conn.execute(
+		UPSERT_META_TEXT_SQL,
+		rusqlite::params![
+			SCHEMA_VERSION_KEY,
+			encode_schema_version(INTERNAL_SCHEMA_VERSION)
+		],
+	)
+	.context("record test internal schema version")?;
+	Ok(())
+}
+
 // Test shim keeps moved tests in crate-root tests/ with private-module access.
 #[cfg(test)]
-#[path = "../../tests/internal_schema.rs"]
+#[path = "../../../tests/internal_schema.rs"]
 pub(crate) mod tests;

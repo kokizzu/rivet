@@ -105,7 +105,8 @@ use super::{
 	},
 	cached_active_sqlite_actor, cached_serverless_sqlite_generation, remote_sqlite_executor_cell,
 	remote_sqlite_executor_from_parts, spawn_tracked_remote_sqlite_task,
-	validate_remote_sqlite_params, validate_sqlite_get_page_range_request,
+	validate_remote_sqlite_batch, validate_remote_sqlite_params,
+	validate_sqlite_get_page_range_request,
 };
 use crate::conn::{
 	RemoteSqliteExecutors, RemoteSqliteInflight, remote_sqlite_inflight_count,
@@ -477,6 +478,44 @@ fn validate_remote_sqlite_params_bounds_total_bind_bytes() {
 	let err = validate_remote_sqlite_params(Some(&too_large))
 		.expect_err("oversized bind params should fail");
 	assert!(err.to_string().contains("bind params had"));
+}
+
+#[test]
+fn validate_remote_sqlite_batch_preserves_per_statement_limits() {
+	let small_statement = || rivet_envoy_protocol::SqliteBatchStatement {
+		sql: "SELECT ?".to_string(),
+		params: Some(vec![
+			rivet_envoy_protocol::SqliteBindParam::SqliteValueBlob(
+				rivet_envoy_protocol::SqliteValueBlob {
+					value: vec![0; 80 * 1024],
+				},
+			),
+		]),
+	};
+	validate_remote_sqlite_batch(&[small_statement(), small_statement()])
+		.expect("aggregate batch bindings may exceed the per-statement limit");
+
+	let many_statements = (0..257)
+		.map(|_| rivet_envoy_protocol::SqliteBatchStatement {
+			sql: "SELECT 1".to_string(),
+			params: None,
+		})
+		.collect::<Vec<_>>();
+	validate_remote_sqlite_batch(&many_statements)
+		.expect("batch statement count should not have an envoy-only limit");
+
+	let oversized_statement = rivet_envoy_protocol::SqliteBatchStatement {
+		sql: "SELECT ?".to_string(),
+		params: Some(vec![
+			rivet_envoy_protocol::SqliteBindParam::SqliteValueBlob(
+				rivet_envoy_protocol::SqliteValueBlob {
+					value: vec![0; super::MAX_REMOTE_SQL_BIND_BYTES + 1],
+				},
+			),
+		]),
+	};
+	validate_remote_sqlite_batch(&[oversized_statement])
+		.expect_err("an individually oversized statement should still fail");
 }
 
 async fn has_remote_sqlite_executor(

@@ -1148,7 +1148,7 @@ impl ActorTask {
 		self.ctx.configure_actor_events(self.actor_event_tx.clone());
 
 		let schema_started_at = Instant::now();
-		crate::actor::internal_schema::ensure_internal_schema(self.ctx.sql())
+		crate::actor::internal_storage::schema::ensure_internal_schema(self.ctx.sql())
 			.await
 			.context("initialize internal sqlite schema")?;
 		tracing::debug!(

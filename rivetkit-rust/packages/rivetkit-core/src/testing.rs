@@ -204,7 +204,7 @@ fn spawn_remote_sqlite(mut receiver: mpsc::UnboundedReceiver<ToEnvoyMessage>) {
 	std::thread::spawn(move || {
 		let conn =
 			rusqlite::Connection::open_in_memory().expect("test sqlite connection should open");
-		conn.execute_batch(TEST_INTERNAL_SCHEMA_SQL)
+		crate::actor::internal_storage::schema::initialize_test_schema(&conn)
 			.expect("test sqlite schema should initialize");
 		let runtime = tokio::runtime::Builder::new_current_thread()
 			.enable_all()
@@ -373,89 +373,3 @@ fn sqlite_column_value(value: ValueRef<'_>) -> protocol::SqliteColumnValue {
 	}
 }
 
-const TEST_INTERNAL_SCHEMA_SQL: &str = r#"
-CREATE TABLE _rivet_meta (
-    key TEXT PRIMARY KEY,
-    value BLOB NOT NULL
-) STRICT, WITHOUT ROWID;
-CREATE TABLE _rivet_runtime (
-    id INTEGER PRIMARY KEY CHECK (id = 1),
-    last_pushed_alarm INTEGER,
-    inspector_token TEXT,
-    queue_next_id INTEGER NOT NULL
-) STRICT;
-CREATE TABLE _rivet_actor (
-    id INTEGER PRIMARY KEY CHECK (id = 1),
-    has_initialized INTEGER NOT NULL,
-    input BLOB
-) STRICT;
-CREATE TABLE _rivet_actor_state (
-    id INTEGER PRIMARY KEY CHECK (id = 1),
-    state BLOB NOT NULL
-) STRICT;
-CREATE TABLE _rivet_schedule_events (
-    event_id TEXT PRIMARY KEY,
-    trigger_at INTEGER NOT NULL,
-    action TEXT NOT NULL,
-    args BLOB,
-    kind INTEGER NOT NULL,
-    cron_expression TEXT,
-    timezone TEXT,
-    interval_ms INTEGER,
-    last_started_at INTEGER,
-    max_history INTEGER NOT NULL
-) STRICT, WITHOUT ROWID;
-CREATE INDEX _rivet_schedule_events_trigger_at
-    ON _rivet_schedule_events (trigger_at);
-CREATE TABLE _rivet_schedule_history (
-    id INTEGER PRIMARY KEY,
-    schedule_id TEXT NOT NULL,
-    action TEXT NOT NULL,
-    scheduled_at INTEGER NOT NULL,
-    fired_at INTEGER NOT NULL,
-    finished_at INTEGER,
-    result INTEGER NOT NULL,
-    error_group TEXT,
-    error_code TEXT,
-    error_message TEXT,
-    error_metadata BLOB
-) STRICT;
-CREATE INDEX _rivet_schedule_history_schedule
-    ON _rivet_schedule_history (schedule_id, fired_at DESC, id DESC);
-CREATE INDEX _rivet_schedule_history_fired_at
-    ON _rivet_schedule_history (fired_at DESC, id DESC);
-CREATE INDEX _rivet_schedule_history_running
-    ON _rivet_schedule_history (result)
-    WHERE result = 0;
-CREATE TABLE _rivet_conns (
-    conn_id TEXT PRIMARY KEY,
-    parameters BLOB NOT NULL,
-    gateway_id BLOB NOT NULL,
-    request_id BLOB NOT NULL,
-    request_path TEXT NOT NULL,
-    request_headers BLOB NOT NULL
-) STRICT, WITHOUT ROWID;
-CREATE TABLE _rivet_conn_state (
-    conn_id TEXT PRIMARY KEY,
-    state BLOB NOT NULL,
-    server_message_index INTEGER NOT NULL,
-    client_message_index INTEGER NOT NULL,
-    subscriptions BLOB NOT NULL
-) STRICT, WITHOUT ROWID;
-CREATE TABLE _rivet_queue (
-    id INTEGER PRIMARY KEY,
-    name TEXT NOT NULL,
-    body BLOB NOT NULL,
-    created_at INTEGER NOT NULL
-) STRICT;
-CREATE TABLE _rivet_wf_kv (
-    key BLOB PRIMARY KEY,
-    value BLOB NOT NULL
-) STRICT, WITHOUT ROWID;
-CREATE TABLE _rivet_user_kv (
-    key BLOB PRIMARY KEY,
-    value BLOB NOT NULL
-) STRICT, WITHOUT ROWID;
-INSERT INTO _rivet_meta (key, value)
-VALUES ('schema_version', x'0600000000000000');
-"#;

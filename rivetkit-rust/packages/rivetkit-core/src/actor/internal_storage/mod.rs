@@ -14,6 +14,11 @@ use crate::error::KvRuntimeError;
 use crate::sqlite::{BindParam, ColumnValue, SqliteBatchStatement, SqliteDb};
 use crate::types::ListOpts;
 
+pub(crate) mod queries;
+pub(crate) mod schema;
+
+pub(crate) use queries::*;
+
 const USER_KV_VALUE_LIMIT: usize = 128 * 1024;
 /// Mirrors the engine-side `MAX_KEY_SIZE` in
 /// `engine/packages/pegboard/src/actor_kv/` so the documented 2 KiB key limit
@@ -30,59 +35,6 @@ pub(crate) const KV_TX_MAX_PAYLOAD_BYTES: usize = 512 * 1024;
 /// Row cap per transaction paired with the payload budget above.
 pub(crate) const KV_TX_MAX_ROWS: usize = 128;
 const CONNECTION_DESTINATION_ROWS_PER_RECORD: usize = 2;
-
-pub(crate) const LOAD_ACTOR_SNAPSHOT_SQL: &str = "SELECT a.has_initialized, a.input, s.state FROM _rivet_actor a JOIN _rivet_actor_state s ON s.id = a.id WHERE a.id = 1";
-pub(crate) const LOAD_CONNECTIONS_SQL: &str = "SELECT c.conn_id, c.parameters, s.state, s.subscriptions, c.gateway_id, c.request_id, s.server_message_index, s.client_message_index, c.request_path, c.request_headers FROM _rivet_conns c JOIN _rivet_conn_state s ON s.conn_id = c.conn_id ORDER BY c.conn_id";
-pub(crate) const RESET_SCHEDULES_FOR_LEGACY_IMPORT_SQL: &str =
-	"DELETE FROM _rivet_schedule_events";
-pub(crate) const LOAD_QUEUE_NEXT_ID_SQL: &str =
-	"SELECT queue_next_id FROM _rivet_runtime WHERE id = 1";
-pub(crate) const LOAD_QUEUE_STATS_SQL: &str = "SELECT COUNT(*), MAX(id) FROM _rivet_queue";
-pub(crate) const LOAD_QUEUE_MESSAGES_SQL: &str =
-	"SELECT id, name, body, created_at FROM _rivet_queue ORDER BY id";
-pub(crate) const DELETE_QUEUE_MESSAGE_SQL: &str = "DELETE FROM _rivet_queue WHERE id = ?";
-pub(crate) const RESET_QUEUE_SQL: &str = "DELETE FROM _rivet_queue";
-pub(crate) const DELETE_USER_KV_SQL: &str = "DELETE FROM _rivet_user_kv WHERE key = ?";
-pub(crate) const DELETE_USER_KV_RANGE_SQL: &str =
-	"DELETE FROM _rivet_user_kv WHERE key >= ? AND key < ?";
-pub(crate) const DELETE_CONN_STATE_SQL: &str =
-	"DELETE FROM _rivet_conn_state WHERE conn_id = ?";
-pub(crate) const DELETE_CONN_SQL: &str = "DELETE FROM _rivet_conns WHERE conn_id = ?";
-pub(crate) const LOAD_LAST_PUSHED_ALARM_SQL: &str =
-	"SELECT last_pushed_alarm FROM _rivet_runtime WHERE id = 1";
-pub(crate) const LOAD_INSPECTOR_TOKEN_SQL: &str =
-	"SELECT inspector_token FROM _rivet_runtime WHERE id = 1";
-pub(crate) const LOAD_META_TEXT_SQL: &str = "SELECT value FROM _rivet_meta WHERE key = ?";
-
-pub(crate) fn user_kv_batch_get_sql(key_count: usize) -> String {
-	let placeholders = std::iter::repeat_n("?", key_count)
-		.collect::<Vec<_>>()
-		.join(", ");
-	format!("SELECT key, value FROM _rivet_user_kv WHERE key IN ({placeholders})")
-}
-
-pub(crate) fn user_kv_list_sql(where_clause: &str, reverse: bool, limited: bool) -> String {
-	let order = if reverse { "DESC" } else { "ASC" };
-	let limit_clause = if limited { " LIMIT ?" } else { "" };
-	format!(
-		"SELECT key, value FROM _rivet_user_kv {where_clause} ORDER BY key {order}{limit_clause}"
-	)
-}
-
-pub(crate) fn clear_table_select_sql(
-	table: &str,
-	key_column: &str,
-	size_expression: &str,
-) -> String {
-	format!(
-		"SELECT {key_column}, {size_expression} FROM {table} ORDER BY {key_column} LIMIT {}",
-		KV_TX_MAX_ROWS
-	)
-}
-
-pub(crate) fn clear_table_delete_sql(table: &str, key_column: &str) -> String {
-	format!("DELETE FROM {table} WHERE {key_column} = ?")
-}
 
 /// Splits `entries` into contiguous chunks that each stay within the
 /// per-transaction row and payload budgets. A single oversized entry gets its
@@ -148,14 +100,14 @@ pub(crate) async fn load_actor_snapshot(db: &SqliteDb) -> Result<Option<Internal
 pub(crate) async fn persist_actor_snapshot(db: &SqliteDb, actor: &PersistedActor) -> Result<()> {
 	let statements = vec![
 		SqliteBatchStatement {
-			sql: "INSERT INTO _rivet_actor (id, has_initialized, input) VALUES (1, ?, ?) ON CONFLICT(id) DO UPDATE SET has_initialized = excluded.has_initialized, input = excluded.input".to_owned(),
+			sql: UPSERT_ACTOR_SQL.to_owned(),
 			params: Some(vec![
 				BindParam::Integer(if actor.has_initialized { 1 } else { 0 }),
 				optional_blob_param(actor.input.clone()),
 			]),
 		},
 		SqliteBatchStatement {
-			sql: "INSERT INTO _rivet_actor_state (id, state) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET state = excluded.state".to_owned(),
+			sql: UPSERT_ACTOR_STATE_SQL.to_owned(),
 			params: Some(vec![BindParam::Blob(actor.state.clone())]),
 		},
 	];
@@ -176,14 +128,14 @@ pub(crate) async fn import_legacy_actor_snapshot(
 ) -> Result<()> {
 	let mut statements = vec![
 		SqliteBatchStatement {
-			sql: "INSERT INTO _rivet_actor (id, has_initialized, input) VALUES (1, ?, ?) ON CONFLICT(id) DO UPDATE SET has_initialized = excluded.has_initialized, input = excluded.input".to_owned(),
+			sql: UPSERT_ACTOR_SQL.to_owned(),
 			params: Some(vec![
 				BindParam::Integer(if actor.has_initialized { 1 } else { 0 }),
 				optional_blob_param(actor.input.clone()),
 			]),
 		},
 		SqliteBatchStatement {
-			sql: "INSERT INTO _rivet_actor_state (id, state) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET state = excluded.state".to_owned(),
+			sql: UPSERT_ACTOR_STATE_SQL.to_owned(),
 			params: Some(vec![BindParam::Blob(actor.state.clone())]),
 		},
 		SqliteBatchStatement {
@@ -193,7 +145,7 @@ pub(crate) async fn import_legacy_actor_snapshot(
 	];
 	for event in &actor.scheduled_events {
 		statements.push(SqliteBatchStatement {
-			sql: "INSERT INTO _rivet_schedule_events (event_id, trigger_at, action, args, kind, cron_expression, timezone, interval_ms, last_started_at, max_history) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)".to_owned(),
+			sql: INSERT_SCHEDULE_EVENT_SQL.to_owned(),
 			params: Some(vec![
 				BindParam::Text(event.event_id.clone()),
 				BindParam::Integer(event.timestamp),
@@ -264,14 +216,14 @@ fn build_actor_core_and_connection_statements(
 
 	if let Some(actor) = actor {
 		statements.push(SqliteBatchStatement {
-			sql: "INSERT INTO _rivet_actor (id, has_initialized, input) VALUES (1, ?, ?) ON CONFLICT(id) DO UPDATE SET has_initialized = excluded.has_initialized, input = excluded.input".to_owned(),
+			sql: UPSERT_ACTOR_SQL.to_owned(),
 			params: Some(vec![
 				BindParam::Integer(if actor.has_initialized { 1 } else { 0 }),
 				optional_blob_param(actor.input.clone()),
 			]),
 		});
 		statements.push(SqliteBatchStatement {
-			sql: "INSERT INTO _rivet_actor_state (id, state) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET state = excluded.state".to_owned(),
+			sql: UPSERT_ACTOR_STATE_SQL.to_owned(),
 			params: Some(vec![BindParam::Blob(actor.state.clone())]),
 		});
 	}
@@ -424,8 +376,7 @@ pub(crate) async fn persist_queue_message(
 	let next_id = i64::try_from(next_id).context("queue next id exceeds sqlite integer range")?;
 	db.execute_batch(vec![
 		SqliteBatchStatement {
-			sql: "INSERT OR REPLACE INTO _rivet_queue (id, name, body, created_at) VALUES (?, ?, ?, ?)"
-				.to_owned(),
+			sql: INSERT_QUEUE_MESSAGE_SQL.to_owned(),
 			params: Some(vec![
 				BindParam::Integer(id),
 				BindParam::Text(message.name.clone()),
@@ -434,7 +385,7 @@ pub(crate) async fn persist_queue_message(
 			]),
 		},
 		SqliteBatchStatement {
-			sql: "INSERT INTO _rivet_runtime (id, last_pushed_alarm, inspector_token, queue_next_id) VALUES (1, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET queue_next_id = excluded.queue_next_id".to_owned(),
+			sql: UPSERT_QUEUE_NEXT_ID_SQL.to_owned(),
 			params: Some(vec![
 				BindParam::Null,
 				BindParam::Null,
@@ -457,8 +408,7 @@ pub(crate) async fn persist_queue_messages(
 		let mut statements = Vec::with_capacity(chunk.len());
 		for (id, message) in chunk {
 			statements.push(SqliteBatchStatement {
-				sql: "INSERT OR REPLACE INTO _rivet_queue (id, name, body, created_at) VALUES (?, ?, ?, ?)"
-					.to_owned(),
+				sql: INSERT_QUEUE_MESSAGE_SQL.to_owned(),
 				params: Some(vec![
 					BindParam::Integer(
 						i64::try_from(*id)
@@ -505,7 +455,7 @@ fn split_queue_tx_chunks(
 pub(crate) async fn persist_queue_next_id(db: &SqliteDb, next_id: u64) -> Result<()> {
 	let next_id = i64::try_from(next_id).context("queue next id exceeds sqlite integer range")?;
 	db.execute(
-		"INSERT INTO _rivet_runtime (id, last_pushed_alarm, inspector_token, queue_next_id) VALUES (1, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET queue_next_id = excluded.queue_next_id",
+		UPSERT_QUEUE_NEXT_ID_SQL,
 		Some(vec![
 			BindParam::Null,
 			BindParam::Null,
@@ -635,7 +585,7 @@ pub(crate) async fn user_kv_batch_put(db: &SqliteDb, entries: &[(&[u8], &[u8])])
 		let statements = chunk
 			.iter()
 			.map(|(key, value)| SqliteBatchStatement {
-				sql: "INSERT INTO _rivet_user_kv (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value".to_owned(),
+				sql: UPSERT_USER_KV_SQL.to_owned(),
 				params: Some(vec![
 					BindParam::Blob((*key).to_vec()),
 					BindParam::Blob((*value).to_vec()),
@@ -736,7 +686,7 @@ pub(crate) async fn workflow_kv_batch_put(db: &SqliteDb, entries: &[(&[u8], &[u8
 			);
 		}
 		statements.push(SqliteBatchStatement {
-			sql: "INSERT INTO _rivet_wf_kv (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value".to_owned(),
+			sql: UPSERT_WORKFLOW_KV_SQL.to_owned(),
 			params: Some(vec![
 				BindParam::Blob((*key).to_vec()),
 				BindParam::Blob((*value).to_vec()),
@@ -764,7 +714,7 @@ fn build_workflow_kv_statements(writes: &[WorkflowKvWrite]) -> Result<Vec<Sqlite
 				);
 			}
 			Ok(SqliteBatchStatement {
-				sql: "INSERT INTO _rivet_wf_kv (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value".to_owned(),
+				sql: UPSERT_WORKFLOW_KV_SQL.to_owned(),
 				params: Some(vec![
 					BindParam::Blob(make_workflow_key(&write.key)),
 					BindParam::Blob(write.value.clone()),
@@ -857,7 +807,7 @@ fn push_connection_statements(
 	)?;
 
 	statements.push(SqliteBatchStatement {
-		sql: "INSERT OR IGNORE INTO _rivet_conns (conn_id, parameters, gateway_id, request_id, request_path, request_headers) VALUES (?, ?, ?, ?, ?, ?)".to_owned(),
+		sql: INSERT_CONNECTION_SQL.to_owned(),
 		params: Some(vec![
 			BindParam::Text(connection.id.clone()),
 			BindParam::Blob(connection.parameters.clone()),
@@ -868,7 +818,7 @@ fn push_connection_statements(
 		]),
 	});
 	statements.push(SqliteBatchStatement {
-		sql: "INSERT INTO _rivet_conn_state (conn_id, state, server_message_index, client_message_index, subscriptions) VALUES (?, ?, ?, ?, ?) ON CONFLICT(conn_id) DO UPDATE SET state = excluded.state, server_message_index = excluded.server_message_index, client_message_index = excluded.client_message_index, subscriptions = excluded.subscriptions".to_owned(),
+		sql: UPSERT_CONNECTION_STATE_SQL.to_owned(),
 		params: Some(vec![
 			BindParam::Text(connection.id.clone()),
 			BindParam::Blob(connection.state.clone()),
@@ -904,7 +854,7 @@ pub(crate) async fn load_last_pushed_alarm(db: &SqliteDb) -> Result<Option<i64>>
 
 pub(crate) async fn persist_last_pushed_alarm(db: &SqliteDb, alarm_ts: Option<i64>) -> Result<()> {
 	db.execute(
-		"INSERT INTO _rivet_runtime (id, last_pushed_alarm, inspector_token, queue_next_id) VALUES (1, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET last_pushed_alarm = excluded.last_pushed_alarm",
+		UPSERT_LAST_PUSHED_ALARM_SQL,
 		Some(vec![
 			optional_i64_param(alarm_ts),
 			BindParam::Null,
@@ -929,7 +879,7 @@ pub(crate) async fn load_inspector_token(db: &SqliteDb) -> Result<Option<String>
 
 pub(crate) async fn persist_inspector_token(db: &SqliteDb, token: &str) -> Result<()> {
 	db.execute(
-		"INSERT INTO _rivet_runtime (id, last_pushed_alarm, inspector_token, queue_next_id) VALUES (1, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET inspector_token = excluded.inspector_token",
+		UPSERT_INSPECTOR_TOKEN_SQL,
 		Some(vec![
 			BindParam::Null,
 			BindParam::Text(token.to_owned()),
@@ -964,7 +914,7 @@ pub(crate) async fn load_meta_text(db: &SqliteDb, key: &str) -> Result<Option<St
 /// not a general-purpose runtime KV accessor.
 pub(crate) async fn persist_meta_text(db: &SqliteDb, key: &str, value: &str) -> Result<()> {
 	db.execute(
-		"INSERT INTO _rivet_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+		UPSERT_META_TEXT_SQL,
 		Some(vec![
 			BindParam::Text(key.to_owned()),
 			BindParam::Blob(value.as_bytes().to_vec()),
@@ -1026,7 +976,12 @@ async fn clear_table_bounded(
 	loop {
 		let rows = db
 			.query(
-				clear_table_select_sql(table, key_column, size_expression),
+				clear_table_select_sql(
+					table,
+					key_column,
+					size_expression,
+					KV_TX_MAX_ROWS,
+				),
 				None,
 			)
 			.await?;
@@ -1187,5 +1142,5 @@ fn decode_cbor_blob<T: serde::de::DeserializeOwned>(
 
 // Test shim keeps moved tests in crate-root tests/ with private-module access.
 #[cfg(test)]
-#[path = "../../tests/internal_storage.rs"]
+#[path = "../../../tests/internal_storage.rs"]
 pub(crate) mod tests;

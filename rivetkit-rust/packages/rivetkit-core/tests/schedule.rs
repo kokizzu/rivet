@@ -636,10 +636,55 @@ mod moved_tests {
 	async fn global_history_pruning_is_periodic() {
 		let ctx = context("actor-periodic-global-history-prune");
 		assert!(ctx.should_prune_global_history());
+		ctx.record_schedule_history_inserted();
 		for _ in 1..GLOBAL_HISTORY_PRUNE_INTERVAL {
 			assert!(!ctx.should_prune_global_history());
+			ctx.record_schedule_history_inserted();
 		}
 		assert!(ctx.should_prune_global_history());
+	}
+
+	#[tokio::test]
+	async fn failed_history_insert_keeps_global_pruning_due() {
+		let ctx = context("actor-failed-global-history-prune");
+		ctx.sql()
+			.execute(
+				"WITH RECURSIVE n(value) AS (SELECT 1 UNION ALL SELECT value + 1 FROM n WHERE value < 9999) INSERT INTO _rivet_schedule_history (schedule_id, action, scheduled_at, fired_at, finished_at, result, error_group, error_code, error_message, error_metadata) SELECT 'cron:seed', 'seed', value, value, value, 1, NULL, NULL, NULL, NULL FROM n",
+				None,
+			)
+			.await
+			.unwrap();
+		ctx.cron_every("tick", 5_000, "tick", &[], Some(1))
+			.await
+			.unwrap();
+		ctx.sql()
+			.execute(
+				"CREATE TRIGGER fail_schedule_history_insert BEFORE INSERT ON _rivet_schedule_history BEGIN SELECT RAISE(FAIL, 'injected history failure'); END;",
+				None,
+			)
+			.await
+			.unwrap();
+		ctx.set_schedule_time_for_tests(BASE_TIME + 5_000);
+		assert!(ctx.take_due_schedule_dispatches().await.is_err());
+		assert!(ctx.should_prune_global_history());
+
+		ctx.sql()
+			.execute("DROP TRIGGER fail_schedule_history_insert;", None)
+			.await
+			.unwrap();
+		let dispatch = ctx.take_due_schedule_dispatches().await.unwrap().remove(0);
+		ctx.finish_schedule_dispatch(&dispatch.event_id, dispatch.history_id, None)
+			.await;
+
+		let count = ctx
+			.sql()
+			.query("SELECT COUNT(*) FROM _rivet_schedule_history", None)
+			.await
+			.unwrap();
+		assert_eq!(
+			count.rows,
+			vec![vec![crate::sqlite::ColumnValue::Integer(9_900)]]
+		);
 	}
 
 	#[tokio::test]

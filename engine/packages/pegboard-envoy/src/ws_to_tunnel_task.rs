@@ -44,7 +44,6 @@ use crate::{
 };
 
 const MAX_REMOTE_SQL_BIND_BYTES: usize = 128 * 1024;
-const MAX_REMOTE_SQL_BATCH_STATEMENTS: usize = 256;
 
 /// Wall-clock threshold above which a single handle_message invocation is logged as a head-of-line
 /// blocking risk. The ws_to_tunnel_task loop is strictly serial per envoy, so any handler that
@@ -1731,22 +1730,7 @@ async fn handle_remote_sqlite_execute_batch(
 		request.generation,
 	)
 	.await?;
-	if request.statements.len() > MAX_REMOTE_SQL_BATCH_STATEMENTS {
-		bail!(
-			"remote sqlite batch had {} statements, exceeding limit {MAX_REMOTE_SQL_BATCH_STATEMENTS}",
-			request.statements.len()
-		);
-	}
-	let bind_bytes = request
-		.statements
-		.iter()
-		.map(|statement| bind_params_bytes(statement.params.as_ref()))
-		.sum::<usize>();
-	if bind_bytes > MAX_REMOTE_SQL_BIND_BYTES {
-		bail!(
-			"remote sqlite batch bind params had {bind_bytes} bytes, exceeding limit {MAX_REMOTE_SQL_BIND_BYTES}"
-		);
-	}
+	validate_remote_sqlite_batch(&request.statements)?;
 
 	let actor_db = actor_db(ctx, conn, request.actor_id.clone()).await?;
 	let database = remote_sqlite_executor_from_parts(
@@ -1971,6 +1955,13 @@ fn validate_remote_sqlite_params(params: Option<&Vec<protocol::SqliteBindParam>>
 		bail!(
 			"remote sqlite bind params had {total} bytes, exceeding limit {MAX_REMOTE_SQL_BIND_BYTES}"
 		);
+	}
+	Ok(())
+}
+
+fn validate_remote_sqlite_batch(statements: &[protocol::SqliteBatchStatement]) -> Result<()> {
+	for statement in statements {
+		validate_remote_sqlite_params(statement.params.as_ref())?;
 	}
 	Ok(())
 }

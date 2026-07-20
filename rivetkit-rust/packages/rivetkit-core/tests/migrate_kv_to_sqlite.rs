@@ -22,8 +22,8 @@ use tokio::sync::{Mutex as AsyncMutex, mpsc};
 
 use crate::actor::connection::{PersistedConnection, encode_persisted_connection};
 use crate::actor::context::ActorContext;
-use crate::actor::internal_schema;
 use crate::actor::internal_storage::{self, InternalActorSnapshot};
+use crate::actor::internal_storage::schema as internal_schema;
 use crate::actor::keys::{
 	INSPECTOR_TOKEN_KEY, KV_PREFIX, LAST_PUSHED_ALARM_KEY, PERSIST_DATA_KEY, QUEUE_METADATA_KEY,
 	make_connection_key, make_prefixed_key, make_queue_message_key, make_traces_key,
