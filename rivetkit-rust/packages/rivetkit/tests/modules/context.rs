@@ -276,7 +276,7 @@ async fn scheduling_surface_matches_typescript_api() {
 		.expect("get interval job")
 		.expect("interval job exists");
 	assert_eq!(frequent.kind, ScheduleKind::Every);
-	assert_eq!(frequent.interval_ms, Some(5_000));
+	assert_eq!(frequent.interval, Some(Duration::from_secs(5)));
 	assert_eq!(frequent.max_history, 100);
 	assert_eq!(ctx.cron().list().await.expect("list recurring jobs").len(), 2);
 	assert!(ctx

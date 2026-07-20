@@ -139,4 +139,23 @@ describe("actor scheduling public API", () => {
 		expect(actorScheduleGet).toHaveBeenCalledWith(context, "one-shot-id");
 		expect(actorCronGet).toHaveBeenCalledWith(context, "daily-report");
 	});
+
+	test("fixed interval job info uses the unitless interval field", async () => {
+		const { runtime, actorCronGet } = runtimeWithScheduleSpies();
+		actorCronGet.mockResolvedValue({
+			name: "refresh-cache",
+			kind: "every",
+			action: "refreshCache",
+			args: new Uint8Array([0x80]),
+			nextRunAt: 456,
+			intervalMs: 60_000,
+			maxHistory: 100,
+		});
+		const c = new ActorContextHandleAdapter(runtime, context);
+
+		await expect(c.cron.get("refresh-cache")).resolves.toMatchObject({
+			kind: "every",
+			interval: 60_000,
+		});
+	});
 });

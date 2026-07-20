@@ -14,7 +14,7 @@ pub use crate::{
 	action::{Action, ActionEntry, ActionSet, Handles, Raw},
 	actor::Actor,
 	context::{
-		ConnCtx, ConnIter, Cron, CronEveryOptions, CronSetOptions, Ctx, Schedule, StateMut,
+		ConnCtx, ConnIter, Cron, CronEveryOptions, CronJobInfo, CronSetOptions, Ctx, Schedule, StateMut,
 		StateRef,
 	},
 	event::{
@@ -28,7 +28,7 @@ pub use crate::{
 };
 pub use rivetkit_client as client;
 pub use rivetkit_core::actor::schedule::{
-	CronFire, CronJobInfo, ScheduleErrorInfo, ScheduleKind, ScheduledEventInfo, ScheduledFireInfo,
+	CronFire, ScheduleErrorInfo, ScheduleKind, ScheduledEventInfo, ScheduledFireInfo,
 };
 pub use rivetkit_core::actor::state::OnStateChangeGuard;
 pub use rivetkit_core::metrics_endpoint::RenderedMetrics;

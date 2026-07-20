@@ -7,13 +7,16 @@ use std::sync::{
 	Arc, OnceLock,
 	atomic::{AtomicBool, Ordering},
 };
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use parking_lot::{
 	MappedRwLockReadGuard, MappedRwLockWriteGuard, RwLock, RwLockReadGuard, RwLockWriteGuard,
 };
 use rivetkit_client::{Client, ClientConfig, EncodingKind, TransportKind};
-use rivetkit_core::actor::schedule::{CronFire, CronJobInfo, ScheduledEventInfo};
+use rivetkit_core::actor::schedule::{
+	CronFire, CronJobInfo as CoreCronJobInfo, ScheduleKind, ScheduledEventInfo,
+};
 use rivetkit_core::actor::state::OnStateChangeGuard;
 use rivetkit_core::{
 	ActorContext, ActorKey, ActorKv, ConnHandle, ConnId, KeepAwakeRegion, RequestSaveOpts,
@@ -117,10 +120,24 @@ pub struct CronSetOptions<'a> {
 
 pub struct CronEveryOptions<'a> {
 	pub name: &'a str,
-	pub interval: std::time::Duration,
+	pub interval: Duration,
 	pub action: &'a str,
 	pub args: &'a [u8],
 	pub max_history: Option<i64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct CronJobInfo {
+	pub name: String,
+	pub kind: ScheduleKind,
+	pub action: String,
+	pub args: Vec<u8>,
+	pub next_run_at: i64,
+	pub last_run_at: Option<i64>,
+	pub expression: Option<String>,
+	pub timezone: Option<String>,
+	pub interval: Option<Duration>,
+	pub max_history: i64,
 }
 
 impl<A: Actor> Clone for Ctx<A> {
@@ -535,11 +552,20 @@ impl Cron<'_> {
 	}
 
 	pub async fn get(&self, name: &str) -> anyhow::Result<Option<CronJobInfo>> {
-		self.inner.cron_get(name).await
+		self.inner
+			.cron_get(name)
+			.await?
+			.map(cron_job_info_from_core)
+			.transpose()
 	}
 
 	pub async fn list(&self) -> anyhow::Result<Vec<CronJobInfo>> {
-		self.inner.cron_list().await
+		self.inner
+			.cron_list()
+			.await?
+			.into_iter()
+			.map(cron_job_info_from_core)
+			.collect()
 	}
 
 	pub async fn delete(&self, name: &str) -> anyhow::Result<bool> {
@@ -549,6 +575,29 @@ impl Cron<'_> {
 	pub async fn history(&self, name: &str, limit: Option<i64>) -> anyhow::Result<Vec<CronFire>> {
 		self.inner.cron_history(name, limit).await
 	}
+}
+
+fn cron_job_info_from_core(value: CoreCronJobInfo) -> anyhow::Result<CronJobInfo> {
+	let interval = value
+		.interval_ms
+		.map(|interval| {
+			u64::try_from(interval)
+				.context("schedule interval is negative")
+				.map(Duration::from_millis)
+		})
+		.transpose()?;
+	Ok(CronJobInfo {
+		name: value.name,
+		kind: value.kind,
+		action: value.action,
+		args: value.args,
+		next_run_at: value.next_run_at,
+		last_run_at: value.last_run_at,
+		expression: value.expression,
+		timezone: value.timezone,
+		interval,
+		max_history: value.max_history,
+	})
 }
 
 pub struct ConnIter<'a, A: Actor> {
