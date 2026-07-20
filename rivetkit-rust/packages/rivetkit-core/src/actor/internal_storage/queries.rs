@@ -43,7 +43,7 @@ pub(crate) const NEXT_FUTURE_SCHEDULE_SQL: &str =
 	"SELECT MIN(trigger_at) FROM _rivet_schedule_events WHERE trigger_at > ?";
 pub(crate) const NEXT_SCHEDULE_SQL: &str =
 	"SELECT MIN(trigger_at) FROM _rivet_schedule_events";
-pub(crate) const PRUNE_SCHEDULE_HISTORY_SQL: &str = "DELETE FROM _rivet_schedule_history WHERE schedule_id = ? AND id NOT IN (SELECT id FROM _rivet_schedule_history WHERE schedule_id = ? ORDER BY fired_at DESC, id DESC LIMIT ?)";
+pub(crate) const PRUNE_SCHEDULE_HISTORY_SQL: &str = "DELETE FROM _rivet_schedule_history WHERE id IN (SELECT id FROM _rivet_schedule_history WHERE schedule_id = ? ORDER BY fired_at DESC, id DESC LIMIT -1 OFFSET ?)";
 pub(crate) const PRUNE_GLOBAL_HISTORY_SQL: &str = "DELETE FROM _rivet_schedule_history WHERE id IN (SELECT id FROM _rivet_schedule_history ORDER BY fired_at DESC, id DESC LIMIT -1 OFFSET ?)";
 
 pub(crate) fn claim_one_shots_sql(event_count: usize) -> String {
@@ -60,6 +60,17 @@ pub(crate) const LOAD_QUEUE_NEXT_ID_SQL: &str =
 pub(crate) const LOAD_QUEUE_STATS_SQL: &str = "SELECT COUNT(*), MAX(id) FROM _rivet_queue";
 pub(crate) const LOAD_QUEUE_MESSAGES_SQL: &str =
 	"SELECT id, name, body, created_at FROM _rivet_queue ORDER BY id";
+pub(crate) fn load_queue_messages_matching_sql(name_count: usize) -> String {
+	let filter = if name_count == 0 {
+		String::new()
+	} else {
+		let placeholders = std::iter::repeat_n("?", name_count)
+			.collect::<Vec<_>>()
+			.join(", ");
+		format!(" WHERE name IN ({placeholders})")
+	};
+	format!("SELECT id, name, body, created_at FROM _rivet_queue{filter} ORDER BY id LIMIT ?")
+}
 pub(crate) const INSERT_QUEUE_MESSAGE_SQL: &str =
 	"INSERT OR REPLACE INTO _rivet_queue (id, name, body, created_at) VALUES (?, ?, ?, ?)";
 pub(crate) const DELETE_QUEUE_MESSAGE_SQL: &str = "DELETE FROM _rivet_queue WHERE id = ?";

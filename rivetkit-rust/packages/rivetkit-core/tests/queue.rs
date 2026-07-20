@@ -1,7 +1,7 @@
 use super::*;
 
 mod moved_tests {
-	use super::{QueueNextOpts, QueueWaitOpts};
+	use super::{QueueNextBatchOpts, QueueNextOpts, QueueWaitOpts};
 
 	use crate::actor::context::ActorContext;
 	use crate::actor::keys::{
@@ -26,6 +26,49 @@ mod moved_tests {
 		let error = rivet_error::RivetError::extract(&error);
 		assert_eq!(error.group(), "actor");
 		assert_eq!(error.code(), "aborted");
+	}
+
+	#[tokio::test]
+	async fn next_batch_filters_and_limits_messages_in_enqueue_order() {
+		let queue = test_queue();
+		crate::actor::internal_storage::schema::ensure_internal_schema(queue.sql())
+			.await
+			.expect("initialize queue storage");
+		for (name, body) in [
+			("ignored", b"first".as_slice()),
+			("target", b"second".as_slice()),
+			("target", b"third".as_slice()),
+			("target", b"fourth".as_slice()),
+		] {
+			queue.send(name, body).await.expect("send queue message");
+		}
+
+		let selected = queue
+			.next_batch(QueueNextBatchOpts {
+				names: Some(vec!["target".into()]),
+				count: 2,
+				timeout: None,
+				signal: None,
+				completable: false,
+			})
+			.await
+			.expect("receive filtered queue batch");
+		assert_eq!(
+			selected
+				.into_iter()
+				.map(|message| message.body)
+				.collect::<Vec<_>>(),
+			vec![b"second".to_vec(), b"third".to_vec()]
+		);
+
+		let remaining = queue.inspect_messages().await.expect("inspect queue");
+		assert_eq!(
+			remaining
+				.into_iter()
+				.map(|message| message.body)
+				.collect::<Vec<_>>(),
+			vec![b"first".to_vec(), b"fourth".to_vec()]
+		);
 	}
 
 	#[test]

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::io::Cursor;
 
 use anyhow::{Context, Result, bail};
@@ -472,10 +472,31 @@ pub(crate) async fn load_queue_messages(db: &SqliteDb) -> Result<Vec<QueueMessag
 		.query(LOAD_QUEUE_MESSAGES_SQL, None)
 		.await
 		.context("load internal queue messages")?;
+	decode_queue_message_rows(&result.rows)
+}
 
-	result
-		.rows
-		.iter()
+pub(crate) async fn load_queue_messages_matching(
+	db: &SqliteDb,
+	names: Option<&BTreeSet<String>>,
+	limit: u32,
+) -> Result<Vec<QueueMessageRow>> {
+	let mut params = names
+		.into_iter()
+		.flat_map(|names| names.iter().cloned().map(BindParam::Text))
+		.collect::<Vec<_>>();
+	params.push(BindParam::Integer(i64::from(limit)));
+	let result = db
+		.query(
+			load_queue_messages_matching_sql(names.map_or(0, BTreeSet::len)),
+			Some(params),
+		)
+		.await
+		.context("load matching internal queue messages")?;
+	decode_queue_message_rows(&result.rows)
+}
+
+fn decode_queue_message_rows(rows: &[Vec<ColumnValue>]) -> Result<Vec<QueueMessageRow>> {
+	rows.iter()
 		.map(|row| {
 			Ok(QueueMessageRow {
 				id: u64::try_from(read_i64(row, 0, "queue message id")?)

@@ -1202,7 +1202,6 @@ fn history_prune_statements(
 		sql: PRUNE_SCHEDULE_HISTORY_SQL.to_owned(),
 		params: Some(vec![
 			BindParam::Text(event_id.to_owned()),
-			BindParam::Text(event_id.to_owned()),
 			BindParam::Integer(max_history),
 		]),
 	}];

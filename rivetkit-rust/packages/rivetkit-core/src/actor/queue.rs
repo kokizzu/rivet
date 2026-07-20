@@ -450,15 +450,11 @@ impl ActorContext {
 		let names = normalize_names(Some(names));
 
 		loop {
-			let messages = self.list_messages().await?;
-			let has_match = if let Some(names) = names.as_ref() {
-				messages
-					.into_iter()
-					.any(|message| names.contains(&message.name))
-			} else {
-				!messages.is_empty()
-			};
-			if has_match {
+			if !self
+				.list_messages_matching(names.as_ref(), 1)
+				.await?
+				.is_empty()
+			{
 				return Ok(());
 			}
 
@@ -588,20 +584,7 @@ impl ActorContext {
 	) -> Result<Vec<QueueMessage>> {
 		let _receive_guard = self.0.queue_receive_lock.lock().await;
 
-		let messages = self.list_messages().await?;
-		let mut selected = Vec::new();
-		for message in messages {
-			if let Some(names) = names
-				&& !names.contains(&message.name)
-			{
-				continue;
-			}
-
-			selected.push(message);
-			if selected.len() >= count as usize {
-				break;
-			}
-		}
+		let selected = self.list_messages_matching(names, count).await?;
 
 		if selected.is_empty() {
 			return Ok(Vec::new());
@@ -633,13 +616,7 @@ impl ActorContext {
 			.await
 			.context("list sqlite queue messages")?
 			.into_iter()
-			.map(|row| QueueMessage {
-				id: row.id,
-				name: row.message.name,
-				body: row.message.body,
-				created_at: row.message.created_at,
-				completion: None,
-			})
+			.map(queue_message_from_row)
 			.collect();
 
 		let actual_size = messages.len().try_into().unwrap_or(u32::MAX);
@@ -655,6 +632,17 @@ impl ActorContext {
 		}
 
 		Ok(messages)
+	}
+
+	async fn list_messages_matching(
+		&self,
+		names: Option<&BTreeSet<String>>,
+		limit: u32,
+	) -> Result<Vec<QueueMessage>> {
+		internal_storage::load_queue_messages_matching(self.sql(), names, limit)
+			.await
+			.context("list matching sqlite queue messages")
+			.map(|rows| rows.into_iter().map(queue_message_from_row).collect())
 	}
 
 	fn attach_completion(&self, mut message: QueueMessage) -> QueueMessage {
@@ -988,6 +976,16 @@ fn normalize_names(names: Option<Vec<String>>) -> Option<BTreeSet<String>> {
 			Some(normalized)
 		}
 	})
+}
+
+fn queue_message_from_row(row: internal_storage::QueueMessageRow) -> QueueMessage {
+	QueueMessage {
+		id: row.id,
+		name: row.message.name,
+		body: row.message.body,
+		created_at: row.message.created_at,
+		completion: None,
+	}
 }
 
 fn current_timestamp_ms() -> Result<i64> {
