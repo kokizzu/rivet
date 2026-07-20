@@ -1420,7 +1420,7 @@ class NativeCronAdapter implements ActorCron {
 		await this.#runtime.actorCronEvery(
 			this.#ctx,
 			options.name,
-			options.intervalMs,
+			options.interval,
 			options.action,
 			encodeValue(options.args ?? []),
 			options.maxHistory,
@@ -1487,7 +1487,7 @@ function decodeCronJobInfo(job: RuntimeCronJobInfo): CronJobInfo {
 	return {
 		...base,
 		kind: "every",
-		intervalMs: job.intervalMs as number,
+		interval: job.intervalMs as number,
 	};
 }
 

@@ -34,7 +34,7 @@ Use `cron.every` for frequent work such as presence sweeps or cache refreshes:
 ```ts
 await c.cron.every({
   name: "presence-sweep",
-  intervalMs: 15_000, // Minimum 5 seconds.
+	interval: 15_000, // Minimum 5 seconds.
   action: "sweepPresence",
   maxHistory: 25,
 });

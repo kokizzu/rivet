@@ -48,7 +48,7 @@ const cache = actor({
   onCreate: async (c) => {
     await c.cron.every({
       name: "refresh-cache",
-      intervalMs: 60_000, // Minimum 5 seconds.
+		interval: 60_000, // Minimum 5 seconds.
       action: "refreshCache",
       args: ["products"], // Optional.
       maxHistory: 100, // Optional; defaults to 100. Set to 0 to disable.
@@ -114,7 +114,7 @@ Fixed-interval jobs keep their cadence anchored to scheduled deadlines, so actio
 ```ts
 await c.cron.every({
   name: "presence-sweep",
-  intervalMs: 15_000, // Minimum 5 seconds.
+	interval: 15_000, // Minimum 5 seconds.
   action: "sweepPresence",
   args: [], // Optional.
   maxHistory: 25, // Optional; defaults to 100. Set to 0 to disable.

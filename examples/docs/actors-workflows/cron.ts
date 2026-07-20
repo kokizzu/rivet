@@ -12,7 +12,7 @@ export const cronActor = actor({
   onCreate: async (c) => {
     await c.cron.every({
       name: "workflow-tick",
-      intervalMs: 60_000,
+      interval: 60_000,
       action: "enqueueCronTick",
       args: [],
       maxHistory: 100,

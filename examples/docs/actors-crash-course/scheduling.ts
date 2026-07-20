@@ -11,7 +11,7 @@ const reminder = actor({
 
     await c.cron.every({
       name: "reminder-check",
-      intervalMs: 60_000,
+      interval: 60_000,
       action: "sendReminder",
     });
   },

@@ -132,7 +132,7 @@ export interface ActorCronSetOptions {
 export interface ActorCronEveryOptions {
 	name: string;
 	/** Fixed interval in milliseconds. Minimum 5,000. */
-	intervalMs: number;
+	interval: number;
 	action: string;
 	args?: unknown[];
 	/** Defaults to 100. Set to 0 to disable and clear history. Maximum 1,000. */
@@ -165,7 +165,7 @@ export type CronJobInfo = {
 	maxHistory: number;
 } & (
 	| { kind: "cron"; expression: string; timezone: string }
-	| { kind: "every"; intervalMs: number }
+	| { kind: "every"; interval: number }
 );
 
 export interface ScheduledFireInfo {
