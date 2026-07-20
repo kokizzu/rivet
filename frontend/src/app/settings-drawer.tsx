@@ -295,7 +295,13 @@ function NavItem({
 					: "text-muted-foreground hover:bg-foreground/[0.04] hover:text-foreground",
 			)}
 		>
-			<Icon icon={icon} className="size-3 shrink-0" />
+			<Icon
+				icon={icon}
+				className={cn(
+					"!size-3 shrink-0",
+					icon === faRivet && "scale-125",
+				)}
+			/>
 			<span className="truncate">{label}</span>
 			{trailing}
 		</button>

@@ -86,7 +86,7 @@ export default defineConfig(({ mode }) => {
 					rewrite: (path: string) => path.replace(/^\/api/, ""),
 				},
 			},
-			allowedHosts: ["local.staging.rivet.dev"],
+			allowedHosts: ["local.staging.rivet.dev", ".e2b.app", ".onamp.dev"],
 		},
 		preview: {
 			port: 43708,
