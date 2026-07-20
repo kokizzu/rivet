@@ -3,7 +3,7 @@ use anyhow::{Context, Result, bail};
 use super::queries::{LOAD_META_TEXT_SQL, UPSERT_META_TEXT_SQL};
 use crate::sqlite::{BindParam, ColumnValue, SqliteBatchStatement, SqliteDb};
 
-pub(crate) const INTERNAL_SCHEMA_VERSION: i64 = 6;
+pub(crate) const INTERNAL_SCHEMA_VERSION: i64 = 1;
 
 const SCHEMA_VERSION_KEY: &str = "schema_version";
 
@@ -52,8 +52,6 @@ CREATE TABLE _rivet_actor_state (
     state BLOB NOT NULL
 ) STRICT
 "#,
-	],
-	&[
 		// W[per schedule/cancel/fire, immediate | point insert/delete | <200 B | replaces full actor blob rewrite with one row]
 		r#"
 CREATE TABLE _rivet_schedule_events (
@@ -104,8 +102,6 @@ CREATE INDEX _rivet_schedule_history_running
     ON _rivet_schedule_history (result)
     WHERE result = 0
 "#,
-	],
-	&[
 		// W[once per connect, DELETE on disconnect | whole row | up to 256 KiB | COLD: immutable per conn, separate from hot message index]
 		r#"
 CREATE TABLE _rivet_conns (
@@ -127,8 +123,6 @@ CREATE TABLE _rivet_conn_state (
     subscriptions        BLOB NOT NULL
 ) STRICT, WITHOUT ROWID
 "#,
-	],
-	&[
 		// W[per enqueue plus queue_next_id; batch DELETE on receive/ack | append/delete, never rewritten | body <=256 KiB | INTEGER PK avoids hidden index]
 		r#"
 CREATE TABLE _rivet_queue (
@@ -138,8 +132,6 @@ CREATE TABLE _rivet_queue (
     created_at INTEGER NOT NULL
 ) STRICT
 "#,
-	],
-	&[
 		// W[per workflow step flush | keyed upsert + range delete | values <=256 KiB | verbatim fdb-tuple keys in one clustered tree]
 		r#"
 CREATE TABLE _rivet_wf_kv (
@@ -147,8 +139,6 @@ CREATE TABLE _rivet_wf_kv (
     value BLOB NOT NULL
 ) STRICT, WITHOUT ROWID
 "#,
-	],
-	&[
 		// W[per c.kv op (deprecated) | keyed upsert/delete/range | values <=128 KiB | verbatim raw KV key bytes]
 		r#"
 CREATE TABLE _rivet_user_kv (
@@ -178,19 +168,14 @@ pub(crate) async fn ensure_internal_schema(db: &SqliteDb) -> Result<()> {
 }
 
 async fn apply_schema_ladder(db: &SqliteDb, current_version: i64) -> Result<()> {
-	let statements = migration_statements(current_version, INTERNAL_SCHEMA_VERSION)?;
-	match db.execute_batch(statements).await {
-		Ok(_) => Ok(()),
-		Err(error) if is_commit_too_large(&error) => {
-			for version in current_version + 1..=INTERNAL_SCHEMA_VERSION {
-				db.execute_batch(migration_statements(version - 1, version)?)
-					.await
-					.with_context(|| format!("apply rivet internal schema migration v{version}"))?;
-			}
-			Ok(())
-		}
-		Err(error) => Err(error).context("apply rivet internal schema migrations"),
+	// Apply and record each version atomically so a failed upgrade resumes from
+	// the last completed version without relying on backend-specific errors.
+	for version in current_version + 1..=INTERNAL_SCHEMA_VERSION {
+		db.execute_batch(migration_statements(version - 1, version)?)
+			.await
+			.with_context(|| format!("apply rivet internal schema migration v{version}"))?;
 	}
+	Ok(())
 }
 
 fn migration_statements(from_version: i64, to_version: i64) -> Result<Vec<SqliteBatchStatement>> {
@@ -244,12 +229,6 @@ fn decode_schema_version(value: &[u8]) -> Result<i64> {
 		.try_into()
 		.context("rivet internal schema_version must be an i64 little-endian blob")?;
 	Ok(i64::from_le_bytes(bytes))
-}
-
-fn is_commit_too_large(error: &anyhow::Error) -> bool {
-	error
-		.chain()
-		.any(|cause| cause.to_string().contains("commit_too_large"))
 }
 
 #[cfg(any(test, feature = "test-support"))]
