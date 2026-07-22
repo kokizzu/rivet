@@ -1,6 +1,6 @@
 {
 	"name": "@rivet-dev/vercel-world",
-	"version": "2.3.6",
+	"version": "2.3.7",
 	"description": "Vercel Workflows backed by Rivet Actors",
 	"license": "Apache-2.0",
 	"publishConfig": {
