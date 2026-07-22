@@ -130,7 +130,11 @@ async fn stops_after_the_configured_retry_bound() {
 	.await
 	.expect_err("runner config should exhaust its retry bound");
 
-	assert!(error.to_string().contains("did not become ready after 3 attempts"));
+	assert!(
+		error
+			.to_string()
+			.contains("did not become ready after 3 attempts")
+	);
 	assert_eq!(state.datacenter_requests.load(Ordering::SeqCst), 3);
 	assert_eq!(state.upsert_requests.load(Ordering::SeqCst), 3);
 	let _ = shutdown.send(());

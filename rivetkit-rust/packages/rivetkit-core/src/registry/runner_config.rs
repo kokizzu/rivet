@@ -116,16 +116,16 @@ async fn ensure_local_normal_runner_config_once(
 		})?;
 	let status = response.status();
 	if !status.is_success() {
-		let response_body = response
-			.text()
-			.await
-			.map_err(|error| {
-				AttemptError::Retryable(
-					anyhow::Error::new(error).context("read failed runner config response body"),
-				)
-			})?;
+		let response_body = response.text().await.map_err(|error| {
+			AttemptError::Retryable(
+				anyhow::Error::new(error).context("read failed runner config response body"),
+			)
+		})?;
 		return Err(response_error(
-			format!("failed to upsert local runner config `{}`", config.pool_name),
+			format!(
+				"failed to upsert local runner config `{}`",
+				config.pool_name
+			),
 			status,
 			response_body,
 		));
@@ -153,14 +153,11 @@ async fn get_datacenters(
 		})?;
 	let status = response.status();
 	if !status.is_success() {
-		let response_body = response
-			.text()
-			.await
-			.map_err(|error| {
-				AttemptError::Retryable(
-					anyhow::Error::new(error).context("read failed datacenters response body"),
-				)
-			})?;
+		let response_body = response.text().await.map_err(|error| {
+			AttemptError::Retryable(
+				anyhow::Error::new(error).context("read failed datacenters response body"),
+			)
+		})?;
 		return Err(response_error(
 			"failed to get local datacenters for runner config".to_owned(),
 			status,
