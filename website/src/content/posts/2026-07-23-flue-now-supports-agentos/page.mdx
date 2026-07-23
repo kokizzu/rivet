@@ -8,8 +8,6 @@ title: "Flue now supports agentOS"
 description: "A lightweight alternative to sandbox VMs for your Flue agents, running on WebAssembly and V8 isolates."
 ---
 
-import imgContainerVsIsolate from "./container-vs-isolate.svg";
-
 Today, [Rivet's Flue fork](https://github.com/rivet-dev/flue) supports [agentOS](https://agentos-sdk.dev).
 
 Cloudflare Workers popularized **running backend code in V8 isolates instead of dedicated containers**. Most backends sit **idle waiting on a database**, an API, or the network, so lightweight execution environments can start quickly and return shared capacity to the pool while they wait.
@@ -20,8 +18,6 @@ Running backends this way unlocked two things:
 - **Idle got free**: The shared runtime can pause your code while it waits on an external request and bill you nothing for the wait.
 
 It turns out, **agentic workloads look a lot like the backend workloads** that Cloudflare optimized with V8 isolates.
-
-<img src={imgContainerVsIsolate.src} alt="Container-backed execution environments retain assigned capacity through idle stretches, while isolates share a process and return capacity to the pool between work." />
 
 ## Why agentOS: the isolate model for sandboxes
 
@@ -89,7 +85,7 @@ import { rivet } from "@rivet-dev/flue";
 export default defineConfig({ target: rivet() });
 ```
 
-```ts agents/assistant.ts
+```ts assistant.ts
 import { createAgent } from "@flue/runtime";
 import { agentOSSandbox } from "@rivet-dev/agentos-flue";
 import { registry } from "../actors";
