@@ -426,7 +426,7 @@ async fn handle_actor_event<A: Actor>(
 				ShutdownKind::Destroy => actor.on_destroy(ctx).await,
 			};
 			reply.send(result);
-			return Ok(true);
+			// Keep the loop alive so the finalize-phase `SerializeState` can capture state the hook wrote; core ends it by closing the channel.
 		}
 		ActorEvent::DisconnectConn { conn_id, reply } => {
 			reply.send(ctx.disconnect_conn(&conn_id).await);
@@ -912,6 +912,7 @@ mod tests {
 		);
 
 		request_sleep(&tx).await;
+		drop(tx);
 		actor.await.expect("join run_actor").expect("run actor");
 	}
 
@@ -933,6 +934,7 @@ mod tests {
 		);
 
 		request_sleep(&tx).await;
+		drop(tx);
 		actor.await.expect("join run_actor").expect("run actor");
 	}
 
@@ -953,6 +955,7 @@ mod tests {
 		assert_eq!(response.status().as_u16(), 404);
 
 		request_sleep(&tx).await;
+		drop(tx);
 		actor.await.expect("join run_actor").expect("run actor");
 	}
 
@@ -966,6 +969,7 @@ mod tests {
 		assert_eq!(state.created, 1);
 
 		request_sleep(&tx).await;
+		drop(tx);
 		actor.await.expect("join run_actor").expect("run actor");
 	}
 
@@ -1020,6 +1024,7 @@ mod tests {
 		assert!(error.to_string().contains("websockets not supported"));
 
 		request_sleep(&tx).await;
+		drop(tx);
 		actor.await.expect("join run_actor").expect("run actor");
 	}
 
@@ -1055,6 +1060,7 @@ mod tests {
 		tx.send(ActorEvent::ConnectionClosed { conn })
 			.expect("send connection closed");
 		request_sleep(&tx).await;
+		drop(tx);
 		actor.await.expect("join run_actor").expect("run actor");
 
 		let log = &ctx.state().log;
@@ -1084,6 +1090,7 @@ mod tests {
 		assert!(error.to_string().contains("subscribe denied"));
 
 		request_sleep(&tx).await;
+		drop(tx);
 		actor.await.expect("join run_actor").expect("run actor");
 
 		let log = &ctx.state().log;
@@ -1118,6 +1125,7 @@ mod tests {
 		assert!(error.to_string().contains("connection rejected"));
 
 		request_sleep(&tx).await;
+		drop(tx);
 		actor.await.expect("join run_actor").expect("run actor");
 		assert!(
 			!ctx.state()
@@ -1135,6 +1143,7 @@ mod tests {
 		let actor = tokio::spawn(run_actor::<LifecycleActor>(start));
 
 		request_sleep(&tx).await;
+		drop(tx);
 		actor.await.expect("join run_actor").expect("run actor");
 
 		assert!(ctx.state().log.iter().any(|entry| entry == "run_aborted"));
@@ -1148,9 +1157,32 @@ mod tests {
 		let actor = tokio::spawn(run_actor::<LifecycleActor>(start));
 
 		request_destroy(&tx).await;
+		drop(tx);
 		actor.await.expect("join run_actor").expect("run actor");
 
 		assert!(ctx.state().log.iter().any(|entry| entry == "on_destroy"));
+	}
+
+	#[tokio::test]
+	async fn run_actor_serializes_state_after_cleanup() {
+		// Core sends `SerializeState` during finalize, after the cleanup hook, to
+		// capture state the hook wrote. The event loop must stay alive to handle
+		// it instead of ending on the cleanup event.
+		let (tx, rx) = unbounded_channel();
+		let start = lifecycle_start(Some(cbor(&LifecycleInput { count: 5 })), None, rx.into());
+		let actor = tokio::spawn(run_actor::<LifecycleActor>(start));
+
+		request_sleep(&tx).await;
+		let state = decode_actor_state(request_serialize(&tx).await);
+		assert_eq!(state.count, 5);
+		assert!(
+			state.log.iter().any(|entry| entry == "on_sleep"),
+			"serialize after cleanup lost on_sleep state, got: {:?}",
+			state.log
+		);
+
+		drop(tx);
+		actor.await.expect("join run_actor").expect("run actor");
 	}
 
 	#[tokio::test]
@@ -1300,6 +1332,7 @@ mod tests {
 		);
 
 		request_sleep(&tx).await;
+		drop(tx);
 		actor.await.expect("join run_actor").expect("run actor");
 	}
 
@@ -1338,6 +1371,7 @@ mod tests {
 		);
 
 		request_sleep(&tx).await;
+		drop(tx);
 		actor.await.expect("join run_actor").expect("run actor");
 	}
 
@@ -1365,6 +1399,7 @@ mod tests {
 		assert_eq!(error.code(), "action_not_found");
 
 		request_sleep(&tx).await;
+		drop(tx);
 		actor.await.expect("join run_actor").expect("run actor");
 	}
 
@@ -1394,6 +1429,7 @@ mod tests {
 		);
 
 		request_sleep(&tx).await;
+		drop(tx);
 		actor.await.expect("join run_actor").expect("run actor");
 	}
 
@@ -1430,6 +1466,7 @@ mod tests {
 		assert_eq!(error.code(), "not_found");
 
 		request_sleep(&tx).await;
+		drop(tx);
 		actor.await.expect("join run_actor").expect("run actor");
 	}
 
@@ -1471,6 +1508,7 @@ mod tests {
 		);
 
 		request_sleep(&tx).await;
+		drop(tx);
 		actor.await.expect("join run_actor").expect("run actor");
 	}
 
