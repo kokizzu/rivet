@@ -520,7 +520,7 @@ function ComputeForm({
 					/>
 					<NumberField
 						name="instanceRequestConcurrency"
-						label="Instance request concurrency"
+						label="Max actors per container"
 					/>
 				</SettingsCard>
 				<SettingsCard
