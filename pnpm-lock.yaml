@@ -2305,11 +2305,11 @@ importers:
         specifier: ^5.5.2
         version: 5.9.3
 
-  examples/vercel-workflow:
+  examples/workflow-sdk:
     dependencies:
-      '@rivet-dev/vercel-world':
+      '@rivet-dev/workflow-world':
         specifier: workspace:*
-        version: link:../../integrations/vercel-world
+        version: link:../../integrations/workflow-world
       hono:
         specifier: ^4.12.25
         version: 4.12.25
@@ -3084,7 +3084,7 @@ importers:
         specifier: ^4.0.15
         version: 4.1.10(@opentelemetry/api@1.9.0)(@types/node@25.0.7)(msw@2.14.4(@types/node@25.0.7)(typescript@6.0.3))(vite@8.0.14(@types/node@25.0.7)(esbuild@0.28.1)(jiti@2.7.0)(less@4.4.1)(sass@1.93.2)(stylus@0.62.0)(terser@5.46.0)(tsx@4.23.1)(yaml@2.9.0))
 
-  integrations/vercel-world:
+  integrations/workflow-world:
     dependencies:
       '@workflow/errors':
         specifier: 5.0.0-beta.11
