@@ -21,7 +21,7 @@ pub(crate) mod moved_tests {
 		RemoteSqliteRequest, RemoteSqliteResponse, RemoteSqliteResponseEnvelope,
 	};
 	use rusqlite::types::{Value, ValueRef};
-	use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot};
+	use tokio::sync::{Mutex as AsyncMutex, Notify, mpsc, oneshot};
 	use tokio::task::yield_now;
 	use tokio::time::{advance, sleep, timeout};
 	use tracing::field::{Field, Visit};
@@ -245,7 +245,13 @@ pub(crate) mod moved_tests {
 		let (_dispatch_tx, dispatch_rx) = mpsc::unbounded_channel();
 		let (events_tx, events_rx) = mpsc::unbounded_channel();
 		ctx.configure_lifecycle_events(Some(events_tx));
-		let factory = Arc::new(ActorFactory::new(Default::default(), |start| {
+		let serialize_count = Arc::new(AtomicUsize::new(0));
+		let first_serialized = Arc::new(Notify::new());
+		let factory_serialize_count = serialize_count.clone();
+		let factory_first_serialized = first_serialized.clone();
+		let factory = Arc::new(ActorFactory::new(Default::default(), move |start| {
+			let serialize_count = factory_serialize_count.clone();
+			let first_serialized = factory_first_serialized.clone();
 			Box::pin(async move {
 				let mut events = start.events;
 				while let Some(event) = events.recv().await {
@@ -254,9 +260,17 @@ pub(crate) mod moved_tests {
 						reply,
 					} = event
 					{
+						let index = serialize_count.fetch_add(1, Ordering::SeqCst);
 						reply.send(Ok(vec![StateDelta::ActorState(
-							b"lifecycle-state".to_vec(),
+							if index == 0 {
+								b"stale-transaction-state".to_vec()
+							} else {
+								b"lifecycle-state".to_vec()
+							},
 						)]));
+						if index == 0 {
+							first_serialized.notify_one();
+						}
 					}
 				}
 				Ok(())
@@ -279,6 +293,17 @@ pub(crate) mod moved_tests {
 			.await
 			.expect("start reply should send")
 			.expect("start should succeed");
+		let transaction = ctx
+			.begin_state_transaction(None)
+			.await
+			.expect("begin state transaction");
+		let rollback = tokio::spawn(async move {
+			first_serialized.notified().await;
+			transaction
+				.rollback()
+				.await
+				.expect("roll back state transaction");
+		});
 
 		let flush_ctx = ctx.clone();
 		let flush = tokio::spawn(async move {
@@ -298,11 +323,13 @@ pub(crate) mod moved_tests {
 			LifecycleEvent::WorkflowFlushRequested { .. }
 		));
 		task.handle_event(event).await;
+		rollback.await.expect("rollback task should join");
 		flush
 			.await
 			.expect("workflow flush task should join")
 			.expect("workflow flush should succeed");
 
+		assert_eq!(serialize_count.load(Ordering::SeqCst), 2);
 		assert_eq!(ctx.state(), b"lifecycle-state");
 		assert_eq!(load_persisted_actor(&ctx).await.state, b"lifecycle-state");
 		let workflow = ctx

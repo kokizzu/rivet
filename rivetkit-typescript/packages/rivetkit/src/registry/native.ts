@@ -45,6 +45,11 @@ import {
 import { convertRegistryConfigToClientConfig } from "@/client/config";
 import { HEADER_CONN_PARAMS } from "@/common/actor-router-consts";
 import type { AnyDatabaseProvider } from "@/common/database/config";
+import {
+	bindNativeStateTransactionContext,
+	db as defaultDb,
+	registerNativeStateTransactionOpener,
+} from "@/common/database/mod";
 import { wrapJsNativeDatabase } from "@/common/database/native-database";
 import { assertJsonCompatValue, type JsonCompatValue } from "@/common/encoding";
 import { isResponseLike, type ResponseLike } from "@/common/fetch-like";
@@ -129,10 +134,14 @@ type NativeOnStateChangeHandler = (
 ) => void | Promise<void>;
 type NativePersistConnState = {
 	state: unknown;
-	// Memoized deep write-through proxy and the state object it wraps. Rebuilt
-	// only when the underlying state object identity changes.
-	stateProxy?: unknown;
-	stateProxyTarget?: unknown;
+};
+
+type NativeStateTransactionScope = {
+	actorContext: ActorContextHandleAdapter;
+	actorStateBaseline: unknown;
+	connectionStateBaselines: Map<string, Uint8Array>;
+	committed: boolean;
+	release: () => void;
 };
 
 const defaultRuntimeLoaders: RuntimeLoaders = {
@@ -278,14 +287,14 @@ type NativePersistActorState = {
 	state: unknown;
 	isInOnStateChange: boolean;
 	connStates: Map<string, NativePersistConnState>;
-	// Memoized deep write-through proxy and the state object it wraps. Rebuilt
-	// only when the underlying state object identity changes.
-	stateProxy?: unknown;
-	stateProxyTarget?: unknown;
 	// Set when a coalesced save and onStateChange flush is pending for the
 	// current event loop tick.
 	saveScheduled?: boolean;
 	pendingSaveHandle?: ReturnType<typeof setImmediate>;
+	activeStateTransactionOwner?: symbol;
+	pendingStateTransactionOwners?: Set<symbol>;
+	stateTransactionTail?: Promise<void>;
+	stateTransactionSaveDeferred?: boolean;
 };
 type NativeDestroyGate = {
 	destroyCompletion?: Promise<void>;
@@ -371,6 +380,15 @@ function stateMutationReentrantError(): RivetError {
 	);
 }
 
+function stateTransactionConflictError(): RivetError {
+	return new RivetError(
+		"actor",
+		"state_transaction_conflict",
+		"State cannot be mutated by another action while an experimental state-aware database transaction is active.",
+		{ public: true, statusCode: 409 },
+	);
+}
+
 function databaseNotConfiguredError(): RivetError {
 	return new RivetError(
 		"actor",
@@ -388,7 +406,6 @@ function databaseClientNotReadyError(): RivetError {
 		{ public: true },
 	);
 }
-
 function stateNotEnabledError(): RivetError {
 	return new RivetError(
 		"actor",
@@ -557,6 +574,40 @@ function getOrCreateNativeSqlDatabase(
 				commit: () => runtime.actorSqlTransactionCommit(transaction),
 				rollback: () =>
 					runtime.actorSqlTransactionRollback(transaction),
+			};
+		},
+		beginStateTransaction: async (timeoutMs, context) => {
+			const scope = context as NativeStateTransactionScope | undefined;
+			if (!scope) {
+				throw new Error(
+					"actor state transaction context is not configured",
+				);
+			}
+			const transaction = await runtime.actorBeginStateTransaction(
+				ctx,
+				timeoutMs,
+			);
+			return {
+				exec: async () => {
+					throw new Error(
+						"actor state transactions only support single-statement execute calls",
+					);
+				},
+				execute: (sql, params) =>
+					runtime.actorStateTransactionExecute(
+						transaction,
+						sql,
+						params,
+					),
+				commit: async () => {
+					await runtime.actorStateTransactionCommit(
+						transaction,
+						scope.actorContext.serializeForTick("save"),
+					);
+					scope.committed = true;
+				},
+				rollback: () =>
+					runtime.actorStateTransactionRollback(transaction),
 			};
 		},
 		query: (sql, params) => runtime.actorSqlQuery(ctx, sql, params),
@@ -1234,6 +1285,9 @@ class NativeConnAdapter {
 	#schemas: NativeValidationConfig;
 	#ctx?: ActorContextHandle;
 	#queueHibernationRemoval?: (connId: string) => void;
+	#assertCanMutateState?: () => void;
+	#stateProxy?: unknown;
+	#stateProxyTarget?: unknown;
 
 	constructor(
 		runtime: CoreRuntime,
@@ -1241,12 +1295,14 @@ class NativeConnAdapter {
 		schemas: NativeValidationConfig = {},
 		ctx?: ActorContextHandle,
 		queueHibernationRemoval?: (connId: string) => void,
+		assertCanMutateState?: () => void,
 	) {
 		this.#runtime = runtime;
 		this.#conn = conn;
 		this.#schemas = schemas;
 		this.#ctx = ctx;
 		this.#queueHibernationRemoval = queueHibernationRemoval;
+		this.#assertCanMutateState = assertCanMutateState;
 		(
 			this as NativeConnAdapter & {
 				[CONN_STATE_MANAGER_SYMBOL]?: unknown;
@@ -1285,34 +1341,38 @@ class NativeConnAdapter {
 		// allocates fresh on-change caches and rewraps the whole tree. Memoize
 		// the proxy keyed on the underlying state object so repeated reads and
 		// deep read cascades reuse a single proxy.
-		const connState = getNativeConnPersistState(
-			this.#runtime,
-			this.#ctx,
-			this.#conn,
-		);
 		if (
-			connState.stateProxy === undefined ||
-			connState.stateProxyTarget !== nextState
+			this.#stateProxy === undefined ||
+			this.#stateProxyTarget !== nextState
 		) {
-			connState.stateProxyTarget = nextState;
-			connState.stateProxy = this.#createStateProxy(nextState);
+			this.#stateProxyTarget = nextState;
+			this.#stateProxy = this.#createStateProxy(nextState);
 		}
-		return connState.stateProxy;
+		return this.#stateProxy;
 	}
 
 	#createStateProxy(state: unknown): unknown {
+		const assertCurrentState = () => {
+			this.#assertCanMutateState?.();
+			if (this.#ctx && this.#readState() !== state) {
+				throw stateTransactionConflictError();
+			}
+		};
 		return createWriteThroughProxy(
 			state,
 			(nextValue) => {
+				assertCurrentState();
 				this.#writeState(nextValue, { writeNative: true });
 			},
 			(newValue) => {
+				assertCurrentState();
 				assertJsonCompatValue(newValue);
 			},
 		);
 	}
 
 	set state(value: unknown) {
+		this.#assertCanMutateState?.();
 		const nextValue = unwrapWriteThroughProxy(value);
 		assertJsonCompatValue(nextValue);
 		this.#writeState(nextValue, { writeNative: true });
@@ -2525,15 +2585,18 @@ class NativeConnectionMap implements ReadonlyMap<string, NativeConnAdapter> {
 	#runtime: CoreRuntime;
 	#ctx: ActorContextHandle;
 	#schemas: NativeValidationConfig;
+	#assertCanMutateState: () => void;
 
 	constructor(
 		runtime: CoreRuntime,
 		ctx: ActorContextHandle,
 		schemas: NativeValidationConfig,
+		assertCanMutateState: () => void,
 	) {
 		this.#runtime = runtime;
 		this.#ctx = ctx;
 		this.#schemas = schemas;
+		this.#assertCanMutateState = assertCanMutateState;
 	}
 
 	#connToAdapter(conn: ConnHandle): NativeConnAdapter {
@@ -2549,6 +2612,7 @@ class NativeConnectionMap implements ReadonlyMap<string, NativeConnAdapter> {
 						connId,
 					),
 				),
+			this.#assertCanMutateState,
 		);
 	}
 
@@ -2636,10 +2700,13 @@ export class ActorContextHandleAdapter {
 	#queue?: NativeQueueAdapter;
 	#request?: Request;
 	#schedule?: NativeScheduleAdapter;
-	#sql?: ReturnType<typeof wrapJsNativeDatabase>;
+	#run?: { setWakeAt(timestamp: number | null): Promise<void> };
 	#runHandlerActiveProvider?: () => boolean;
 	#onStateChange?: NativeOnStateChangeHandler;
 	#stateEnabled: boolean;
+	#stateProxy?: unknown;
+	#stateProxyTarget?: unknown;
+	readonly #stateTransactionOwner = Symbol("actor-state-transaction-owner");
 
 	constructor(
 		runtime: CoreRuntime,
@@ -2681,13 +2748,6 @@ export class ActorContextHandleAdapter {
 		return this.#kv;
 	}
 
-	get sql() {
-		if (!this.#sql) {
-			this.#sql = getOrCreateNativeSqlDatabase(this.#runtime, this.#ctx);
-		}
-		return this.#sql;
-	}
-
 	async actorRuntimeSocket(): Promise<{ path: string }> {
 		return await callNative(() =>
 			this.#runtime.actorRuntimeSocketProvision(this.#ctx),
@@ -2706,7 +2766,7 @@ export class ActorContextHandleAdapter {
 		const runtimeState = getNativeRuntimeState(this.#runtime, this.#ctx);
 		const cachedClient = runtimeState.databaseClient;
 		if (cachedClient) {
-			this.#db = cachedClient.client;
+			this.#db = this.#bindDatabaseClient(cachedClient.client);
 			return this.#db;
 		}
 
@@ -2724,29 +2784,35 @@ export class ActorContextHandleAdapter {
 		if (!this.#stateEnabled) {
 			throw stateNotEnabledError();
 		}
-		const actorState = getNativePersistState(this.#runtime, this.#ctx);
 		const nextState = this.#readState();
 		// Reading `c.state` rebuilds the deep write-through proxy, which
 		// allocates fresh on-change caches and rewraps the whole tree. Memoize
 		// the proxy keyed on the underlying state object so repeated reads and
 		// deep read cascades reuse a single proxy.
 		if (
-			actorState.stateProxy === undefined ||
-			actorState.stateProxyTarget !== nextState
+			this.#stateProxy === undefined ||
+			this.#stateProxyTarget !== nextState
 		) {
-			actorState.stateProxyTarget = nextState;
-			actorState.stateProxy = createWriteThroughProxy(
+			const assertCurrentState = () => {
+				this.#assertCanMutateState();
+				if (this.#readState() !== nextState) {
+					throw stateTransactionConflictError();
+				}
+			};
+			this.#stateProxyTarget = nextState;
+			this.#stateProxy = createWriteThroughProxy(
 				nextState,
 				(nextValue) => {
+					assertCurrentState();
 					this.#writeState(nextValue, { scheduleSave: true });
 				},
 				(newValue) => {
-					this.#assertCanMutateState();
+					assertCurrentState();
 					assertJsonCompatValue(newValue);
 				},
 			);
 		}
-		return actorState.stateProxy;
+		return this.#stateProxy;
 	}
 
 	set state(value: unknown) {
@@ -2837,6 +2903,7 @@ export class ActorContextHandleAdapter {
 				this.#runtime,
 				this.#ctx,
 				this.#schemas,
+				() => this.#assertCanMutateState(),
 			);
 		}
 		return this.#connMap;
@@ -2917,12 +2984,12 @@ export class ActorContextHandleAdapter {
 		const runtimeState = getNativeRuntimeState(this.#runtime, this.#ctx);
 		const cachedClient = runtimeState.databaseClient;
 		if (cachedClient) {
-			this.#db = cachedClient.client;
+			this.#db = this.#bindDatabaseClient(cachedClient.client);
 			return this.#db;
 		}
 
 		const actorId = this.actorId;
-		const client = await this.#databaseProvider.createClient({
+		const createdClient = await this.#databaseProvider.createClient({
 			actorId,
 			kv: {
 				batchPut: async (entries) => {
@@ -2943,21 +3010,147 @@ export class ActorContextHandleAdapter {
 			log: {
 				debug: (obj) => logger().debug(obj),
 			},
-			nativeDatabaseProvider: {
-				open: async (requestedActorId) => {
-					void requestedActorId;
-					return getOrCreateNativeSqlDatabase(
+			nativeDatabaseProvider: registerNativeStateTransactionOpener(
+				{
+					open: async (requestedActorId) => {
+						void requestedActorId;
+						return getOrCreateNativeSqlDatabase(
+							this.#runtime,
+							this.#ctx,
+						);
+					},
+				},
+				async (timeoutMs, context) =>
+					await getOrCreateNativeSqlDatabase(
 						this.#runtime,
 						this.#ctx,
-					);
-				},
-			},
+					).beginStateTransaction(timeoutMs, context),
+			),
 		});
 		runtimeState.databaseClient = {
-			client,
+			client: createdClient,
 		};
-		this.#db = client;
-		return client;
+		this.#db = this.#bindDatabaseClient(createdClient);
+		return this.#db;
+	}
+
+	#bindDatabaseClient(client: unknown): unknown {
+		return bindNativeStateTransactionContext(client, {
+			enter: async () => await this.#enterStateTransaction(),
+			exit: (scope) =>
+				this.#exitStateTransaction(
+					scope as NativeStateTransactionScope,
+				),
+		});
+	}
+
+	async #enterStateTransaction(): Promise<NativeStateTransactionScope> {
+		const actorState = getNativePersistState(this.#runtime, this.#ctx);
+		let pendingOwners = actorState.pendingStateTransactionOwners;
+		if (!pendingOwners) {
+			pendingOwners = new Set();
+			actorState.pendingStateTransactionOwners = pendingOwners;
+		}
+		if (
+			actorState.activeStateTransactionOwner ===
+				this.#stateTransactionOwner ||
+			pendingOwners.has(this.#stateTransactionOwner)
+		) {
+			throw stateTransactionConflictError();
+		}
+		pendingOwners.add(this.#stateTransactionOwner);
+		const predecessor =
+			actorState.stateTransactionTail ?? Promise.resolve();
+		let release!: () => void;
+		const hold = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		actorState.stateTransactionTail = predecessor.then(
+			async () => await hold,
+		);
+		try {
+			await predecessor;
+			pendingOwners.delete(this.#stateTransactionOwner);
+			actorState.activeStateTransactionOwner =
+				this.#stateTransactionOwner;
+			return {
+				actorContext: this,
+				actorStateBaseline: this.#stateEnabled
+					? structuredClone(this.#readState())
+					: undefined,
+				connectionStateBaselines: new Map(
+					callNativeSync(() =>
+						this.#runtime.actorConns(this.#ctx),
+					).map((conn) => [
+						callNativeSync(() => this.#runtime.connId(conn)),
+						new Uint8Array(
+							callNativeSync(() => this.#runtime.connState(conn)),
+						),
+					]),
+				),
+				committed: false,
+				release,
+			};
+		} catch (error) {
+			pendingOwners.delete(this.#stateTransactionOwner);
+			if (
+				actorState.activeStateTransactionOwner ===
+				this.#stateTransactionOwner
+			) {
+				actorState.activeStateTransactionOwner = undefined;
+			}
+			release();
+			throw error;
+		}
+	}
+
+	#exitStateTransaction(scope: NativeStateTransactionScope): void {
+		const actorState = getNativePersistState(this.#runtime, this.#ctx);
+		try {
+			if (!scope.committed) {
+				this.#restoreStateTransactionBaseline(scope);
+			}
+		} finally {
+			if (
+				actorState.activeStateTransactionOwner ===
+				this.#stateTransactionOwner
+			) {
+				actorState.activeStateTransactionOwner = undefined;
+			}
+			if (actorState.stateTransactionSaveDeferred) {
+				actorState.stateTransactionSaveDeferred = false;
+				this.#scheduleSave();
+			}
+			scope.release();
+		}
+	}
+
+	#restoreStateTransactionBaseline(scope: NativeStateTransactionScope): void {
+		const actorState = getNativePersistState(this.#runtime, this.#ctx);
+		if (actorState.pendingSaveHandle !== undefined) {
+			clearImmediate(actorState.pendingSaveHandle);
+		}
+		actorState.pendingSaveHandle = undefined;
+		actorState.saveScheduled = false;
+
+		if (this.#stateEnabled) {
+			actorState.state = structuredClone(scope.actorStateBaseline);
+		}
+		for (const conn of callNativeSync(() =>
+			this.#runtime.actorConns(this.#ctx),
+		)) {
+			const connId = callNativeSync(() => this.#runtime.connId(conn));
+			const baseline = scope.connectionStateBaselines.get(connId);
+			if (baseline === undefined) {
+				continue;
+			}
+			callNativeSync(() => this.#runtime.connSetState(conn, baseline));
+			const cached = actorState.connStates.get(connId);
+			if (cached) {
+				cached.state = decodeValue(baseline);
+			}
+		}
+		this.#scheduleSave();
 	}
 
 	async prepare(): Promise<void> {
@@ -2980,7 +3173,6 @@ export class ActorContextHandleAdapter {
 
 	async closeDatabase(): Promise<void> {
 		this.#db = undefined;
-		this.#sql = undefined;
 		await closeNativeDatabaseClient(this.#runtime, this.#ctx);
 		await closeNativeSqlDatabase(this.#runtime, this.#ctx);
 	}
@@ -3005,6 +3197,7 @@ export class ActorContextHandleAdapter {
 		maxWait?: number;
 	}): Promise<void> {
 		if (opts?.immediate) {
+			this.#assertCanAwaitStateSave();
 			await callNative(() =>
 				this.#runtime.actorRequestSaveAndWait(this.#ctx, {
 					immediate: true,
@@ -3030,9 +3223,20 @@ export class ActorContextHandleAdapter {
 	async saveStateAndWorkflowBatch(
 		writes: Array<{ key: Uint8Array; value: Uint8Array }>,
 	): Promise<void> {
+		this.#assertCanAwaitStateSave();
 		await callNative(() =>
 			this.#runtime.actorSaveStateAndWorkflowBatch(this.#ctx, writes),
 		);
+	}
+
+	#assertCanAwaitStateSave(): void {
+		const actorState = getNativePersistState(this.#runtime, this.#ctx);
+		if (
+			actorState.activeStateTransactionOwner ===
+			this.#stateTransactionOwner
+		) {
+			throw stateTransactionConflictError();
+		}
 	}
 
 	serializeForTick(reason: SerializeStateReason): RuntimeStateDeltaPayload {
@@ -3202,7 +3406,6 @@ export class ActorContextHandleAdapter {
 		// down so the request-save and onStateChange always run.
 		this.#flushStateChange();
 		this.#abortSignalCleanup?.();
-		this.#sql = undefined;
 	}
 
 	#createActorAbortSignal(): AbortSignal {
@@ -3249,6 +3452,19 @@ export class ActorContextHandleAdapter {
 		if (actorState.isInOnStateChange) {
 			throw stateMutationReentrantError();
 		}
+		if (
+			actorState.activeStateTransactionOwner !==
+				this.#stateTransactionOwner &&
+			(actorState.activeStateTransactionOwner !== undefined ||
+				(actorState.pendingStateTransactionOwners?.size ?? 0) > 0)
+		) {
+			throw stateTransactionConflictError();
+		}
+	}
+
+	/** @internal */
+	assertCanMutateState(): void {
+		this.#assertCanMutateState();
 	}
 
 	// Coalesce the request-save and onStateChange work to once per event loop
@@ -3270,6 +3486,15 @@ export class ActorContextHandleAdapter {
 	#flushStateChange(): void {
 		const actorState = getNativePersistState(this.#runtime, this.#ctx);
 		if (!actorState.saveScheduled) {
+			return;
+		}
+		if (actorState.activeStateTransactionOwner !== undefined) {
+			actorState.saveScheduled = false;
+			if (actorState.pendingSaveHandle !== undefined) {
+				clearImmediate(actorState.pendingSaveHandle);
+				actorState.pendingSaveHandle = undefined;
+			}
+			actorState.stateTransactionSaveDeferred = true;
 			return;
 		}
 		actorState.saveScheduled = false;
@@ -3525,27 +3750,31 @@ function withConnContext(
 	onStateChange?: NativeOnStateChangeHandler,
 	dispatchCancelToken?: CancellationTokenHandle,
 ) {
-	return Object.assign(
-		new ActorContextHandleAdapter(
+	const actorContext = new ActorContextHandleAdapter(
+		runtime,
+		ctx,
+		clientFactory,
+		schemas,
+		databaseProvider,
+		request,
+		stateEnabled,
+		undefined,
+		onStateChange,
+		dispatchCancelToken,
+	);
+	return Object.assign(actorContext, {
+		conn: new NativeConnAdapter(
 			runtime,
-			ctx,
-			clientFactory,
+			conn,
 			schemas,
-			databaseProvider,
-			request,
-			stateEnabled,
-			undefined,
-			onStateChange,
-			dispatchCancelToken,
-		),
-		{
-			conn: new NativeConnAdapter(runtime, conn, schemas, ctx, (connId) =>
+			ctx,
+			(connId) =>
 				callNativeSync(() =>
 					runtime.actorQueueHibernationRemoval(ctx, connId),
 				),
-			),
-		},
-	);
+			() => actorContext.assertCanMutateState(),
+		),
+	});
 }
 
 function buildActorConfig(
@@ -3562,7 +3791,7 @@ function buildActorConfig(
 	return {
 		name: options.name as string | undefined,
 		icon: options.icon as string | undefined,
-		hasDatabase: config.db !== undefined || usesRemoteSqlite,
+		hasDatabase: true,
 		remoteSqlite: usesRemoteSqlite,
 		enableActorRuntimeSocket: options.enableActorRuntimeSocket === true,
 		hasState:
@@ -3708,7 +3937,10 @@ export function buildNativeFactory(
 	definition: AnyActorDefinition,
 ): ActorFactoryHandle {
 	const config = definition.config as Record<string, any>;
-	const databaseProvider = config.db as AnyDatabaseProvider;
+	const databaseProvider = (config.db ?? defaultDb()) as Exclude<
+		AnyDatabaseProvider,
+		undefined
+	>;
 	const actionHandlers = flattenActionHandlers(config.actions);
 	const schemaConfig: NativeValidationConfig = {
 		actionInputSchemas: flattenActionInputSchemas(
@@ -3857,6 +4089,7 @@ export function buildNativeFactory(
 		const workflowState = async () =>
 			(await getNativeWorkflowInspector(ctx)?.getState?.()) ?? null;
 		const actorCtx = makeActorCtx(ctx, jsRequest);
+		const sql = getOrCreateNativeSqlDatabase(runtime, ctx);
 		try {
 			if (
 				url.pathname === "/inspector/state" &&
@@ -4028,7 +4261,7 @@ export function buildNativeFactory(
 				url.pathname === "/inspector/database/schema" &&
 				jsRequest.method === "GET"
 			) {
-				const db = actorCtx.sql;
+				const db = sql;
 				const tables = queryRows(
 					await db.query(
 						"SELECT name, type FROM sqlite_master WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '__drizzle_%' ORDER BY name",
@@ -4082,7 +4315,7 @@ export function buildNativeFactory(
 				);
 				const quoted = `"${table.replace(/"/g, '""')}"`;
 				const rows = queryRows(
-					await actorCtx.sql.query(
+					await sql.query(
 						`SELECT * FROM ${quoted} LIMIT ? OFFSET ?`,
 						[
 							Math.max(0, Math.min(limit, 500)),
@@ -4125,15 +4358,11 @@ export function buildNativeFactory(
 					const bindings = normalizeSqlitePropertyBindings(
 						body.properties as Record<string, unknown>,
 					);
-					const rows = queryRows(
-						await actorCtx.sql.query(body.sql, bindings),
-					);
+					const rows = queryRows(await sql.query(body.sql, bindings));
 					return jsonResponse({ rows: jsonSafe(rows) });
 				}
 				const args = Array.isArray(body.args) ? body.args : [];
-				const rows = queryRows(
-					await actorCtx.sql.query(body.sql, args),
-				);
+				const rows = queryRows(await sql.query(body.sql, args));
 				return jsonResponse({ rows: jsonSafe(rows) });
 			}
 			if (
@@ -4162,7 +4391,7 @@ export function buildNativeFactory(
 					rpcs: Object.keys(actionHandlers).sort(),
 					queueSize: inspectorSnapshot.queueSize,
 					isStateEnabled: stateEnabled,
-					isDatabaseEnabled: databaseProvider !== undefined,
+					isDatabaseEnabled: true,
 					isWorkflowEnabled:
 						getNativeWorkflowInspector(ctx) !== undefined,
 					workflowState: await workflowState(),
@@ -4547,6 +4776,7 @@ export function buildNativeFactory(
 											connId,
 										),
 									),
+								() => actorCtx.assertCanMutateState(),
 							);
 							try {
 								const nextConnState = hasStaticConnState
@@ -4602,6 +4832,7 @@ export function buildNativeFactory(
 											connId,
 										),
 									),
+								() => actorCtx.assertCanMutateState(),
 							);
 							try {
 								await config.onConnect(
@@ -4645,6 +4876,7 @@ export function buildNativeFactory(
 													connId,
 												),
 											),
+										() => actorCtx.assertCanMutateState(),
 									),
 								);
 							}

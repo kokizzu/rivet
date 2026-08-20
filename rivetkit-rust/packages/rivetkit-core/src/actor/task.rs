@@ -52,7 +52,7 @@ use crate::actor::messages::{
 	WorkflowKvWrite,
 };
 use crate::actor::metrics::startup_phase::StartupPhase;
-use crate::actor::state::PersistedActor;
+use crate::actor::state::{PersistedActor, RequestSaveOpts};
 use crate::actor::task_types::ShutdownKind;
 use crate::actor::work_registry::ActorWorkKind;
 use crate::error::{ActorLifecycle as ActorLifecycleError, ActorRuntime};
@@ -855,21 +855,33 @@ impl ActorTask {
 		) {
 			return Err(ActorLifecycleError::NotReady.build());
 		}
-		let save_request_revision = self.ctx.save_request_revision();
-		let (reply_tx, reply_rx) = oneshot::channel();
-		self.send_actor_event(
-			"workflow_flush_serialize_state",
-			ActorEvent::SerializeState {
-				reason: SerializeStateReason::Save,
-				reply: Reply::from(reply_tx),
-			},
-		)?;
-		let deltas = reply_rx
-			.await
-			.context("receive workflow flush serialize-state reply")??;
-		self.ctx
-			.save_state_and_workflow_batch_with_revision(deltas, writes, save_request_revision)
-			.await
+		loop {
+			let save_request_revision = self.ctx.save_request_revision();
+			let state_transaction_epoch = self.ctx.state_transaction_epoch();
+			let (reply_tx, reply_rx) = oneshot::channel();
+			self.send_actor_event(
+				"workflow_flush_serialize_state",
+				ActorEvent::SerializeState {
+					reason: SerializeStateReason::Save,
+					reply: Reply::from(reply_tx),
+				},
+			)?;
+			let deltas = reply_rx
+				.await
+				.context("receive workflow flush serialize-state reply")??;
+			if self
+				.ctx
+				.save_state_and_workflow_batch_at_transaction_epoch(
+					deltas,
+					writes.clone(),
+					save_request_revision,
+					state_transaction_epoch,
+				)
+				.await?
+			{
+				return Ok(());
+			}
+		}
 	}
 
 	async fn handle_dispatch(&mut self, command: DispatchCommand) {
@@ -1940,6 +1952,7 @@ impl ActorTask {
 		}
 
 		let save_request_revision = self.ctx.save_request_revision();
+		let state_transaction_epoch = self.ctx.state_transaction_epoch();
 		let (reply_tx, reply_rx) = oneshot::channel();
 		match self.send_actor_event(
 			"save_tick",
@@ -1971,17 +1984,34 @@ impl ActorTask {
 				// triggers record_state_updated after persist, which the inspector
 				// websocket signal subscriber forwards as StateUpdated. Broadcasting
 				// the overlay here too would deliver a duplicate message.
-				if let Err(error) = self
+				match self
 					.ctx
-					.save_state_with_revision(deltas, save_request_revision)
+					.save_state_with_revision_at_transaction_epoch(
+						deltas,
+						save_request_revision,
+						state_transaction_epoch,
+					)
 					.await
 				{
-					tracing::error!(?error, "failed to persist actor save tick");
-					self.schedule_state_save(true);
-					self.sync_inspector_serialize_deadline();
-				} else if self.ctx.save_requested() {
-					self.schedule_state_save(self.ctx.save_requested_immediate());
-					self.sync_inspector_serialize_deadline();
+					Ok(true) => {
+						if self.ctx.save_requested() {
+							self.schedule_state_save(self.ctx.save_requested_immediate());
+							self.sync_inspector_serialize_deadline();
+						}
+					}
+					Ok(false) => {
+						self.ctx.request_save(RequestSaveOpts {
+							immediate: true,
+							max_wait_ms: None,
+						});
+						self.schedule_state_save(true);
+						self.sync_inspector_serialize_deadline();
+					}
+					Err(error) => {
+						tracing::error!(?error, "failed to persist actor save tick");
+						self.schedule_state_save(true);
+						self.sync_inspector_serialize_deadline();
+					}
 				}
 			}
 			Ok(Err(error)) => {
