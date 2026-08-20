@@ -22,6 +22,11 @@ use tokio::sync::{Mutex as AsyncMutex, Notify, OnceCell, broadcast, mpsc, onesho
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+#[cfg(not(feature = "wasm-runtime"))]
+type LocalAlarmTask = JoinHandle<()>;
+#[cfg(feature = "wasm-runtime")]
+type LocalAlarmTask = futures::future::AbortHandle;
+
 use crate::ActorConfig;
 #[cfg(feature = "sqlite-local")]
 use crate::actor::actor_runtime_socket::{
@@ -75,6 +80,8 @@ pub(crate) struct ActorContextInner {
 	pub(super) current_state: RwLock<Vec<u8>>,
 	pub(super) persisted: RwLock<PersistedActor>,
 	pub(super) last_pushed_alarm: RwLock<Option<i64>>,
+	pub(super) run_wake_at: RwLock<Option<i64>>,
+	pub(super) run_wake_revision: AtomicU64,
 	pub(super) state_save_interval: Duration,
 	pub(super) state_dirty: AtomicBool,
 	pub(super) state_revision: AtomicU64,
@@ -108,11 +115,12 @@ pub(crate) struct ActorContextInner {
 	pub(super) schedule_internal_keep_awake: Mutex<Option<InternalKeepAwakeCallback>>,
 	pub(super) schedule_local_alarm_callback: Mutex<Option<LocalAlarmCallback>>,
 	// Forced-sync: the local alarm timer is aborted from sync paths.
-	pub(super) schedule_local_alarm_task: Mutex<Option<JoinHandle<()>>>,
+	pub(super) schedule_local_alarm_task: Mutex<Option<LocalAlarmTask>>,
 	// Forced-sync: receivers are pushed/taken from sync paths and awaited after
 	// being moved out of the lock.
 	pub(super) schedule_pending_alarm_writes: Mutex<Vec<oneshot::Receiver<()>>>,
 	pub(super) schedule_local_alarm_epoch: AtomicU64,
+	pub(super) schedule_alarm_push_epoch: AtomicU64,
 	pub(super) schedule_alarm_dispatch_enabled: AtomicBool,
 	pub(super) schedule_dirty_since_push: AtomicBool,
 	pub(super) schedule_mutation_lock: AsyncMutex<()>,
@@ -298,6 +306,8 @@ impl ActorContext {
 			current_state: RwLock::new(Vec::new()),
 			persisted: RwLock::new(PersistedActor::default()),
 			last_pushed_alarm: RwLock::new(None),
+			run_wake_at: RwLock::new(None),
+			run_wake_revision: AtomicU64::new(0),
 			state_save_interval,
 			state_dirty: AtomicBool::new(false),
 			state_revision: AtomicU64::new(0),
@@ -328,6 +338,7 @@ impl ActorContext {
 			schedule_local_alarm_task: Mutex::new(None),
 			schedule_pending_alarm_writes: Mutex::new(Vec::new()),
 			schedule_local_alarm_epoch: AtomicU64::new(0),
+			schedule_alarm_push_epoch: AtomicU64::new(0),
 			schedule_alarm_dispatch_enabled: AtomicBool::new(true),
 			// A fresh actor context has no in-process record of a successful
 			// envoy alarm push yet, so the first sync must always push.

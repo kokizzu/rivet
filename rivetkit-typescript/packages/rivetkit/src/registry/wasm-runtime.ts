@@ -400,6 +400,17 @@ export class WasmCoreRuntime implements CoreRuntime {
 		);
 	}
 
+	async actorSetRunWakeAt(
+		ctx: ActorContextHandle,
+		timestampMs?: number | undefined | null,
+	): Promise<void> {
+		await callHandleAsync(
+			asWasmActorContext(ctx),
+			"setRunWakeAt",
+			optionalWasmNumber(timestampMs),
+		);
+	}
+
 	actorRequestSave(
 		ctx: ActorContextHandle,
 		opts?: RuntimeRequestSaveOpts | undefined | null,

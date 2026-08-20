@@ -314,6 +314,7 @@ export declare class ActorContext {
   aborted(): boolean
   runHandlerActive(): boolean
   restartRunHandler(): void
+  setRunWakeAt(timestampMs?: number | undefined | null): Promise<void>
   beginKeepAwake(): number
   endKeepAwake(regionId: number): void
   keepAwake(promise: Promise<any>): void

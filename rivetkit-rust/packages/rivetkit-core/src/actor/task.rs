@@ -317,6 +317,7 @@ struct SleepGraceState {
 struct PersistedStartup {
 	actor: PersistedActor,
 	last_pushed_alarm: Option<i64>,
+	run_wake_at: Option<i64>,
 }
 
 struct PendingLifecycleReply {
@@ -1190,6 +1191,7 @@ impl ActorTask {
 		let core_init_result: Result<()> = async {
 			self.ctx.load_persisted_actor(persisted.actor);
 			self.ctx.load_last_pushed_alarm(persisted.last_pushed_alarm);
+			self.ctx.load_run_wake_at(persisted.run_wake_at);
 			// New manual-startup runtimes must not persist initialization until the
 			// runtime startup_ready handshake completes. The runtime preamble owns
 			// initial state creation.
@@ -1289,6 +1291,7 @@ impl ActorTask {
 			return Ok(PersistedStartup {
 				actor: snapshot.actor,
 				last_pushed_alarm: snapshot.last_pushed_alarm,
+				run_wake_at: snapshot.run_wake_at,
 			});
 		}
 		Ok(PersistedStartup {
@@ -1297,6 +1300,7 @@ impl ActorTask {
 				..PersistedActor::default()
 			},
 			last_pushed_alarm: None,
+			run_wake_at: None,
 		})
 	}
 
@@ -1422,7 +1426,61 @@ impl ActorTask {
 			return Ok(());
 		}
 
-		self.ctx.drain_overdue_scheduled_events().await
+		let due_run_wake = self.ctx.consume_due_run_wake().await?;
+		if let Err(error) = self.ctx.drain_overdue_scheduled_events().await {
+			if self.lifecycle != LifecycleState::DestroyGrace
+				&& let Some((wake_at, wake_revision)) = due_run_wake
+				&& let Err(restore_error) = self
+					.ctx
+					.restore_run_wake_at_if_unchanged(wake_at, wake_revision)
+					.await
+			{
+				tracing::error!(
+					?restore_error,
+					wake_at,
+					"failed to restore run wake after schedule alarm dispatch failed",
+				);
+			}
+			return Err(error);
+		}
+		// Destroy is terminal. Consume the logical deadline so it cannot keep a
+		// past physical alarm armed, but never ensure the foreign run handler
+		// after its destroy cleanup has started.
+		if self.lifecycle == LifecycleState::DestroyGrace {
+			return Ok(());
+		}
+		if let Some((wake_at, wake_revision)) = due_run_wake {
+			let (reply_tx, reply_rx) = oneshot::channel();
+			if let Err(error) = self.ctx.try_send_actor_event(
+				ActorEvent::RunWake {
+					wake_at,
+					wake_revision,
+					reply: Reply::from(reply_tx),
+				},
+				"run_wake",
+			) {
+				self.ctx
+					.restore_run_wake_at_if_unchanged(wake_at, wake_revision)
+					.await?;
+				return Err(error).context("dispatch due run wake");
+			}
+			let restart_result = match reply_rx.await {
+				Ok(result) => result,
+				Err(error) => {
+					self.ctx
+						.restore_run_wake_at_if_unchanged(wake_at, wake_revision)
+						.await?;
+					return Err(error).context("receive due run wake reply");
+				}
+			};
+			if let Err(error) = restart_result {
+				self.ctx
+					.restore_run_wake_at_if_unchanged(wake_at, wake_revision)
+					.await?;
+				return Err(error).context("ensure run handler active for due wake");
+			}
+		}
+		Ok(())
 	}
 
 	fn handle_run_handle_outcome(

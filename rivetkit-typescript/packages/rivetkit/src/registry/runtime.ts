@@ -480,6 +480,10 @@ export interface CoreRuntime {
 		ctx: ActorContextHandle,
 		timestampMs?: number | undefined | null,
 	): void;
+	actorSetRunWakeAt(
+		ctx: ActorContextHandle,
+		timestampMs?: number | undefined | null,
+	): Promise<void>;
 	actorRequestSave(
 		ctx: ActorContextHandle,
 		opts?: RuntimeRequestSaveOpts | undefined | null,

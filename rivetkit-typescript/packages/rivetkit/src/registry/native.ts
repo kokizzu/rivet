@@ -15,6 +15,8 @@ import {
 	disposeRunInspector,
 	getRunFunction,
 	getRunInspectorConfig,
+	getRunInspectorKind,
+	hasRunInspectorConfig,
 	RAW_STATE_SYMBOL,
 	type ScheduledEventInfo,
 	type WorkflowInspectorConfig,
@@ -88,6 +90,7 @@ import {
 	validateQueueBody,
 	validateQueueComplete,
 } from "./native-validation";
+import { RunHandlerCoordinator } from "./run-handler-coordinator";
 import type {
 	ActorContextHandle,
 	ActorFactoryHandle,
@@ -406,6 +409,15 @@ function databaseClientNotReadyError(): RivetError {
 		{ public: true },
 	);
 }
+function runHandlerNotConfiguredError(): RivetError {
+	return new RivetError(
+		"actor",
+		"run_handler_unavailable",
+		"Cannot schedule a run wake because this actor does not define a run handler.",
+		{ public: true, statusCode: 409 },
+	);
+}
+
 function stateNotEnabledError(): RivetError {
 	return new RivetError(
 		"actor",
@@ -2701,7 +2713,7 @@ export class ActorContextHandleAdapter {
 	#request?: Request;
 	#schedule?: NativeScheduleAdapter;
 	#run?: { setWakeAt(timestamp: number | null): Promise<void> };
-	#runHandlerActiveProvider?: () => boolean;
+	#runHandlerConfigured: boolean;
 	#onStateChange?: NativeOnStateChangeHandler;
 	#stateEnabled: boolean;
 	#stateProxy?: unknown;
@@ -2716,16 +2728,16 @@ export class ActorContextHandleAdapter {
 		databaseProvider?: AnyDatabaseProvider,
 		request?: Request,
 		stateEnabled = true,
-		runHandlerActiveProvider?: () => boolean,
 		onStateChange?: NativeOnStateChangeHandler,
 		dispatchCancelToken?: CancellationTokenHandle,
+		runHandlerConfigured = false,
 	) {
 		this.#runtime = runtime;
 		this.#ctx = ctx;
 		this.#clientFactory = clientFactory;
 		this.#schemas = schemas;
 		this.#dispatchCancelToken = dispatchCancelToken;
-		this.#runHandlerActiveProvider = runHandlerActiveProvider;
+		this.#runHandlerConfigured = runHandlerConfigured;
 		this.#onStateChange = onStateChange;
 		this.#stateEnabled = stateEnabled;
 		if (databaseProvider) {
@@ -2860,6 +2872,30 @@ export class ActorContextHandleAdapter {
 			);
 		}
 		return this.#queue;
+	}
+
+	get run() {
+		if (!this.#run) {
+			this.#run = {
+				setWakeAt: async (timestamp: number | null) => {
+					if (timestamp !== null && !this.#runHandlerConfigured) {
+						throw runHandlerNotConfiguredError();
+					}
+					if (
+						timestamp !== null &&
+						(!Number.isSafeInteger(timestamp) || timestamp < 0)
+					) {
+						throw new TypeError(
+							"Run wake timestamp must be a non-negative safe integer or null",
+						);
+					}
+					await callNative(() =>
+						this.#runtime.actorSetRunWakeAt(this.#ctx, timestamp),
+					);
+				},
+			};
+		}
+		return this.#run;
 	}
 
 	get schedule(): NativeScheduleAdapter {
@@ -3302,10 +3338,6 @@ export class ActorContextHandleAdapter {
 		return promise;
 	}
 
-	runHandlerActive(): boolean {
-		return this.#runHandlerActiveProvider?.() ?? false;
-	}
-
 	internalKeepAwake<T>(run: Promise<T> | (() => Promise<T>)): Promise<T> {
 		const promise = typeof run === "function" ? run() : run;
 		// Track only completion, swallowing the outcome. The real result/error
@@ -3698,10 +3730,6 @@ class NativeWorkflowRuntimeAdapter {
 		};
 	}
 
-	isRunHandlerActive(): boolean {
-		return this.#ctx.runHandlerActive();
-	}
-
 	async restartRunHandler(): Promise<void> {
 		await this.#ctx.restartRunHandler();
 	}
@@ -3749,6 +3777,7 @@ function withConnContext(
 	stateEnabled = true,
 	onStateChange?: NativeOnStateChangeHandler,
 	dispatchCancelToken?: CancellationTokenHandle,
+	runHandlerConfigured = false,
 ) {
 	const actorContext = new ActorContextHandleAdapter(
 		runtime,
@@ -3758,9 +3787,9 @@ function withConnContext(
 		databaseProvider,
 		request,
 		stateEnabled,
-		undefined,
 		onStateChange,
 		dispatchCancelToken,
+		runHandlerConfigured,
 	);
 	return Object.assign(actorContext, {
 		conn: new NativeConnAdapter(
@@ -3958,16 +3987,21 @@ export function buildNativeFactory(
 			),
 			{ encoding: "bare" },
 		);
-	const nativeRunHandlerActiveByActorId = new Map<string, boolean>();
-	const isNativeRunHandlerActive = (ctx: ActorContextHandle) =>
-		nativeRunHandlerActiveByActorId.get(
-			callNativeSync(() => runtime.actorId(ctx)),
-		) ?? false;
-	const getNativeWorkflowInspector = (ctx: ActorContextHandle) =>
-		getRunInspectorConfig(
-			config.run,
-			callNativeSync(() => runtime.actorId(ctx)),
-		)?.workflow as NativeWorkflowInspectorConfig | undefined;
+	const run = getRunFunction(config.run);
+	const runHandlerCoordinator =
+		getRunInspectorKind(config.run) === "workflow"
+			? new RunHandlerCoordinator(config.run)
+			: undefined;
+	const getNativeWorkflowInspector = (ctx: ActorContextHandle) => {
+		const actorId = callNativeSync(() => runtime.actorId(ctx));
+		const restart = () =>
+			callNativeSync(() => runtime.actorRestartRunHandler(ctx));
+		return (runHandlerCoordinator?.getInspector(actorId, restart)
+			?.workflow ??
+			getRunInspectorConfig(config.run, actorId)?.workflow) as
+			| NativeWorkflowInspectorConfig
+			| undefined;
+	};
 	const onStateChange =
 		typeof config.onStateChange === "function"
 			? (actorCtx: ActorContextHandleAdapter, nextState: unknown) => {
@@ -4000,9 +4034,9 @@ export function buildNativeFactory(
 			databaseProvider,
 			request,
 			stateEnabled,
-			() => isNativeRunHandlerActive(ctx),
 			onStateChange,
 			cancelToken,
+			run !== undefined,
 		);
 	const makeConnCtx = (
 		ctx: ActorContextHandle,
@@ -4021,6 +4055,7 @@ export function buildNativeFactory(
 			stateEnabled,
 			onStateChange,
 			cancelToken,
+			run !== undefined,
 		);
 	const maybeHandleNativeInspectorRequest = async (
 		ctx: ActorContextHandle,
@@ -4647,6 +4682,7 @@ export function buildNativeFactory(
 			async (error: unknown, payload: { ctx: ActorContextHandle }) => {
 				const { ctx } = unwrapTsfnPayload(error, payload);
 				const actorCtx = makeActorCtx(ctx);
+				const actorId = callNativeSync(() => runtime.actorId(ctx));
 				// TODO: Move this save hook into cleanupNativeSleepRuntimeState
 				// so immediate and deferred sleep cleanup share one save-state
 				// path instead of passing a callback through cleanup.
@@ -4677,6 +4713,8 @@ export function buildNativeFactory(
 							saveActorState,
 						);
 					} finally {
+						runHandlerCoordinator?.destroy(actorId);
+						disposeRunInspector(config.run, actorId);
 						await actorCtx.dispose();
 					}
 				}
@@ -4686,16 +4724,16 @@ export function buildNativeFactory(
 			async (error: unknown, payload: { ctx: ActorContextHandle }) => {
 				const { ctx } = unwrapTsfnPayload(error, payload);
 				const actorCtx = makeActorCtx(ctx);
+				const actorId = callNativeSync(() => runtime.actorId(ctx));
+				// Close run control before user cleanup so replay cannot race actor
+				// destruction. Recreating this actor id receives a fresh controller.
+				runHandlerCoordinator?.destroy(actorId);
+				disposeRunInspector(config.run, actorId);
 				try {
 					if (typeof config.onDestroy === "function") {
 						await config.onDestroy(actorCtx);
 					}
 				} finally {
-					const actorId = callNativeSync(() => runtime.actorId(ctx));
-					// Release actorId-keyed state so it does not accumulate per
-					// destroyed actor.
-					nativeRunHandlerActiveByActorId.delete(actorId);
-					disposeRunInspector(config.run, actorId);
 					resolveNativeDestroy(runtime, ctx);
 					await actorCtx.closeDatabase();
 					clearNativeRuntimeState(runtime, ctx);
@@ -5085,7 +5123,6 @@ export function buildNativeFactory(
 					)
 				: undefined,
 		run: (() => {
-			const run = getRunFunction(config.run);
 			if (!run) {
 				return undefined;
 			}
@@ -5097,67 +5134,75 @@ export function buildNativeFactory(
 				) => {
 					const { ctx } = unwrapTsfnPayload(error, payload);
 					const actorId = callNativeSync(() => runtime.actorId(ctx));
-					const actorCtx = makeActorCtx(ctx);
-					nativeRunHandlerActiveByActorId.set(actorId, true);
-					try {
-						await run(actorCtx);
-					} finally {
-						// Delete rather than set(false): an absent entry already
-						// reads as inactive, and deleting keeps this map bounded
-						// to currently-running handlers instead of accumulating an
-						// entry per actor id forever.
-						nativeRunHandlerActiveByActorId.delete(actorId);
-						await actorCtx.dispose();
+					const executeRun = async () => {
+						const actorCtx = makeActorCtx(ctx);
+						try {
+							await run(actorCtx);
+						} finally {
+							await actorCtx.dispose();
+						}
+					};
+					if (runHandlerCoordinator) {
+						const outcome = await runHandlerCoordinator.run(
+							actorId,
+							() =>
+								callNativeSync(() =>
+									runtime.actorRestartRunHandler(ctx),
+								),
+							executeRun,
+						);
+						// Only a start suppressed behind a failed replay must preserve a
+						// consumed durable wake. Closed actors must remain closed.
+						return outcome !== "suppressed";
 					}
+					await executeRun();
+					return true;
 				},
 			);
 		})(),
-		getWorkflowHistory:
-			getRunInspectorConfig(config.run) !== undefined
-				? wrapNativeCallback(
-						async (
-							error: unknown,
-							payload: { ctx: ActorContextHandle },
-						) => {
-							const { ctx } = unwrapTsfnPayload(error, payload);
-							const history =
-								getNativeWorkflowInspector(ctx)?.getHistory();
-							return history == null
-								? undefined
-								: toUint8Array(history);
+		getWorkflowHistory: hasRunInspectorConfig(config.run)
+			? wrapNativeCallback(
+					async (
+						error: unknown,
+						payload: { ctx: ActorContextHandle },
+					) => {
+						const { ctx } = unwrapTsfnPayload(error, payload);
+						const history =
+							getNativeWorkflowInspector(ctx)?.getHistory();
+						return history == null
+							? undefined
+							: toUint8Array(history);
+					},
+				)
+			: undefined,
+		replayWorkflow: hasRunInspectorConfig(config.run)
+			? wrapNativeCallback(
+					async (
+						error: unknown,
+						payload: {
+							ctx: ActorContextHandle;
+							entryId?: string;
 						},
-					)
-				: undefined,
-		replayWorkflow:
-			getRunInspectorConfig(config.run) !== undefined
-				? wrapNativeCallback(
-						async (
-							error: unknown,
-							payload: {
-								ctx: ActorContextHandle;
-								entryId?: string;
-							},
-						) => {
-							const { ctx, entryId } = unwrapTsfnPayload(
-								error,
-								payload,
-							);
-							const workflowInspector =
-								getNativeWorkflowInspector(ctx);
-							if (!workflowInspector?.replayFromStep) {
-								return undefined;
-							}
+					) => {
+						const { ctx, entryId } = unwrapTsfnPayload(
+							error,
+							payload,
+						);
+						const workflowInspector =
+							getNativeWorkflowInspector(ctx);
+						if (!workflowInspector?.replayFromStep) {
+							return undefined;
+						}
 
-							const history =
-								(await workflowInspector.replayFromStep(
-									entryId,
-								)) ?? null;
-							return history == null
-								? undefined
-								: toUint8Array(history);
-						},
-					)
-				: undefined,
+						const history =
+							(await workflowInspector.replayFromStep(entryId)) ??
+							null;
+						return history == null
+							? undefined
+							: toUint8Array(history);
+					},
+				)
+			: undefined,
 		actions: Object.fromEntries(
 			Object.entries(actionHandlers).map(([name, handler]) => [
 				name,
@@ -5239,6 +5284,7 @@ export function buildNativeFactory(
 					stateEnabled,
 					onStateChange,
 					cancelToken,
+					run !== undefined,
 				);
 				try {
 					if (

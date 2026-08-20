@@ -429,6 +429,13 @@ export class NapiCoreRuntime implements CoreRuntime {
 		asNativeActorContext(ctx).setAlarm(timestampMs);
 	}
 
+	async actorSetRunWakeAt(
+		ctx: ActorContextHandle,
+		timestampMs?: number | undefined | null,
+	): Promise<void> {
+		await asNativeActorContext(ctx).setRunWakeAt(timestampMs);
+	}
+
 	actorRequestSave(
 		ctx: ActorContextHandle,
 		opts?: RuntimeRequestSaveOpts | undefined | null,
