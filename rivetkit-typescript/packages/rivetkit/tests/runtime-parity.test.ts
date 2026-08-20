@@ -101,6 +101,14 @@ class FakeActorContext {
 	readonly runtimeBag = {};
 	readonly registeredTasks: Array<Promise<void>> = [];
 	readonly abortController = new AbortController();
+	queueMessages: Array<{
+		id(): bigint;
+		name(): string;
+		body(): Uint8Array;
+		createdAt(): number;
+		isCompletable(): boolean;
+		complete(): Promise<void>;
+	}> = [];
 
 	constructor(
 		private readonly scenario: ParityScenario,
@@ -165,6 +173,12 @@ class FakeActorContext {
 
 	abortSignal(): AbortSignal {
 		return this.abortController.signal;
+	}
+
+	queue() {
+		return {
+			nextBatch: async () => this.queueMessages.splice(0),
+		};
 	}
 }
 
@@ -420,6 +434,54 @@ async function invokePromotedStatus(
 }
 
 describe("CoreRuntime NAPI and wasm parity", () => {
+	test.each([
+		["napi", 42n, 42],
+		["wasm", 42n, 42],
+		["napi", 2n ** 53n + 1n, 2n ** 53n + 1n],
+		["wasm", 2n ** 53n + 1n, 2n ** 53n + 1n],
+	] as const)("%s exposes queue message id %s without losing precision", async (kind, messageId, expectedId) => {
+		const runtimeCase = createRuntimeCase(kind);
+		let receivedId: number | bigint | undefined;
+		const definition = actor({
+			state: {},
+			actions: {
+				receive: async (c) => {
+					receivedId = (await c.queue.next()).id;
+				},
+			},
+		});
+		const factory = buildNativeFactory(
+			runtimeCase.runtime,
+			registryConfig(definition),
+			definition,
+		) as unknown as FakeActorFactory;
+		const ctx = new FakeActorContext(runtimeCase.scenario);
+		ctx.stateBytes = Buffer.from(
+			(await factory.callbacks.createState?.(null, {
+				ctx,
+				input: encodeValue(null),
+			})) ?? encodeValue({}),
+		);
+		ctx.queueMessages.push({
+			id: () => messageId,
+			name: () => "work",
+			body: () => encodeValue({}),
+			createdAt: () => 0,
+			isCompletable: () => false,
+			complete: async () => {},
+		});
+
+		await factory.callbacks.actions.receive(null, {
+			ctx,
+			conn: null,
+			name: "receive",
+			args: encodeValue([]),
+			cancelToken: new FakeCancellationToken(),
+		});
+
+		expect(receivedId).toBe(expectedId);
+	});
+
 	test("scheduled fire metadata is appended after validated action args", async () => {
 		const runtimeCase = createRuntimeCase("napi");
 		let received: unknown[] = [];

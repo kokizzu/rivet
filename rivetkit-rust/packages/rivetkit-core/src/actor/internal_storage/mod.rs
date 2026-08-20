@@ -476,6 +476,20 @@ pub(crate) async fn load_queue_messages(db: &SqliteDb) -> Result<Vec<QueueMessag
 		.context("load internal queue messages")?;
 	decode_queue_message_rows(&result.rows)
 }
+pub(crate) async fn load_queue_message_name(db: &SqliteDb, id: u64) -> Result<Option<String>> {
+	let id = i64::try_from(id).context("queue message id exceeds sqlite integer range")?;
+	let result = db
+		.query(
+			LOAD_QUEUE_MESSAGE_NAME_SQL,
+			Some(vec![BindParam::Integer(id)]),
+		)
+		.await
+		.context("load internal queue message name")?;
+	let Some(row) = result.rows.first() else {
+		return Ok(None);
+	};
+	Ok(Some(read_text(row, 0, "queue message name")?))
+}
 
 pub(crate) async fn load_queue_messages_matching(
 	db: &SqliteDb,
@@ -623,9 +637,9 @@ fn decode_queue_message_rows(rows: &[Vec<ColumnValue>]) -> Result<Vec<QueueMessa
 		.collect()
 }
 
-pub(crate) async fn delete_queue_messages(db: &SqliteDb, ids: &[u64]) -> Result<()> {
+pub(crate) async fn delete_queue_messages(db: &SqliteDb, ids: &[u64]) -> Result<u32> {
 	if ids.is_empty() {
-		return Ok(());
+		return Ok(0);
 	}
 
 	let mut statements = Vec::with_capacity(ids.len());
@@ -637,10 +651,17 @@ pub(crate) async fn delete_queue_messages(db: &SqliteDb, ids: &[u64]) -> Result<
 			)]),
 		});
 	}
-	db.execute_batch(statements)
+	let results = db
+		.execute_batch(statements)
 		.await
 		.context("delete internal queue messages")?;
-	Ok(())
+	results.into_iter().try_fold(0u32, |deleted, result| {
+		let changes = u32::try_from(result.changes)
+			.context("deleted queue message count is outside u32 range")?;
+		deleted
+			.checked_add(changes)
+			.context("deleted queue message count exceeds u32 range")
+	})
 }
 
 pub(crate) async fn reset_queue(db: &SqliteDb) -> Result<()> {

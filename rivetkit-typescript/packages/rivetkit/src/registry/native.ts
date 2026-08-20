@@ -1734,8 +1734,9 @@ function wrapQueueMessage(
 	schemas: NativeValidationConfig["queues"],
 ) {
 	const name = callNativeSync(() => message.name());
+	const id = callNativeSync(() => message.id());
 	return {
-		id: Number(callNativeSync(() => message.id())),
+		id: id <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(id) : id,
 		name,
 		body: validateQueueBody(
 			schemas,
@@ -1918,6 +1919,32 @@ class NativeQueueAdapter {
 		} finally {
 			cleanup?.();
 		}
+	}
+	async waitForAvailable(
+		names?: readonly string[],
+		options?: { timeout?: number; signal?: AbortSignal },
+	): Promise<void> {
+		await this.waitForNamesAvailable(names ?? [], options);
+	}
+
+	async complete(
+		message: { id: number | bigint; name: string },
+		response?: unknown,
+	): Promise<void> {
+		const validatedResponse = validateQueueComplete(
+			this.#schemas,
+			message.name,
+			response,
+		);
+		await callNative(() =>
+			this.#runtime.actorQueueCompletePersisted(
+				this.#ctx,
+				BigInt(message.id),
+				message.name,
+				encodeValue(validatedResponse),
+			),
+		);
+		this.#pendingCompletableMessageIds.delete(message.id.toString());
 	}
 
 	async enqueueAndWait(
