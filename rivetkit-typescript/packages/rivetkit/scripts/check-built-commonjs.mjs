@@ -15,7 +15,23 @@ for (const relativePath of readdirSync(outputDir, { recursive: true })) {
 
 const require = createRequire(import.meta.url);
 const rivetkit = require("../dist/tsup/mod.cjs");
+const workflowInspectorCjs = require("../dist/tsup/inspector/workflow.cjs");
+const workflowInspectorEsm = await import(
+	new URL("../dist/tsup/inspector/workflow.js", import.meta.url)
+);
 
 if (typeof rivetkit.actor !== "function") {
 	throw new Error("CommonJS build does not export actor()");
+}
+
+for (const [format, workflowInspector] of [
+	["CommonJS", workflowInspectorCjs],
+	["ESM", workflowInspectorEsm],
+]) {
+	if (
+		typeof workflowInspector.encodeWorkflowHistoryTransport !== "function" ||
+		typeof workflowInspector.decodeWorkflowHistoryTransport !== "function"
+	) {
+		throw new Error(`${format} workflow Inspector build is missing its codec`);
+	}
 }
