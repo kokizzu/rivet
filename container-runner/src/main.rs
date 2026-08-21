@@ -133,6 +133,36 @@ pub fn idle_timeout() -> Option<Duration> {
 	*IDLE_TIMEOUT
 }
 
+/// When set, an actor that starts a second time self-sleeps instead of running
+/// again; its persisted `started_once` records the first real start. Configured via
+/// RIVET_REJECT_SECOND_START (truthy `1`/`true`/`yes`/`on`). Off by default.
+static REJECT_SECOND_START: LazyLock<bool> = LazyLock::new(|| {
+	std::env::var("RIVET_REJECT_SECOND_START")
+		.map(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+		.unwrap_or(false)
+});
+
+/// Whether the reject-second-start guard is enabled. See [`REJECT_SECOND_START`].
+pub fn reject_second_start() -> bool {
+	*REJECT_SECOND_START
+}
+
+/// Non-idle mode commits `started_once` only after the actor survives this window,
+/// so a child that crashes within it is not treated as a real start and the retry
+/// may run. Configured via RIVET_SECOND_START_GRACE_SECS, default 10s.
+static SECOND_START_GRACE: LazyLock<Duration> = LazyLock::new(|| {
+	let secs = std::env::var("RIVET_SECOND_START_GRACE_SECS")
+		.ok()
+		.and_then(|value| value.parse::<u64>().ok())
+		.unwrap_or(10);
+	Duration::from_secs(secs)
+});
+
+/// Grace an actor must survive before its start is committed. See [`SECOND_START_GRACE`].
+pub fn second_start_grace() -> Duration {
+	*SECOND_START_GRACE
+}
+
 /// Token that fires on a platform shutdown signal. Cuts a drain wait short so the
 /// platform's SIGTERM→SIGKILL budget is honored.
 pub fn exit_token() -> &'static CancellationToken {
