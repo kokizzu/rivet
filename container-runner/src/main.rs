@@ -133,6 +133,28 @@ pub fn idle_timeout() -> Option<Duration> {
 	*IDLE_TIMEOUT
 }
 
+/// The idle window plus up to 20% jitter (capped at 60s), so instances armed at the
+/// same time do not all sleep in the same instant and tear down in a wave. Jitter is
+/// only ever added, never subtracted, so an actor never sleeps before its window.
+pub fn idle_timeout_with_jitter(base: Duration) -> Duration {
+	let max_jitter = base.mul_f64(0.2).min(Duration::from_secs(60));
+	base + random_duration_up_to(max_jitter)
+}
+
+/// A `Duration` uniformly in `[0, max]`, drawn from the OS CSPRNG. Falls back to no
+/// jitter when the CSPRNG is unavailable.
+fn random_duration_up_to(max: Duration) -> Duration {
+	let max_ms = max.as_millis() as u64;
+	if max_ms == 0 {
+		return Duration::ZERO;
+	}
+	let mut buf = [0u8; 8];
+	match std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut buf)) {
+		Ok(()) => Duration::from_millis(u64::from_le_bytes(buf) % (max_ms + 1)),
+		Err(_) => Duration::ZERO,
+	}
+}
+
 /// When set, an actor that starts a second time self-sleeps instead of running
 /// again; its persisted `started_once` records the first real start. Configured via
 /// RIVET_REJECT_SECOND_START (truthy `1`/`true`/`yes`/`on`). Off by default.

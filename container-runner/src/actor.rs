@@ -15,8 +15,9 @@ use tokio::sync::Mutex as TokioMutex;
 use crate::child::{ChildProcess, SpawnSpec, log_prefix};
 use crate::input::{ActorInput, ActorState};
 use crate::{
-	children, drain_grace, effective_stop_grace, exit_token, idle_timeout, reject_second_start,
-	release_child_port, request_exit, reserve_child_port, runner_config, second_start_grace,
+	children, drain_grace, effective_stop_grace, exit_token, idle_timeout, idle_timeout_with_jitter,
+	reject_second_start, release_child_port, request_exit, reserve_child_port, runner_config,
+	second_start_grace,
 };
 
 /// Live actor contexts keyed by actor id, so the shutdown path can report actors
@@ -94,21 +95,23 @@ impl GameServer {
 	/// window, if no request has arrived, ask the actor to sleep (`stop_child` then
 	/// exits the container). Cancelled early if the actor starts shutting down.
 	fn arm_idle_timeout(self: &Arc<Self>, ctx: &Ctx<Self>, actor_id: String) {
-		let Some(timeout) = idle_timeout() else {
+		let Some(base) = idle_timeout() else {
 			return;
 		};
+		// Jitter the window so instances started together do not sleep in lockstep.
+		let delay = idle_timeout_with_jitter(base);
 		let this = self.clone();
 		let ctx = ctx.clone();
 		tokio::spawn(async move {
 			let abort = ctx.abort_signal();
 			tokio::select! {
-				_ = tokio::time::sleep(timeout) => {}
+				_ = tokio::time::sleep(delay) => {}
 				_ = abort.cancelled() => return,
 			}
 			if this.idle_state.load(Ordering::Relaxed) == IDLE_REQUESTED {
 				return;
 			}
-			tracing::info!(actor_id = %actor_id, ?timeout, "no request within idle timeout, sleeping");
+			tracing::info!(actor_id = %actor_id, ?delay, "no request within idle timeout, sleeping");
 			if let Err(err) = ctx.sleep() {
 				tracing::debug!(error = ?err, actor_id = %actor_id, "idle sleep request failed");
 			}
