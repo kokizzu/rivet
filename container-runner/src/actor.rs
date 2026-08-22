@@ -25,15 +25,16 @@ use crate::{
 static ACTOR_CTXS: LazyLock<scc::HashMap<String, Ctx<GameServer>>> =
 	LazyLock::new(scc::HashMap::new);
 
-/// One-shot idle lifecycle for a generation, in a single atomic. The startup timer
-/// sleeps the actor only while it is `ARMED`; a request moves it to `REQUESTED` so the
-/// timer will not sleep.
+/// One-shot idle lifecycle for a generation, in a single atomic. The startup timer sleeps
+/// only while `ARMED`; a request moves it to `REQUESTED` (no sleep), and the timer firing with
+/// no request moves it to `IDLE_SLEEPING`, which `on_sleep` reads to skip the drain.
 const IDLE_ARMED: u8 = 0;
 const IDLE_REQUESTED: u8 = 1;
+const IDLE_SLEEPING: u8 = 2;
 
 pub struct GameServer {
 	child: TokioMutex<Option<Arc<ChildProcess>>>,
-	/// One-shot idle state: `IDLE_ARMED` / `IDLE_REQUESTED`.
+	/// One-shot idle state: `IDLE_ARMED` / `IDLE_REQUESTED` / `IDLE_SLEEPING`.
 	idle_state: AtomicU8,
 	/// Set when `on_start` detected a repeat start and skipped spawning a child, so
 	/// `run` destroys the actor instead of running. See [`reject_second_start`].
@@ -108,7 +109,14 @@ impl GameServer {
 				_ = tokio::time::sleep(delay) => {}
 				_ = abort.cancelled() => return,
 			}
-			if this.idle_state.load(Ordering::Relaxed) == IDLE_REQUESTED {
+			// Sleep only if still armed. If a request raced in, the CAS fails and we do
+			// nothing; on success the state records this as an idle-timer sleep so
+			// `on_sleep` skips the drain.
+			if this
+				.idle_state
+				.compare_exchange(IDLE_ARMED, IDLE_SLEEPING, Ordering::SeqCst, Ordering::SeqCst)
+				.is_err()
+			{
 				return;
 			}
 			tracing::info!(actor_id = %actor_id, ?delay, "no request within idle timeout, sleeping");
@@ -361,12 +369,11 @@ impl Actor for GameServer {
 		crate::proxy::ws_proxy(child_port, path, ws).await
 	}
 
-	/// Engine-initiated sleep. `no_sleep` blocks only idle sleep; the engine can
-	/// still sleep an actor (dashboard, crash policy, eviction), so we stop the child.
-	/// In idle-timeout mode the sleep is (treated as) an idle sleep, so it skips the
-	/// drain and stops promptly; otherwise it drains for in-flight work first.
+	/// Engine-initiated sleep. An idle-timer sleep with no request has nothing to drain, so it
+	/// stops promptly; every other sleep (an active actor, or idle timeout disabled) drains
+	/// in-flight work first. `no_sleep` blocks only idle sleep, not engine-driven sleeps.
 	async fn on_sleep(self: Arc<Self>, ctx: Ctx<Self>) -> Result<()> {
-		if idle_timeout().is_some() {
+		if self.idle_state.load(Ordering::SeqCst) == IDLE_SLEEPING {
 			self.stop_child(ctx.actor_id(), "actor sleeping (idle)").await;
 		} else {
 			self.drain_then_stop_child(ctx.actor_id(), "actor sleeping").await;
