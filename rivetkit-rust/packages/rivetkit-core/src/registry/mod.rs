@@ -1148,23 +1148,37 @@ impl RegistryDispatcher {
 		}
 
 		let mut join_guard = instance.join.lock().await;
-		if let Some(join) = join_guard.take() {
+		// Fold the join outcome into the result instead of propagating with `?`,
+		// so the stop handle is always signaled and never dropped unsignaled.
+		let join_result = if let Some(join) = join_guard.take() {
 			join.await
-				.context("join actor task")?
-				.context("actor task failed")?;
-		}
+				.context("join actor task")
+				.and_then(|result| result.context("actor task failed"))
+		} else {
+			Ok(())
+		};
 		instance.ctx.configure_lifecycle_events(None);
 
-		match shutdown_result {
+		if let (Err(shutdown_error), Err(join_error)) = (&shutdown_result, &join_result) {
+			tracing::warn!(
+				actor_id,
+				%shutdown_error,
+				discarded_join_error = %join_error,
+				"actor stop had both shutdown and join failures; only the shutdown error is returned"
+			);
+		}
+
+		let final_result = shutdown_result.and(join_result);
+		match &final_result {
 			Ok(_) => {
 				let _ = stop_handle.complete();
-				Ok(())
 			}
 			Err(error) => {
-				let _ = stop_handle.fail(anyhow::Error::new(RivetError::extract(&error)));
-				Err(error).with_context(|| format!("stop actor `{actor_id}`"))
+				let _ = stop_handle.fail(anyhow::Error::new(RivetError::extract(error)));
 			}
 		}
+
+		final_result.with_context(|| format!("stop actor `{actor_id}`"))
 	}
 }
 
