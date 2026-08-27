@@ -92,6 +92,7 @@ import {
 import { churnDb } from "./actors/testing/churn-db.ts";
 import { growDb } from "./actors/testing/grow-db.ts";
 import { inlineClientActor } from "./actors/testing/inline-client.ts";
+import { largeCommitDb } from "./actors/testing/large-commit-db.ts";
 import { loadTestAgent } from "./actors/testing/load-test-agent.ts";
 import { loadTestAgent2 } from "./actors/testing/load-test-agent-2.ts";
 import { mockAgenticLoop } from "./actors/testing/mock-agentic-loop.ts";
@@ -292,6 +293,7 @@ export const registry = setup({
 		rawSqliteFuzzer,
 		sqliteMemoryPressure,
 		growDb,
+		largeCommitDb,
 		churnDb,
 		mockAgenticLoop,
 		sleepCloseFuzz,
