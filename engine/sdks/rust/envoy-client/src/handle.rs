@@ -223,6 +223,28 @@ impl EnvoyHandle {
 		}
 	}
 
+	/// Resolve once the envoy has no active actors (or has stopped). Event-driven via
+	/// `actors_notify`, which `remove_actor` pings on deregister; armed with `enable`
+	/// before the count check so a drain-to-zero cannot race past the waiter.
+	pub async fn wait_actors_drained(&self) {
+		loop {
+			let notified = self.shared.actors_notify.notified();
+			tokio::pin!(notified);
+			// Register interest before reading the count so a `notify_waiters` that
+			// fires between the check and the await is not lost.
+			notified.as_mut().enable();
+
+			if self.is_stopped() || self.active_actor_count() == 0 {
+				return;
+			}
+
+			tokio::select! {
+				_ = notified => {}
+				_ = self.wait_stopped() => return,
+			}
+		}
+	}
+
 	pub fn http_request_counter(
 		&self,
 		actor_id: &str,

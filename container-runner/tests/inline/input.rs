@@ -76,6 +76,27 @@ fn actor_state_cbor_round_trips() {
 }
 
 #[test]
+fn new_actor_state_decodes_into_legacy_bare_input() {
+	// Rollback direction: state written by a newer binary (ActorState with
+	// `started_once`) must still decode on an older binary whose state was a bare
+	// ActorInput. The old decoder ignores `started_once` and keeps the launch spec.
+	let state = ActorState {
+		input: ActorInput {
+			command: Some(vec!["./GameServer".to_string()]),
+			args: vec!["-x".to_string()],
+			env: std::collections::HashMap::from([("A".to_string(), "1".to_string())]),
+			port: Some(7777),
+		},
+		started_once: true,
+	};
+	let decoded: ActorInput = cbor_round_trip(&state).unwrap();
+	assert_eq!(decoded.command.as_deref(), Some(&["./GameServer".to_string()][..]));
+	assert_eq!(decoded.args, vec!["-x".to_string()]);
+	assert_eq!(decoded.env.get("A").map(String::as_str), Some("1"));
+	assert_eq!(decoded.port, Some(7777));
+}
+
+#[test]
 fn legacy_bare_input_state_decodes_into_actor_state() {
 	// State written before `started_once` existed was a bare ActorInput. The
 	// flattened input must still decode, defaulting `started_once` to false.

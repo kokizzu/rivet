@@ -101,6 +101,16 @@ static SIGTERM_BUDGET: LazyLock<Duration> = LazyLock::new(|| {
 	Duration::from_secs(secs)
 });
 
+/// On an actor-driven exit, how long to wait for in-flight actor stops to flush their
+/// `Stopped` to the engine before the envoy announces it is going away. Bounded so a
+/// stuck actor cannot hang the exit; the actor normally stops in well under a second.
+const ACTOR_STOP_FLUSH_BUDGET: Duration = Duration::from_secs(10);
+
+/// Cancelled when a platform signal (SIGTERM/SIGINT) starts shutdown. Cuts the
+/// actor-driven drain wait short so a reclaim arriving mid-drain is not delayed by
+/// [`ACTOR_STOP_FLUSH_BUDGET`] and cannot overrun the SIGTERM→SIGKILL budget.
+static SIGNAL_TOKEN: LazyLock<CancellationToken> = LazyLock::new(CancellationToken::new);
+
 /// How long an engine pause (sleep, lost, going-away) lets the child keep serving
 /// and exit on its own before we SIGTERM it. Defaults to 15 min (RIVET_DRAIN_GRACE_SECS);
 /// must fit inside the engine's per-runner `drain_grace_period` or a reclaim cuts it short.
@@ -463,7 +473,29 @@ async fn async_main() -> Result<()> {
 		tokio::join!(drain, stop_all_children(*SIGTERM_BUDGET));
 	} else {
 		stop_all_children(*SIGTERM_BUDGET).await;
-		runtime.shutdown().await;
+		// Flush an in-flight actor's `Stopped` to the engine before the envoy announces
+		// it is going away, or that announcement becomes a per-actor `GoingAway` that
+		// overrides the destroy and reallocates it. A signal cuts the wait short.
+		let signaled = tokio::select! {
+			_ = runtime.wait_actors_drained(ACTOR_STOP_FLUSH_BUDGET) => false,
+			_ = SIGNAL_TOKEN.cancelled() => {
+				tracing::warn!("platform signal during actor drain, proceeding to shutdown");
+				true
+			}
+		};
+		// A clean actor-driven exit has no deadline, but if a platform signal arrived
+		// mid-drain the reclaim clock is running, so bound the envoy shutdown by the
+		// SIGTERM budget like the signal-driven branch does.
+		if signaled || SIGNAL_SHUTDOWN.load(Ordering::Acquire) {
+			if tokio::time::timeout(*SIGTERM_BUDGET, runtime.shutdown())
+				.await
+				.is_err()
+			{
+				tracing::warn!("engine drain exceeded the signal budget");
+			}
+		} else {
+			runtime.shutdown().await;
+		}
 	}
 	serve_shutdown.cancel();
 
@@ -536,6 +568,7 @@ fn spawn_signal_handler() {
 			_ = sigint.recv() => tracing::info!("received SIGINT"),
 		}
 		SIGNAL_SHUTDOWN.store(true, Ordering::Release);
+		SIGNAL_TOKEN.cancel();
 		request_exit("-", "signal");
 	});
 }

@@ -104,6 +104,11 @@ impl CoreEnvoyHandle {
 		self.handle.started().await
 	}
 
+	/// Resolves once the envoy has no active actors (or has stopped).
+	pub async fn wait_actors_drained(&self) {
+		self.handle.wait_actors_drained().await
+	}
+
 	/// Engine-reported drain threshold in milliseconds. `None` until the
 	/// envoy has completed its first protocol-metadata exchange with the
 	/// engine.

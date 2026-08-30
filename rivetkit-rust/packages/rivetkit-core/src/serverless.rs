@@ -232,6 +232,15 @@ impl CoreServerlessRuntime {
 		}
 	}
 
+	/// Wait (bounded) for active actors to reach zero, so an in-flight actor's `Stopped`
+	/// reaches the engine before `shutdown` announces the envoy is going away. Otherwise
+	/// that announcement becomes a `GoingAway` that overrides the destroy and reallocates.
+	pub async fn wait_actors_drained(&self, timeout_dur: Duration) {
+		let handle = { self.envoy.lock().await.as_ref().cloned() };
+		let Some(handle) = handle else { return };
+		let _ = timeout(timeout_dur, CoreEnvoyHandle::new(handle).wait_actors_drained()).await;
+	}
+
 	pub async fn active_envoy_actor_count(&self) -> Option<usize> {
 		self.active_envoy_status()
 			.await
