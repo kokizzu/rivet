@@ -46,7 +46,10 @@ import {
 } from "@/client/client";
 import { convertRegistryConfigToClientConfig } from "@/client/config";
 import { HEADER_CONN_PARAMS } from "@/common/actor-router-consts";
-import type { AnyDatabaseProvider } from "@/common/database/config";
+import type {
+	AnyDatabaseProvider,
+	SqliteProfilingOptions,
+} from "@/common/database/config";
 import {
 	bindNativeStateTransactionContext,
 	db as defaultDb,
@@ -569,10 +572,11 @@ function getOrCreateNativeSqlDatabase(
 		execute: (sql, params) => runtime.actorSqlExecute(ctx, sql, params),
 		executeBatch: (statements) =>
 			runtime.actorSqlExecuteBatch(ctx, statements),
-		beginTransaction: async (timeoutMs) => {
+		beginTransaction: async (timeoutMs, name) => {
 			const transaction = await runtime.actorSqlBeginTransaction(
 				ctx,
 				timeoutMs,
+				name,
 			);
 			return {
 				exec: (sql) =>
@@ -3816,12 +3820,16 @@ function buildActorConfig(
 	const canHibernate = options.canHibernateWebSocket;
 	const usesRemoteSqlite =
 		sqliteBackendForConfig(registryConfig) === "remote";
+	const sqliteProfiling = (
+		config.db as { sqliteProfiling?: SqliteProfilingOptions } | undefined
+	)?.sqliteProfiling;
 
 	return {
 		name: options.name as string | undefined,
 		icon: options.icon as string | undefined,
 		hasDatabase: true,
 		remoteSqlite: usesRemoteSqlite,
+		sqliteProfiling,
 		enableActorRuntimeSocket: options.enableActorRuntimeSocket === true,
 		hasState:
 			config.state !== undefined ||

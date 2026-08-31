@@ -9,6 +9,8 @@ export type {
 	SqliteBindings,
 	SqliteDatabase,
 	SqliteNativeMetrics,
+	SqliteProfilingOptions,
 	SqliteQueryResult,
+	SqliteTransactionOptions,
 } from "@/common/database/config";
 export { db } from "@/common/database/mod";

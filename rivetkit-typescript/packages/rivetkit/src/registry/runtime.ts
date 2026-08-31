@@ -1,4 +1,7 @@
-import type { SqliteNativeMetrics } from "@/common/database/config";
+import type {
+	SqliteNativeMetrics,
+	SqliteProfilingOptions,
+} from "@/common/database/config";
 import { stringifyError } from "@/common/utils";
 import type { RegistryConfig } from "./config";
 import { logger } from "./log";
@@ -256,6 +259,7 @@ export interface RuntimeSqlDatabase {
 	): Promise<RuntimeSqlRunResult>;
 	beginTransaction(
 		timeoutMs?: number,
+		name?: string,
 	): Promise<RuntimeSqlTransactionDatabase>;
 	metrics?(): SqliteNativeMetrics | null;
 	takeLastKvError?(): string | null;
@@ -277,6 +281,7 @@ export interface RuntimeActorConfig {
 	icon?: string;
 	hasDatabase?: boolean;
 	remoteSqlite?: boolean;
+	sqliteProfiling?: SqliteProfilingOptions;
 	enableActorRuntimeSocket?: boolean;
 	hasState?: boolean;
 	canHibernateWebsocket?: boolean;
@@ -606,6 +611,7 @@ export interface CoreRuntime {
 	actorSqlBeginTransaction(
 		ctx: ActorContextHandle,
 		timeoutMs?: number,
+		name?: string,
 	): Promise<SqliteTransactionHandle>;
 	actorSqlTransactionExec(
 		transaction: SqliteTransactionHandle,

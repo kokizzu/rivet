@@ -17,6 +17,7 @@ class FakeSqliteDatabase implements SqliteDatabase {
 	executeCalls: { sql: string; params?: SqliteBindings }[] = [];
 	stateTransactionTimeouts: Array<number | undefined> = [];
 	transactionTimeouts: Array<number | undefined> = [];
+	transactionNames: Array<string | undefined> = [];
 
 	async exec(): Promise<void> {}
 
@@ -30,8 +31,10 @@ class FakeSqliteDatabase implements SqliteDatabase {
 
 	async beginTransaction(
 		timeoutMs?: number,
+		name?: string,
 	): Promise<SqliteTransactionDatabase> {
 		this.transactionTimeouts.push(timeoutMs);
+		this.transactionNames.push(name);
 		this.record("BEGIN");
 		return {
 			exec: async () => {},
@@ -151,6 +154,23 @@ describe("db", () => {
 			"COMMIT",
 		]);
 		expect(nativeDb.transactionTimeouts).toEqual([300_000]);
+		expect(nativeDb.transactionNames).toEqual(["rivetkit-migration"]);
+	});
+
+	test("exposes profiling controls to the actor runtime", () => {
+		const provider = db({
+			profiling: {
+				enabled: false,
+				maxTrackedStatementFingerprints: 12,
+				baselineSampleRate: 0.25,
+			},
+		});
+
+		expect(provider.sqliteProfiling).toEqual({
+			enabled: false,
+			maxTrackedStatementFingerprints: 12,
+			baselineSampleRate: 0.25,
+		});
 	});
 
 	test("rolls back migrations when onMigrate fails", async () => {
@@ -186,15 +206,35 @@ describe("db", () => {
 				);
 				return 42;
 			},
-			{ timeout: 120_000 },
+			{ name: "insert-item", timeout: 120_000 },
 		);
 		expect(value).toBe(42);
 		expect(nativeDb.transactionTimeouts).toEqual([120_000]);
+		expect(nativeDb.transactionNames).toEqual(["insert-item"]);
 		expect(nativeDb.executeCalls.map(({ sql }) => sql)).toEqual([
 			"BEGIN",
 			"INSERT INTO items(value) VALUES (?)",
 			"COMMIT",
 		]);
+	});
+
+	test("validates transaction names", async () => {
+		const client = await db().createClient(
+			testProviderContext(new FakeSqliteDatabase()),
+		);
+		await expect(
+			client.transaction(async () => {}, { name: "" }),
+		).rejects.toThrow("must not be empty");
+	});
+
+	test("defers the configured transaction name byte limit to the runtime", async () => {
+		const nativeDb = new FakeSqliteDatabase();
+		const client = await db().createClient(testProviderContext(nativeDb));
+		const name = "x".repeat(129);
+
+		await client.transaction(async () => {}, { name });
+
+		expect(nativeDb.transactionNames).toEqual([name]);
 	});
 
 	test("rolls back a transaction when the callback throws", async () => {

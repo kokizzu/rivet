@@ -4,21 +4,31 @@ import type {
 	NativeDatabaseProvider,
 	RawAccess,
 	SqliteDatabase,
+	SqliteProfilingOptions,
 	SqliteTransactionDatabase,
+	SqliteTransactionOptions,
 } from "./config";
 import {
 	isManualTransactionControl,
 	isSqliteBindingObject,
 	MIGRATION_TRANSACTION_TIMEOUT_MS,
 	toSqliteBindings,
+	validateTransactionName,
 	validateTransactionTimeout,
 } from "./shared";
 
 export type { RawAccess } from "./config";
 
-interface DatabaseFactoryConfig {
+export interface DatabaseFactoryConfig {
 	onMigrate?: (db: RawAccess) => Promise<void> | void;
 	warnOnManualTransactions?: boolean;
+	/**
+	 * SQLite profiling configuration.
+	 *
+	 * @experimental This entire configuration surface is experimental and
+	 * subject to change without notice.
+	 */
+	profiling?: SqliteProfilingOptions;
 }
 const nativeStateTransactionOpeners = new WeakMap<
 	NativeDatabaseProvider,
@@ -73,8 +83,10 @@ function hasMultipleStatements(query: string): boolean {
 export function db({
 	onMigrate,
 	warnOnManualTransactions = true,
+	profiling,
 }: DatabaseFactoryConfig = {}): DatabaseProvider<RawAccess> {
 	const provider: DatabaseProvider<RawAccess> = {
+		sqliteProfiling: profiling,
 		createClient: async (ctx) => {
 			const nativeDatabaseProvider = ctx.nativeDatabaseProvider;
 			if (!nativeDatabaseProvider) {
@@ -178,12 +190,10 @@ export function db({
 					},
 					transaction: async <T>(
 						callback: (tx: RawAccess) => Promise<T> | T,
-						options?: {
-							timeout?: number;
-							experimental?: { includeState?: boolean };
-						},
+						options?: SqliteTransactionOptions,
 					): Promise<T> => {
 						validateTransactionTimeout(options?.timeout);
+						validateTransactionName(options?.name);
 						if (
 							transactionScoped &&
 							options?.experimental?.includeState
@@ -216,7 +226,10 @@ export function db({
 											stateScope,
 										);
 									})()
-								: await db.beginTransaction(options?.timeout);
+								: await db.beginTransaction(
+										options?.timeout,
+										options?.name,
+									);
 							const tx = createClient(transaction, true);
 							try {
 								const result = await callback(tx);
@@ -317,6 +330,9 @@ async function withMigrationSavepoint<T>(
 				throw error;
 			}
 		},
-		{ timeout: MIGRATION_TRANSACTION_TIMEOUT_MS },
+		{
+			name: "rivetkit-migration",
+			timeout: MIGRATION_TRANSACTION_TIMEOUT_MS,
+		},
 	);
 }

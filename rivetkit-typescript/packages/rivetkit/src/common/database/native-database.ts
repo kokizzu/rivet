@@ -85,7 +85,10 @@ export interface JsNativeDatabaseLike {
 		timeoutMs?: number,
 		context?: unknown,
 	): Promise<JsNativeTransactionLike>;
-	beginTransaction(timeoutMs?: number): Promise<JsNativeTransactionLike>;
+	beginTransaction(
+		timeoutMs?: number,
+		name?: string,
+	): Promise<JsNativeTransactionLike>;
 	query(
 		sql: string,
 		params?: NativeBindParam[] | null,
@@ -429,11 +432,12 @@ export function wrapJsNativeDatabase(
 		},
 		async beginTransaction(
 			timeoutMs?: number,
+			name?: string,
 		): Promise<SqliteTransactionDatabase> {
 			const release = gate.enter();
 			let transaction: JsNativeTransactionLike;
 			try {
-				transaction = await database.beginTransaction(timeoutMs);
+				transaction = await database.beginTransaction(timeoutMs, name);
 			} catch (error) {
 				enrichNativeDatabaseError(database, error);
 			} finally {

@@ -28,6 +28,43 @@ export interface SqliteBatchStatement {
 	params?: SqliteBindings;
 }
 
+export interface SqliteTransactionOptions {
+	/** Static operation name used to aggregate transaction performance. */
+	name?: string;
+	/** Deadlock-safety timeout in milliseconds. */
+	timeout?: number;
+	/** @experimental */
+	experimental?: {
+		/**
+		 * Atomically includes actor and hibernatable connection state.
+		 * Only single-statement `execute` calls are supported in the transaction.
+		 * Concurrent actions that try to mutate state while the transaction is
+		 * active fail with `actor.state_transaction_conflict`.
+		 */
+		includeState?: boolean;
+	};
+}
+
+/**
+ * SQLite profiling configuration.
+ *
+ * @experimental This entire configuration surface is experimental and subject
+ * to change without notice.
+ */
+export interface SqliteProfilingOptions {
+	enabled?: boolean;
+	maxTrackedStatementFingerprints?: number;
+	maxTrackedTransactionFingerprints?: number;
+	maxPrometheusSeries?: number;
+	maxStatementsPerTransactionTrace?: number;
+	maxGetPagesRequestsPerTrace?: number;
+	maxTransactionNameBytes?: number;
+	slowOperationThresholdMs?: number;
+	baselineSampleRate?: number;
+	maxDiagnosticEventsPerMinute?: number;
+	diagnosticEventQueueCapacity?: number;
+}
+
 export interface SqliteNativeMetrics {
 	requestBuildNs: number;
 	serializeNs: number;
@@ -51,7 +88,10 @@ export interface SqliteDatabase {
 	executeBatch(
 		statements: SqliteBatchStatement[],
 	): Promise<SqliteExecuteResult[]>;
-	beginTransaction(timeoutMs?: number): Promise<SqliteTransactionDatabase>;
+	beginTransaction(
+		timeoutMs?: number,
+		name?: string,
+	): Promise<SqliteTransactionDatabase>;
 	run(sql: string, params?: SqliteBindings): Promise<void>;
 	query(sql: string, params?: SqliteBindings): Promise<SqliteQueryResult>;
 	nativeMetrics?():
@@ -122,6 +162,13 @@ export interface DatabaseProviderContext {
 
 export type DatabaseProvider<DB extends RawAccess> = {
 	/**
+	 * Local SQLite profiling controls consumed by the actor runtime.
+	 *
+	 * @experimental This entire configuration surface is experimental and
+	 * subject to change without notice.
+	 */
+	sqliteProfiling?: SqliteProfilingOptions;
+	/**
 	 * Creates a new database client for the actor.
 	 * The result is passed to the actor context as `c.db`.
 	 * @experimental
@@ -165,19 +212,7 @@ export type RawAccess = {
 	/** Runs a callback in an isolated SQLite transaction. */
 	transaction: <T>(
 		callback: (tx: RawAccess) => Promise<T> | T,
-		options?: {
-			timeout?: number;
-			/** @experimental */
-			experimental?: {
-				/**
-				 * Atomically includes actor and hibernatable connection state.
-				 * Only single-statement `execute` calls are supported in the transaction.
-				 * Concurrent actions that try to mutate state while the transaction is
-				 * active fail with `actor.state_transaction_conflict`.
-				 */
-				includeState?: boolean;
-			};
-		},
+		options?: SqliteTransactionOptions,
 	) => Promise<T>;
 	/**
 	 * Returns native SQLite metrics when the active runtime supports them.
