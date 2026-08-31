@@ -1,11 +1,3 @@
-import type {
-	ActorContext as WasmActorContext,
-	ActorFactory as WasmActorFactory,
-	CancellationToken as WasmCancellationToken,
-	ConnHandle as WasmConnHandle,
-	CoreRegistry as WasmCoreRegistry,
-	WebSocketHandle as WasmWebSocketHandle,
-} from "@rivetkit/rivetkit-wasm";
 import { decodeBridgeRivetError, RivetError } from "@/actor/errors";
 import type {
 	WasmRuntimeBindings,
@@ -63,6 +55,35 @@ type WasmBindings = WasmRuntimeBindings;
 export type WasmInitInput = WasmRuntimeInitInput;
 type AnyFunction = (...args: unknown[]) => unknown;
 type WasmRuntimeLoadConfig = Pick<WasmRuntimeConfig, "bindings" | "initInput">;
+type WasmActorContext = object;
+type WasmActorFactory = object;
+type WasmConnHandle = object;
+type WasmWebSocketHandle = object;
+
+interface WasmCancellationToken {
+	aborted(): boolean;
+	cancel(): void;
+	onCancelled(callback: (...args: unknown[]) => unknown): void;
+}
+
+interface WasmCoreRegistry {
+	register(name: string, factory: WasmActorFactory): void;
+	serve(config: RuntimeServeConfig): Promise<void>;
+	shutdown(): Promise<void>;
+}
+
+interface WasmConstructors {
+	CoreRegistry: new () => WasmCoreRegistry;
+	ActorFactory: new (
+		callbacks: object,
+		config: RuntimeActorConfig | undefined | null,
+	) => WasmActorFactory;
+	CancellationToken: new () => WasmCancellationToken;
+}
+
+function asWasmConstructors(bindings: WasmBindings): WasmConstructors {
+	return bindings as unknown as WasmConstructors;
+}
 
 function asWasmRegistry(handle: RegistryHandle): WasmCoreRegistry {
 	return handle as unknown as WasmCoreRegistry;
@@ -236,11 +257,11 @@ function childHandle<T>(handle: unknown, name: string): T {
 export class WasmCoreRuntime implements CoreRuntime {
 	readonly kind = "wasm";
 
-	#bindings: WasmBindings;
+	#constructors: WasmConstructors;
 	#sql = new WeakMap<WasmActorContext, RuntimeSqlDatabase>();
 
 	constructor(bindings: WasmBindings) {
-		this.#bindings = bindings;
+		this.#constructors = asWasmConstructors(bindings);
 	}
 
 	#actorSql(ctx: ActorContextHandle): RuntimeSqlDatabase {
@@ -255,7 +276,7 @@ export class WasmCoreRuntime implements CoreRuntime {
 
 	createRegistry(): RegistryHandle {
 		return callWasmSync(() =>
-			asRegistryHandle(new this.#bindings.CoreRegistry()),
+			asRegistryHandle(new this.#constructors.CoreRegistry()),
 		);
 	}
 
@@ -343,7 +364,7 @@ export class WasmCoreRuntime implements CoreRuntime {
 	): ActorFactoryHandle {
 		return callWasmSync(() =>
 			asActorFactoryHandle(
-				new this.#bindings.ActorFactory(callbacks, config),
+				new this.#constructors.ActorFactory(callbacks, config),
 			),
 		);
 	}
@@ -351,7 +372,7 @@ export class WasmCoreRuntime implements CoreRuntime {
 	createCancellationToken(): CancellationTokenHandle {
 		return callWasmSync(
 			() =>
-				new this.#bindings.CancellationToken() as unknown as CancellationTokenHandle,
+				new this.#constructors.CancellationToken() as unknown as CancellationTokenHandle,
 		);
 	}
 
