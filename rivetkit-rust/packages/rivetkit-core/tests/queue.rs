@@ -9,8 +9,8 @@ mod moved_tests {
 		QUEUE_METADATA_KEY, decode_queue_message_key, make_queue_message_key,
 	};
 	use crate::kv::Kv;
-	use std::sync::atomic::{AtomicBool, Ordering};
 	use std::sync::Arc;
+	use std::sync::atomic::{AtomicBool, Ordering};
 	use std::time::Duration;
 	use tokio::task::yield_now;
 	use tokio_util::sync::CancellationToken;
@@ -221,12 +221,10 @@ mod moved_tests {
 				}
 				let queue = queue.clone();
 				let runtime = runtime.clone();
-				std::thread::spawn(move || {
-					runtime.block_on(queue.send("target", b"ready"))
-				})
-				.join()
-				.expect("enqueue thread joins")
-				.expect("enqueue target before waiter parks");
+				std::thread::spawn(move || runtime.block_on(queue.send("target", b"ready")))
+					.join()
+					.expect("enqueue thread joins")
+					.expect("enqueue target before waiter parks");
 			}
 		})));
 

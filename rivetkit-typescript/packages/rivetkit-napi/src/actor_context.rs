@@ -36,8 +36,7 @@ use crate::{NapiInvalidArgument, NapiInvalidState, napi_anyhow_error};
 type AbortSignalTsfn = ThreadsafeFunction<(), ErrorStrategy::CalleeHandled>;
 type DisconnectPredicateTsfn =
 	ThreadsafeFunction<DisconnectPredicatePayload, ErrorStrategy::CalleeHandled>;
-type RunRestartHook =
-	Arc<dyn Fn(Option<(i64, u64)>) -> anyhow::Result<()> + Send + Sync + 'static>;
+type RunRestartHook = Arc<dyn Fn(Option<(i64, u64)>) -> anyhow::Result<()> + Send + Sync + 'static>;
 pub(crate) type RegisteredTask = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
 static ACTOR_CONTEXT_SHARED: LazyLock<SccHashMap<String, Weak<ActorContextShared>>> =

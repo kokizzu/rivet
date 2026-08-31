@@ -256,7 +256,10 @@ fn print_config(config: &PoolConfig, with_env_vars: bool) {
 				println!("  {:<10} {key}={value}", "");
 			}
 		} else {
-			println!("  {:<10} {env_count} (use --with-env-vars to show)", "env vars");
+			println!(
+				"  {:<10} {env_count} (use --with-env-vars to show)",
+				"env vars"
+			);
 		}
 	}
 }

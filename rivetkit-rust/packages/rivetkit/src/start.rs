@@ -926,7 +926,10 @@ mod tests {
 			_p: PhantomData,
 		};
 
-		assert!(matches!(events.try_recv(), Some(RuntimeEvent::ConnClosed(_))));
+		assert!(matches!(
+			events.try_recv(),
+			Some(RuntimeEvent::ConnClosed(_))
+		));
 		assert!(wake_rx.blocking_recv().expect("run wake reply").is_ok());
 	}
 
@@ -955,7 +958,10 @@ mod tests {
 			_p: PhantomData,
 		};
 
-		assert!(matches!(events.recv().await, Some(RuntimeEvent::ConnClosed(_))));
+		assert!(matches!(
+			events.recv().await,
+			Some(RuntimeEvent::ConnClosed(_))
+		));
 		assert!(wake_rx.await.expect("run wake reply").is_ok());
 	}
 

@@ -771,7 +771,11 @@ async fn get_or_create_falls_back_to_config_pool_name() {
 			.disable_metadata_lookup(true),
 	);
 	let actor = client
-		.get_or_create("counter", vec!["k".to_owned()], GetOrCreateOptions::default())
+		.get_or_create(
+			"counter",
+			vec!["k".to_owned()],
+			GetOrCreateOptions::default(),
+		)
 		.unwrap();
 	// Resolving the handle to an actor ID triggers the PUT /actors request
 	// that carries runner_name_selector.

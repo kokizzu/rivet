@@ -17,8 +17,7 @@ use tokio::sync::Mutex as TokioMutex;
 use crate::child::{ChildProcess, SpawnSpec, log_prefix};
 use crate::input::ActorInput;
 use crate::{
-	children, effective_stop_grace, release_child_port, reserve_child_port,
-	runner_config,
+	children, effective_stop_grace, release_child_port, reserve_child_port, runner_config,
 };
 
 /// Live actor contexts on this instance, keyed by actor id. Lets the process

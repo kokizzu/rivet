@@ -523,7 +523,11 @@ impl RemoteManager {
 			push_query_param(&mut params, "rvt-input", &URL_SAFE_NO_PAD.encode(encoded));
 		}
 		if method == "getOrCreate" {
-			push_query_param(&mut params, "rvt-runner", pool_name.unwrap_or(&self.pool_name));
+			push_query_param(
+				&mut params,
+				"rvt-runner",
+				pool_name.unwrap_or(&self.pool_name),
+			);
 			push_query_param(&mut params, "rvt-crash-policy", "sleep");
 		}
 		if let Some(region) = region {

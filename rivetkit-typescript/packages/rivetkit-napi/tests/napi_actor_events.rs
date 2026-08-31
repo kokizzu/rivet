@@ -346,7 +346,7 @@ mod moved_tests {
 		let (_registered_task_tx, mut registered_task_rx) = unbounded_channel();
 		let (tx, rx) = oneshot::channel();
 
-			dispatch_event(
+		dispatch_event(
 			ActorEvent::RunWake {
 				wake_at: 123,
 				wake_revision: 1,

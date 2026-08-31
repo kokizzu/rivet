@@ -515,7 +515,12 @@ mod moved_tests {
 			.await
 			.expect("roll back state transaction");
 
-		assert!(!stale_save.await.expect("stale save task").expect("stale save"));
+		assert!(
+			!stale_save
+				.await
+				.expect("stale save task")
+				.expect("stale save")
+		);
 		assert_eq!(ctx.state(), vec![1]);
 	}
 

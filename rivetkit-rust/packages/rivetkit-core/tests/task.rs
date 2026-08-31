@@ -261,13 +261,11 @@ pub(crate) mod moved_tests {
 					} = event
 					{
 						let index = serialize_count.fetch_add(1, Ordering::SeqCst);
-						reply.send(Ok(vec![StateDelta::ActorState(
-							if index == 0 {
-								b"stale-transaction-state".to_vec()
-							} else {
-								b"lifecycle-state".to_vec()
-							},
-						)]));
+						reply.send(Ok(vec![StateDelta::ActorState(if index == 0 {
+							b"stale-transaction-state".to_vec()
+						} else {
+							b"lifecycle-state".to_vec()
+						})]));
 						if index == 0 {
 							first_serialized.notify_one();
 						}
