@@ -59,7 +59,6 @@ struct OnceEventTestState {
 
 #[derive(Clone)]
 struct ConfigHeaderTestState {
-	saw_actor_lookup: Arc<AtomicBool>,
 	saw_action: Arc<AtomicBool>,
 	saw_connection_websocket: Arc<AtomicBool>,
 	saw_raw_websocket: Arc<AtomicBool>,
@@ -74,12 +73,6 @@ struct MetadataLookupState {
 #[derive(Clone)]
 struct DisableMetadataState {
 	saw_metadata: Arc<AtomicBool>,
-}
-
-#[derive(Deserialize)]
-struct ActorRequest {
-	name: String,
-	key: String,
 }
 
 #[derive(Serialize)]
@@ -143,7 +136,6 @@ async fn default_bare_action_round_trips_against_test_actor() {
 		saw_raw_websocket: Arc::new(AtomicBool::new(false)),
 	};
 	let app = Router::new()
-		.route("/actors", put(get_or_create_actor))
 		.route("/gateway/{actor_id}/action/{action}", post(action))
 		.with_state(state.clone());
 
@@ -179,7 +171,6 @@ async fn default_bare_queue_send_round_trips_against_test_actor() {
 		saw_raw_websocket: Arc::new(AtomicBool::new(false)),
 	};
 	let app = Router::new()
-		.route("/actors", put(get_or_create_actor))
 		.route("/gateway/{actor_id}/queue/{queue}", post(queue_send))
 		.with_state(state.clone());
 
@@ -229,7 +220,6 @@ async fn raw_fetch_posts_to_actor_request_endpoint() {
 		saw_raw_websocket: Arc::new(AtomicBool::new(false)),
 	};
 	let app = Router::new()
-		.route("/actors", put(get_or_create_actor))
 		.route("/gateway/{actor_id}/request/{*path}", any(raw_fetch))
 		.with_state(state.clone());
 
@@ -276,7 +266,6 @@ async fn raw_web_socket_round_trips_against_test_actor() {
 		saw_raw_websocket: Arc::new(AtomicBool::new(false)),
 	};
 	let app = Router::new()
-		.route("/actors", put(get_or_create_actor))
 		.route("/gateway/{actor_id}/websocket/{*path}", any(raw_websocket))
 		.with_state(state.clone());
 
@@ -319,7 +308,6 @@ async fn raw_web_socket_round_trips_against_test_actor() {
 async fn connection_lifecycle_callbacks_fire_and_status_watch_updates() {
 	let release_init = Arc::new(Notify::new());
 	let app = Router::new()
-		.route("/actors", put(get_or_create_actor))
 		.route("/gateway/{actor_id}/connect", any(connection_websocket))
 		.with_state(ConnectionTestState {
 			release_init: release_init.clone(),
@@ -404,7 +392,6 @@ async fn once_event_callback_fires_once_and_unsubscribes() {
 	let release_init = Arc::new(Notify::new());
 	let unsubscribe_seen = Arc::new(Notify::new());
 	let app = Router::new()
-		.route("/actors", put(get_or_create_actor))
 		.route(
 			"/gateway/{actor_id}/connect",
 			any(connection_once_event_websocket),
@@ -459,13 +446,11 @@ async fn once_event_callback_fires_once_and_unsubscribes() {
 #[tokio::test]
 async fn config_headers_are_sent_on_http_and_websocket_paths() {
 	let state = ConfigHeaderTestState {
-		saw_actor_lookup: Arc::new(AtomicBool::new(false)),
 		saw_action: Arc::new(AtomicBool::new(false)),
 		saw_connection_websocket: Arc::new(AtomicBool::new(false)),
 		saw_raw_websocket: Arc::new(AtomicBool::new(false)),
 	};
 	let app = Router::new()
-		.route("/actors", put(get_or_create_actor_with_config_header))
 		.route(
 			"/gateway/{actor_id}/action/{action}",
 			post(action_with_config_header),
@@ -513,7 +498,6 @@ async fn config_headers_are_sent_on_http_and_websocket_paths() {
 		.unwrap();
 	raw_ws.close(None).await.unwrap();
 
-	assert!(state.saw_actor_lookup.load(Ordering::SeqCst));
 	assert!(state.saw_action.load(Ordering::SeqCst));
 	assert!(state.saw_connection_websocket.load(Ordering::SeqCst));
 	assert!(state.saw_raw_websocket.load(Ordering::SeqCst));
@@ -884,7 +868,6 @@ async fn metadata_lookup_overrides_endpoint_before_requests() {
 		saw_raw_websocket: Arc::new(AtomicBool::new(false)),
 	};
 	let target_app = Router::new()
-		.route("/actors", put(get_or_create_actor))
 		.route("/gateway/{actor_id}/action/{action}", post(action))
 		.with_state(target_state.clone());
 	let target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -930,7 +913,6 @@ async fn disable_metadata_lookup_skips_pre_call_metadata_fetch() {
 	let saw_metadata = Arc::new(AtomicBool::new(false));
 	let app = Router::new()
 		.route("/metadata", get(disabled_metadata_response))
-		.route("/actors", put(get_or_create_actor))
 		.route(
 			"/gateway/{actor_id}/action/{action}",
 			post(action_for_disable_metadata),
@@ -959,34 +941,6 @@ async fn disable_metadata_lookup_skips_pre_call_metadata_fetch() {
 	assert!(!saw_metadata.load(Ordering::SeqCst));
 
 	server.abort();
-}
-
-async fn get_or_create_actor(Json(request): Json<ActorRequest>) -> impl IntoResponse {
-	Json(ActorResponse {
-		actor: Actor {
-			actor_id: "actor-1",
-			name: request.name,
-			key: request.key,
-		},
-		created: true,
-	})
-}
-
-async fn get_or_create_actor_with_config_header(
-	State(state): State<ConfigHeaderTestState>,
-	headers: HeaderMap,
-	Json(request): Json<ActorRequest>,
-) -> impl IntoResponse {
-	assert_config_header(&headers);
-	state.saw_actor_lookup.store(true, Ordering::SeqCst);
-	Json(ActorResponse {
-		actor: Actor {
-			actor_id: "actor-1",
-			name: request.name,
-			key: request.key,
-		},
-		created: true,
-	})
 }
 
 async fn metadata_response(
@@ -1025,31 +979,31 @@ async fn raw_fetch(
 	uri: Uri,
 	body: Bytes,
 ) -> impl IntoResponse {
-	assert_eq!(actor_id, "actor-1");
+	assert_eq!(actor_id, "counter");
 	assert_eq!(path, "api/echo");
 	assert_eq!(method, AxumMethod::POST);
+	assert_eq!(uri.path(), "/gateway/counter/request/api/echo");
+	let params = query_map(uri.query().unwrap_or_default());
+	assert_eq!(params.get("source").map(String::as_str), Some("rust"));
 	assert_eq!(
-		uri.path_and_query().map(|value| value.as_str()),
-		Some("/gateway/actor-1/request/api/echo?source=rust")
+		params.get("rvt-namespace").map(String::as_str),
+		Some("default")
 	);
+	assert_eq!(
+		params.get("rvt-method").map(String::as_str),
+		Some("getOrCreate")
+	);
+	assert_eq!(params.get("rvt-key").map(String::as_str), Some("raw-fetch"));
 	assert_eq!(
 		headers
 			.get("x-test-header")
 			.and_then(|value| value.to_str().ok()),
 		Some("raw")
 	);
-	assert_eq!(
-		headers
-			.get("x-rivet-target")
-			.and_then(|value| value.to_str().ok()),
-		Some("actor")
-	);
-	assert_eq!(
-		headers
-			.get("x-rivet-actor")
-			.and_then(|value| value.to_str().ok()),
-		Some("actor-1")
-	);
+	// Query-based routing resolves the actor from the URL, so no actor
+	// target/id headers are sent.
+	assert!(headers.get("x-rivet-target").is_none());
+	assert!(headers.get("x-rivet-actor").is_none());
 	state.saw_raw_fetch.store(true, Ordering::SeqCst);
 
 	(
@@ -1066,11 +1020,18 @@ async fn raw_websocket(
 	uri: Uri,
 	ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
-	assert_eq!(actor_id, "actor-1");
+	assert_eq!(actor_id, "counter");
 	assert_eq!(path, "ws");
+	assert_eq!(uri.path(), "/gateway/counter/websocket/ws");
+	let params = query_map(uri.query().unwrap_or_default());
+	assert_eq!(params.get("source").map(String::as_str), Some("rust"));
 	assert_eq!(
-		uri.path_and_query().map(|value| value.as_str()),
-		Some("/gateway/actor-1/websocket/ws?source=rust")
+		params.get("rvt-method").map(String::as_str),
+		Some("getOrCreate")
+	);
+	assert_eq!(
+		params.get("rvt-key").map(String::as_str),
+		Some("raw-websocket")
 	);
 	let protocols = headers
 		.get(header::SEC_WEBSOCKET_PROTOCOL)
@@ -1078,8 +1039,10 @@ async fn raw_websocket(
 		.unwrap_or_default()
 		.to_owned();
 	assert!(protocols.contains("rivet"));
-	assert!(protocols.contains("rivet_target.actor"));
-	assert!(protocols.contains("rivet_actor.actor-1"));
+	// Query-based routing resolves the actor from the URL, so no actor
+	// target/id protocols are sent.
+	assert!(!protocols.contains("rivet_target.actor"));
+	assert!(!protocols.contains("rivet_actor."));
 	assert!(protocols.contains("raw.test"));
 	assert!(!protocols.contains("rivet_encoding."));
 	state.saw_raw_websocket.store(true, Ordering::SeqCst);
@@ -1111,7 +1074,7 @@ async fn action(
 	headers: HeaderMap,
 	body: Bytes,
 ) -> impl IntoResponse {
-	assert_eq!(actor_id, "actor-1");
+	assert_eq!(actor_id, "counter");
 	assert_eq!(action, "increment");
 	assert_eq!(
 		headers
@@ -1189,7 +1152,7 @@ async fn queue_send(
 	headers: HeaderMap,
 	body: Bytes,
 ) -> impl IntoResponse {
-	assert_eq!(actor_id, "actor-1");
+	assert_eq!(actor_id, "counter");
 	assert_eq!(queue, "jobs");
 	assert_eq!(
 		headers
@@ -1238,7 +1201,7 @@ async fn connection_websocket(
 	Path(actor_id): Path<String>,
 	ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
-	assert_eq!(actor_id, "actor-1");
+	assert_eq!(actor_id, "counter");
 	ws.protocols(["rivet"])
 		.on_upgrade(move |socket| connection_lifecycle(socket, state))
 }
@@ -1248,7 +1211,7 @@ async fn connection_once_event_websocket(
 	Path(actor_id): Path<String>,
 	ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
-	assert_eq!(actor_id, "actor-1");
+	assert_eq!(actor_id, "counter");
 	ws.protocols(["rivet"])
 		.on_upgrade(move |socket| connection_once_event(socket, state))
 }
@@ -1259,7 +1222,7 @@ async fn connection_websocket_with_config_header(
 	headers: HeaderMap,
 	ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
-	assert_eq!(actor_id, "actor-1");
+	assert_eq!(actor_id, "counter");
 	assert_config_header(&headers);
 	state.saw_connection_websocket.store(true, Ordering::SeqCst);
 	ws.protocols(["rivet"])
@@ -1272,7 +1235,7 @@ async fn raw_websocket_with_config_header(
 	headers: HeaderMap,
 	ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
-	assert_eq!(actor_id, "actor-1");
+	assert_eq!(actor_id, "counter");
 	assert_eq!(path, "ws");
 	assert_config_header(&headers);
 	state.saw_raw_websocket.store(true, Ordering::SeqCst);
@@ -1411,6 +1374,22 @@ fn endpoint(addr: SocketAddr) -> String {
 
 fn query_params(url: &Url) -> HashMap<String, String> {
 	url.query_pairs().into_owned().collect()
+}
+
+fn query_map(query: &str) -> HashMap<String, String> {
+	query
+		.split('&')
+		.filter(|pair| !pair.is_empty())
+		.filter_map(|pair| {
+			let mut parts = pair.splitn(2, '=');
+			let key = parts.next()?;
+			let value = parts.next().unwrap_or("");
+			Some((
+				urlencoding::decode(key).ok()?.into_owned(),
+				urlencoding::decode(value).ok()?.into_owned(),
+			))
+		})
+		.collect()
 }
 
 fn test_client(addr: SocketAddr) -> Client {

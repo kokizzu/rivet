@@ -16,19 +16,16 @@ use super::{
 };
 
 pub(crate) async fn connect(args: DriverConnectArgs) -> Result<DriverConnection> {
-	// Resolve actor ID
-	let actor_id = args.remote_manager.resolve_actor_id(&args.query).await?;
+	// Resolve gateway target (query targets are resolved by the gateway).
+	let target = args.remote_manager.gateway_target(&args.query).await?;
 
-	debug!(
-		"Opening WebSocket connection to actor via gateway: {}",
-		actor_id
-	);
+	debug!(?target, "opening WebSocket connection to actor via gateway");
 
 	// Open WebSocket via remote manager (gateway)
 	let ws = args
 		.remote_manager
 		.open_websocket(
-			&actor_id,
+			&target,
 			args.encoding_kind,
 			args.parameters,
 			args.conn_id,

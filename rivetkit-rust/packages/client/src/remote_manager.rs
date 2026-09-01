@@ -111,6 +111,13 @@ struct ActorsCreateResponse {
 	actor: Actor,
 }
 
+/// How a data-plane request should address its actor at the gateway.
+#[derive(Debug, Clone)]
+pub enum GatewayTarget {
+	Direct { actor_id: String },
+	Query { query: ActorQuery },
+}
+
 impl RemoteManager {
 	pub fn new(endpoint: &str, token: Option<String>) -> Self {
 		Self {
@@ -437,24 +444,54 @@ impl RemoteManager {
 		}
 	}
 
+	/// Resolve a query into a gateway target for a data-plane request. Key-based
+	/// queries route to the gateway for resolution; `getForId` and `create`
+	/// resolve to a direct actor id.
+	pub async fn gateway_target(&self, query: &ActorQuery) -> Result<GatewayTarget> {
+		match query {
+			ActorQuery::GetForId { get_for_id } => Ok(GatewayTarget::Direct {
+				actor_id: get_for_id.actor_id.clone(),
+			}),
+			ActorQuery::GetForKey { .. } | ActorQuery::GetOrCreateForKey { .. } => {
+				Ok(GatewayTarget::Query {
+					query: query.clone(),
+				})
+			}
+			ActorQuery::Create { create } => {
+				let actor_id = self
+					.create_actor(
+						&create.name,
+						&create.key,
+						create.input.clone(),
+						create.pool_name.clone(),
+					)
+					.await?;
+				Ok(GatewayTarget::Direct { actor_id })
+			}
+		}
+	}
+
 	pub async fn send_request(
 		&self,
-		actor_id: &str,
+		target: &GatewayTarget,
 		path: &str,
 		method: Method,
 		headers: HeaderMap,
 		body: Option<Bytes>,
 	) -> Result<reqwest::Response> {
 		let config = self.resolved_config().await?;
-		let url = self.build_actor_gateway_url_with(&config, actor_id, path);
+		let url = self.build_gateway_url(&config, target, path)?;
 
-		let mut req = self.apply_common_headers_with(
-			self.client
-				.request(method, &url)
+		let mut builder = self.client.request(method, &url);
+		// Query targets are resolved by the gateway from the URL, so no actor
+		// headers are sent.
+		if let GatewayTarget::Direct { actor_id } = target {
+			builder = builder
 				.header(HEADER_RIVET_TARGET, "actor")
-				.header(HEADER_RIVET_ACTOR, actor_id),
-			&config,
-		)?;
+				.header(HEADER_RIVET_ACTOR, actor_id.as_str());
+		}
+
+		let mut req = self.apply_common_headers_with(builder, &config)?;
 
 		req = req.headers(headers);
 
@@ -467,36 +504,67 @@ impl RemoteManager {
 	}
 
 	pub fn gateway_url(&self, query: &ActorQuery) -> Result<String> {
+		let config = self.base_config();
 		match query {
 			ActorQuery::GetForId { get_for_id } => {
-				Ok(self.build_actor_gateway_url(&get_for_id.actor_id, ""))
+				Ok(self.build_actor_gateway_url_with(&config, &get_for_id.actor_id, ""))
 			}
-			ActorQuery::GetForKey { get_for_key } => self.build_actor_query_gateway_url(
-				&get_for_key.name,
-				"get",
-				Some(&get_for_key.key),
-				None,
-				None,
-				None,
-			),
-			ActorQuery::GetOrCreateForKey {
-				get_or_create_for_key,
-			} => self.build_actor_query_gateway_url(
-				&get_or_create_for_key.name,
-				"getOrCreate",
-				Some(&get_or_create_for_key.key),
-				get_or_create_for_key.input.as_ref(),
-				get_or_create_for_key.region.as_deref(),
-				get_or_create_for_key.pool_name.as_deref(),
-			),
+			ActorQuery::GetForKey { .. } | ActorQuery::GetOrCreateForKey { .. } => {
+				self.build_query_gateway_url(&config, query, "")
+			}
 			ActorQuery::Create { .. } => {
 				Err(anyhow!("gateway URL does not support create actor queries"))
 			}
 		}
 	}
 
-	pub fn build_actor_gateway_url(&self, actor_id: &str, path: &str) -> String {
-		self.build_actor_gateway_url_with(&self.base_config(), actor_id, path)
+	fn build_gateway_url(
+		&self,
+		config: &ResolvedClientConfig,
+		target: &GatewayTarget,
+		path: &str,
+	) -> Result<String> {
+		match target {
+			GatewayTarget::Direct { actor_id } => {
+				Ok(self.build_actor_gateway_url_with(config, actor_id, path))
+			}
+			GatewayTarget::Query { query } => self.build_query_gateway_url(config, query, path),
+		}
+	}
+
+	fn build_query_gateway_url(
+		&self,
+		config: &ResolvedClientConfig,
+		query: &ActorQuery,
+		path: &str,
+	) -> Result<String> {
+		match query {
+			ActorQuery::GetForKey { get_for_key } => self.build_actor_query_gateway_url(
+				config,
+				&get_for_key.name,
+				"get",
+				Some(&get_for_key.key),
+				None,
+				None,
+				None,
+				path,
+			),
+			ActorQuery::GetOrCreateForKey {
+				get_or_create_for_key,
+			} => self.build_actor_query_gateway_url(
+				config,
+				&get_or_create_for_key.name,
+				"getOrCreate",
+				Some(&get_or_create_for_key.key),
+				get_or_create_for_key.input.as_ref(),
+				get_or_create_for_key.region.as_deref(),
+				get_or_create_for_key.pool_name.as_deref(),
+				path,
+			),
+			ActorQuery::GetForId { .. } | ActorQuery::Create { .. } => Err(anyhow!(
+				"query gateway URL only supports get and getOrCreate queries"
+			)),
+		}
 	}
 
 	fn build_actor_gateway_url_with(
@@ -524,18 +592,20 @@ impl RemoteManager {
 
 	fn build_actor_query_gateway_url(
 		&self,
+		config: &ResolvedClientConfig,
 		name: &str,
 		method: &str,
 		key: Option<&ActorKey>,
 		input: Option<&serde_json::Value>,
 		region: Option<&str>,
 		pool_name: Option<&str>,
+		path: &str,
 	) -> Result<String> {
-		if self.namespace.is_empty() {
+		if config.namespace.is_empty() {
 			return Err(anyhow!("actor query namespace must not be empty"));
 		}
 		let mut params = Vec::new();
-		push_query_param(&mut params, "rvt-namespace", &self.namespace);
+		push_query_param(&mut params, "rvt-namespace", &config.namespace);
 		push_query_param(&mut params, "rvt-method", method);
 		if let Some(key) = key {
 			if !key.is_empty() {
@@ -564,18 +634,33 @@ impl RemoteManager {
 		if let Some(region) = region {
 			push_query_param(&mut params, "rvt-region", region);
 		}
-		if let Some(token) = &self.token {
+		if let Some(token) = &config.token {
 			push_query_param(&mut params, "rvt-token", token);
 		}
 
 		let query = params.join("&");
-		let path = format!("/gateway/{}?{}", urlencoding::encode(name), query);
-		Ok(combine_url_path(&self.endpoint, &path))
+		// Merge with the forwarded path's existing query string instead of
+		// introducing a second `?`.
+		let separator = if path.ends_with('?') || path.ends_with('&') {
+			""
+		} else if path.contains('?') {
+			"&"
+		} else {
+			"?"
+		};
+		let gateway_path = format!(
+			"/gateway/{}{}{}{}",
+			urlencoding::encode(name),
+			path,
+			separator,
+			query
+		);
+		Ok(combine_url_path(&config.endpoint, &gateway_path))
 	}
 
 	pub async fn open_websocket(
 		&self,
-		actor_id: &str,
+		target: &GatewayTarget,
 		encoding: EncodingKind,
 		params: Option<serde_json::Value>,
 		conn_id: Option<String>,
@@ -584,19 +669,20 @@ impl RemoteManager {
 		use tokio_tungstenite::connect_async;
 
 		let config = self.resolved_config().await?;
-		let ws_url = self.websocket_url(&self.build_actor_gateway_url_with(
+		let ws_url = self.websocket_url(&self.build_gateway_url(
 			&config,
-			actor_id,
+			target,
 			PATH_CONNECT_WEBSOCKET,
-		))?;
+		)?)?;
 
-		// Build protocols
-		let mut protocols = vec![
-			WS_PROTOCOL_STANDARD.to_string(),
-			format!("{}actor", WS_PROTOCOL_TARGET),
-			format!("{}{}", WS_PROTOCOL_ACTOR, actor_id),
-			format!("{}{}", WS_PROTOCOL_ENCODING, encoding.as_str()),
-		];
+		// Actor target/id protocols are only sent for direct targets; query
+		// targets are resolved by the gateway from the URL.
+		let mut protocols = vec![WS_PROTOCOL_STANDARD.to_string()];
+		if let GatewayTarget::Direct { actor_id } = target {
+			protocols.push(format!("{}actor", WS_PROTOCOL_TARGET));
+			protocols.push(format!("{}{}", WS_PROTOCOL_ACTOR, actor_id));
+		}
+		protocols.push(format!("{}{}", WS_PROTOCOL_ENCODING, encoding.as_str()));
 
 		if let Some(token) = &config.token {
 			protocols.push(format!("{}{}", WS_PROTOCOL_TOKEN, token));
@@ -631,7 +717,7 @@ impl RemoteManager {
 
 	pub async fn open_raw_websocket(
 		&self,
-		actor_id: &str,
+		target: &GatewayTarget,
 		path: &str,
 		params: Option<serde_json::Value>,
 		protocols: Option<Vec<String>>,
@@ -640,17 +726,14 @@ impl RemoteManager {
 
 		let gateway_path = normalize_raw_websocket_path(path);
 		let config = self.resolved_config().await?;
-		let ws_url = self.websocket_url(&self.build_actor_gateway_url_with(
-			&config,
-			actor_id,
-			&gateway_path,
-		))?;
+		let ws_url =
+			self.websocket_url(&self.build_gateway_url(&config, target, &gateway_path)?)?;
 
-		let mut all_protocols = vec![
-			WS_PROTOCOL_STANDARD.to_string(),
-			format!("{}actor", WS_PROTOCOL_TARGET),
-			format!("{}{}", WS_PROTOCOL_ACTOR, actor_id),
-		];
+		let mut all_protocols = vec![WS_PROTOCOL_STANDARD.to_string()];
+		if let GatewayTarget::Direct { actor_id } = target {
+			all_protocols.push(format!("{}actor", WS_PROTOCOL_TARGET));
+			all_protocols.push(format!("{}{}", WS_PROTOCOL_ACTOR, actor_id));
+		}
 		if let Some(token) = &config.token {
 			all_protocols.push(format!("{}{}", WS_PROTOCOL_TOKEN, token));
 		}

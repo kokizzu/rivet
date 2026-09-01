@@ -56,9 +56,9 @@ impl ActorHandleStateless {
 	}
 
 	pub async fn action(&self, name: &str, args: Vec<JsonValue>) -> Result<JsonValue> {
-		// Resolve actor ID
+		// Resolve gateway target (query targets are resolved by the gateway).
 		let query = self.query.lock().expect("query lock poisoned").clone();
-		let actor_id = self.remote_manager.resolve_actor_id(&query).await?;
+		let target = self.remote_manager.gateway_target(&query).await?;
 
 		let body = codec::encode_http_action_request(self.encoding_kind, &args)?;
 
@@ -69,7 +69,7 @@ impl ActorHandleStateless {
 		let res = self
 			.remote_manager
 			.send_request(
-				&actor_id,
+				&target,
 				&path,
 				Method::POST,
 				headers,
@@ -117,7 +117,7 @@ impl ActorHandleStateless {
 		timeout: Option<Duration>,
 	) -> Result<Option<QueueSendResult>> {
 		let query = self.query.lock().expect("query lock poisoned").clone();
-		let actor_id = self.remote_manager.resolve_actor_id(&query).await?;
+		let target = self.remote_manager.gateway_target(&query).await?;
 		let timeout_ms =
 			timeout.map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX));
 		let request_body =
@@ -129,7 +129,7 @@ impl ActorHandleStateless {
 		let res = self
 			.remote_manager
 			.send_request(
-				&actor_id,
+				&target,
 				&path,
 				Method::POST,
 				headers,
@@ -163,10 +163,10 @@ impl ActorHandleStateless {
 		body: Option<Bytes>,
 	) -> Result<Response> {
 		let query = self.query.lock().expect("query lock poisoned").clone();
-		let actor_id = self.remote_manager.resolve_actor_id(&query).await?;
+		let target = self.remote_manager.gateway_target(&query).await?;
 		let path = normalize_fetch_path(path);
 		self.remote_manager
-			.send_request(&actor_id, &path, method, headers, body)
+			.send_request(&target, &path, method, headers, body)
 			.await
 	}
 
@@ -176,9 +176,9 @@ impl ActorHandleStateless {
 		protocols: Option<Vec<String>>,
 	) -> Result<RawWebSocket> {
 		let query = self.query.lock().expect("query lock poisoned").clone();
-		let actor_id = self.remote_manager.resolve_actor_id(&query).await?;
+		let target = self.remote_manager.gateway_target(&query).await?;
 		self.remote_manager
-			.open_raw_websocket(&actor_id, path, self.params.clone(), protocols)
+			.open_raw_websocket(&target, path, self.params.clone(), protocols)
 			.await
 	}
 
@@ -193,11 +193,11 @@ impl ActorHandleStateless {
 
 	pub async fn reload(&self) -> Result<()> {
 		let query = self.query.lock().expect("query lock poisoned").clone();
-		let actor_id = self.remote_manager.resolve_actor_id(&query).await?;
+		let target = self.remote_manager.gateway_target(&query).await?;
 		let res = self
 			.remote_manager
 			.send_request(
-				&actor_id,
+				&target,
 				"/dynamic/reload",
 				Method::PUT,
 				HeaderMap::new(),
