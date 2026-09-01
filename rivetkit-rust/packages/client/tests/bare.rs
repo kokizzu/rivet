@@ -2,7 +2,7 @@ use std::{
 	collections::HashMap,
 	net::SocketAddr,
 	sync::{
-		atomic::{AtomicBool, Ordering},
+		atomic::{AtomicBool, AtomicUsize, Ordering},
 		Arc,
 	},
 	time::Duration,
@@ -782,6 +782,68 @@ async fn get_or_create_falls_back_to_config_pool_name() {
 	actor.resolve().await.unwrap();
 
 	assert_eq!(state.take(), vec!["config-pool".to_owned()]);
+
+	server.abort();
+}
+
+// When PUT /actors reports the key is reserved in a different datacenter,
+// get_or_create must heal by falling back to a get-by-key lookup and return
+// the already-allocated actor instead of erroring.
+#[tokio::test]
+async fn get_or_create_retries_as_get_on_datacenter_conflict() {
+	let put_hits = Arc::new(AtomicUsize::new(0));
+	let put_hits_handler = put_hits.clone();
+
+	let app = Router::new().route(
+		"/actors",
+		put(move || {
+			let put_hits_handler = put_hits_handler.clone();
+			async move {
+				put_hits_handler.fetch_add(1, Ordering::SeqCst);
+				(
+					StatusCode::BAD_REQUEST,
+					Json(json!({
+						"group": "actor",
+						"code": "key_reserved_in_different_datacenter",
+					})),
+				)
+			}
+		})
+		.get(|| async {
+			Json(json!({
+				"actors": [{
+					"actor_id": "actor-healed",
+					"name": "counter",
+					"key": "k",
+				}],
+			}))
+		}),
+	);
+
+	let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+	let addr = listener.local_addr().unwrap();
+	let server = tokio::spawn(async move {
+		axum::serve(listener, app).await.unwrap();
+	});
+
+	let client = Client::new(
+		ClientConfig::new(endpoint(addr))
+			.namespace("ns")
+			.pool_name("config-pool")
+			.disable_metadata_lookup(true),
+	);
+	let actor = client
+		.get_or_create(
+			"counter",
+			vec!["k".to_owned()],
+			GetOrCreateOptions::default(),
+		)
+		.unwrap();
+
+	let actor_id = actor.resolve().await.unwrap();
+
+	assert_eq!(actor_id, "actor-healed");
+	assert_eq!(put_hits.load(Ordering::SeqCst), 1);
 
 	server.abort();
 }
