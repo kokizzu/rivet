@@ -185,16 +185,25 @@ pub fn decode_http_error(
 			error_from_json_value(&value)
 		}
 		EncodingKind::Bare => {
-			let error =
-                <wire::versioned::HttpResponseError as OwnedVersionedData>::deserialize_with_embedded_version(
-                    payload,
-                )
-                .context("decode bare http error")?;
-			let metadata = error
-				.metadata
-				.map(|payload| serde_cbor::from_slice(&payload))
-				.transpose()?;
-			Ok((error.group, error.code, error.message, metadata))
+			// Routing-level errors from the gateway (e.g. actor not found) are
+			// emitted as JSON regardless of the client encoding, so fall back to
+			// parsing JSON when the payload is not valid BARE.
+			match <wire::versioned::HttpResponseError as OwnedVersionedData>::deserialize_with_embedded_version(
+				payload,
+			) {
+				Ok(error) => {
+					let metadata = error
+						.metadata
+						.map(|payload| serde_cbor::from_slice(&payload))
+						.transpose()?;
+					Ok((error.group, error.code, error.message, metadata))
+				}
+				Err(bare_err) => serde_json::from_slice::<JsonValue>(payload)
+					.ok()
+					.and_then(|value| error_from_json_value(&value).ok())
+					.ok_or(bare_err)
+					.context("decode bare http error"),
+			}
 		}
 	}
 }

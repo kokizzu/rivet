@@ -211,6 +211,48 @@ async fn default_bare_queue_send_round_trips_against_test_actor() {
 	server.abort();
 }
 
+// A getForKey miss is resolved at the gateway, which returns a JSON routing
+// error even though the client uses the bare encoding. The action error path
+// must surface the structured group/code, not just the HTTP status.
+#[tokio::test]
+async fn bare_action_surfaces_structured_gateway_not_found_error() {
+	let app = Router::new().route(
+		"/gateway/{actor_id}/action/{action}",
+		post(|| async {
+			(
+				StatusCode::NOT_FOUND,
+				[(header::CONTENT_TYPE, "application/json")],
+				serde_json::to_vec(&json!({
+					"group": "actor",
+					"code": "not_found",
+					"message": "The actor does not exist or was destroyed.",
+				}))
+				.unwrap(),
+			)
+		}),
+	);
+
+	let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+	let addr = listener.local_addr().unwrap();
+	let server = tokio::spawn(async move {
+		axum::serve(listener, app).await.unwrap();
+	});
+
+	let client = test_client(addr);
+	let actor = client
+		.get("counter", vec!["missing".to_owned()], GetOptions::default())
+		.unwrap();
+
+	let error = actor
+		.action("increment", vec![json!(2)])
+		.await
+		.unwrap_err()
+		.to_string();
+	assert!(error.contains("actor/not_found"), "{error}");
+
+	server.abort();
+}
+
 #[tokio::test]
 async fn raw_fetch_posts_to_actor_request_endpoint() {
 	let state = TestState {
