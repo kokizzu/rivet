@@ -139,7 +139,10 @@ export class ActorHandleRaw {
 	): Promise<QueueSendResult | void> {
 		return await this.#queueSendMutex.run(async () => {
 			const maxAttempts = this.#getDynamicQueryMaxAttempts();
-			let useQueryTarget = false;
+			// Dynamic (get/getOrCreate) handles resolve at the gateway per
+			// request so cross-datacenter queries forward to the reserved dc,
+			// rather than pre-resolving via the non-forwarding PUT /actors path.
+			let useQueryTarget = isDynamicActorQuery(this.#actorResolutionState);
 
 			for (let attempt = 0; attempt < maxAttempts; attempt++) {
 				let actorId: string | undefined;
@@ -216,11 +219,12 @@ export class ActorHandleRaw {
 						code,
 					);
 					if (invalidated && attempt < maxAttempts - 1) {
-						useQueryTarget =
+						const waitForReady =
 							code === "starting" ||
 							code === "stopping" ||
 							code.startsWith("destroyed_");
-						if (useQueryTarget) {
+						useQueryTarget = useQueryTarget || waitForReady;
+						if (waitForReady) {
 							await this.#waitForRetryWindow();
 						}
 						continue;
@@ -276,7 +280,7 @@ export class ActorHandleRaw {
 		} & ActorActionOptions,
 	): Promise<unknown> {
 		const maxAttempts = this.#getDynamicQueryMaxAttempts();
-		let useQueryTarget = false;
+		let useQueryTarget = isDynamicActorQuery(this.#actorResolutionState);
 		const gatewayOptions = resolveActorGatewayOptions(
 			this.#gatewayOptions,
 			opts,
@@ -648,7 +652,7 @@ export class ActorHandleRaw {
 		init?: ActorFetchInit,
 	) {
 		const maxAttempts = this.#getDynamicQueryMaxAttempts();
-		let useQueryTarget = false;
+		let useQueryTarget = isDynamicActorQuery(this.#actorResolutionState);
 		const { skipReadyWait, ...requestInit } = init ?? {};
 		const gatewayOptions = resolveActorGatewayOptions(
 			this.#gatewayOptions,
@@ -725,11 +729,12 @@ export class ActorHandleRaw {
 					code,
 				);
 				if (invalidated && attempt < maxAttempts - 1) {
-					useQueryTarget =
+					const waitForReady =
 						code === "starting" ||
 						code === "stopping" ||
 						code.startsWith("destroyed_");
-					if (useQueryTarget) {
+					useQueryTarget = useQueryTarget || waitForReady;
+					if (waitForReady) {
 						await this.#waitForRetryWindow();
 					}
 					continue;
@@ -799,13 +804,13 @@ export class ActorHandleRaw {
 
 		const invalidated = this.#invalidateResolvedActorId(group, code);
 		if (invalidated && attempt < maxAttempts - 1) {
-			const useQueryTarget =
+			const waitForReady =
 				code === "starting" ||
 				code === "stopping" ||
 				code.startsWith("destroyed_");
 			return {
-				useQueryTarget,
-				waitForRetryWindow: useQueryTarget,
+				useQueryTarget: true,
+				waitForRetryWindow: waitForReady,
 			};
 		}
 
