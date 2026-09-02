@@ -162,6 +162,7 @@ program
 	.option("--latest <bool>", "Override latest")
 	.option("--branch <name>", "Override branch name")
 	.option("--targets <list>", "Override target groups (comma-separated or 'all')")
+	.option("--preview-name <name>", "Override the preview version label + npm dist-tag (preview only)")
 	.action(async (opts) => {
 		const overrides: Parameters<typeof resolveContext>[0] = {};
 		if (opts.trigger) overrides.trigger = opts.trigger as Trigger;
@@ -171,6 +172,7 @@ program
 		}
 		if (opts.branch) overrides.branch = opts.branch;
 		if (opts.targets) overrides.targets = opts.targets;
+		if (opts.previewName) overrides.previewName = opts.previewName;
 		const ctx = await resolveContext(overrides);
 		log.info(
 			`resolved: trigger=${ctx.trigger} version=${ctx.version} npm_tag=${ctx.npmTag} sha=${ctx.sha} latest=${ctx.latest} targets=${ctx.targets.join(",")}${ctx.branch !== undefined ? ` branch=${ctx.branch}` : ""}`,

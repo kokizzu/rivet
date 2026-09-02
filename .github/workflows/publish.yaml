@@ -49,6 +49,10 @@ on:
           - container-runner
           - engine
           - cli
+      preview_name:
+        description: "Preview only: custom name for the version label + npm dist-tag (default: sanitized branch). Ignored on release."
+        required: false
+        type: string
 
 env:
   # Depot project ID (rivet-dev/rivet-engine).

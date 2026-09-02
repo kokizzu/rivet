@@ -51,6 +51,7 @@ export interface ResolveOverrides {
 	branch?: string;
 	sha?: string;
 	targets?: string;
+	previewName?: string;
 }
 
 function findRepoRoot(): string {
@@ -198,6 +199,17 @@ export async function resolveContext(
 		branch = await readBranchName(repoRoot);
 	}
 
+	// Preview label: an optional custom name that replaces the branch-derived
+	// identifier used for the preview version and npm dist-tag. Lets a preview
+	// publish under a readable name instead of a long branch slug. Only applies
+	// to preview (branch) publishes; a release derives its identifiers from the
+	// explicit version. Does NOT change the trigger, so passing preview_name
+	// never turns a preview into a release.
+	const previewName =
+		overrides.previewName ?? readInputFromEvent<string>("preview_name");
+	const label =
+		trigger === "branch" && previewName ? previewName : branch;
+
 	// Release version: override > workflow_dispatch input > error.
 	let version = overrides.version;
 	if (!version && trigger === "release") {
@@ -210,7 +222,7 @@ export async function resolveContext(
 			trigger,
 			PREVIEW_BASE_VERSION,
 			sha,
-			branch,
+			label,
 			version,
 		);
 	} else if (!version) {
@@ -227,7 +239,7 @@ export async function resolveContext(
 	}
 	if (trigger !== "release") latest = false;
 
-	const npmTag = computeNpmTag(trigger, version, latest, branch);
+	const npmTag = computeNpmTag(trigger, version, latest, label);
 
 	// Resolve selective-publish scope. Releases always cover every group so a
 	// cut is never partial; only preview publishes may narrow scope.
