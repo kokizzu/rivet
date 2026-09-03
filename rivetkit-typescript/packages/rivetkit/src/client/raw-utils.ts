@@ -13,6 +13,20 @@ import type {
 import { ActorError } from "./errors";
 import { logger } from "./log";
 
+/** Buffer a one-shot ReadableStream body to bytes so every retry attempt can re-send it. */
+export async function prepareRetryableInit(
+	init: RequestInit,
+): Promise<RequestInit> {
+	if (init.body instanceof ReadableStream) {
+		return {
+			...init,
+			body: new Uint8Array(await new Response(init.body).arrayBuffer()),
+		};
+	}
+
+	return init;
+}
+
 /**
  * Shared implementation for raw HTTP fetch requests
  */

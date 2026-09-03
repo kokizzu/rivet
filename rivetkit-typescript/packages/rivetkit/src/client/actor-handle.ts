@@ -60,7 +60,7 @@ import {
 	type QueueSendResult,
 	type QueueSendWaitOptions,
 } from "./queue";
-import { rawHttpFetch, rawWebSocket } from "./raw-utils";
+import { prepareRetryableInit, rawHttpFetch, rawWebSocket } from "./raw-utils";
 import { resolveGatewayTarget } from "./resolve-gateway-target";
 import { sendHttpRequest } from "./utils";
 
@@ -654,12 +654,17 @@ export class ActorHandleRaw {
 		input: string | URL | Request,
 		init?: ActorFetchInit,
 	) {
-		const { skipReadyWait, ...requestInit } = init ?? {};
-		const hasBody =
-			requestInit.body !== undefined
-				? requestInit.body !== null
-				: isRequestLike(input) && input.body !== null;
-		const maxAttempts = hasBody ? 1 : this.#getDynamicQueryMaxAttempts();
+		const { skipReadyWait, ...restInit } = init ?? {};
+		const maxAttempts = this.#getDynamicQueryMaxAttempts();
+		// Buffer a streaming init body before the loop, but only when retries are possible.
+		const requestInit =
+			maxAttempts > 1 ? await prepareRetryableInit(restInit) : restInit;
+		// Clone the input Request only when its own body is the one being sent.
+		// If init replaces the body, cloning a consumed input would throw.
+		const clonesInputBody =
+			requestInit.body === undefined &&
+			isRequestLike(input) &&
+			input.body !== null;
 		let useQueryTarget = isDynamicActorQuery(this.#actorResolutionState);
 		const gatewayOptions = resolveActorGatewayOptions(
 			this.#gatewayOptions,
@@ -680,7 +685,9 @@ export class ActorHandleRaw {
 					this.#driver,
 					target,
 					this.#params,
-					input,
+					// Clone a body-bearing Request so retries don't reuse a consumed stream.
+					// NOTE: This holds the body in memory until GC (unavoidable).
+					clonesInputBody ? input.clone() : input,
 					requestInit,
 					gatewayOptions,
 				);

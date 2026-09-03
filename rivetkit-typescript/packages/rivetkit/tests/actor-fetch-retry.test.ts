@@ -33,12 +33,23 @@ function dynamicHandle(driver: EngineControlClient) {
 }
 
 describe("ActorHandleRaw.fetch", () => {
-	test("does not replay a Request body after delivery starts", async () => {
+	test("clones a Request body so a retry can re-send it", async () => {
 		const bodies: string[] = [];
+		let attempts = 0;
 		const driver = {
 			async sendRequest(_target: GatewayTarget, request: Request) {
+				attempts++;
 				bodies.push(await request.text());
-				throw new ActorError("actor", "starting", "actor is starting");
+				// Fail the first attempt with a retryable lifecycle error so the
+				// loop re-issues the request, then succeed.
+				if (attempts === 1) {
+					throw new ActorError(
+						"actor",
+						"starting",
+						"actor is starting",
+					);
+				}
+				return Response.json({ ok: true });
 			},
 		} as EngineControlClient;
 		const handle = new ActorHandleRaw(
@@ -54,33 +65,112 @@ describe("ActorHandleRaw.fetch", () => {
 			body: "persistent request body",
 		});
 
-		await expect(handle.fetch(request)).rejects.toMatchObject({
-			group: "actor",
-			code: "starting",
-		});
+		const response = await handle.fetch(request);
 
-		expect(bodies).toEqual(["persistent request body"]);
-		expect(request.bodyUsed).toBe(true);
+		expect(response.ok).toBe(true);
+		expect(attempts).toBe(2);
+		// Each attempt clones the caller's Request, so the retry re-sends the
+		// full body rather than an empty/disturbed stream.
+		expect(bodies).toEqual([
+			"persistent request body",
+			"persistent request body",
+		]);
+		// The caller's Request is never consumed directly, so it stays intact
+		// and can be inspected or re-issued after the call.
+		expect(request.bodyUsed).toBe(false);
 	});
 
-	test("does not retry a body provided through init", async () => {
+	test("retries and re-sends a string init body", async () => {
+		const bodies: string[] = [];
 		let attempts = 0;
 		const driver = {
 			async sendRequest(_target: GatewayTarget, request: Request) {
 				attempts++;
-				expect(await request.text()).toBe("body from init");
-				throw new ActorError("actor", "starting", "actor is starting");
+				bodies.push(await request.text());
+				if (attempts === 1) {
+					throw new ActorError(
+						"actor",
+						"starting",
+						"actor is starting",
+					);
+				}
+				return Response.json({ ok: true });
 			},
 		} as EngineControlClient;
 		const handle = dynamicHandle(driver);
 
-		await expect(
-			handle.fetch("http://example.test/submit", {
-				method: "POST",
-				body: "body from init",
-			}),
-		).rejects.toMatchObject({ group: "actor", code: "starting" });
-		expect(attempts).toBe(1);
+		const response = await handle.fetch("http://example.test/submit", {
+			method: "POST",
+			body: "body from init",
+		});
+
+		expect(response.ok).toBe(true);
+		expect(attempts).toBe(2);
+		// A string init body is re-sendable, so the retry delivers it again.
+		expect(bodies).toEqual(["body from init", "body from init"]);
+	});
+
+	test("buffers a streaming init body so a retry can re-send it", async () => {
+		const bodies: string[] = [];
+		let attempts = 0;
+		const driver = {
+			async sendRequest(_target: GatewayTarget, request: Request) {
+				attempts++;
+				bodies.push(await request.text());
+				if (attempts === 1) {
+					throw new ActorError(
+						"actor",
+						"starting",
+						"actor is starting",
+					);
+				}
+				return Response.json({ ok: true });
+			},
+		} as EngineControlClient;
+		const handle = dynamicHandle(driver);
+
+		const stream = new ReadableStream({
+			start(controller) {
+				controller.enqueue(new TextEncoder().encode("streamed body"));
+				controller.close();
+			},
+		});
+
+		const response = await handle.fetch("http://example.test/submit", {
+			method: "POST",
+			body: stream,
+		});
+
+		expect(response.ok).toBe(true);
+		expect(attempts).toBe(2);
+		// The one-shot stream is buffered up front, so the retry re-sends the
+		// full payload instead of a disturbed stream.
+		expect(bodies).toEqual(["streamed body", "streamed body"]);
+	});
+
+	test("sends an init body override without cloning a consumed Request", async () => {
+		const bodies: string[] = [];
+		const driver = {
+			async sendRequest(_target: GatewayTarget, request: Request) {
+				bodies.push(await request.text());
+				return Response.json({ ok: true });
+			},
+		} as EngineControlClient;
+		const handle = dynamicHandle(driver);
+
+		const request = new Request("http://example.test/submit", {
+			method: "POST",
+			body: "original body",
+		});
+		// Consume the caller's Request, then replace its body through init.
+		await request.text();
+		expect(request.bodyUsed).toBe(true);
+
+		const response = await handle.fetch(request, { body: "replacement" });
+
+		expect(response.ok).toBe(true);
+		// The replacement body is sent; the consumed input is never cloned.
+		expect(bodies).toEqual(["replacement"]);
 	});
 
 	test("retains lifecycle retries for bodyless requests", async () => {
