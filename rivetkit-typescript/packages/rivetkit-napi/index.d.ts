@@ -44,11 +44,6 @@ export interface JsInspectorSnapshot {
 export interface JsActorRuntimeSocketEndpointInfo {
   path: string
 }
-export interface JsHttpResponse {
-  status?: number
-  headers?: Record<string, string>
-  body?: Buffer
-}
 export interface JsQueueSendResult {
   status: string
   response?: Buffer
@@ -164,6 +159,12 @@ export interface JsSqliteVfsMetrics {
   writeBufferDirtyPages: number
   dbSizePages: number
 }
+export interface JsHttpResponse {
+  status?: number
+  headers?: Record<string, string>
+  body?: Buffer
+  stream?: boolean
+}
 export interface JsQueueNextOptions {
   names?: Array<string>
   timeoutMs?: number
@@ -241,7 +242,8 @@ export interface JsServerlessResponseHead {
 export interface JsApplicationResponse {
   status: number
   headers: Record<string, string>
-  body: Buffer
+  body?: Buffer
+  stream?: boolean
 }
 export interface JsRegistryRouteResponse {
   status: number
@@ -390,6 +392,18 @@ export declare class JsActorStateTransaction {
   execute(sql: string, params?: Array<JsBindParam> | undefined | null): Promise<NativeExecuteResult>
   commit(payload: StateDeltaPayload): Promise<void>
   rollback(): Promise<void>
+}
+/** JavaScript-facing writer for a streaming actor HTTP response. */
+export declare class HttpResponseBodyStream {
+  cancelled(): Promise<void>
+  write(chunk: Buffer): Promise<void>
+  end(): Promise<void>
+  error(message: string): Promise<void>
+}
+/** JavaScript-facing reader for a streaming actor HTTP request. */
+export declare class HttpRequestBodyStream {
+  read(): Promise<Buffer | null>
+  cancel(): Promise<void>
 }
 export declare class Kv {
   get(key: Buffer): Promise<Buffer | null>

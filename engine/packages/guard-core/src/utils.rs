@@ -144,6 +144,7 @@ pub(crate) fn err_into_response(err: anyhow::Error) -> Result<Response<ResponseB
 				("guard", "actor_stopped_while_waiting") => StatusCode::SERVICE_UNAVAILABLE,
 				("guard", "tunnel_request_aborted") => StatusCode::SERVICE_UNAVAILABLE,
 				("guard", "tunnel_message_timeout") => StatusCode::GATEWAY_TIMEOUT,
+				("guard", "request_delivery_unconfirmed") => StatusCode::SERVICE_UNAVAILABLE,
 				("guard", "tunnel_response_closed") => StatusCode::SERVICE_UNAVAILABLE,
 				("guard", "gateway_response_start_timeout") => StatusCode::GATEWAY_TIMEOUT,
 				("guard", "actor_ready_timeout") => StatusCode::SERVICE_UNAVAILABLE,
@@ -175,10 +176,12 @@ pub(crate) fn err_into_response(err: anyhow::Error) -> Result<Response<ResponseB
 
 	let body_json = serde_json::to_vec(&error_response)?;
 	let bytes = Bytes::from(body_json);
+	let error_code = format!("{}.{}", error_response.group, error_response.code);
 
 	Response::builder()
 		.status(status)
 		.header(hyper::header::CONTENT_TYPE, "application/json")
+		.header(X_RIVET_ERROR, error_code)
 		.body(ResponseBody::Full(Full::new(bytes)))
 		.map_err(Into::into)
 }
@@ -186,13 +189,15 @@ pub(crate) fn err_into_response(err: anyhow::Error) -> Result<Response<ResponseB
 pub(crate) fn should_retry_request(res: &Result<Response<ResponseBody>>) -> bool {
 	match res {
 		Ok(resp) => should_retry_request_inner(resp.status(), resp.headers()),
-		Err(err) => {
-			if let Some(rivet_err) = err.chain().find_map(|x| x.downcast_ref::<RivetError>()) {
-				rivet_err.group() == "guard" && is_retryable_guard_http_error(rivet_err.code())
-			} else {
-				false
-			}
-		}
+		Err(err) => should_retry_error(err),
+	}
+}
+
+pub(crate) fn should_retry_error(err: &anyhow::Error) -> bool {
+	if let Some(rivet_err) = err.chain().find_map(|x| x.downcast_ref::<RivetError>()) {
+		rivet_err.group() == "guard" && is_retryable_guard_http_error(rivet_err.code())
+	} else {
+		false
 	}
 }
 

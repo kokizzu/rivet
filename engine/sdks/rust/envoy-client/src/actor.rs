@@ -1,23 +1,28 @@
-use std::collections::BTreeMap;
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::{
+	collections::{BTreeMap, HashMap},
+	sync::Arc,
+};
 
 use crate::async_counter::AsyncCounter;
 use rivet_envoy_protocol as protocol;
-use tokio::sync::mpsc;
-use tokio::sync::oneshot;
 use tokio::sync::oneshot::error::TryRecvError;
-use tokio::task::{JoinError, JoinSet};
+use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinSet;
 use tracing::Instrument;
 
-use crate::config::{HttpRequest, HttpResponse, WebSocketMessage};
 use crate::connection::ws_send;
 use crate::context::SharedContext;
 use crate::handle::EnvoyHandle;
+use crate::http::HttpRequest;
+#[cfg(test)]
+use crate::http::{HTTP_BODY_STREAM_CHANNEL_CAPACITY, HttpResponse, ResponseChunk};
 use crate::stringify::stringify_to_rivet_tunnel_message_kind;
 use crate::utils::{
 	BufferMap, id_to_str, spawn_detached, wrapping_add_u16, wrapping_lte_u16, wrapping_sub_u16,
 };
+use crate::websocket::{WebSocketHandler, WebSocketMessage, WebSocketSender, WsOutgoing};
+
+mod http;
 
 pub enum ToActor {
 	Intent {
@@ -36,12 +41,34 @@ pub enum ToActor {
 	ReqStart {
 		message_id: protocol::MessageId,
 		req: protocol::ToEnvoyRequestStart,
+		connection_session: u64,
+	},
+	ConnectionClosed {
+		session: u64,
 	},
 	ReqChunk {
 		message_id: protocol::MessageId,
 		chunk: protocol::ToEnvoyRequestChunk,
 	},
 	ReqAbort {
+		message_id: protocol::MessageId,
+		reason: protocol::HttpStreamAbortReason,
+	},
+	ReqProtocolViolation {
+		message_id: protocol::MessageId,
+		detail: String,
+	},
+	ReqBodyCancelled {
+		message_id: protocol::MessageId,
+	},
+	ReqBodyCancel {
+		message_id: protocol::MessageId,
+	},
+	ResponseBodyWindowUpdate {
+		message_id: protocol::MessageId,
+		consumed_bytes: u64,
+	},
+	ReqComplete {
 		message_id: protocol::MessageId,
 	},
 	WsOpen {
@@ -64,32 +91,29 @@ pub enum ToActor {
 	},
 }
 
-struct PendingRequest {
+struct WebSocketRequestState {
 	envoy_message_index: u16,
-	body_tx: Option<mpsc::UnboundedSender<Vec<u8>>>,
 }
 
 struct WsEntry {
 	is_hibernatable: bool,
 	rivet_message_index: u16,
-	ws_handler: Option<crate::config::WebSocketHandler>,
-	outgoing_tx: mpsc::UnboundedSender<crate::config::WsOutgoing>,
+	ws_handler: Option<WebSocketHandler>,
+	outgoing_tx: mpsc::UnboundedSender<WsOutgoing>,
 }
 
 struct ActorContext {
 	shared: Arc<SharedContext>,
+	tx: mpsc::UnboundedSender<ToActor>,
 	actor_id: String,
 	generation: u32,
 	command_idx: i64,
 	event_index: i64,
 	error: Option<String>,
-	pending_requests: BufferMap<PendingRequest>,
+	http_requests: http::HttpRequests,
+	websocket_requests: BufferMap<WebSocketRequestState>,
 	ws_entries: BufferMap<WsEntry>,
 	hibernating_requests: Vec<protocol::HibernatingRequest>,
-	active_http_request_count: Arc<AsyncCounter>,
-}
-
-struct ActiveHttpRequestGuard {
 	active_http_request_count: Arc<AsyncCounter>,
 }
 
@@ -102,21 +126,6 @@ struct PendingStop {
 enum StopProgress {
 	Stopped,
 	Pending(PendingStop),
-}
-
-impl ActiveHttpRequestGuard {
-	fn new(active_http_request_count: Arc<AsyncCounter>) -> Self {
-		active_http_request_count.increment();
-		Self {
-			active_http_request_count,
-		}
-	}
-}
-
-impl Drop for ActiveHttpRequestGuard {
-	fn drop(&mut self) {
-		self.active_http_request_count.decrement();
-	}
 }
 
 pub fn create_actor(
@@ -136,6 +145,7 @@ pub fn create_actor(
 		config,
 		hibernating_requests,
 		preloaded_kv,
+		tx.clone(),
 		rx,
 		active_http_request_count.clone(),
 	));
@@ -158,6 +168,7 @@ async fn actor_inner(
 	config: protocol::ActorConfig,
 	hibernating_requests: Vec<protocol::HibernatingRequest>,
 	preloaded_kv: Option<protocol::PreloadedKv>,
+	tx: mpsc::UnboundedSender<ToActor>,
 	mut rx: mpsc::UnboundedReceiver<ToActor>,
 	active_http_request_count: Arc<AsyncCounter>,
 ) {
@@ -169,12 +180,14 @@ async fn actor_inner(
 
 	let mut ctx = ActorContext {
 		shared: shared.clone(),
+		tx,
 		actor_id: actor_id.clone(),
 		generation,
 		command_idx: 0,
 		event_index: 0,
 		error: None,
-		pending_requests: BufferMap::new(),
+		http_requests: http::HttpRequests::new(),
+		websocket_requests: BufferMap::new(),
 		ws_entries: BufferMap::new(),
 		hibernating_requests,
 		active_http_request_count,
@@ -245,7 +258,7 @@ async fn actor_inner(
 				}
 			} => {
 				if let Some(result) = maybe_task {
-					handle_http_request_task_result(result);
+					http::handle_task_result(result);
 				}
 			}
 			msg = async {
@@ -325,14 +338,47 @@ async fn actor_inner(
 							let _ = ack_tx.send(());
 						}
 					}
-					ToActor::ReqStart { message_id, req } => {
-						handle_req_start(&mut ctx, &handle, &mut http_request_tasks, message_id, req);
+					ToActor::ReqStart { message_id, req, connection_session } => {
+						http::handle_req_start(
+							&mut ctx,
+							&handle,
+							&mut http_request_tasks,
+							message_id,
+							req,
+							connection_session,
+						);
+					}
+					ToActor::ConnectionClosed { session } => {
+						http::handle_connection_closed(&mut ctx, session).await;
 					}
 					ToActor::ReqChunk { message_id, chunk } => {
-						handle_req_chunk(&mut ctx, message_id, chunk);
+						http::handle_req_chunk(&mut ctx, message_id, chunk);
 					}
-					ToActor::ReqAbort { message_id } => {
-						handle_req_abort(&mut ctx, message_id);
+					ToActor::ReqAbort { message_id, reason } => {
+						http::handle_req_abort(&mut ctx, message_id, reason);
+					}
+					ToActor::ReqProtocolViolation { message_id, detail } => {
+						http::handle_protocol_violation(&mut ctx, message_id, detail).await;
+					}
+					ToActor::ReqBodyCancelled { message_id } => {
+						http::handle_req_body_cancelled(&mut ctx, message_id);
+					}
+					ToActor::ReqBodyCancel { message_id } => {
+						http::handle_req_body_cancel(&mut ctx, message_id);
+					}
+					ToActor::ResponseBodyWindowUpdate {
+						message_id,
+						consumed_bytes,
+					} => {
+						http::handle_response_body_window_update(
+							&mut ctx,
+							message_id,
+							consumed_bytes,
+						)
+						.await;
+					}
+					ToActor::ReqComplete { message_id } => {
+						http::handle_req_complete(&mut ctx, message_id);
 					}
 					ToActor::WsOpen {
 						message_id,
@@ -365,14 +411,14 @@ async fn actor_inner(
 				let pending = pending_stop
 					.take()
 					.expect("pending stop must exist when stop completion resolves");
-				abort_and_join_http_request_tasks(&mut ctx, &mut http_request_tasks).await;
+				http::abort_and_join_tasks(&mut ctx, &mut http_request_tasks).await;
 				finalize_stop(&mut ctx, pending, stop_result);
 				break;
 			}
 		}
 	}
 
-	abort_and_join_http_request_tasks(&mut ctx, &mut http_request_tasks).await;
+	http::abort_and_join_tasks(&mut ctx, &mut http_request_tasks).await;
 	tracing::debug!("envoy actor stopped");
 }
 
@@ -420,7 +466,7 @@ async fn begin_stop(
 			ctx.actor_id.clone(),
 			ctx.generation,
 			reason.clone(),
-			crate::config::ActorStopHandle::new(stop_tx),
+			crate::callbacks::ActorStopHandle::new(stop_tx),
 		)
 		.await;
 
@@ -508,158 +554,18 @@ fn send_stopped_event(
 	);
 }
 
-fn handle_req_start(
-	ctx: &mut ActorContext,
-	handle: &EnvoyHandle,
-	http_request_tasks: &mut JoinSet<()>,
-	message_id: protocol::MessageId,
-	req: protocol::ToEnvoyRequestStart,
-) {
-	let pending = PendingRequest {
-		envoy_message_index: 0,
-		body_tx: None,
-	};
-	ctx.pending_requests
-		.insert(&[&message_id.gateway_id, &message_id.request_id], pending);
-
-	let headers: HashMap<String, String> = req
-		.headers
-		.iter()
-		.map(|(k, v)| (k.clone(), v.clone()))
-		.collect();
-
-	let body_stream = if req.stream {
-		let (body_tx, body_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-		if let Some(pending) = ctx
-			.pending_requests
-			.get_mut(&[&message_id.gateway_id, &message_id.request_id])
-		{
-			pending.body_tx = Some(body_tx);
-		}
-		Some(body_rx)
-	} else {
-		None
-	};
-
-	let request = HttpRequest {
-		method: req.method,
-		path: req.path,
-		headers,
-		body: req.body,
-		body_stream,
-	};
-
-	let shared = ctx.shared.clone();
-	let handle_clone = handle.clone();
-	let actor_id = ctx.actor_id.clone();
-	let gateway_id = message_id.gateway_id;
-	let request_id = message_id.request_id;
-	let request_guard = ActiveHttpRequestGuard::new(ctx.active_http_request_count.clone());
-
-	let task = async move {
-		let _request_guard = request_guard;
-		let response = shared
-			.config
-			.callbacks
-			.fetch(handle_clone, actor_id, gateway_id, request_id, request)
-			.await;
-
-		match response {
-			Ok(response) => {
-				send_response(&shared, gateway_id, request_id, response).await;
-			}
-			Err(error) => {
-				tracing::error!(?error, "fetch failed");
-				send_fetch_error_response(&shared, gateway_id, request_id).await;
-			}
-		}
-	}
-	.in_current_span();
-
-	#[cfg(target_arch = "wasm32")]
-	http_request_tasks.spawn_local(task);
-	#[cfg(not(target_arch = "wasm32"))]
-	http_request_tasks.spawn(task);
-
-	if !req.stream {
-		ctx.pending_requests
-			.remove(&[&message_id.gateway_id, &message_id.request_id]);
-	}
-}
-
-fn handle_http_request_task_result(result: Result<(), JoinError>) {
-	if let Err(error) = result {
-		if error.is_cancelled() {
-			return;
-		}
-
-		tracing::error!(?error, "http request task failed");
-	}
-}
-
-async fn abort_and_join_http_request_tasks(
-	ctx: &mut ActorContext,
-	http_request_tasks: &mut JoinSet<()>,
-) {
-	if http_request_tasks.is_empty() {
-		return;
-	}
-
-	let active_http_request_count = ctx.active_http_request_count.load();
-	tracing::debug!(
-		active_http_request_count,
-		"aborting in-flight http request tasks"
-	);
-
-	http_request_tasks.abort_all();
-
-	while let Some(result) = http_request_tasks.join_next().await {
-		handle_http_request_task_result(result);
-	}
-}
-
-fn handle_req_chunk(
-	ctx: &mut ActorContext,
-	message_id: protocol::MessageId,
-	chunk: protocol::ToEnvoyRequestChunk,
-) {
-	let finish = chunk.finish;
-	let pending = ctx
-		.pending_requests
-		.get(&[&message_id.gateway_id, &message_id.request_id]);
-	if let Some(pending) = pending {
-		if let Some(body_tx) = &pending.body_tx {
-			let _ = body_tx.send(chunk.body);
-		} else {
-			tracing::warn!("received chunk for pending request without stream controller");
-		}
-	} else {
-		tracing::warn!("received chunk for unknown pending request");
-	}
-
-	if finish {
-		ctx.pending_requests
-			.remove(&[&message_id.gateway_id, &message_id.request_id]);
-	}
-}
-
-fn handle_req_abort(ctx: &mut ActorContext, message_id: protocol::MessageId) {
-	ctx.pending_requests
-		.remove(&[&message_id.gateway_id, &message_id.request_id]);
-}
-
 fn spawn_ws_outgoing_task(
 	shared: Arc<SharedContext>,
 	gateway_id: protocol::GatewayId,
 	request_id: protocol::RequestId,
-	mut outgoing_rx: mpsc::UnboundedReceiver<crate::config::WsOutgoing>,
+	mut outgoing_rx: mpsc::UnboundedReceiver<WsOutgoing>,
 ) {
 	let ws_task = async move {
 		let mut idx: u16 = 0;
 		while let Some(msg) = outgoing_rx.recv().await {
 			idx += 1;
 			match msg {
-				crate::config::WsOutgoing::Message { data, binary } => {
+				WsOutgoing::Message { data, binary } => {
 					ws_send(
 						&shared,
 						protocol::ToRivet::ToRivetTunnelMessage(protocol::ToRivetTunnelMessage {
@@ -676,10 +582,10 @@ fn spawn_ws_outgoing_task(
 					)
 					.await;
 				}
-				crate::config::WsOutgoing::Flush { tx } => {
+				WsOutgoing::Flush { tx } => {
 					let _ = tx.send(());
 				}
-				crate::config::WsOutgoing::Close { code, reason } => {
+				WsOutgoing::Close { code, reason } => {
 					ws_send(
 						&shared,
 						protocol::ToRivet::ToRivetTunnelMessage(protocol::ToRivetTunnelMessage {
@@ -722,11 +628,10 @@ async fn handle_ws_open(
 		.unwrap_or(false);
 
 	if !is_restoring_hibernatable {
-		ctx.pending_requests.insert(
+		ctx.websocket_requests.insert(
 			&[&message_id.gateway_id, &message_id.request_id],
-			PendingRequest {
+			WebSocketRequestState {
 				envoy_message_index: 0,
-				body_tx: None,
 			},
 		);
 	}
@@ -776,7 +681,7 @@ async fn handle_ws_open(
 				)
 				.await;
 
-				ctx.pending_requests
+				ctx.websocket_requests
 					.remove(&[&message_id.gateway_id, &message_id.request_id]);
 				return;
 			}
@@ -784,8 +689,8 @@ async fn handle_ws_open(
 	};
 
 	// Create outgoing channel BEFORE calling websocket() so the sender is available immediately
-	let (outgoing_tx, outgoing_rx) = mpsc::unbounded_channel::<crate::config::WsOutgoing>();
-	let sender = crate::config::WebSocketSender {
+	let (outgoing_tx, outgoing_rx) = mpsc::unbounded_channel::<WsOutgoing>();
+	let sender = WebSocketSender {
 		tx: outgoing_tx.clone(),
 	};
 
@@ -866,7 +771,7 @@ async fn handle_ws_open(
 			{
 				if let Some(handler) = &mut ws.ws_handler {
 					if let Some(on_open) = handler.on_open.take() {
-						let sender = crate::config::WebSocketSender {
+						let sender = WebSocketSender {
 							tx: ws.outgoing_tx.clone(),
 						};
 
@@ -892,7 +797,7 @@ async fn handle_ws_open(
 			)
 			.await;
 
-			ctx.pending_requests
+			ctx.websocket_requests
 				.remove(&[&message_id.gateway_id, &message_id.request_id]);
 			ctx.ws_entries
 				.remove(&[&message_id.gateway_id, &message_id.request_id]);
@@ -956,7 +861,7 @@ async fn handle_ws_message(
 		}
 
 		if let Some(handler) = &ws.ws_handler {
-			let sender = crate::config::WebSocketSender {
+			let sender = WebSocketSender {
 				tx: ws.outgoing_tx.clone(),
 			};
 			let ws_msg = WebSocketMessage {
@@ -989,7 +894,7 @@ async fn handle_ws_close(
 			let reason = close.reason.unwrap_or_default();
 			(handler.on_close)(code, reason).await;
 		}
-		ctx.pending_requests
+		ctx.websocket_requests
 			.remove(&[&message_id.gateway_id, &message_id.request_id]);
 	} else {
 		tracing::warn!("received close for unknown ws");
@@ -1014,11 +919,10 @@ async fn handle_hws_restore(
 		});
 
 		if let Some(meta) = meta {
-			ctx.pending_requests.insert(
+			ctx.websocket_requests.insert(
 				&[&hib_req.gateway_id, &hib_req.request_id],
-				PendingRequest {
+				WebSocketRequestState {
 					envoy_message_index: meta.envoy_message_index,
-					body_tx: None,
 				},
 			);
 
@@ -1035,7 +939,7 @@ async fn handle_hws_restore(
 			};
 
 			let (hws_outgoing_tx, hws_outgoing_rx) = mpsc::unbounded_channel();
-			let hws_sender = crate::config::WebSocketSender {
+			let hws_sender = WebSocketSender {
 				tx: hws_outgoing_tx.clone(),
 			};
 
@@ -1059,12 +963,6 @@ async fn handle_hws_restore(
 
 			match ws_result {
 				Ok(ws_handler) => {
-					spawn_ws_outgoing_task(
-						ctx.shared.clone(),
-						hib_req.gateway_id,
-						hib_req.request_id,
-						hws_outgoing_rx,
-					);
 					ctx.ws_entries.insert(
 						&[&hib_req.gateway_id, &hib_req.request_id],
 						WsEntry {
@@ -1074,6 +972,25 @@ async fn handle_hws_restore(
 							outgoing_tx: hws_outgoing_tx,
 						},
 					);
+					if !handle
+						.rebind_hibernating_websocket(
+							ctx.actor_id.clone(),
+							ctx.generation,
+							hib_req.gateway_id,
+							hib_req.request_id,
+						)
+						.await
+					{
+						tracing::warn!(
+							request_id = id_to_str(&hib_req.request_id),
+							"hibernating websocket route disappeared before restore"
+						);
+						ctx.websocket_requests
+							.remove(&[&hib_req.gateway_id, &hib_req.request_id]);
+						ctx.ws_entries
+							.remove(&[&hib_req.gateway_id, &hib_req.request_id]);
+						continue;
+					}
 					// Gateway wake flows wait for the websocket-open ack before
 					// they resume forwarding buffered client messages.
 					send_actor_message(
@@ -1087,13 +1004,22 @@ async fn handle_hws_restore(
 						),
 					)
 					.await;
+					// Writes made by the restored callback are already queued in
+					// `hws_outgoing_rx`. Start forwarding them only after the exact route
+					// is rebound and the restore Open frame has entered the ordered tunnel.
+					spawn_ws_outgoing_task(
+						ctx.shared.clone(),
+						hib_req.gateway_id,
+						hib_req.request_id,
+						hws_outgoing_rx,
+					);
 					if let Some(ws) = ctx
 						.ws_entries
 						.get_mut(&[&hib_req.gateway_id, &hib_req.request_id])
 					{
 						if let Some(handler) = &mut ws.ws_handler {
 							if let Some(on_open) = handler.on_open.take() {
-								let sender = crate::config::WebSocketSender {
+								let sender = WebSocketSender {
 									tx: ws.outgoing_tx.clone(),
 								};
 
@@ -1127,7 +1053,7 @@ async fn handle_hws_restore(
 					)
 					.await;
 
-					ctx.pending_requests
+					ctx.websocket_requests
 						.remove(&[&hib_req.gateway_id, &hib_req.request_id]);
 				}
 			}
@@ -1175,7 +1101,7 @@ async fn handle_hws_restore(
 			};
 
 			let (stale_tx, _) = mpsc::unbounded_channel();
-			let stale_sender = crate::config::WebSocketSender { tx: stale_tx };
+			let stale_sender = WebSocketSender { tx: stale_tx };
 
 			let ws_result = ctx
 				.shared
@@ -1247,7 +1173,7 @@ async fn send_actor_message(
 	request_id: protocol::RequestId,
 	message_kind: protocol::ToRivetTunnelMessageKind,
 ) {
-	let req = ctx.pending_requests.get_mut(&[&gateway_id, &request_id]);
+	let req = ctx.websocket_requests.get_mut(&[&gateway_id, &request_id]);
 	let envoy_message_index = if let Some(req) = req {
 		let idx = req.envoy_message_index;
 		req.envoy_message_index += 1;
@@ -1283,118 +1209,9 @@ async fn send_actor_message(
 		}
 		let _ = crate::envoy::send_to_envoy_tx(
 			&ctx.shared,
-			crate::envoy::ToEnvoyMessage::BufferTunnelMsg { msg: buffer_msg },
+			crate::envoy::ToEnvoyMessage::SendOrBufferTunnelMsg { msg: buffer_msg },
 		);
 	}
-}
-
-async fn send_response(
-	shared: &SharedContext,
-	gateway_id: protocol::GatewayId,
-	request_id: protocol::RequestId,
-	mut response: HttpResponse,
-) {
-	let mut headers = HashMap::new();
-	for (k, v) in response.headers {
-		headers.insert(k, v);
-	}
-
-	let is_streaming = response.body_stream.is_some();
-
-	if !is_streaming {
-		if let Some(body) = &response.body {
-			if !headers.contains_key("content-length") {
-				headers.insert("content-length".to_string(), body.len().to_string());
-			}
-		}
-	}
-
-	// Send the response start
-	ws_send(
-		shared,
-		protocol::ToRivet::ToRivetTunnelMessage(protocol::ToRivetTunnelMessage {
-			message_id: protocol::MessageId {
-				gateway_id,
-				request_id,
-				message_index: 0,
-			},
-			message_kind: protocol::ToRivetTunnelMessageKind::ToRivetResponseStart(
-				protocol::ToRivetResponseStart {
-					status: response.status,
-					headers,
-					body: response.body,
-					stream: is_streaming,
-				},
-			),
-		}),
-	)
-	.await;
-
-	// If streaming, read chunks from the body_stream and forward them
-	if let Some(ref mut body_stream) = response.body_stream {
-		let mut message_index: u16 = 1;
-		while let Some(chunk) = body_stream.recv().await {
-			let finish = chunk.finish;
-			ws_send(
-				shared,
-				protocol::ToRivet::ToRivetTunnelMessage(protocol::ToRivetTunnelMessage {
-					message_id: protocol::MessageId {
-						gateway_id,
-						request_id,
-						message_index,
-					},
-					message_kind: protocol::ToRivetTunnelMessageKind::ToRivetResponseChunk(
-						protocol::ToRivetResponseChunk {
-							body: chunk.data,
-							finish,
-						},
-					),
-				}),
-			)
-			.await;
-			message_index = message_index.wrapping_add(1);
-			if finish {
-				break;
-			}
-		}
-	}
-}
-
-async fn send_fetch_error_response(
-	shared: &SharedContext,
-	gateway_id: protocol::GatewayId,
-	request_id: protocol::RequestId,
-) {
-	let body =
-		br#"{"group":"envoy","code":"fetch_failed","message":"actor fetch failed","metadata":{}}"#
-			.to_vec();
-	let mut headers = HashMap::new();
-	headers.insert("content-type".to_string(), "application/json".to_string());
-	headers.insert("content-length".to_string(), body.len().to_string());
-	headers.insert(
-		"x-rivet-error".to_string(),
-		"envoy.fetch_failed".to_string(),
-	);
-
-	ws_send(
-		shared,
-		protocol::ToRivet::ToRivetTunnelMessage(protocol::ToRivetTunnelMessage {
-			message_id: protocol::MessageId {
-				gateway_id,
-				request_id,
-				message_index: 0,
-			},
-			message_kind: protocol::ToRivetTunnelMessageKind::ToRivetResponseStart(
-				protocol::ToRivetResponseStart {
-					status: 500,
-					headers,
-					body: Some(body),
-					stream: false,
-				},
-			),
-		}),
-	)
-	.await;
 }
 
 #[cfg(test)]
@@ -1402,16 +1219,16 @@ mod tests {
 	use std::collections::HashMap;
 	use std::future::pending;
 	use std::sync::Mutex;
-	use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+	use std::sync::atomic::{AtomicBool, Ordering};
 	use std::time::{Duration, Instant};
 
 	use tokio::sync::Notify;
 	use tokio::sync::oneshot;
-	use tokio::task::yield_now;
+	use vbare::OwnedVersionedData;
 
 	use super::*;
 	use crate::config::{BoxFuture, EnvoyCallbacks, WebSocketHandler, WebSocketSender};
-	use crate::context::{SharedActorEntry, WsTxMessage};
+	use crate::context::WsTxMessage;
 	use crate::envoy::ToEnvoyMessage;
 
 	struct DropSignal(Option<oneshot::Sender<()>>);
@@ -1424,7 +1241,7 @@ mod tests {
 		}
 	}
 
-	struct TestCallbacks {
+	pub(super) struct TestCallbacks {
 		fetch_started_tx: Mutex<Option<oneshot::Sender<()>>>,
 		fetch_dropped_tx: Mutex<Option<oneshot::Sender<()>>>,
 		release_fetch: Arc<Notify>,
@@ -1432,7 +1249,7 @@ mod tests {
 	}
 
 	impl TestCallbacks {
-		fn idle() -> Self {
+		pub(super) fn idle() -> Self {
 			Self {
 				fetch_started_tx: Mutex::new(None),
 				fetch_dropped_tx: Mutex::new(None),
@@ -1450,7 +1267,7 @@ mod tests {
 			}
 		}
 
-		fn hanging(
+		pub(super) fn hanging(
 			fetch_started_tx: oneshot::Sender<()>,
 			fetch_dropped_tx: oneshot::Sender<()>,
 		) -> Self {
@@ -1465,6 +1282,14 @@ mod tests {
 
 	struct DeferredStopCallbacks {
 		stop_handle_tx: Mutex<Option<oneshot::Sender<crate::config::ActorStopHandle>>>,
+	}
+
+	pub(super) struct StreamingCallbacks {
+		pub(super) body_tx: Mutex<Option<oneshot::Sender<mpsc::Sender<ResponseChunk>>>>,
+	}
+
+	pub(super) struct StreamingRequestCallbacks {
+		pub(super) request_tx: Mutex<Option<oneshot::Sender<HttpRequest>>>,
 	}
 
 	impl EnvoyCallbacks for TestCallbacks {
@@ -1497,7 +1322,7 @@ mod tests {
 			_actor_id: String,
 			_gateway_id: protocol::GatewayId,
 			_request_id: protocol::RequestId,
-			_request: HttpRequest,
+			request: HttpRequest,
 		) -> BoxFuture<anyhow::Result<HttpResponse>> {
 			let fetch_started_tx = self
 				.fetch_started_tx
@@ -1513,6 +1338,7 @@ mod tests {
 			let complete_fetch = self.complete_fetch.load(Ordering::Acquire);
 
 			Box::pin(async move {
+				let _request = request;
 				if let Some(tx) = fetch_started_tx {
 					let _ = tx.send(());
 				}
@@ -1554,6 +1380,72 @@ mod tests {
 					on_open: None,
 				})
 			})
+		}
+
+		fn can_hibernate(
+			&self,
+			_actor_id: &str,
+			_gateway_id: &protocol::GatewayId,
+			_request_id: &protocol::RequestId,
+			_request: &HttpRequest,
+		) -> BoxFuture<anyhow::Result<bool>> {
+			Box::pin(async { Ok(false) })
+		}
+	}
+
+	impl EnvoyCallbacks for StreamingRequestCallbacks {
+		fn on_actor_start(
+			&self,
+			_handle: EnvoyHandle,
+			_actor_id: String,
+			_generation: u32,
+			_config: protocol::ActorConfig,
+			_preloaded_kv: Option<protocol::PreloadedKv>,
+		) -> BoxFuture<anyhow::Result<()>> {
+			Box::pin(async { Ok(()) })
+		}
+
+		fn on_shutdown(&self) {}
+
+		fn fetch(
+			&self,
+			_handle: EnvoyHandle,
+			_actor_id: String,
+			_gateway_id: protocol::GatewayId,
+			_request_id: protocol::RequestId,
+			request: HttpRequest,
+		) -> BoxFuture<anyhow::Result<HttpResponse>> {
+			let request_tx = self
+				.request_tx
+				.lock()
+				.expect("streaming request mutex poisoned")
+				.take();
+			Box::pin(async move {
+				let Some(request_tx) = request_tx else {
+					anyhow::bail!("streaming request sender missing");
+				};
+				request_tx
+					.send(request)
+					.map_err(|_| anyhow::anyhow!("streaming request receiver dropped"))?;
+				pending::<()>().await;
+				unreachable!("pending request callback should not resolve")
+			})
+		}
+
+		fn websocket(
+			&self,
+			_handle: EnvoyHandle,
+			_actor_id: String,
+			_gateway_id: protocol::GatewayId,
+			_request_id: protocol::RequestId,
+			_request: HttpRequest,
+			_path: String,
+			_headers: HashMap<String, String>,
+			_is_hibernatable: bool,
+			_is_restoring_hibernatable: bool,
+			_sender: WebSocketSender,
+		) -> BoxFuture<anyhow::Result<WebSocketHandler>> {
+			Box::pin(async { anyhow::bail!("websocket should not be called in HTTP stream test") })
 		}
 
 		fn can_hibernate(
@@ -1646,7 +1538,86 @@ mod tests {
 		}
 	}
 
-	fn build_shared_context(
+	impl EnvoyCallbacks for StreamingCallbacks {
+		fn on_actor_start(
+			&self,
+			_handle: EnvoyHandle,
+			_actor_id: String,
+			_generation: u32,
+			_config: protocol::ActorConfig,
+			_preloaded_kv: Option<protocol::PreloadedKv>,
+		) -> BoxFuture<anyhow::Result<()>> {
+			Box::pin(async { Ok(()) })
+		}
+
+		fn on_actor_stop(
+			&self,
+			_handle: EnvoyHandle,
+			_actor_id: String,
+			_generation: u32,
+			_reason: protocol::StopActorReason,
+		) -> BoxFuture<anyhow::Result<()>> {
+			Box::pin(async { Ok(()) })
+		}
+
+		fn on_shutdown(&self) {}
+
+		fn fetch(
+			&self,
+			_handle: EnvoyHandle,
+			_actor_id: String,
+			_gateway_id: protocol::GatewayId,
+			_request_id: protocol::RequestId,
+			_request: HttpRequest,
+		) -> BoxFuture<anyhow::Result<HttpResponse>> {
+			let body_tx = self
+				.body_tx
+				.lock()
+				.expect("streaming body mutex poisoned")
+				.take();
+
+			Box::pin(async move {
+				let (tx, rx) = mpsc::channel(HTTP_BODY_STREAM_CHANNEL_CAPACITY);
+				if let Some(body_tx) = body_tx {
+					let _ = body_tx.send(tx);
+				}
+				Ok(HttpResponse {
+					status: 200,
+					headers: HashMap::new(),
+					body: None,
+					body_stream: Some(rx.into()),
+				})
+			})
+		}
+
+		fn websocket(
+			&self,
+			_handle: EnvoyHandle,
+			_actor_id: String,
+			_gateway_id: protocol::GatewayId,
+			_request_id: protocol::RequestId,
+			_request: HttpRequest,
+			_path: String,
+			_headers: HashMap<String, String>,
+			_is_hibernatable: bool,
+			_is_restoring_hibernatable: bool,
+			_sender: WebSocketSender,
+		) -> BoxFuture<anyhow::Result<WebSocketHandler>> {
+			Box::pin(async { anyhow::bail!("websocket should not be called in streaming test") })
+		}
+
+		fn can_hibernate(
+			&self,
+			_actor_id: &str,
+			_gateway_id: &protocol::GatewayId,
+			_request_id: &protocol::RequestId,
+			_request: &HttpRequest,
+		) -> BoxFuture<anyhow::Result<bool>> {
+			Box::pin(async { Ok(false) })
+		}
+	}
+
+	pub(super) fn build_shared_context(
 		callbacks: Arc<dyn EnvoyCallbacks>,
 	) -> (Arc<SharedContext>, mpsc::UnboundedReceiver<ToEnvoyMessage>) {
 		let (envoy_tx, envoy_rx) = mpsc::unbounded_channel();
@@ -1672,6 +1643,7 @@ mod tests {
 			ws_tx: Arc::new(tokio::sync::Mutex::new(
 				None::<mpsc::UnboundedSender<WsTxMessage>>,
 			)),
+			http_ws_tx: Arc::new(tokio::sync::Mutex::new(None)),
 			connection_session: std::sync::atomic::AtomicU64::new(0),
 			next_connection_session: std::sync::atomic::AtomicU64::new(0),
 			connection_session_tx: tokio::sync::watch::channel(0).0,
@@ -1683,7 +1655,7 @@ mod tests {
 		(shared, envoy_rx)
 	}
 
-	fn actor_config() -> protocol::ActorConfig {
+	pub(super) fn actor_config() -> protocol::ActorConfig {
 		protocol::ActorConfig {
 			name: "test".to_string(),
 			key: Some("test-key".to_string()),
@@ -1692,18 +1664,20 @@ mod tests {
 		}
 	}
 
-	fn request_start() -> protocol::ToEnvoyRequestStart {
+	pub(super) fn request_start() -> protocol::ToEnvoyRequestStart {
 		protocol::ToEnvoyRequestStart {
 			actor_id: "test-actor".to_string(),
+			actor_generation: Some(1),
 			method: "GET".to_string(),
 			path: "/test".to_string(),
 			headers: HashMap::new(),
 			body: None,
 			stream: false,
+			response_stream: true,
 		}
 	}
 
-	fn message_id() -> protocol::MessageId {
+	pub(super) fn message_id() -> protocol::MessageId {
 		protocol::MessageId {
 			gateway_id: [1, 2, 3, 4],
 			request_id: [5, 6, 7, 8],
@@ -1711,7 +1685,7 @@ mod tests {
 		}
 	}
 
-	async fn wait_for_zero(active_http_request_count: &Arc<AsyncCounter>) {
+	pub(super) async fn wait_for_zero(active_http_request_count: &Arc<AsyncCounter>) {
 		assert!(
 			active_http_request_count
 				.wait_zero(Instant::now() + Duration::from_secs(2))
@@ -1720,7 +1694,32 @@ mod tests {
 		);
 	}
 
-	async fn wait_for_stopped_event(envoy_rx: &mut mpsc::UnboundedReceiver<ToEnvoyMessage>) {
+	pub(super) async fn recv_ws_tunnel_msg(
+		ws_rx: &mut mpsc::UnboundedReceiver<WsTxMessage>,
+	) -> protocol::ToRivetTunnelMessage {
+		tokio::time::timeout(Duration::from_secs(2), async {
+			loop {
+				let Some(msg) = ws_rx.recv().await else {
+					panic!("websocket channel closed before tunnel message");
+				};
+				let WsTxMessage::Send(bytes) = msg else {
+					continue;
+				};
+				let message =
+					protocol::versioned::ToRivet::deserialize(&bytes, protocol::PROTOCOL_VERSION)
+						.expect("failed to decode ToRivet message");
+				if let protocol::ToRivet::ToRivetTunnelMessage(msg) = message {
+					return msg;
+				}
+			}
+		})
+		.await
+		.expect("timed out waiting for tunnel message")
+	}
+
+	pub(super) async fn wait_for_stopped_event(
+		envoy_rx: &mut mpsc::UnboundedReceiver<ToEnvoyMessage>,
+	) {
 		tokio::time::timeout(Duration::from_secs(2), async {
 			loop {
 				let Some(msg) = envoy_rx.recv().await else {
@@ -1837,6 +1836,7 @@ mod tests {
 			.send(ToActor::ReqStart {
 				message_id: message_id(),
 				req: request_start(),
+				connection_session: 1,
 			})
 			.expect("failed to send request start");
 
@@ -1877,6 +1877,7 @@ mod tests {
 			.send(ToActor::ReqStart {
 				message_id: message_id(),
 				req: request_start(),
+				connection_session: 1,
 			})
 			.expect("failed to send request start");
 
@@ -1978,76 +1979,8 @@ mod tests {
 		assert!(stop_handle.complete(), "stop handle should complete once");
 		assert_alarm_before_stopped_event(&mut envoy_rx, Some(123)).await;
 	}
-
-	#[tokio::test]
-	async fn http_request_guard_counter_is_visible_through_envoy_handle() {
-		let (shared, _envoy_rx) = build_shared_context(Arc::new(TestCallbacks::idle()));
-		let handle = EnvoyHandle {
-			shared: shared.clone(),
-			started_rx: tokio::sync::watch::channel(()).1,
-		};
-		let counter = Arc::new(AsyncCounter::new());
-		shared
-			.actors
-			.lock()
-			.expect("shared actor registry poisoned")
-			.entry("actor-4".to_string())
-			.or_insert_with(HashMap::new)
-			.insert(
-				4,
-				SharedActorEntry {
-					handle: mpsc::unbounded_channel().0,
-					active_http_request_count: counter.clone(),
-				},
-			);
-
-		let request_guard = ActiveHttpRequestGuard::new(counter);
-		let handle_counter = handle
-			.http_request_counter("actor-4", Some(4))
-			.expect("counter should be returned");
-		assert_eq!(handle_counter.load(), 1);
-
-		drop(request_guard);
-		assert_eq!(handle_counter.load(), 0);
-		assert!(
-			handle_counter
-				.wait_zero(Instant::now() + Duration::from_secs(2))
-				.await
-		);
-	}
-
-	#[tokio::test]
-	async fn active_http_request_counter_waiter_wakes_only_after_final_drop() {
-		let counter = Arc::new(AsyncCounter::new());
-		let guard_a = ActiveHttpRequestGuard::new(counter.clone());
-		let guard_b = ActiveHttpRequestGuard::new(counter.clone());
-		let wake_count = Arc::new(AtomicUsize::new(0));
-
-		let waiter = tokio::spawn({
-			let counter = counter.clone();
-			let wake_count = wake_count.clone();
-			async move {
-				let woke = counter
-					.wait_zero(Instant::now() + Duration::from_secs(2))
-					.await;
-				if woke {
-					wake_count.fetch_add(1, Ordering::SeqCst);
-				}
-				woke
-			}
-		});
-
-		yield_now().await;
-		drop(guard_a);
-		yield_now().await;
-		assert_eq!(wake_count.load(Ordering::SeqCst), 0);
-		assert!(
-			!waiter.is_finished(),
-			"waiter should stay pending until the final in-flight request completes"
-		);
-
-		drop(guard_b);
-		assert!(waiter.await.expect("waiter should join"));
-		assert_eq!(wake_count.load(Ordering::SeqCst), 1);
-	}
 }
+
+#[cfg(test)]
+#[path = "../tests/support/actor_http_stream.rs"]
+mod http_stream_tests;

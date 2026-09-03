@@ -20,6 +20,8 @@ pub struct Output {
 	pub connectable: bool,
 	pub runner_id: Option<Id>,
 	pub envoy_key: Option<String>,
+	pub envoy_protocol_version: Option<u16>,
+	pub generation: Option<u32>,
 	pub version: u32,
 }
 
@@ -43,6 +45,7 @@ pub async fn pegboard_actor_get_for_gateway(
 			let runner_id_key = keys::actor::RunnerIdKey::new(input.actor_id);
 			let version_key = keys::actor::VersionKey::new(input.actor_id);
 			let envoy_key_key = keys::actor::EnvoyKeyKey::new(input.actor_id);
+			let generation_key = keys::actor::GenerationKey::new(input.actor_id);
 
 			let (
 				namespace_id_entry,
@@ -55,6 +58,7 @@ pub async fn pegboard_actor_get_for_gateway(
 				runner_id,
 				version_entry,
 				envoy_key,
+				generation,
 			) = tokio::try_join!(
 				tx.read_opt(&namespace_id_key, Serializable),
 				tx.read_opt(&workflow_id_key, Serializable),
@@ -66,6 +70,7 @@ pub async fn pegboard_actor_get_for_gateway(
 				tx.read_opt(&runner_id_key, Serializable),
 				tx.read_opt(&version_key, Serializable),
 				tx.read_opt(&envoy_key_key, Serializable),
+				tx.read_opt(&generation_key, Serializable),
 			)?;
 
 			let (Some(namespace_id), Some(workflow_id)) = (namespace_id_entry, workflow_id_entry)
@@ -74,6 +79,16 @@ pub async fn pegboard_actor_get_for_gateway(
 			};
 
 			tx.tag(&format!("actor_get_for_gateway:{namespace_id}"))?;
+
+			let envoy_protocol_version = if let Some(envoy_key) = &envoy_key {
+				tx.read_opt(
+					&keys::envoy::ProtocolVersionKey::new(namespace_id, envoy_key.clone()),
+					Serializable,
+				)
+				.await?
+			} else {
+				None
+			};
 
 			Ok(Some(Output {
 				namespace_id,
@@ -85,6 +100,8 @@ pub async fn pegboard_actor_get_for_gateway(
 				connectable,
 				runner_id,
 				envoy_key,
+				envoy_protocol_version,
+				generation,
 				version: version_entry.unwrap_or(1),
 			}))
 		})

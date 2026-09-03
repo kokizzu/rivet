@@ -20,6 +20,11 @@ export RIVET__PEGBOARD__ENVOY_LOST_THRESHOLD="7000"
 # Allow faster metadata polling for hot-reload in development (in milliseconds)
 export RIVET__PEGBOARD__MIN_METADATA_POLL_INTERVAL="1000"
 
+# Exercise Guard Gateway V3 for all supported local actors without changing the
+# application config default used by deployed environments.
+export RIVET__FEATURES__GUARD_GATEWAY_V3__MODE="on"
+export RIVET__FEATURES__GUARD_GATEWAY_V3__PERCENTAGE="100"
+
 # Reduce shutdown durations for faster development iteration (in seconds)
 export RIVET__RUNTIME__WORKER_SHUTDOWN_DURATION="1"
 export RIVET__RUNTIME__GUARD_SHUTDOWN_DURATION="1"

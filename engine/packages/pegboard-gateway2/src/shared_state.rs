@@ -69,7 +69,13 @@ fn to_envoy_tunnel_message_kind_name(kind: &protocol::ToEnvoyTunnelMessageKind) 
 	match kind {
 		protocol::ToEnvoyTunnelMessageKind::ToEnvoyRequestStart(_) => "ToEnvoyRequestStart",
 		protocol::ToEnvoyTunnelMessageKind::ToEnvoyRequestChunk(_) => "ToEnvoyRequestChunk",
-		protocol::ToEnvoyTunnelMessageKind::ToEnvoyRequestAbort => "ToEnvoyRequestAbort",
+		protocol::ToEnvoyTunnelMessageKind::ToEnvoyRequestAbort(_) => "ToEnvoyRequestAbort",
+		protocol::ToEnvoyTunnelMessageKind::ToEnvoyRequestBodyCancel => {
+			"ToEnvoyRequestBodyCancel"
+		}
+		protocol::ToEnvoyTunnelMessageKind::ToEnvoyResponseBodyWindowUpdate(_) => {
+			"ToEnvoyResponseBodyWindowUpdate"
+		}
 		protocol::ToEnvoyTunnelMessageKind::ToEnvoyWebSocketOpen(_) => "ToEnvoyWebSocketOpen",
 		protocol::ToEnvoyTunnelMessageKind::ToEnvoyWebSocketMessage(_) => "ToEnvoyWebSocketMessage",
 		protocol::ToEnvoyTunnelMessageKind::ToEnvoyWebSocketClose(_) => "ToEnvoyWebSocketClose",
@@ -80,7 +86,13 @@ fn to_rivet_tunnel_message_kind_name(kind: &protocol::ToRivetTunnelMessageKind) 
 	match kind {
 		protocol::ToRivetTunnelMessageKind::ToRivetResponseStart(_) => "ToRivetResponseStart",
 		protocol::ToRivetTunnelMessageKind::ToRivetResponseChunk(_) => "ToRivetResponseChunk",
-		protocol::ToRivetTunnelMessageKind::ToRivetResponseAbort => "ToRivetResponseAbort",
+		protocol::ToRivetTunnelMessageKind::ToRivetResponseAbort(_) => "ToRivetResponseAbort",
+		protocol::ToRivetTunnelMessageKind::ToRivetRequestBodyWindowUpdate(_) => {
+			"ToRivetRequestBodyWindowUpdate"
+		}
+		protocol::ToRivetTunnelMessageKind::ToRivetRequestBodyCancel => {
+			"ToRivetRequestBodyCancel"
+		}
 		protocol::ToRivetTunnelMessageKind::ToRivetWebSocketOpen(_) => "ToRivetWebSocketOpen",
 		protocol::ToRivetTunnelMessageKind::ToRivetWebSocketMessage(_) => "ToRivetWebSocketMessage",
 		protocol::ToRivetTunnelMessageKind::ToRivetWebSocketMessageAck(_) => {
@@ -96,6 +108,23 @@ fn to_rivet_tunnel_message_kind_name(kind: &protocol::ToRivetTunnelMessageKind) 
 /// controls the structured-log signal that surfaces individual slow events for
 /// post-hoc correlation with actor/envoy identity.
 static SLOW_PING_THRESHOLD_MS: AtomicU64 = AtomicU64::new(50);
+const GATEWAY2_FALLBACK_PROTOCOL_VERSION: u16 = 6;
+
+fn gateway2_protocol_version(envoy_protocol_version: Option<u16>) -> u16 {
+	match envoy_protocol_version {
+		Some(version @ 1..=PROTOCOL_VERSION) => version,
+		Some(version) if version > PROTOCOL_VERSION => PROTOCOL_VERSION,
+		_ => GATEWAY2_FALLBACK_PROTOCOL_VERSION,
+	}
+}
+
+fn serialize_for_envoy(
+	message: protocol::ToEnvoyConn,
+	envoy_protocol_version: Option<u16>,
+) -> Result<Vec<u8>> {
+	versioned::ToEnvoyConn::wrap_latest(message)
+		.serialize_with_embedded_version(gateway2_protocol_version(envoy_protocol_version))
+}
 
 pub fn init_slow_ping_threshold_from_env() {
 	if let Ok(raw) = std::env::var("RIVET_GATEWAY2_SLOW_PING_THRESHOLD_MS") {
@@ -138,6 +167,17 @@ impl RequestStopResult {
 			RequestStopResult::ActorReadyTimeout => "actor_ready_timeout",
 			RequestStopResult::RequestTimeout => "request_timeout",
 			RequestStopResult::EnvoyError => "envoy_error",
+		}
+	}
+
+	fn lifecycle_result(self) -> rivet_guard_core::metrics::PegboardGatewayResult {
+		use rivet_guard_core::metrics::PegboardGatewayResult;
+		match self {
+			Self::Success => PegboardGatewayResult::Success,
+			Self::ClientDisconnect => PegboardGatewayResult::ClientDisconnect,
+			Self::ActorReadyTimeout => PegboardGatewayResult::ActorReadyTimeout,
+			Self::RequestTimeout => PegboardGatewayResult::RequestTimeout,
+			Self::EnvoyError => PegboardGatewayResult::EnvoyError,
 		}
 	}
 }
@@ -349,9 +389,11 @@ impl SharedState {
 		pool_name: &str,
 		actor_key: Option<String>,
 		actor_generation: Option<u32>,
+		envoy_protocol_version: Option<u16>,
 		protocol: RequestProtocol,
 		receiver_subject: String,
 		request_id: protocol::RequestId,
+		lifecycle: rivet_guard_core::metrics::PegboardGatewayLifecycle,
 		after_hibernation: bool,
 	) -> Result<InFlightRequestCtx> {
 		let (msg_tx, msg_rx) = mpsc::unbounded_channel();
@@ -369,7 +411,9 @@ impl SharedState {
 					pool_name: pool_name.to_string(),
 					actor_key,
 					actor_generation,
+					envoy_protocol_version,
 					protocol,
+					lifecycle,
 					receiver_subject,
 					message_index: 0,
 					created_at: Instant::now(),
@@ -394,6 +438,7 @@ impl SharedState {
 			Entry::Occupied(mut entry) => {
 				entry.actor_key = actor_key;
 				entry.actor_generation = actor_generation;
+				entry.envoy_protocol_version = envoy_protocol_version;
 				entry.wake(receiver_subject, msg_tx, drop_tx);
 
 				false
@@ -601,8 +646,7 @@ impl InFlightRequestHandle {
 		};
 
 		let message = protocol::ToEnvoyConn::ToEnvoyTunnelMessage(payload);
-		let message_serialized = versioned::ToEnvoyConn::wrap_latest(message)
-			.serialize_with_embedded_version(PROTOCOL_VERSION)?;
+		let message_serialized = serialize_for_envoy(message, req.envoy_protocol_version)?;
 
 		if let (Some(hs), true) = (req.hibernation_state_mut(), is_ws_message) {
 			hs.total_pending_ws_msgs_size += message_serialized.len() as u64;
@@ -811,6 +855,7 @@ impl InFlightRequestHandle {
 		let pool_name = req.pool_name.clone();
 		let actor_key = req.actor_key.clone();
 		let actor_generation = req.actor_generation.clone();
+		let envoy_protocol_version = req.envoy_protocol_version;
 		let protocol = req.protocol.to_string();
 
 		// Release lock before further async work
@@ -851,8 +896,7 @@ impl InFlightRequestHandle {
 			request_id: self.request_id,
 			ts: now,
 		});
-		let message_serialized = versioned::ToEnvoyConn::wrap_latest(message)
-			.serialize_with_embedded_version(PROTOCOL_VERSION)?;
+		let message_serialized = serialize_for_envoy(message, envoy_protocol_version)?;
 
 		self.shared_state
 			.ups
@@ -1076,7 +1120,9 @@ struct InFlightRequest {
 	pool_name: String,
 	actor_key: Option<String>,
 	actor_generation: Option<u32>,
+	envoy_protocol_version: Option<u16>,
 	protocol: RequestProtocol,
+	lifecycle: rivet_guard_core::metrics::PegboardGatewayLifecycle,
 	/// UPS subject to send messages to for this request.
 	receiver_subject: String,
 	/// Message index counter for this request.
@@ -1087,12 +1133,14 @@ struct InFlightRequest {
 
 impl InFlightRequest {
 	fn observe_terminal(&self, result: RequestStopResult) {
+		self.lifecycle.finish(result.lifecycle_result());
+		let result = result.as_str();
 		metrics::REQUEST_DURATION_SECONDS
 			.with_label_values(&[
 				self.namespace_id.to_string().as_str(),
 				self.pool_name.as_str(),
 				self.protocol.to_string().as_str(),
-				result.as_str(),
+				result,
 			])
 			.observe(self.created_at.elapsed().as_secs_f64());
 	}
@@ -1447,6 +1495,99 @@ fn forward_tunnel_message(
 
 fn wrapping_gt(a: u16, b: u16) -> bool {
 	a != b && a.wrapping_sub(b) < u16::MAX / 2
+}
+
+#[cfg(test)]
+mod tests {
+	use std::collections::HashMap;
+
+	use super::*;
+
+	fn serialize_v6_tunnel_message(
+		message_kind: protocol::ToEnvoyTunnelMessageKind,
+	) -> Vec<u8> {
+		serialize_for_envoy(
+			protocol::ToEnvoyConn::ToEnvoyTunnelMessage(protocol::ToEnvoyTunnelMessage {
+				message_id: protocol::MessageId {
+					gateway_id: [1; 4],
+					request_id: [2; 4],
+					message_index: 3,
+				},
+				message_kind,
+			}),
+			Some(6),
+		)
+		.expect("serialize V6 Gateway2 tunnel message")
+	}
+
+	#[test]
+	fn protocol_selection_preserves_v6_and_caps_future_versions() {
+		assert_eq!(gateway2_protocol_version(None), 6);
+		assert_eq!(gateway2_protocol_version(Some(0)), 6);
+		assert_eq!(gateway2_protocol_version(Some(6)), 6);
+		assert_eq!(gateway2_protocol_version(Some(7)), 7);
+		assert_eq!(gateway2_protocol_version(Some(u16::MAX)), PROTOCOL_VERSION);
+	}
+
+	#[test]
+	fn v6_http_request_start_is_encoded_as_a_v6_transport_frame() {
+		let encoded = serialize_v6_tunnel_message(
+			protocol::ToEnvoyTunnelMessageKind::ToEnvoyRequestStart(
+				protocol::ToEnvoyRequestStart {
+					actor_id: "actor".into(),
+					actor_generation: None,
+					method: "POST".into(),
+					path: "/upload".into(),
+					headers: HashMap::new(),
+					body: Some(vec![1, 2, 3]),
+					stream: false,
+					response_stream: false,
+				},
+			),
+		);
+
+		assert_eq!(&encoded[..2], &6u16.to_le_bytes());
+		let decoded = versioned::ToEnvoyConn::deserialize_version(&encoded[2..], 6)
+			.expect("decode raw V6 HTTP frame");
+		let versioned::ToEnvoyConn::V6(
+			protocol::generated::v6::ToEnvoyConn::ToEnvoyTunnelMessage(message),
+		) = decoded
+		else {
+			panic!("expected a V6 tunnel message");
+		};
+		assert!(matches!(
+			message.message_kind,
+			protocol::generated::v6::ToEnvoyTunnelMessageKind::ToEnvoyRequestStart(_)
+		));
+	}
+
+	#[test]
+	fn v6_websocket_open_is_encoded_as_a_v6_transport_frame() {
+		let encoded = serialize_v6_tunnel_message(
+			protocol::ToEnvoyTunnelMessageKind::ToEnvoyWebSocketOpen(
+				protocol::ToEnvoyWebSocketOpen {
+					actor_id: "actor".into(),
+					actor_generation: None,
+					path: "/socket".into(),
+					headers: HashMap::new(),
+				},
+			),
+		);
+
+		assert_eq!(&encoded[..2], &6u16.to_le_bytes());
+		let decoded = versioned::ToEnvoyConn::deserialize_version(&encoded[2..], 6)
+			.expect("decode raw V6 websocket frame");
+		let versioned::ToEnvoyConn::V6(
+			protocol::generated::v6::ToEnvoyConn::ToEnvoyTunnelMessage(message),
+		) = decoded
+		else {
+			panic!("expected a V6 tunnel message");
+		};
+		assert!(matches!(
+			message.message_kind,
+			protocol::generated::v6::ToEnvoyTunnelMessageKind::ToEnvoyWebSocketOpen(_)
+		));
+	}
 }
 
 // fn wrapping_lt(a: u16, b: u16) -> bool {

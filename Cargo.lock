@@ -4098,6 +4098,41 @@ dependencies = [
 ]
 
 [[package]]
+name = "pegboard-gateway3"
+version = "2.3.11"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bytes",
+ "futures-util",
+ "gasoline",
+ "http-body-util",
+ "hyper 1.6.0",
+ "hyper-tungstenite",
+ "lazy_static",
+ "namespace",
+ "pegboard",
+ "rand 0.8.5",
+ "replace_with",
+ "rivet-config",
+ "rivet-envoy-protocol",
+ "rivet-error",
+ "rivet-guard-core",
+ "rivet-metrics",
+ "rivet-util",
+ "scc",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
+ "universaldb",
+ "universalpubsub",
+ "vbare",
+]
+
+[[package]]
 name = "pegboard-outbound"
 version = "2.3.11"
 dependencies = [
@@ -5574,6 +5609,7 @@ dependencies = [
  "pegboard-envoy",
  "pegboard-gateway",
  "pegboard-gateway2",
+ "pegboard-gateway3",
  "pegboard-runner",
  "regex",
  "rivet-api-builder",
@@ -5583,6 +5619,7 @@ dependencies = [
  "rivet-cache",
  "rivet-config",
  "rivet-data",
+ "rivet-envoy-protocol",
  "rivet-error",
  "rivet-guard-core",
  "rivet-logs",
@@ -5592,6 +5629,7 @@ dependencies = [
  "rivet-runner-protocol",
  "rivet-runtime",
  "rivet-types",
+ "rivet-util",
  "rustls",
  "rustls-pemfile",
  "serde",
@@ -5605,6 +5643,7 @@ dependencies = [
  "universalpubsub",
  "url",
  "urlencoding",
+ "xxhash-rust",
 ]
 
 [[package]]
@@ -5647,6 +5686,7 @@ dependencies = [
  "tokio-rustls",
  "tokio-stream",
  "tokio-tungstenite",
+ "tokio-util",
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
