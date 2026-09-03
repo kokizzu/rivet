@@ -174,6 +174,7 @@ impl<'a, T: Signal + Serialize> SignalBuilder<'a, T> {
 							self.ctx
 								.db()
 								.commit_workflow_removed_event(
+									self.ctx.worker_id(),
 									self.ctx.workflow_id(),
 									&location,
 									EventType::SignalSend,
@@ -192,9 +193,12 @@ impl<'a, T: Signal + Serialize> SignalBuilder<'a, T> {
 					};
 
 					let db_write_started = Instant::now();
-					self.ctx
+
+					let res = self
+						.ctx
 						.db()
 						.publish_signal_from_workflow(
+							self.ctx.worker_id(),
 							self.ctx.workflow_id(),
 							&location,
 							self.version,
@@ -205,7 +209,34 @@ impl<'a, T: Signal + Serialize> SignalBuilder<'a, T> {
 							&input_val,
 							self.ctx.loop_location(),
 						)
-						.await?;
+						.await;
+
+					match res {
+						Ok(_) => {}
+						Err(WorkflowError::WorkflowNotFound) if self.graceful_not_found => {
+							tracing::debug!("signal target not found");
+
+							// Insert removed event
+							self.ctx
+								.db()
+								.commit_workflow_removed_event(
+									self.ctx.worker_id(),
+									self.ctx.workflow_id(),
+									&location,
+									EventType::SignalSend,
+									Some(T::NAME),
+									self.ctx.loop_location(),
+								)
+								.await?;
+
+							// Move to next event
+							self.ctx.cursor_mut().update(&location);
+
+							return Ok(None);
+						}
+						Err(err) => return Err(err.into()),
+					}
+
 					db_write_duration = db_write_started.elapsed();
 				}
 				(None, Some(workflow_id), true) => {
@@ -215,9 +246,12 @@ impl<'a, T: Signal + Serialize> SignalBuilder<'a, T> {
 					);
 
 					let db_write_started = Instant::now();
-					self.ctx
+
+					let res = self
+						.ctx
 						.db()
 						.publish_signal_from_workflow(
+							self.ctx.worker_id(),
 							self.ctx.workflow_id(),
 							&location,
 							self.version,
@@ -228,7 +262,34 @@ impl<'a, T: Signal + Serialize> SignalBuilder<'a, T> {
 							&input_val,
 							self.ctx.loop_location(),
 						)
-						.await?;
+						.await;
+
+					match res {
+						Ok(_) => {}
+						Err(WorkflowError::WorkflowNotFound) if self.graceful_not_found => {
+							tracing::debug!("signal target not found");
+
+							// Insert removed event
+							self.ctx
+								.db()
+								.commit_workflow_removed_event(
+									self.ctx.worker_id(),
+									self.ctx.workflow_id(),
+									&location,
+									EventType::SignalSend,
+									Some(T::NAME),
+									self.ctx.loop_location(),
+								)
+								.await?;
+
+							// Move to next event
+							self.ctx.cursor_mut().update(&location);
+
+							return Ok(None);
+						}
+						Err(err) => return Err(err.into()),
+					}
+
 					db_write_duration = db_write_started.elapsed();
 				}
 				(None, None, false) => {

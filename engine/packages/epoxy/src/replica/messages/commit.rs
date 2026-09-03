@@ -4,7 +4,7 @@ use universaldb::Transaction;
 
 use crate::replica::commit_kv::{self, CommitKvOutcome};
 
-#[tracing::instrument(skip_all, fields(%replica_id, key = ?commit_req.key))]
+#[tracing::instrument(level = "debug", skip_all, fields(%replica_id, key = ?commit_req.key))]
 pub async fn commit(
 	tx: &Transaction,
 	replica_id: protocol::ReplicaId,

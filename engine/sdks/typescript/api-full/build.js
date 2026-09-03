@@ -1,4 +1,6 @@
 const { build } = require("esbuild");
+const fs = require("fs");
+const path = require("path");
 
 void main();
 
@@ -49,6 +51,22 @@ async function bundle({ platform, target, format, outdir }) {
 		entryPoint: "./src/serialization/index.ts",
 		outfile: `./dist/${outdir}/serialization.js`,
 	});
+
+	// Mark the output directory's module type. This package has no top-level
+	// "type", so without a per-directory marker strict ESM loaders (tsx, vite,
+	// Node) treat the bundled .js files as CommonJS and named exports such as
+	// `RivetClient` fail to resolve.
+	writeTypeMarker(outdir, format);
+}
+
+function writeTypeMarker(outdir, format) {
+	const type = format === "esm" ? "module" : "commonjs";
+	const dir = path.join(__dirname, "dist", outdir);
+	fs.mkdirSync(dir, { recursive: true });
+	fs.writeFileSync(
+		path.join(dir, "package.json"),
+		`${JSON.stringify({ type }, null, 2)}\n`,
+	);
 }
 
 async function runEsbuild({ platform, target, format, entryPoint, outfile }) {

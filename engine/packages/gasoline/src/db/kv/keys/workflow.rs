@@ -806,6 +806,10 @@ impl PendingSignalKey {
 	pub fn subspace(workflow_id: Id, signal_name: String) -> PendingSignalSubspaceKey {
 		PendingSignalSubspaceKey::new(workflow_id, signal_name)
 	}
+
+	pub fn entire_subspace(workflow_id: Id) -> PendingSignalSubspaceKey {
+		PendingSignalSubspaceKey::entire(workflow_id)
+	}
 }
 
 impl FormalKey for PendingSignalKey {
@@ -856,14 +860,21 @@ impl<'de> TupleUnpack<'de> for PendingSignalKey {
 
 pub struct PendingSignalSubspaceKey {
 	workflow_id: Id,
-	signal_name: String,
+	signal_name: Option<String>,
 }
 
 impl PendingSignalSubspaceKey {
 	pub fn new(workflow_id: Id, signal_name: String) -> Self {
 		PendingSignalSubspaceKey {
 			workflow_id,
-			signal_name,
+			signal_name: Some(signal_name),
+		}
+	}
+
+	pub fn entire(workflow_id: Id) -> Self {
+		PendingSignalSubspaceKey {
+			workflow_id,
+			signal_name: None,
 		}
 	}
 }
@@ -874,14 +885,16 @@ impl TuplePack for PendingSignalSubspaceKey {
 		w: &mut W,
 		tuple_depth: TupleDepth,
 	) -> std::io::Result<VersionstampOffset> {
-		let t = (
-			WORKFLOW,
-			SIGNAL,
-			self.workflow_id,
-			PENDING,
-			&self.signal_name,
-		);
-		t.pack(w, tuple_depth)
+		let mut offset = VersionstampOffset::None { size: 0 };
+
+		let t = (WORKFLOW, SIGNAL, self.workflow_id);
+		offset += t.pack(w, tuple_depth)?;
+
+		if let Some(signal_name) = &self.signal_name {
+			offset += (PENDING, signal_name).pack(w, tuple_depth)?;
+		}
+
+		Ok(offset)
 	}
 }
 
@@ -1517,5 +1530,91 @@ impl TuplePack for PruneIdxSubspaceKey {
 		}
 
 		Ok(offset)
+	}
+}
+
+#[derive(Debug)]
+pub struct DeadIdxKey {
+	pub workflow_name: String,
+	pub error: String,
+	pub workflow_id: Id,
+}
+
+impl DeadIdxKey {
+	pub fn new(workflow_name: String, error: String, workflow_id: Id) -> Self {
+		DeadIdxKey {
+			workflow_name,
+			error,
+			workflow_id,
+		}
+	}
+
+	pub fn subspace(workflow_name: String) -> DeadIdxSubspaceKey {
+		DeadIdxSubspaceKey::new(workflow_name)
+	}
+}
+
+impl FormalKey for DeadIdxKey {
+	type Value = ();
+
+	fn deserialize(&self, _raw: &[u8]) -> Result<Self::Value> {
+		Ok(())
+	}
+
+	fn serialize(&self, _value: Self::Value) -> Result<Vec<u8>> {
+		Ok(Vec::new())
+	}
+}
+
+impl TuplePack for DeadIdxKey {
+	fn pack<W: std::io::Write>(
+		&self,
+		w: &mut W,
+		tuple_depth: TupleDepth,
+	) -> std::io::Result<VersionstampOffset> {
+		let t = (
+			WORKFLOW,
+			DEAD_IDX,
+			&self.workflow_name,
+			&self.error,
+			self.workflow_id,
+		);
+		t.pack(w, tuple_depth)
+	}
+}
+
+impl<'de> TupleUnpack<'de> for DeadIdxKey {
+	fn unpack(input: &[u8], tuple_depth: TupleDepth) -> PackResult<(&[u8], Self)> {
+		let (input, (_, _, workflow_name, error, workflow_id)) =
+			<(usize, usize, String, String, Id)>::unpack(input, tuple_depth)?;
+
+		let v = DeadIdxKey {
+			workflow_name,
+			error,
+			workflow_id,
+		};
+
+		Ok((input, v))
+	}
+}
+
+pub struct DeadIdxSubspaceKey {
+	workflow_name: String,
+}
+
+impl DeadIdxSubspaceKey {
+	pub fn new(workflow_name: String) -> Self {
+		DeadIdxSubspaceKey { workflow_name }
+	}
+}
+
+impl TuplePack for DeadIdxSubspaceKey {
+	fn pack<W: std::io::Write>(
+		&self,
+		w: &mut W,
+		tuple_depth: TupleDepth,
+	) -> std::io::Result<VersionstampOffset> {
+		let t = (WORKFLOW, DEAD_IDX, &self.workflow_name);
+		t.pack(w, tuple_depth)
 	}
 }

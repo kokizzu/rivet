@@ -8,7 +8,10 @@ use super::{
 	},
 	fork::{derive_branch_at, derive_bucket_branch_at},
 	resolve::{resolve_bucket_branch, resolve_database_pointer},
-	shared::{now_ms, read_bucket_branch_record, read_database_branch_record},
+	shared::{
+		clear_database_branch_owner, now_ms, read_bucket_branch_record,
+		read_database_branch_record, write_database_pointer,
+	},
 };
 use crate::conveyer::{
 	error::SqliteStorageError,
@@ -171,16 +174,17 @@ pub async fn rollback_database(
 					MutationType::Add,
 				);
 
-				let new_ptr = DatabasePointer {
-					current_branch: rolled_branch_id,
-					last_swapped_at_ms: now_ms,
-				};
-				let encoded_pointer = encode_database_pointer(new_ptr)
-					.context("encode sqlite rollback database pointer")?;
-				tx.informal().set(
-					&keys::database_pointer_cur_key(bucket_branch, &database_id),
-					&encoded_pointer,
-				);
+				clear_database_branch_owner(&tx, cur_ptr.current_branch);
+				write_database_pointer(
+					&tx,
+					bucket,
+					bucket_branch,
+					&database_id,
+					DatabasePointer {
+						current_branch: rolled_branch_id,
+						last_swapped_at_ms: now_ms,
+					},
+				)?;
 
 				Ok(())
 			}
@@ -231,16 +235,17 @@ pub(crate) async fn rollback_database_to_target_tx(
 		MutationType::Add,
 	);
 
-	let new_ptr = DatabasePointer {
-		current_branch: rolled_branch_id,
-		last_swapped_at_ms: now_ms,
-	};
-	let encoded_pointer =
-		encode_database_pointer(new_ptr).context("encode sqlite rollback database pointer")?;
-	tx.informal().set(
-		&keys::database_pointer_cur_key(bucket_branch, database_id),
-		&encoded_pointer,
-	);
+	clear_database_branch_owner(tx, cur_ptr.current_branch);
+	write_database_pointer(
+		tx,
+		bucket,
+		bucket_branch,
+		database_id,
+		DatabasePointer {
+			current_branch: rolled_branch_id,
+			last_swapped_at_ms: now_ms,
+		},
+	)?;
 
 	Ok(())
 }

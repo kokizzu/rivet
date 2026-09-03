@@ -6,7 +6,7 @@ import {
 	faSignalStream,
 	type IconProp,
 } from "@rivet-gg/icons";
-import type { MetricType } from "@/app/billing/usage-format";
+import type { MetricType } from "@/app/billing/usage-card";
 
 export interface UsageMetricConfig {
 	key: string;
@@ -16,8 +16,11 @@ export interface UsageMetricConfig {
 	metricType: MetricType;
 }
 
-// Display metadata (title, description, icon) for each billed metric, in render
-// order. The usage endpoint owns the numbers and which metrics exist.
+// Display metadata for the metrics the backend returns from the billing usage
+// endpoint, in render order. The endpoint is the source of truth for WHICH
+// metrics exist and their numbers; this only supplies titles, descriptions, and
+// icons. Compute metrics are billed on the backend but not yet returned by the
+// usage endpoint, so they have no card here.
 export const USAGE_METRICS: UsageMetricConfig[] = [
 	{
 		key: "actor_awake",

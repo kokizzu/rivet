@@ -29,6 +29,11 @@ impl Key {
 pub(super) enum Message {
 	GetPages(protocol::ToRivetSqliteGetPagesRequest),
 	Commit(protocol::ToRivetSqliteCommitRequest),
+	// Staged commits share this task with the single-shot path so one actor's stage, its segments
+	// and its finalize are serialized against each other and against its ordinary commits.
+	StageBegin(protocol::ToRivetSqliteCommitStageBeginRequest),
+	StageSegment(protocol::ToRivetSqliteCommitStageSegmentRequest),
+	Finalize(protocol::ToRivetSqliteCommitFinalizeRequest),
 }
 
 pub(super) async fn task(
@@ -70,6 +75,42 @@ pub(super) async fn task(
 						conn.pool_name.as_str(),
 					])
 					.observe(timed_response.commit_completed_at.elapsed().as_secs_f64());
+			}
+			Ok(Some(Message::StageBegin(req))) => {
+				let response = ws_to_tunnel_task::handle_sqlite_commit_stage_begin_response(
+					&ctx, &conn, req.data,
+				)
+				.await;
+				ws_to_tunnel_task::send_sqlite_commit_stage_begin_response(
+					&conn,
+					req.request_id,
+					response,
+				)
+				.await?;
+			}
+			Ok(Some(Message::StageSegment(req))) => {
+				let response = ws_to_tunnel_task::handle_sqlite_commit_stage_segment_response(
+					&ctx, &conn, req.data,
+				)
+				.await;
+				ws_to_tunnel_task::send_sqlite_commit_stage_segment_response(
+					&conn,
+					req.request_id,
+					response,
+				)
+				.await?;
+			}
+			Ok(Some(Message::Finalize(req))) => {
+				let response = ws_to_tunnel_task::handle_sqlite_commit_finalize_response(
+					&ctx, &conn, req.data,
+				)
+				.await;
+				ws_to_tunnel_task::send_sqlite_commit_finalize_response(
+					&conn,
+					req.request_id,
+					response,
+				)
+				.await?;
 			}
 			Ok(None) | Err(_) => return Ok(TaskExit::SqlitePage(key)),
 		}

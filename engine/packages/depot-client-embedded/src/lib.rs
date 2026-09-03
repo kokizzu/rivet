@@ -114,6 +114,93 @@ impl SqliteTransport for EmbeddedDepotSqliteTransport {
 			)),
 		}
 	}
+
+	async fn commit_stage_begin(
+		&self,
+		request: protocol::SqliteCommitStageBeginRequest,
+	) -> Result<protocol::SqliteCommitStageBeginResponse> {
+		match self
+			.db
+			.commit_stage_begin(
+				request.expected_generation.unwrap_or_default(),
+				request.expected_head_txid,
+			)
+			.await
+		{
+			Ok(txid) => Ok(
+				protocol::SqliteCommitStageBeginResponse::SqliteCommitStageBeginOk(
+					protocol::SqliteCommitStageBeginOk { txid },
+				),
+			),
+			Err(err) => Ok(
+				protocol::SqliteCommitStageBeginResponse::SqliteErrorResponse(
+					sqlite_error_response(&err),
+				),
+			),
+		}
+	}
+
+	async fn commit_stage_segment(
+		&self,
+		request: protocol::SqliteCommitStageSegmentRequest,
+	) -> Result<protocol::SqliteCommitStageSegmentResponse> {
+		match self
+			.db
+			.commit_stage_segment(
+				request.expected_generation.unwrap_or_default(),
+				request.txid,
+				request.first_pgno,
+				request
+					.dirty_pages
+					.into_iter()
+					.map(|page| depot::types::DirtyPage {
+						pgno: page.pgno,
+						bytes: page.bytes,
+					})
+					.collect(),
+			)
+			.await
+		{
+			Ok(staged_bytes) => Ok(
+				protocol::SqliteCommitStageSegmentResponse::SqliteCommitStageSegmentOk(
+					protocol::SqliteCommitStageSegmentOk { staged_bytes },
+				),
+			),
+			Err(err) => Ok(
+				protocol::SqliteCommitStageSegmentResponse::SqliteErrorResponse(
+					sqlite_error_response(&err),
+				),
+			),
+		}
+	}
+
+	async fn commit_finalize(
+		&self,
+		request: protocol::SqliteCommitFinalizeRequest,
+	) -> Result<protocol::SqliteCommitFinalizeResponse> {
+		match self
+			.db
+			.commit_finalize(
+				request.expected_generation.unwrap_or_default(),
+				request.txid,
+				request.new_db_size_pages,
+				request.now_ms,
+				request.segment_first_pgnos,
+			)
+			.await
+		{
+			Ok(result) => Ok(
+				protocol::SqliteCommitFinalizeResponse::SqliteCommitFinalizeOk(
+					protocol::SqliteCommitFinalizeOk {
+						head_txid: Some(result.head_txid),
+					},
+				),
+			),
+			Err(err) => Ok(protocol::SqliteCommitFinalizeResponse::SqliteErrorResponse(
+				sqlite_error_response(&err),
+			)),
+		}
+	}
 }
 
 fn sqlite_error_reason(err: &anyhow::Error) -> String {

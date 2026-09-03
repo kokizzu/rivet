@@ -28,6 +28,7 @@ use crate::conveyer::{
 	db::Db,
 	keys::{self, PAGE_SIZE, SHARD_SIZE},
 	ltx::{DecodedLtx, decode_ltx_v3},
+	shard_blob,
 	types::{
 		BucketId, CommitRow, DatabaseBranchId, DatabaseBranchRecord, DepotReadMode,
 		GetPagesOptions, PageSourceKind, PageSourceProvenance as DepotPageSourceProvenance,
@@ -49,6 +50,8 @@ pub struct DoctorInput {
 	pub skip: SkipOptions,
 	pub min_txid: Option<u64>,
 	pub max_txid: Option<u64>,
+	/// Cold tier used by the Depot resolver image. Without it, any page that only resolves through
+	/// a cold ref reads as missing coverage and the resolver comparison reports a false divergence.
 	#[doc(hidden)]
 	pub progress_hook: Option<DoctorProgressHook>,
 }
@@ -282,6 +285,8 @@ struct DecodedDelta {
 #[derive(Debug, Clone, Serialize)]
 struct DeltaChunkFact {
 	txid: u64,
+	/// First page of the owning segment, or `None` for a pre-segmentation commit's single blob.
+	segment_first_pgno: Option<u32>,
 	chunk_index: u32,
 	encoded_byte_len: usize,
 	chunk_hash: String,
@@ -1035,6 +1040,24 @@ async fn detect_unsupported(
 						{
 							return Ok(Some("branch has head_at_fork metadata"));
 						}
+						for (label, key) in [
+							(
+								"cold compact metadata is present",
+								keys::branch_meta_cold_compact_key(branch_id),
+							),
+							(
+								"cold compactor lease metadata is present",
+								keys::branch_meta_cold_lease_key(branch_id),
+							),
+							(
+								"cold drained manifest metadata is present",
+								keys::branch_manifest_cold_drained_txid_key(branch_id),
+							),
+						] {
+							if tx.informal().get(&key, Snapshot).await?.is_some() {
+								return Ok(Some(label));
+							}
+						}
 						if let (Some(bucket_id), Some(database_id)) =
 							(bucket_id, database_id.as_ref())
 						{
@@ -1068,6 +1091,14 @@ async fn detect_unsupported(
 	if reason.is_none() {
 		let branch_id = resolved.branch_id;
 		for (label, prefix) in [
+			(
+				"cold shard rows are present",
+				keys::branch_compaction_cold_shard_prefix(branch_id),
+			),
+			(
+				"retired cold object rows are present",
+				keys::branch_compaction_retired_cold_object_prefix(branch_id),
+			),
 			(
 				"PITR interval rows are present",
 				keys::branch_pitr_interval_prefix(branch_id),
@@ -1243,6 +1274,18 @@ async fn load_storage_facts(
 		"branch_compaction_stage",
 	)
 	.await?;
+	let cold_rows = count_prefix_rows(
+		db,
+		keys::branch_compaction_cold_shard_prefix(branch_id),
+		"branch_cold_shard",
+	)
+	.await?;
+	let retired_cold_rows = count_prefix_rows(
+		db,
+		keys::branch_compaction_retired_cold_object_prefix(branch_id),
+		"branch_retired_cold_object",
+	)
+	.await?;
 	let pitr_rows = count_prefix_rows(
 		db,
 		keys::branch_pitr_interval_prefix(branch_id),
@@ -1278,24 +1321,36 @@ async fn load_storage_facts(
 		commit_map.insert(txid, commit);
 	}
 
-	let mut chunks_by_txid = BTreeMap::<u64, Vec<(u32, Vec<u8>)>>::new();
+	// Keyed by segment, not by commit. A commit stores its pages as one blob per shard-aligned page
+	// range, and every blob restarts its chunk index at zero, so grouping a segmented commit's rows
+	// under one key would interleave two complete LTX files and report a decode failure for a commit
+	// that is perfectly intact. `None` is a pre-segmentation commit's single blob.
+	let mut chunks_by_segment = BTreeMap::<(u64, Option<u32>), Vec<(u32, Vec<u8>)>>::new();
 	let mut delta_chunk_facts = Vec::new();
 	for row in delta_rows {
 		let txid = keys::decode_branch_delta_chunk_txid(branch_id, &row.key)?;
-		let chunk_idx = keys::decode_branch_delta_chunk_idx(branch_id, txid, &row.key)?;
+		let chunk_ref = keys::decode_branch_delta_chunk_ref(branch_id, txid, &row.key)?;
 		delta_chunk_facts.push(DeltaChunkFact {
 			txid,
-			chunk_index: chunk_idx,
+			segment_first_pgno: chunk_ref.first_pgno(),
+			chunk_index: chunk_ref.chunk_idx(),
 			encoded_byte_len: row.value.len(),
 			chunk_hash: privacy.hash_bytes(&row.value),
 			at_or_below_selected_txid: txid <= selected_txid,
 		});
 		if txid <= selected_txid {
-			chunks_by_txid
-				.entry(txid)
+			chunks_by_segment
+				.entry((txid, chunk_ref.first_pgno()))
 				.or_default()
-				.push((chunk_idx, row.value));
+				.push((chunk_ref.chunk_idx(), row.value));
 		}
+	}
+
+	// Regrouped per commit, since a commit's report covers every page it wrote regardless of how
+	// many blobs hold them.
+	let mut segments_by_txid = BTreeMap::<u64, Vec<Vec<(u32, Vec<u8>)>>>::new();
+	for ((txid, _), chunks) in chunks_by_segment {
+		segments_by_txid.entry(txid).or_default().push(chunks);
 	}
 
 	let mut commits = Vec::new();
@@ -1310,26 +1365,34 @@ async fn load_storage_facts(
 			delta_chunk_indexes,
 			delta_encoded_hash,
 			delta_encoded_bytes,
-		) = if let Some(chunks) = chunks_by_txid.get(txid) {
-			let (chunk_count, chunk_indexes, encoded_hash, encoded_bytes) =
-				delta_chunk_metadata(chunks, &privacy);
-			match decode_delta_chunks(chunks, &privacy) {
-				Ok(delta) => (
-					Some(delta),
-					None,
-					chunk_count,
-					chunk_indexes,
-					encoded_hash,
-					encoded_bytes,
-				),
-				Err(err) => (
-					None,
-					Some(err.to_string()),
-					chunk_count,
-					chunk_indexes,
-					encoded_hash,
-					encoded_bytes,
-				),
+		) = if let Some(segments) = segments_by_txid.get(txid) {
+			match decode_commit_segments(segments, &privacy) {
+				Ok(delta) => {
+					let chunk_count = delta.chunk_count;
+					let chunk_indexes = delta.chunk_indexes.clone();
+					let encoded_hash = delta.encoded_hash.clone();
+					let encoded_bytes = delta.encoded_bytes;
+					(
+						Some(delta),
+						None,
+						chunk_count,
+						chunk_indexes,
+						encoded_hash,
+						encoded_bytes,
+					)
+				}
+				Err(err) => {
+					let (chunk_count, chunk_indexes, encoded_hash, encoded_bytes) =
+						commit_segment_metadata(segments, &privacy);
+					(
+						None,
+						Some(err.to_string()),
+						chunk_count,
+						chunk_indexes,
+						encoded_hash,
+						encoded_bytes,
+					)
+				}
 			}
 		} else {
 			(
@@ -1393,9 +1456,17 @@ async fn load_storage_facts(
 
 	let mut hot_shard_facts = Vec::new();
 	let mut hot_shards = Vec::new();
-	for row in hot_rows {
-		let decoded_key = decode_hot_shard_key(branch_id, &row.key);
-		let decoded_blob = decode_ltx_v3(&row.value);
+	// A shard version spans multiple chunk rows (or one legacy row), so group the scan into whole
+	// versions and report one fact per reassembled blob.
+	let hot_versions = shard_blob::group_shard_version_rows(
+		branch_id,
+		hot_rows
+			.into_iter()
+			.map(|row| (row.key, row.value))
+			.collect(),
+	)?;
+	for (shard_id, as_of_txid, version) in hot_versions {
+		let decoded_blob = decode_ltx_v3(&version.blob);
 		let (decode_status, decode_error, decoded_page_count, min_page, max_page) =
 			match &decoded_blob {
 				Ok(decoded) => {
@@ -1405,23 +1476,23 @@ async fn load_storage_facts(
 				}
 				Err(err) => ("error".to_string(), Some(err.to_string()), None, None, None),
 			};
-		let (shard_id, as_of_txid) = decoded_key.unwrap_or((u32::MAX, u64::MAX));
+		let version_key = keys::branch_shard_key(branch_id, shard_id, as_of_txid);
 		if let Ok(decoded) = decoded_blob {
 			if as_of_txid <= selected_txid {
 				hot_shards.push(HotShardData {
 					shard_id,
 					as_of_txid,
 					decoded,
-					key_hash: privacy.hash_bytes(&row.key),
+					key_hash: privacy.hash_bytes(&version_key),
 				});
 			}
 		}
 		hot_shard_facts.push(HotShardFact {
-			row_key_hash: privacy.hash_bytes(&row.key),
-			shard_id: (shard_id != u32::MAX).then_some(shard_id),
-			as_of_txid: (as_of_txid != u64::MAX).then_some(as_of_txid),
-			encoded_size: row.value.len(),
-			encoded_hash: privacy.hash_bytes(&row.value),
+			row_key_hash: privacy.hash_bytes(&version_key),
+			shard_id: Some(shard_id),
+			as_of_txid: Some(as_of_txid),
+			encoded_size: version.blob.len(),
+			encoded_hash: privacy.hash_bytes(&version.blob),
 			decode_status,
 			decode_error,
 			decoded_page_count,
@@ -1440,6 +1511,8 @@ async fn load_storage_facts(
 		"head_rows": usize::from(commit_map.contains_key(&selected_txid)),
 		"hot_shard_rows": hot_shard_facts.len(),
 		"staged_hot_shard_rows": staged_rows.len(),
+		"cold_compaction_rows": cold_rows,
+		"retired_cold_object_rows": retired_cold_rows,
 		"pitr_rows": pitr_rows,
 		"pin_rows": pin_rows,
 		"approximate_raw_bytes_scanned": delta_chunk_facts.iter().map(|row| row.encoded_byte_len).sum::<usize>(),
@@ -1464,6 +1537,7 @@ async fn load_storage_facts(
 		"hot_present": !hot_shard_facts.is_empty() || !staged_rows.is_empty(),
 		"installed_hot_shard_count": hot_shard_facts.len(),
 		"staged_hot_shard_count": staged_rows.len(),
+		"cold_present": cold_rows > 0 || retired_cold_rows > 0,
 		"conclusion": if !hot_shard_facts.is_empty() || !staged_rows.is_empty() {
 			"hot compaction state exists; hot compaction must be included in diagnosis"
 		} else {
@@ -1503,6 +1577,63 @@ fn delta_chunk_metadata(
 		privacy.hash_bytes(&encoded),
 		encoded.len(),
 	)
+}
+
+/// Aggregate chunk metadata across every blob of one commit, for the case where at least one of
+/// them failed to decode and only the raw shape can be reported.
+fn commit_segment_metadata(
+	segments: &[Vec<(u32, Vec<u8>)>],
+	privacy: &Privacy,
+) -> (usize, Vec<u32>, String, usize) {
+	let mut chunk_count = 0;
+	let mut chunk_indexes = Vec::new();
+	let mut encoded = Vec::new();
+	for segment in segments {
+		let (count, indexes, _, _) = delta_chunk_metadata(segment, privacy);
+		chunk_count += count;
+		chunk_indexes.extend(indexes);
+		let mut sorted = segment.to_vec();
+		sorted.sort_by_key(|(idx, _)| *idx);
+		for (_, chunk) in sorted {
+			encoded.extend_from_slice(&chunk);
+		}
+	}
+
+	(
+		chunk_count,
+		chunk_indexes,
+		privacy.hash_bytes(&encoded),
+		encoded.len(),
+	)
+}
+
+/// Decodes every blob of one commit into the single page set the commit wrote.
+///
+/// Each blob is decoded on its own, because each is a complete LTX file: concatenating them first
+/// would produce a byte string that is not a valid LTX file at all and would report an intact commit
+/// as corrupt. Blobs cover disjoint ascending page ranges, so their pages concatenate into the
+/// sorted set the rest of the report expects.
+fn decode_commit_segments(
+	segments: &[Vec<(u32, Vec<u8>)>],
+	privacy: &Privacy,
+) -> Result<DecodedDelta> {
+	let mut decoded = segments
+		.iter()
+		.map(|segment| decode_delta_chunks(segment, privacy))
+		.collect::<Result<Vec<_>>>()?;
+	ensure!(!decoded.is_empty(), "commit has no delta blobs");
+
+	let mut merged = decoded.remove(0);
+	for rest in decoded {
+		merged.encoded_bytes += rest.encoded_bytes;
+		merged.chunk_count += rest.chunk_count;
+		merged.chunk_indexes.extend(rest.chunk_indexes);
+		merged.decoded.pages.extend(rest.decoded.pages);
+		merged.decoded.page_index.clear();
+	}
+	merged.decoded.pages.sort_by_key(|page| page.pgno);
+
+	Ok(merged)
 }
 
 fn decode_delta_chunks(chunks: &[(u32, Vec<u8>)], privacy: &Privacy) -> Result<DecodedDelta> {
@@ -1993,8 +2124,8 @@ fn page_source_kind_label(kind: PageSourceKind) -> &'static str {
 		PageSourceKind::PidxDelta => "pidx_delta",
 		PageSourceKind::HistoricalDelta => "historical_delta",
 		PageSourceKind::MissingDelta => "missing_delta",
-		PageSourceKind::StaleDelta => "stale_delta",
 		PageSourceKind::HotShard => "hot_shard",
+		PageSourceKind::Cold => "cold",
 		PageSourceKind::ZeroFill => "zero_fill",
 		PageSourceKind::OutOfRange => "out_of_range",
 	}
@@ -2874,6 +3005,7 @@ fn analysis_scope_json(
 		"first_bad_txid_search": !input.skip.first_bad_txid,
 		"page_provenance_collection": !input.skip.page_provenance && !input.skip.resolver_compare,
 		"depot_resolver_comparison": !input.skip.resolver_compare,
+		"cold_tier_configured": false,
 		"artifacts_preserved": input.artifact_dir.is_some(),
 		"start_snapshot": start,
 		"end_snapshot": end,
@@ -3246,17 +3378,6 @@ fn decode_u32_suffix(prefix: &[u8], key: &[u8]) -> Result<u32> {
 		.context("key did not start with expected prefix")?;
 	ensure!(suffix.len() == 4, "expected 4 byte suffix");
 	Ok(u32::from_be_bytes(suffix.try_into()?))
-}
-
-fn decode_hot_shard_key(branch_id: DatabaseBranchId, key: &[u8]) -> Option<(u32, u64)> {
-	let prefix = keys::branch_shard_prefix(branch_id);
-	let suffix = key.strip_prefix(prefix.as_slice())?;
-	if suffix.len() != 13 || suffix[4] != b'/' {
-		return None;
-	}
-	let shard_id = u32::from_be_bytes(suffix[0..4].try_into().ok()?);
-	let as_of_txid = u64::from_be_bytes(suffix[5..13].try_into().ok()?);
-	Some((shard_id, as_of_txid))
 }
 
 fn read_page_hashes(

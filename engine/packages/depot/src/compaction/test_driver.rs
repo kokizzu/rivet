@@ -118,7 +118,12 @@ impl<'a> DepotCompactionTestDriver<'a> {
 
 			for event in history.events.into_iter().rev() {
 				if let EventData::Loop(loop_event) = event.data {
-					let state = serde_json::from_value::<DbManagerState>(loop_event.state)?;
+					// The manager runs nested loops (the resumable install re-dispatch), whose state is
+					// not a `DbManagerState`. Only the outer loop carries the force-compaction results.
+					let Ok(state) = serde_json::from_value::<DbManagerState>(loop_event.state)
+					else {
+						continue;
+					};
 					if let Some(result) = state
 						.force_compactions
 						.recent_results

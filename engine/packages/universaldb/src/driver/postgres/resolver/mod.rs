@@ -182,8 +182,9 @@ fn spawn_commit_subscriber(
 	};
 	let client = nats.client.clone();
 	let subject = nats.subjects.commit(&shared.node_id);
+	let shared = shared.clone();
 	Some(AbortOnDropHandle::new(tokio::spawn(async move {
-		if let Err(err) = super::nats::run_commit_subscriber(client, subject, tx).await {
+		if let Err(err) = super::nats::run_commit_subscriber(&shared, client, subject, tx).await {
 			tracing::warn!(?err, "udb commit subscriber ended");
 		}
 	})))
@@ -618,7 +619,7 @@ async fn drain_batch(
 	shared.advance_durable_version(new_durable);
 
 	if let Transport::MultiNode(nats) = &shared.transport {
-		match super::codec::encode_watermark(new_durable) {
+		match super::codec::encode_watermark(new_durable, shared.commit_protocol_version()) {
 			Ok(payload) => {
 				if let Err(err) = nats
 					.client

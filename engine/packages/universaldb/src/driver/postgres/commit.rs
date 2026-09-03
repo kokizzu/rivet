@@ -106,6 +106,7 @@ async fn submit_nats(
 		&operations,
 		shared.node_id.as_bytes(),
 		client_seq as u64,
+		shared.commit_protocol_version(),
 	)
 	.context("failed to encode commit request")?;
 

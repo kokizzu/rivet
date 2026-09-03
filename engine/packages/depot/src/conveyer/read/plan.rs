@@ -4,8 +4,9 @@ use universaldb::utils::IsolationLevel::Serializable;
 use crate::conveyer::{
 	branch,
 	db::{BranchAncestry, load_branch_ancestry},
+	delta_blob,
 	error::SqliteStorageError,
-	keys,
+	keys::{self},
 	types::{BucketId, DBHead, DatabaseBranchId, decode_db_head},
 };
 
@@ -42,17 +43,10 @@ pub(super) enum ReadSource {
 }
 
 impl ReadSource {
-	pub(super) fn pidx_prefix(self, database_id: &str) -> Vec<u8> {
+	pub(super) fn pidx_key(self, database_id: &str, pgno: u32) -> Vec<u8> {
 		let _ = database_id;
 		match self {
-			Self::Branch(source) => keys::branch_pidx_prefix(source.branch_id),
-		}
-	}
-
-	pub(super) fn decode_pidx_pgno(self, database_id: &str, key: &[u8]) -> Result<u32> {
-		let _ = database_id;
-		match self {
-			Self::Branch(source) => super::pidx::decode_branch_pidx_pgno(source.branch_id, key),
+			Self::Branch(source) => keys::branch_pidx_key(source.branch_id, pgno),
 		}
 	}
 
@@ -60,6 +54,16 @@ impl ReadSource {
 		let _ = database_id;
 		match self {
 			Self::Branch(source) => keys::branch_delta_chunk_prefix(source.branch_id, txid),
+		}
+	}
+
+	/// Exclusive end of a reverse scan over every delta row at or below `max_txid`, including that
+	/// txid's own chunk rows. Owned by the key layer so a caller never has to know how wide a chunk
+	/// suffix is, which is the assumption a second delta layout would silently break.
+	pub(super) fn delta_txid_scan_end(self, database_id: &str, max_txid: u64) -> Vec<u8> {
+		let _ = database_id;
+		match self {
+			Self::Branch(source) => keys::branch_delta_txid_scan_end(source.branch_id, max_txid),
 		}
 	}
 
@@ -77,16 +81,19 @@ impl ReadSource {
 		}
 	}
 
-	pub(super) fn decode_delta_chunk_idx(
+	/// Reassembles one txid's scanned chunk rows into its delta blobs.
+	///
+	/// Owned by the key layer for the same reason the scan bounds are: a caller that sorted rows by
+	/// chunk index and concatenated them would silently interleave a segmented commit's blobs, since
+	/// every segment restarts its chunk index at zero.
+	pub(super) fn reassemble_delta_segments(
 		self,
-		database_id: &str,
 		txid: u64,
-		key: &[u8],
-	) -> Result<u32> {
-		let _ = database_id;
+		rows: Vec<(Vec<u8>, Vec<u8>)>,
+	) -> Result<Vec<delta_blob::DeltaSegment>> {
 		match self {
 			Self::Branch(source) => {
-				keys::decode_branch_delta_chunk_idx(source.branch_id, txid, key)
+				delta_blob::reassemble_delta_segments(source.branch_id, txid, rows)
 			}
 		}
 	}

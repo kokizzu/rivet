@@ -1,37 +1,34 @@
 import type { Rivet } from "@rivet-gg/cloud";
 import { useQuery } from "@tanstack/react-query";
 import { endOfMonth, startOfMonth } from "date-fns";
-import { sumComputeCost } from "@/app/metrics/compute-cost";
-import { COMPUTE_METRICS } from "@/app/metrics/constants";
 import { useCloudProjectDataProvider } from "@/components/actors";
+import { BILLING } from "@/content/billing";
 import { features } from "@/lib/features";
-
-// Compute spend is shown as its own card, separate from the bill total.
-
-export type BillingUsage = Rivet.BillingUsageResponse;
-export type BilledMetricUsage = Rivet.BilledMetricUsage;
-
-export function computeBudgetPercent(usage: BillingUsage): number {
-	return usage.computeBudgetPercent;
-}
+import { COMPUTE_METRICS } from "@/app/metrics/constants";
+import { sumComputeCost } from "@/app/metrics/compute-cost";
 
 // Bucket size (seconds) for the month-to-date compute cost query. Cost is an
 // active-time-weighted sum, so the total is correct at any resolution; this
 // only bounds the number of returned buckets.
 const COMPUTE_COST_RESOLUTION = 800;
 
+// All billing math now lives on the backend: `GET /projects/{id}/billing/usage`
+// returns the fully-computed breakdown (plan, cycle, per-metric usage/included/
+// overage, total, highest percent). The dashboard only renders it, so the
+// pricing rates and overage formulas have a single source of truth on the server
+// and the frontend no longer depends on the shared `@rivetkit/billing-data`
+// package.
+
+export type BillingUsage = Rivet.BillingUsageResponse;
+export type BilledMetricUsage = Rivet.BilledMetricUsage;
+
+/** Fetch the computed billing usage breakdown for the current project. */
 export function useBillingUsage(): BillingUsage | undefined {
 	const dataProvider = useCloudProjectDataProvider();
 	const { data } = useQuery({
 		...dataProvider.currentProjectBillingUsageQueryOptions(),
 	});
 	return data;
-}
-
-export function billedMetricsMap(
-	usage: BillingUsage,
-): Map<string, BilledMetricUsage> {
-	return new Map(usage.metrics.map((m) => [m.metric, m]));
 }
 
 // Aggregate this project's month-to-date compute cost (in dollars) from the

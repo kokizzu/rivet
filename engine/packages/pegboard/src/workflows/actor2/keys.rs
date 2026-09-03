@@ -105,7 +105,7 @@ pub async fn reserve_key(
 						bail!("unreachable: current_value should exist")
 					}
 				}
-				res => bail!("consensus failed: {res:?}"),
+				res => bail!("unreachable: {res:?}"),
 			}
 		}
 	}
@@ -209,6 +209,7 @@ pub struct ProposeInput {
 }
 
 #[activity(Propose)]
+#[max_retries = 10]
 pub async fn propose(ctx: &ActivityCtx, input: &ProposeInput) -> Result<ProposalResult> {
 	let reservation_key = keys::epoxy::ns::ReservationByKeyKey::new(
 		input.namespace_id,
@@ -233,6 +234,15 @@ pub async fn propose(ctx: &ActivityCtx, input: &ProposeInput) -> Result<Proposal
 			target_replicas: Some(input.target_replicas.clone()),
 		})
 		.await?;
+
+	// Error inside the activity to invoke a retry
+	match &proposal_result {
+		ProposalResult::Committed
+		| ProposalResult::ConsensusFailed {
+			reason: ConsensusFailedReason::ExpectedValueDoesNotMatch { .. },
+		} => {}
+		res => bail!("proposal failed: {res:?}"),
+	}
 
 	Ok(proposal_result)
 }

@@ -34,7 +34,7 @@ pub struct StandaloneCtx {
 }
 
 impl StandaloneCtx {
-	#[tracing::instrument(skip_all, fields(name, ray_id, req_id))]
+	#[tracing::instrument(level = "debug", skip_all, fields(name, ray_id, req_id))]
 	pub fn new(
 		db: DatabaseHandle,
 		config: rivet_config::Config,
@@ -66,7 +66,7 @@ impl StandaloneCtx {
 		})
 	}
 
-	#[tracing::instrument(skip_all)]
+	#[tracing::instrument(level = "debug", skip_all)]
 	pub fn with_ray(&self, ray_id: Id, req_id: Id) -> WorkflowResult<Self> {
 		let mut ctx = StandaloneCtx::new(
 			self.db.clone(),
@@ -83,7 +83,7 @@ impl StandaloneCtx {
 		Ok(ctx)
 	}
 
-	#[tracing::instrument(skip_all)]
+	#[tracing::instrument(level = "debug", skip_all)]
 	pub fn new_from_activity(ctx: &ActivityCtx, req_id: Id) -> WorkflowResult<Self> {
 		let mut ctx = StandaloneCtx::new(
 			ctx.db().clone(),
@@ -100,7 +100,7 @@ impl StandaloneCtx {
 		Ok(ctx)
 	}
 
-	#[tracing::instrument(skip_all)]
+	#[tracing::instrument(level = "debug", skip_all)]
 	pub fn new_from_operation(op_ctx: &OperationCtx, req_id: Id) -> WorkflowResult<Self> {
 		let mut ctx = StandaloneCtx::new(
 			op_ctx.db().clone(),

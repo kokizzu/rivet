@@ -162,7 +162,7 @@ impl SqliteWorkerHandle {
 						metrics.record_worker_crash();
 					}
 					thread_inner.closed.notify_waiters();
-					tracing::error!(message = panic_message(&panic), "sqlite worker panicked");
+					tracing::error!(msg = panic_message(&panic), "sqlite worker panicked");
 				}
 			})
 			.context("spawn sqlite worker thread")?;

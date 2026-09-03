@@ -263,14 +263,19 @@ async fn read_timestamp_target_in_branch(
 	timestamp_ms: i64,
 	now_ms: i64,
 ) -> Result<Option<ResolvedRestoreTarget>> {
-	let rows = pitr_interval::scan_pitr_interval_coverage(tx, branch_id, Snapshot).await?;
-	let Some((_bucket_start_ms, coverage)) =
-		rows.into_iter().rev().find(|(bucket_start_ms, coverage)| {
-			*bucket_start_ms <= timestamp_ms
+	let Some((_bucket_start_ms, coverage)) = pitr_interval::find_latest_pitr_interval_coverage(
+		tx,
+		branch_id,
+		timestamp_ms,
+		Snapshot,
+		|bucket_start_ms, coverage| {
+			bucket_start_ms <= timestamp_ms
 				&& coverage.wall_clock_ms <= timestamp_ms
 				&& coverage.expires_at_ms > now_ms
 				&& coverage.versionstamp <= cap
-		})
+		},
+	)
+	.await?
 	else {
 		return Ok(None);
 	};

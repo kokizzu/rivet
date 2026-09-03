@@ -9,7 +9,7 @@
 		"check-types": "tsc --noEmit"
 	},
 	"dependencies": {
-		"rivetkit": "*",
+		"rivetkit": "workspace:*",
 		"@rivet-dev/agent-os-common": "*",
 		"@rivet-dev/agent-os-pi": "^0.1.1"
 	},

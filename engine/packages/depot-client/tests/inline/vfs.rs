@@ -120,6 +120,31 @@ impl SqliteTransport for RecordingInitialPagesTransport {
 	) -> anyhow::Result<protocol::SqliteCommitResponse> {
 		anyhow::bail!("initial-page preload test does not commit")
 	}
+
+	/// Not supported: this double only exercises the single-shot path.
+	///
+	/// Spelled out rather than inherited from a trait default. A default is what let the in-process
+	/// embedded transport ship with no staging at all, so every transport now has to say which it is.
+	async fn commit_stage_begin(
+		&self,
+		_request: protocol::SqliteCommitStageBeginRequest,
+	) -> anyhow::Result<protocol::SqliteCommitStageBeginResponse> {
+		anyhow::bail!("the initial-pages recording transport does not implement staged commits")
+	}
+
+	async fn commit_stage_segment(
+		&self,
+		_request: protocol::SqliteCommitStageSegmentRequest,
+	) -> anyhow::Result<protocol::SqliteCommitStageSegmentResponse> {
+		anyhow::bail!("the initial-pages recording transport does not implement staged commits")
+	}
+
+	async fn commit_finalize(
+		&self,
+		_request: protocol::SqliteCommitFinalizeRequest,
+	) -> anyhow::Result<protocol::SqliteCommitFinalizeResponse> {
+		anyhow::bail!("the initial-pages recording transport does not implement staged commits")
+	}
 }
 
 struct CappedAtomicCommitTransport {
@@ -193,6 +218,31 @@ impl SqliteTransport for CappedAtomicCommitTransport {
 
 		self.inner.commit(request).await
 	}
+
+	/// Not supported: this double only exercises the single-shot path.
+	///
+	/// Spelled out rather than inherited from a trait default. A default is what let the in-process
+	/// embedded transport ship with no staging at all, so every transport now has to say which it is.
+	async fn commit_stage_begin(
+		&self,
+		_request: protocol::SqliteCommitStageBeginRequest,
+	) -> anyhow::Result<protocol::SqliteCommitStageBeginResponse> {
+		anyhow::bail!("the capped atomic commit transport does not implement staged commits")
+	}
+
+	async fn commit_stage_segment(
+		&self,
+		_request: protocol::SqliteCommitStageSegmentRequest,
+	) -> anyhow::Result<protocol::SqliteCommitStageSegmentResponse> {
+		anyhow::bail!("the capped atomic commit transport does not implement staged commits")
+	}
+
+	async fn commit_finalize(
+		&self,
+		_request: protocol::SqliteCommitFinalizeRequest,
+	) -> anyhow::Result<protocol::SqliteCommitFinalizeResponse> {
+		anyhow::bail!("the capped atomic commit transport does not implement staged commits")
+	}
 }
 
 struct MissingDbTransport;
@@ -217,6 +267,31 @@ impl SqliteTransport for MissingDbTransport {
 		_request: protocol::SqliteCommitRequest,
 	) -> anyhow::Result<protocol::SqliteCommitResponse> {
 		anyhow::bail!("missing-db transport test does not commit")
+	}
+
+	/// Not supported: this double only exercises the single-shot path.
+	///
+	/// Spelled out rather than inherited from a trait default. A default is what let the in-process
+	/// embedded transport ship with no staging at all, so every transport now has to say which it is.
+	async fn commit_stage_begin(
+		&self,
+		_request: protocol::SqliteCommitStageBeginRequest,
+	) -> anyhow::Result<protocol::SqliteCommitStageBeginResponse> {
+		anyhow::bail!("the missing-database transport does not implement staged commits")
+	}
+
+	async fn commit_stage_segment(
+		&self,
+		_request: protocol::SqliteCommitStageSegmentRequest,
+	) -> anyhow::Result<protocol::SqliteCommitStageSegmentResponse> {
+		anyhow::bail!("the missing-database transport does not implement staged commits")
+	}
+
+	async fn commit_finalize(
+		&self,
+		_request: protocol::SqliteCommitFinalizeRequest,
+	) -> anyhow::Result<protocol::SqliteCommitFinalizeResponse> {
+		anyhow::bail!("the missing-database transport does not implement staged commits")
 	}
 }
 
@@ -279,6 +354,31 @@ impl SqliteTransport for DelayCapturedGetPagesTransport {
 		request: protocol::SqliteCommitRequest,
 	) -> anyhow::Result<protocol::SqliteCommitResponse> {
 		self.inner.commit(request).await
+	}
+
+	/// Not supported: this double only exercises the single-shot path.
+	///
+	/// Spelled out rather than inherited from a trait default. A default is what let the in-process
+	/// embedded transport ship with no staging at all, so every transport now has to say which it is.
+	async fn commit_stage_begin(
+		&self,
+		_request: protocol::SqliteCommitStageBeginRequest,
+	) -> anyhow::Result<protocol::SqliteCommitStageBeginResponse> {
+		anyhow::bail!("the delayed get_pages transport does not implement staged commits")
+	}
+
+	async fn commit_stage_segment(
+		&self,
+		_request: protocol::SqliteCommitStageSegmentRequest,
+	) -> anyhow::Result<protocol::SqliteCommitStageSegmentResponse> {
+		anyhow::bail!("the delayed get_pages transport does not implement staged commits")
+	}
+
+	async fn commit_finalize(
+		&self,
+		_request: protocol::SqliteCommitFinalizeRequest,
+	) -> anyhow::Result<protocol::SqliteCommitFinalizeResponse> {
+		anyhow::bail!("the delayed get_pages transport does not implement staged commits")
 	}
 }
 
@@ -4707,7 +4807,10 @@ fn warm_pidx_stale_read_then_rmw_commit_produces_malformed_db() {
 					request.now_ms,
 					CommitOptions {
 						expected_head_txid: request.expected_head_txid,
-						..Default::default()
+						// Inline tests drive deliberately large transactions to exercise pager spill
+						// and shard boundaries. The engine-side size cap has its own coverage in
+						// depot.
+						disable_size_cap: true,
 					},
 				)
 				.await
@@ -4721,6 +4824,31 @@ fn warm_pidx_stale_read_then_rmw_commit_produces_malformed_db() {
 					sqlite_error_response(&err),
 				)),
 			}
+		}
+
+		/// Not supported: this double only exercises the single-shot path.
+		///
+		/// Spelled out rather than inherited from a trait default. A default is what let the in-process
+		/// embedded transport ship with no staging at all, so every transport now has to say which it is.
+		async fn commit_stage_begin(
+			&self,
+			_request: protocol::SqliteCommitStageBeginRequest,
+		) -> anyhow::Result<protocol::SqliteCommitStageBeginResponse> {
+			anyhow::bail!("the pinned-database transport does not implement staged commits")
+		}
+
+		async fn commit_stage_segment(
+			&self,
+			_request: protocol::SqliteCommitStageSegmentRequest,
+		) -> anyhow::Result<protocol::SqliteCommitStageSegmentResponse> {
+			anyhow::bail!("the pinned-database transport does not implement staged commits")
+		}
+
+		async fn commit_finalize(
+			&self,
+			_request: protocol::SqliteCommitFinalizeRequest,
+		) -> anyhow::Result<protocol::SqliteCommitFinalizeResponse> {
+			anyhow::bail!("the pinned-database transport does not implement staged commits")
 		}
 	}
 
@@ -5274,7 +5402,10 @@ fn warm_pidx_stale_read_then_rmw_commit_natural_repro() {
 					request.now_ms,
 					CommitOptions {
 						expected_head_txid: request.expected_head_txid,
-						..Default::default()
+						// Inline tests drive deliberately large transactions to exercise pager spill
+						// and shard boundaries. The engine-side size cap has its own coverage in
+						// depot.
+						disable_size_cap: true,
 					},
 				)
 				.await
@@ -5288,6 +5419,31 @@ fn warm_pidx_stale_read_then_rmw_commit_natural_repro() {
 					sqlite_error_response(&err),
 				)),
 			}
+		}
+
+		/// Not supported: this double only exercises the single-shot path.
+		///
+		/// Spelled out rather than inherited from a trait default. A default is what let the in-process
+		/// embedded transport ship with no staging at all, so every transport now has to say which it is.
+		async fn commit_stage_begin(
+			&self,
+			_request: protocol::SqliteCommitStageBeginRequest,
+		) -> anyhow::Result<protocol::SqliteCommitStageBeginResponse> {
+			anyhow::bail!("the pinned-database transport does not implement staged commits")
+		}
+
+		async fn commit_stage_segment(
+			&self,
+			_request: protocol::SqliteCommitStageSegmentRequest,
+		) -> anyhow::Result<protocol::SqliteCommitStageSegmentResponse> {
+			anyhow::bail!("the pinned-database transport does not implement staged commits")
+		}
+
+		async fn commit_finalize(
+			&self,
+			_request: protocol::SqliteCommitFinalizeRequest,
+		) -> anyhow::Result<protocol::SqliteCommitFinalizeResponse> {
+			anyhow::bail!("the pinned-database transport does not implement staged commits")
 		}
 	}
 
@@ -5789,7 +5945,10 @@ fn warm_pidx_stale_read_then_rmw_commit_via_natural_reopen() {
 					request.now_ms,
 					CommitOptions {
 						expected_head_txid: request.expected_head_txid,
-						disable_size_cap: false,
+						// Inline tests drive deliberately large transactions to exercise pager spill
+						// and shard boundaries. The engine-side size cap has its own coverage in
+						// depot.
+						disable_size_cap: true,
 					},
 				)
 				.await
@@ -5803,6 +5962,31 @@ fn warm_pidx_stale_read_then_rmw_commit_via_natural_reopen() {
 					sqlite_error_response(&err),
 				)),
 			}
+		}
+
+		/// Not supported: this double only exercises the single-shot path.
+		///
+		/// Spelled out rather than inherited from a trait default. A default is what let the in-process
+		/// embedded transport ship with no staging at all, so every transport now has to say which it is.
+		async fn commit_stage_begin(
+			&self,
+			_request: protocol::SqliteCommitStageBeginRequest,
+		) -> anyhow::Result<protocol::SqliteCommitStageBeginResponse> {
+			anyhow::bail!("the pinned-database transport does not implement staged commits")
+		}
+
+		async fn commit_stage_segment(
+			&self,
+			_request: protocol::SqliteCommitStageSegmentRequest,
+		) -> anyhow::Result<protocol::SqliteCommitStageSegmentResponse> {
+			anyhow::bail!("the pinned-database transport does not implement staged commits")
+		}
+
+		async fn commit_finalize(
+			&self,
+			_request: protocol::SqliteCommitFinalizeRequest,
+		) -> anyhow::Result<protocol::SqliteCommitFinalizeResponse> {
+			anyhow::bail!("the pinned-database transport does not implement staged commits")
 		}
 	}
 
@@ -7156,4 +7340,61 @@ fn bench_growing_aggregation() {
 			expected_sum
 		);
 	}
+}
+
+#[test]
+fn direct_engine_persists_a_vacuum_shrink_across_reopen() {
+	let runtime = direct_runtime();
+	let harness = DirectEngineHarness::new();
+	let db = harness.open_db(&runtime);
+
+	sqlite_exec(db.as_ptr(), "PRAGMA auto_vacuum = NONE;")
+		.expect("auto_vacuum pragma should succeed");
+	sqlite_exec(
+		db.as_ptr(),
+		"CREATE TABLE blobs (id INTEGER PRIMARY KEY, payload BLOB NOT NULL);",
+	)
+	.expect("create table should succeed");
+	for _ in 0..64 {
+		sqlite_step_statement(
+			db.as_ptr(),
+			"INSERT INTO blobs (payload) VALUES (randomblob(8192));",
+		)
+		.expect("growth insert should succeed");
+	}
+	let grown_pages =
+		sqlite_query_i64(db.as_ptr(), "PRAGMA page_count;").expect("page_count should succeed");
+
+	sqlite_exec(db.as_ptr(), "DELETE FROM blobs;").expect("delete should succeed");
+	sqlite_exec(db.as_ptr(), "VACUUM;").expect("vacuum should succeed");
+	let shrunk_pages = sqlite_query_i64(db.as_ptr(), "PRAGMA page_count;")
+		.expect("shrunk page_count should succeed");
+	assert!(
+		shrunk_pages < grown_pages,
+		"vacuum should shrink the database ({shrunk_pages} vs {grown_pages})",
+	);
+	drop(db);
+
+	let reopened = harness.open_db(&runtime);
+	assert_eq!(
+		sqlite_query_text(reopened.as_ptr(), "PRAGMA integrity_check;")
+			.expect("integrity_check after reopen should succeed"),
+		"ok"
+	);
+	// The batch-atomic probe that runs on every open creates and drops a table, so the reopened
+	// database carries the shrunk size plus that one freelist page.
+	let reopened_pages = sqlite_query_i64(reopened.as_ptr(), "PRAGMA page_count;")
+		.expect("page_count after reopen should succeed");
+	let reopened_freelist = sqlite_query_i64(reopened.as_ptr(), "PRAGMA freelist_count;")
+		.expect("freelist_count after reopen should succeed");
+	assert_eq!(
+		reopened_pages - reopened_freelist,
+		shrunk_pages,
+		"the shrunk size should survive the reopen (grown was {grown_pages})",
+	);
+	assert_eq!(
+		sqlite_query_i64(reopened.as_ptr(), "SELECT COUNT(*) FROM blobs;")
+			.expect("count after reopen should succeed"),
+		0
+	);
 }

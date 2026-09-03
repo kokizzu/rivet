@@ -34,7 +34,7 @@ pub struct Recipient {
 }
 
 /// Returns estimated size of the given actor kv subspace.
-#[tracing::instrument(skip_all)]
+#[tracing::instrument(level = "debug", skip_all)]
 pub async fn estimate_kv_size(tx: &universaldb::Transaction, actor_id: Id) -> Result<i64> {
 	let subspace = &keys::actor_kv::subspace(actor_id);
 	let (start, end) = subspace.range();
@@ -42,7 +42,7 @@ pub async fn estimate_kv_size(tx: &universaldb::Transaction, actor_id: Id) -> Re
 	tx.get_estimated_range_size_bytes(&start, &end).await
 }
 
-#[tracing::instrument(skip_all)]
+#[tracing::instrument(level = "debug", skip_all)]
 pub async fn sqlite_v1_data_exists(db: &universaldb::Database, actor_id: Id) -> Result<bool> {
 	let subspace = keys::actor_kv::subspace(actor_id);
 	let prefix = vec![SQLITE_V1_PREFIX];
@@ -65,13 +65,13 @@ pub async fn sqlite_v1_data_exists(db: &universaldb::Database, actor_id: Id) -> 
 			Ok(stream.try_next().await?.is_some())
 		}
 	})
-	.custom_instrument(tracing::info_span!("kv_sqlite_v1_probe_tx"))
+	.custom_instrument(tracing::debug_span!("kv_sqlite_v1_probe_tx"))
 	.await
 	.map_err(Into::into)
 }
 
 /// Gets keys from the KV store.
-#[tracing::instrument(skip_all)]
+#[tracing::instrument(level = "debug", skip_all)]
 pub async fn get(
 	db: &universaldb::Database,
 	recipient: &Recipient,
@@ -174,7 +174,7 @@ pub async fn get(
 				Ok((keys, values, metadata))
 			}
 		})
-		.custom_instrument(tracing::info_span!("kv_get_tx"))
+		.custom_instrument(tracing::debug_span!("kv_get_tx"))
 		.await
 		.map_err(Into::<anyhow::Error>::into);
 	metrics::ACTOR_KV_OPERATION_DURATION
@@ -184,7 +184,7 @@ pub async fn get(
 }
 
 /// Gets keys from the KV store.
-#[tracing::instrument(skip_all)]
+#[tracing::instrument(level = "debug", skip_all)]
 pub async fn list(
 	db: &universaldb::Database,
 	recipient: &Recipient,
@@ -290,13 +290,13 @@ pub async fn list(
 			Ok((keys, values, metadata))
 		}
 	})
-	.custom_instrument(tracing::info_span!("kv_list_tx"))
+	.custom_instrument(tracing::debug_span!("kv_list_tx"))
 	.await
 	.map_err(Into::<anyhow::Error>::into)
 }
 
 /// Puts keys into the KV store.
-#[tracing::instrument(skip_all)]
+#[tracing::instrument(level = "debug", skip_all)]
 pub async fn put(
 	db: &universaldb::Database,
 	recipient: &Recipient,
@@ -377,7 +377,7 @@ pub async fn put(
 					.await
 			}
 		})
-		.custom_instrument(tracing::info_span!("kv_put_tx"))
+		.custom_instrument(tracing::debug_span!("kv_put_tx"))
 		.await
 		.map_err(Into::into);
 	metrics::ACTOR_KV_OPERATION_DURATION
@@ -387,7 +387,7 @@ pub async fn put(
 }
 
 /// Deletes keys from the KV store. Cannot be undone.
-#[tracing::instrument(skip_all)]
+#[tracing::instrument(level = "debug", skip_all)]
 pub async fn delete(
 	db: &universaldb::Database,
 	recipient: &Recipient,
@@ -426,7 +426,7 @@ pub async fn delete(
 				Ok(())
 			}
 		})
-		.custom_instrument(tracing::info_span!("kv_delete_tx"))
+		.custom_instrument(tracing::debug_span!("kv_delete_tx"))
 		.await
 		.map_err(Into::into);
 	metrics::ACTOR_KV_OPERATION_DURATION
@@ -436,7 +436,7 @@ pub async fn delete(
 }
 
 /// Deletes all keys in the half-open range [start, end). Cannot be undone.
-#[tracing::instrument(skip_all)]
+#[tracing::instrument(level = "debug", skip_all)]
 pub async fn delete_range(
 	db: &universaldb::Database,
 	recipient: &Recipient,
@@ -483,7 +483,7 @@ pub async fn delete_range(
 				Ok(())
 			}
 		})
-		.custom_instrument(tracing::info_span!("kv_delete_range_tx"))
+		.custom_instrument(tracing::debug_span!("kv_delete_range_tx"))
 		.await
 		.map_err(Into::into);
 	metrics::ACTOR_KV_OPERATION_DURATION
@@ -493,7 +493,7 @@ pub async fn delete_range(
 }
 
 /// Deletes all keys from the KV store. Cannot be undone.
-#[tracing::instrument(skip_all)]
+#[tracing::instrument(level = "debug", skip_all)]
 pub async fn delete_all(db: &universaldb::Database, recipient: &Recipient) -> Result<()> {
 	db.txn("pegboard_kv_delete_all", |tx| async move {
 		tx.clear_subspace_range(&keys::actor_kv::subspace(recipient.actor_id));
@@ -510,7 +510,7 @@ pub async fn delete_all(db: &universaldb::Database, recipient: &Recipient) -> Re
 
 		Ok(())
 	})
-	.custom_instrument(tracing::info_span!("kv_delete_all_tx"))
+	.custom_instrument(tracing::debug_span!("kv_delete_all_tx"))
 	.await
 	.map_err(Into::into)
 }

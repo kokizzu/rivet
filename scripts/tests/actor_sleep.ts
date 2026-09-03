@@ -16,7 +16,7 @@ async function main() {
 		const actorResponse = await getOrCreateActor(RIVET_NAMESPACE, "test-runner", "key3");
 		console.log("Actor created:", actorResponse.actor);
 
-		for (let i = 0; i < 10; i++) {
+		for (let i = 0; i < 10000; i++) {
 			await testWebSocket(actorResponse.actor.actor_id);
 
 			console.log("Sleeping actor...");
@@ -36,8 +36,8 @@ async function main() {
 				);
 			}
 
-			// console.log("Waiting...");
-			// await new Promise(resolve => setTimeout(resolve, 2000));
+			console.log("Waiting...");
+			await new Promise(resolve => setTimeout(resolve, 2000));
 		}
 
 		// Make a request to the actor

@@ -61,3 +61,25 @@ pub async fn purge_runner_config_caches(
 
 	Ok(())
 }
+
+/// Starts the usage metrics exporter workflow for the namespace that owns `runner_id`.
+///
+/// Usage metering is an Enterprise-only feature, so these are no-ops here. They exist so the
+/// gateway call sites stay identical across both trees and an upstream sync never has to
+/// reconcile them. Keep the signatures stable.
+pub async fn ensure_ns_metrics_exporter_for_runner(
+	_ctx: &StandaloneCtx,
+	_runner_id: Id,
+) -> Result<()> {
+	Ok(())
+}
+
+/// Starts the usage metrics exporter workflow for `namespace_id`.
+///
+/// See [`ensure_ns_metrics_exporter_for_runner`]. No-op in this edition.
+pub async fn ensure_ns_metrics_exporter_for_namespace(
+	_ctx: &StandaloneCtx,
+	_namespace_id: Id,
+) -> Result<()> {
+	Ok(())
+}

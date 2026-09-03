@@ -116,6 +116,14 @@ Rivet received an unexpected response from your serverless endpoint. This typica
 - Your server routes requests to `registry.start()`, `registry.serve()`, or `registry.handler()` correctly.
 - No middleware is modifying the request or response body.
 
+### `serverless_destination_blocked`
+
+The configured serverless URL points at a destination Rivet is not allowed to reach. Rivet dials serverless endpoints from inside its own network, so by default it refuses any destination that is not publicly routable: private ranges, link-local and cloud metadata addresses, carrier-grade NAT, and other reserved ranges. Check that:
+
+- Your endpoint URL is publicly reachable, and is not an internal hostname or address.
+- The URL scheme is `http` or `https`, and the URL does not embed credentials.
+- If you are self-hosting and intentionally point runners at an address on your own network, set `outbound.allow_private_networks` to `true` in your engine config, or list the specific range in `outbound.allow_cidrs`.
+
 ### `internal_error`
 
 An unexpected error occurred within Rivet. If this persists, please [contact support](https://rivet.dev/actors/docs).

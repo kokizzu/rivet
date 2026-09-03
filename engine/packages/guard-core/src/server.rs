@@ -10,6 +10,7 @@ use std::{
 use anyhow::Result;
 use futures_util::FutureExt;
 use hyper::service::service_fn;
+use rivet_metrics::GaugeGuardExt;
 use rivet_runtime::TermSignal;
 use tokio_rustls::TlsAcceptor;
 use tracing::Instrument;
@@ -93,7 +94,7 @@ pub async fn run_server(
 		port_type_str: String,
 	) {
 		let connection_start = Instant::now();
-		metrics::TCP_CONNECTION_PENDING.inc();
+		let pending_guard = metrics::TCP_CONNECTION_PENDING.inc_guard();
 		metrics::TCP_CONNECTION_TOTAL.inc();
 
 		if tcp_nodelay && let Err(err) = tcp_stream.set_nodelay(true) {
@@ -118,6 +119,8 @@ pub async fn run_server(
 
 		tokio::spawn(
 			async move {
+				let _pending_guard = pending_guard;
+
 				if let Err(err) = conn.await {
 					tracing::warn!("{} connection error: {}", port_type_str, err);
 				}
@@ -126,9 +129,8 @@ pub async fn run_server(
 
 				let connection_duration = connection_start.elapsed().as_secs_f64();
 				metrics::TCP_CONNECTION_DURATION.observe(connection_duration);
-				metrics::TCP_CONNECTION_PENDING.dec();
 			}
-			.instrument(tracing::info_span!(parent: None, "process_connection_task")),
+			.instrument(tracing::debug_span!(parent: None, "process_connection_task")),
 		);
 	}
 
@@ -177,7 +179,7 @@ pub async fn run_server(
 									// Accept TLS connection in a separate task to avoid ownership issues
 									tokio::spawn(async move {
 										let connection_start = Instant::now();
-										metrics::TCP_CONNECTION_PENDING.inc();
+										let _pending_guard = metrics::TCP_CONNECTION_PENDING.inc_guard();
 										metrics::TCP_CONNECTION_TOTAL.inc();
 
 										if tcp_nodelay
@@ -188,7 +190,7 @@ pub async fn run_server(
 
 										match acceptor_clone
 											.accept(tcp_stream)
-											.instrument(tracing::info_span!("accept"))
+											.instrument(tracing::debug_span!("accept"))
 											.await
 										{
 											Result::Ok(tls_stream) => {
@@ -226,8 +228,7 @@ pub async fn run_server(
 
 										let connection_duration = connection_start.elapsed().as_secs_f64();
 										metrics::TCP_CONNECTION_DURATION.observe(connection_duration);
-										metrics::TCP_CONNECTION_PENDING.dec();
-									}.instrument(tracing::info_span!(parent: None, "process_tls_connection_task")));
+									}.instrument(tracing::debug_span!(parent: None, "process_tls_connection_task")));
 								} else {
 									// Fallback to non-TLS handling (useful for testing)
 									// In production, this would not secure the connection

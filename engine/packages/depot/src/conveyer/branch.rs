@@ -15,3 +15,4 @@ pub use resolve::{
 	resolve_or_allocate_root_bucket_branch, write_root_bucket_metadata,
 };
 pub(super) use shared::read_database_branch_record;
+pub(crate) use shared::write_database_pointer;

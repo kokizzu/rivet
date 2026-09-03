@@ -176,7 +176,7 @@ async fn cache_fanout_value(
 				Ok(())
 			}
 		})
-		.custom_instrument(tracing::info_span!("cache_value_tx"))
+		.custom_instrument(tracing::debug_span!("cache_value_tx"))
 		.await
 }
 
@@ -199,6 +199,6 @@ async fn cache_empty_value(ctx: &OperationCtx, replica_id: ReplicaId, key: &[u8]
 			)?;
 			Ok(())
 		})
-		.custom_instrument(tracing::info_span!("cache_empty_value_tx"))
+		.custom_instrument(tracing::debug_span!("cache_empty_value_tx"))
 		.await
 }

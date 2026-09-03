@@ -11,6 +11,24 @@ use tokio::sync::Notify;
 use universaldb::{Database, utils::IsolationLevel::*};
 use uuid::Uuid;
 
+/// A config carrying the compiled universaldb commit protocol version.
+///
+/// `RuntimeProtocols::default()` reports version 0 so that a process which never negotiated cannot
+/// silently reach the wire, which means a test has to supply the real version itself.
+fn test_config() -> rivet_config::Config {
+	rivet_config::Config::from_root_with_build_meta(
+		rivet_config::config::Root::default(),
+		rivet_config::BuildMeta::default(),
+		rivet_config::RuntimeProtocols {
+			universaldb_commit: rivet_config::RuntimeProtocol::new(
+				rivet_config::RuntimeProtocolKind::UniversaldbCommit,
+				rivet_universaldb_commit::PROTOCOL_VERSION,
+			),
+			..Default::default()
+		},
+	)
+}
+
 const KEY: &[u8] = b"conflict_parity/key";
 const OTHER_KEY: &[u8] = b"conflict_parity/other";
 
@@ -78,6 +96,7 @@ async fn postgres_conflict_parity() {
 		tracing::info!(name, "running postgres conflict parity case");
 
 		let driver = universaldb::driver::PostgresDatabaseDriver::new_with_config(
+			test_config(),
 			universaldb::driver::postgres::PostgresConfig::new(connection_string.clone()),
 		)
 		.await

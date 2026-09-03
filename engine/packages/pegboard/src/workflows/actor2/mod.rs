@@ -479,18 +479,6 @@ async fn listen_for_signals(
 		}
 		| Transition::Starting {
 			lost_timeout_ts, ..
-		}
-		| Transition::SleepIntent {
-			lost_timeout_ts, ..
-		}
-		| Transition::StopIntent {
-			lost_timeout_ts, ..
-		}
-		| Transition::GoingAway {
-			lost_timeout_ts, ..
-		}
-		| Transition::Destroying {
-			lost_timeout_ts, ..
 		} => {
 			// Listen for signals with a timeout. if a timeout happens, it means this actor is lost
 			let signals = ctx.listen_n_until::<Main>(*lost_timeout_ts, 256).await?;
@@ -506,17 +494,72 @@ async fn listen_for_signals(
 				signals
 			}
 		}
-		Transition::Running {
+		Transition::SleepIntent {
 			envoy,
-			last_liveness_check_ts,
+			lost_timeout_ts,
+			..
+		}
+		| Transition::StopIntent {
+			envoy,
+			lost_timeout_ts,
+			..
+		}
+		| Transition::GoingAway {
+			envoy,
+			lost_timeout_ts,
+			..
+		}
+		| Transition::Destroying {
+			envoy,
+			lost_timeout_ts,
+			..
 		} => {
+			let next_check_ts =
+				envoy.last_liveness_check_ts + ctx.config().pegboard().envoy_lost_threshold();
+			let sleep_ts = next_check_ts.min(*lost_timeout_ts);
+
 			// Listen for signals with periodic liveness check timeout
-			let signals = ctx
-				.listen_n_until::<Main>(
-					*last_liveness_check_ts + ctx.config().pegboard().envoy_lost_threshold(),
-					256,
-				)
-				.await?;
+			let signals = ctx.listen_n_until::<Main>(sleep_ts, 256).await?;
+
+			// Perform liveness check
+			if signals.is_empty() {
+				// Reached lost timeout, it means this actor is lost
+				if sleep_ts == *lost_timeout_ts {
+					tracing::warn!(actor_id=?input.actor_id, transition=%state.transition, "actor lost");
+
+					// Fake signal
+					vec![Main::Lost(Lost {
+						generation: state.generation,
+						reason: LostReason::EnvoyNoResponse,
+					})]
+				} else {
+					let res = ctx
+						.activity(CheckEnvoyLivenessInput {
+							envoy_key: envoy.envoy_key.clone(),
+						})
+						.await?;
+
+					envoy.last_liveness_check_ts = res.now;
+
+					if res.expired {
+						vec![Main::Lost(Lost {
+							generation: state.generation,
+							reason: LostReason::EnvoyConnectionLost,
+						})]
+					} else {
+						vec![]
+					}
+				}
+			} else {
+				signals
+			}
+		}
+		Transition::Running { envoy } => {
+			let next_check_ts =
+				envoy.last_liveness_check_ts + ctx.config().pegboard().envoy_lost_threshold();
+
+			// Listen for signals with periodic liveness check timeout
+			let signals = ctx.listen_n_until::<Main>(next_check_ts, 256).await?;
 
 			// Perform liveness check
 			if signals.is_empty() {
@@ -526,7 +569,7 @@ async fn listen_for_signals(
 					})
 					.await?;
 
-				*last_liveness_check_ts = res.now;
+				envoy.last_liveness_check_ts = res.now;
 
 				if res.expired {
 					vec![Main::Lost(Lost {
@@ -739,7 +782,7 @@ async fn process_signal(
 								if *destroy_after_start {
 									// Transition to destroying
 									state.transition = Transition::Destroying {
-										envoy: runtime::EnvoyState::new(sig.envoy_key.clone()),
+										envoy: runtime::EnvoyState::new(sig.envoy_key.clone(), now),
 										lost_timeout_ts: now
 											+ ctx.config().pegboard().actor_stop_threshold(),
 									};
@@ -757,8 +800,7 @@ async fn process_signal(
 								} else {
 									// Transition to starting
 									state.transition = Transition::Running {
-										envoy: runtime::EnvoyState::new(sig.envoy_key.clone()),
-										last_liveness_check_ts: now,
+										envoy: runtime::EnvoyState::new(sig.envoy_key.clone(), now),
 									};
 
 									ctx.activity(runtime::SetConnectableInput {

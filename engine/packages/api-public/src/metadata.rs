@@ -2,7 +2,6 @@ use anyhow::Result;
 use axum::response::{IntoResponse, Json, Response};
 use rivet_api_builder::ApiError;
 use rivet_api_builder::extract::Extension;
-use rivet_util::build_meta;
 use serde::Serialize;
 use utoipa::ToSchema;
 
@@ -43,16 +42,21 @@ pub async fn get(Extension(ctx): Extension<ApiCtx>) -> Response {
 pub async fn get_inner(ctx: ApiCtx) -> Result<GetResponse> {
 	ctx.skip_auth();
 
+	let build_meta = ctx.config().build_meta();
+	let protocols = ctx.config().protocols();
+
 	Ok(GetResponse {
-		runtime: build_meta::RUNTIME.to_string(),
-		version: build_meta::VERSION.to_string(),
-		git_sha: build_meta::GIT_SHA.to_string(),
-		build_timestamp: build_meta::BUILD_TIMESTAMP.to_string(),
-		rustc_version: build_meta::RUSTC_VERSION.to_string(),
-		rustc_host: build_meta::RUSTC_HOST.to_string(),
-		cargo_target: build_meta::CARGO_TARGET.to_string(),
-		cargo_profile: build_meta::cargo_profile().to_string(),
-		epoxy_protocol_version: epoxy_protocol::PROTOCOL_VERSION,
-		envoy_protocol_version: rivet_envoy_protocol::PROTOCOL_VERSION,
+		runtime: build_meta.runtime.clone(),
+		version: build_meta.version.clone(),
+		git_sha: build_meta.git_sha.clone(),
+		build_timestamp: build_meta.build_timestamp.clone(),
+		rustc_version: build_meta.rustc_version.clone(),
+		rustc_host: build_meta.rustc_host.clone(),
+		cargo_target: build_meta.cargo_target.clone(),
+		cargo_profile: build_meta.cargo_profile.clone(),
+		// Advertise what the fleet has agreed to speak. A client that took this binary's compiled
+		// version would be rejected by any pod still running older code.
+		epoxy_protocol_version: protocols.epoxy.version(),
+		envoy_protocol_version: protocols.envoy.version(),
 	})
 }

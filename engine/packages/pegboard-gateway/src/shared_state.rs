@@ -176,7 +176,7 @@ impl SharedState {
 		Ok(())
 	}
 
-	#[tracing::instrument(skip_all, fields(%receiver_subject, request_id=%protocol::util::id_to_string(&request_id)))]
+	#[tracing::instrument(level = "debug", skip_all, fields(%receiver_subject, request_id=%protocol::util::id_to_string(&request_id)))]
 	pub async fn start_in_flight_request(
 		&self,
 		receiver_subject: String,
@@ -229,7 +229,7 @@ impl SharedState {
 		}
 	}
 
-	#[tracing::instrument(skip_all, fields(request_id=%protocol::util::id_to_string(&request_id)))]
+	#[tracing::instrument(level = "debug", skip_all, fields(request_id=%protocol::util::id_to_string(&request_id)))]
 	pub async fn send_message(
 		&self,
 		request_id: protocol::mk2::RequestId,
@@ -315,7 +315,7 @@ impl SharedState {
 		Ok(())
 	}
 
-	#[tracing::instrument(skip_all, fields(request_id=%protocol::util::id_to_string(&request_id)))]
+	#[tracing::instrument(level = "debug", skip_all, fields(request_id=%protocol::util::id_to_string(&request_id)))]
 	pub async fn send_and_check_ping(&self, request_id: protocol::mk2::RequestId) -> Result<()> {
 		let req = self
 			.in_flight_requests
@@ -365,7 +365,7 @@ impl SharedState {
 		Ok(())
 	}
 
-	#[tracing::instrument(skip_all, fields(request_id=%protocol::util::id_to_string(&request_id)))]
+	#[tracing::instrument(level = "debug", skip_all, fields(request_id=%protocol::util::id_to_string(&request_id)))]
 	pub async fn keepalive_hws(&self, request_id: protocol::mk2::RequestId) -> Result<()> {
 		let mut req = self
 			.in_flight_requests
@@ -506,7 +506,7 @@ impl SharedState {
 		}
 	}
 
-	#[tracing::instrument(skip_all, fields(request_id=%protocol::util::id_to_string(&request_id), %enable))]
+	#[tracing::instrument(level = "debug", skip_all, fields(request_id=%protocol::util::id_to_string(&request_id), %enable))]
 	pub async fn toggle_hibernation(
 		&self,
 		request_id: protocol::mk2::RequestId,
@@ -638,7 +638,7 @@ impl SharedState {
 	/// **Phase 2**
 	///
 	/// 2a. Remove all requests where it was flagged as stopping and `drop_rx` has been dropped
-	#[tracing::instrument(skip_all)]
+	#[tracing::instrument(level = "debug", skip_all)]
 	async fn gc_in_flight_requests(&self) {
 		let now = Instant::now();
 		let hibernation_timeout =

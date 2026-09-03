@@ -529,6 +529,47 @@ impl EnvoyHandle {
 		}
 	}
 
+	/// Opens a staged commit for a commit too large to cross the socket in one message.
+	pub async fn sqlite_commit_stage_begin(
+		&self,
+		request: protocol::SqliteCommitStageBeginRequest,
+	) -> anyhow::Result<protocol::SqliteCommitStageBeginResponse> {
+		match self
+			.send_sqlite_request(SqliteRequest::CommitStageBegin(request))
+			.await?
+		{
+			SqliteResponse::CommitStageBegin(response) => Ok(response),
+			_ => anyhow::bail!("unexpected sqlite commit_stage_begin response type"),
+		}
+	}
+
+	pub async fn sqlite_commit_stage_segment(
+		&self,
+		request: protocol::SqliteCommitStageSegmentRequest,
+	) -> anyhow::Result<protocol::SqliteCommitStageSegmentResponse> {
+		match self
+			.send_sqlite_request(SqliteRequest::CommitStageSegment(request))
+			.await?
+		{
+			SqliteResponse::CommitStageSegment(response) => Ok(response),
+			_ => anyhow::bail!("unexpected sqlite commit_stage_segment response type"),
+		}
+	}
+
+	/// Publishes a staged commit. This is the point the commit becomes visible.
+	pub async fn sqlite_commit_finalize(
+		&self,
+		request: protocol::SqliteCommitFinalizeRequest,
+	) -> anyhow::Result<protocol::SqliteCommitFinalizeResponse> {
+		match self
+			.send_sqlite_request(SqliteRequest::CommitFinalize(request))
+			.await?
+		{
+			SqliteResponse::CommitFinalize(response) => Ok(response),
+			_ => anyhow::bail!("unexpected sqlite commit_finalize response type"),
+		}
+	}
+
 	pub async fn remote_sqlite_exec(
 		&self,
 		request: protocol::SqliteExecRequest,

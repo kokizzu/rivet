@@ -25,10 +25,16 @@ pub async fn set_bucket_pitr_policy(
 pub async fn get_bucket_pitr_policy(
 	udb: &universaldb::Database,
 	bucket_id: BucketId,
-) -> Result<PitrPolicy> {
+	default_policy: Option<PitrPolicy>,
+) -> Result<Option<PitrPolicy>> {
+	let Some(default_policy) = default_policy else {
+		return Ok(None);
+	};
 	let key = keys::bucket_policy_pitr_key(bucket_id);
 
-	Ok(read_pitr_policy(udb, key).await?.unwrap_or_default())
+	Ok(Some(
+		read_pitr_policy(udb, key).await?.unwrap_or(default_policy),
+	))
 }
 
 pub async fn set_database_pitr_policy_override(
@@ -64,12 +70,19 @@ pub async fn get_effective_pitr_policy(
 	udb: &universaldb::Database,
 	bucket_id: BucketId,
 	database_id: &str,
-) -> Result<PitrPolicy> {
+	default_policy: Option<PitrPolicy>,
+) -> Result<Option<PitrPolicy>> {
+	// A disabled cluster ignores stored overrides. Mirrors
+	// `compaction::shared::read_effective_pitr_policy_for_branch`, which resolves the same precedence
+	// inside a compaction transaction.
+	if default_policy.is_none() {
+		return Ok(None);
+	}
 	if let Some(policy) = get_database_pitr_policy_override(udb, bucket_id, database_id).await? {
-		return Ok(policy);
+		return Ok(Some(policy));
 	}
 
-	get_bucket_pitr_policy(udb, bucket_id).await
+	get_bucket_pitr_policy(udb, bucket_id, default_policy).await
 }
 
 pub async fn set_bucket_shard_cache_policy(

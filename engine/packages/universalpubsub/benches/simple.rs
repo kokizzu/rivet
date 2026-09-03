@@ -12,6 +12,24 @@ use tabled::{builder::Builder, settings::Style};
 use universalpubsub::{NextOutput, PubSub, PublishOpts};
 use uuid::Uuid;
 
+/// A config carrying the compiled ups protocol version.
+///
+/// `RuntimeProtocols::default()` reports version 0 so that a process which never negotiated cannot
+/// silently reach the wire, which means a test has to supply the real version itself.
+fn test_config() -> rivet_config::Config {
+	rivet_config::Config::from_root_with_build_meta(
+		rivet_config::config::Root::default(),
+		rivet_config::BuildMeta::default(),
+		rivet_config::RuntimeProtocols {
+			ups: rivet_config::RuntimeProtocol::new(
+				rivet_config::RuntimeProtocolKind::Ups,
+				rivet_ups_protocol::PROTOCOL_VERSION,
+			),
+			..Default::default()
+		},
+	)
+}
+
 #[derive(Clone, Debug)]
 struct BenchResult {
 	avg: Duration,
@@ -56,6 +74,7 @@ async fn subscribe_and_wait_propagate(
 			}
 		}
 		NextOutput::Unsubscribed => bail!("unexpected unsubscribe during propagation check"),
+		NextOutput::NoResponders => bail!("no responders during propagation check"),
 	}
 
 	Ok(sub)
@@ -76,6 +95,7 @@ async fn run_publish_once(
 	match guard.next().await? {
 		NextOutput::Message(m) => assert_eq!(m.payload, msg),
 		NextOutput::Unsubscribed => bail!("unexpected unsubscribe"),
+		NextOutput::NoResponders => bail!("no responders"),
 	}
 	Ok(())
 }
@@ -97,14 +117,18 @@ async fn run_subscribe_publish_once(
 	match sub.next().await? {
 		NextOutput::Message(m) => assert_eq!(m.payload, msg),
 		NextOutput::Unsubscribed => bail!("unexpected unsubscribe"),
+		NextOutput::NoResponders => bail!("no responders"),
 	}
 	Ok(())
 }
 
 async fn run_request_once(pubsub: &PubSub, subject: &str) -> Result<()> {
 	let payload = b"request payload";
-	let resp = pubsub.request(subject, payload).await?;
-	assert_eq!(resp.payload, payload);
+	match pubsub.request(subject, payload).await? {
+		NextOutput::Message(m) => assert_eq!(m.payload, payload),
+		NextOutput::Unsubscribed => bail!("unexpected unsubscribe"),
+		NextOutput::NoResponders => bail!("no responders"),
+	}
 	Ok(())
 }
 
@@ -129,6 +153,7 @@ async fn run_publish_pipelined_once(
 		match guard.next().await? {
 			NextOutput::Message(m) => assert_eq!(m.payload, msg),
 			NextOutput::Unsubscribed => bail!("unexpected unsubscribe"),
+			NextOutput::NoResponders => bail!("no responders"),
 		}
 	}
 	Ok(())
@@ -147,6 +172,7 @@ async fn run_publish_one_once(
 	match guard.next().await? {
 		NextOutput::Message(m) => assert_eq!(m.payload, msg),
 		NextOutput::Unsubscribed => bail!("unexpected unsubscribe"),
+		NextOutput::NoResponders => bail!("no responders"),
 	}
 	Ok(())
 }
@@ -166,6 +192,7 @@ async fn run_subscribe_publish_one_once(
 	match sub.next().await? {
 		NextOutput::Message(m) => assert_eq!(m.payload, msg),
 		NextOutput::Unsubscribed => bail!("unexpected unsubscribe"),
+		NextOutput::NoResponders => bail!("no responders"),
 	}
 	Ok(())
 }
@@ -354,6 +381,7 @@ async fn run_benches(
 			match sub.next().await? {
 				NextOutput::Message(m) => assert_eq!(m.payload, msg),
 				NextOutput::Unsubscribed => bail!("unexpected unsubscribe"),
+				NextOutput::NoResponders => bail!("no responders"),
 			}
 			// Return the subscriber so the teardown can explicitly drop/unsubscribe
 			Ok(sub)
@@ -486,6 +514,7 @@ async fn run_benches(
 			match sub.next().await? {
 				NextOutput::Message(m) => assert_eq!(m.payload, msg),
 				NextOutput::Unsubscribed => bail!("unexpected unsubscribe"),
+				NextOutput::NoResponders => bail!("no responders"),
 			}
 			// Return the subscriber so the teardown can explicitly drop/unsubscribe
 			Ok(sub)
@@ -564,8 +593,8 @@ async fn setup_nats_pair() -> Result<(PubSub, PubSub)> {
 	)
 	.await?;
 	Ok((
-		PubSub::new_with_memory_optimization(Arc::new(driver_pub), false),
-		PubSub::new_with_memory_optimization(Arc::new(driver_sub), false),
+		PubSub::new_with_memory_optimization(test_config(), Arc::new(driver_pub), false),
+		PubSub::new_with_memory_optimization(test_config(), Arc::new(driver_sub), false),
 	))
 }
 
@@ -591,7 +620,7 @@ async fn setup_nats_single() -> Result<(PubSub, PubSub)> {
 		&server_addrs[..],
 	)
 	.await?;
-	let pubsub = PubSub::new_with_memory_optimization(Arc::new(driver), false);
+	let pubsub = PubSub::new_with_memory_optimization(test_config(), Arc::new(driver), false);
 	Ok((pubsub.clone(), pubsub))
 }
 
@@ -623,8 +652,8 @@ async fn setup_nats_pair_mem() -> Result<(PubSub, PubSub)> {
 	)
 	.await?;
 	Ok((
-		PubSub::new_with_memory_optimization(Arc::new(driver_pub), true),
-		PubSub::new_with_memory_optimization(Arc::new(driver_sub), true),
+		PubSub::new_with_memory_optimization(test_config(), Arc::new(driver_pub), true),
+		PubSub::new_with_memory_optimization(test_config(), Arc::new(driver_sub), true),
 	))
 }
 
@@ -650,7 +679,7 @@ async fn setup_nats_single_mem() -> Result<(PubSub, PubSub)> {
 		&server_addrs[..],
 	)
 	.await?;
-	let pubsub = PubSub::new_with_memory_optimization(Arc::new(driver), true);
+	let pubsub = PubSub::new_with_memory_optimization(test_config(), Arc::new(driver), true);
 	Ok((pubsub.clone(), pubsub))
 }
 
@@ -661,7 +690,7 @@ async fn setup_mem_pair() -> Result<(PubSub, PubSub)> {
 		unreachable!()
 	};
 	let driver = universalpubsub::driver::memory::MemoryDriver::new(memory.channel.clone());
-	let pubsub = PubSub::new(Arc::new(driver));
+	let pubsub = PubSub::new(test_config(), Arc::new(driver));
 	// Memory driver must use the same PubSub instance to exercise the in-process fast path
 	Ok((pubsub.clone(), pubsub.clone()))
 }

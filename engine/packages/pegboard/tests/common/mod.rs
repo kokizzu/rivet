@@ -27,6 +27,7 @@ pub struct HashAllocationInput {
 pub struct EnvoyFixture {
 	pub namespace_id: Id,
 	pub envoy_key: String,
+	pub envoy_conn_id: Option<Id>,
 	pub pool_name: String,
 	pub version: u32,
 	pub create_ts: i64,
@@ -36,10 +37,13 @@ pub struct EnvoyFixture {
 
 #[derive(Debug)]
 pub struct EnvoyKeyState {
+	pub envoy_conn_id: Option<Id>,
 	pub pool_name: bool,
 	pub version: bool,
 	pub create_ts: bool,
 	pub last_ping_ts: bool,
+	pub last_ping_ts_value: Option<i64>,
+	pub last_rtt: Option<u32>,
 	pub expired_ts: bool,
 	pub virtual_nodes: bool,
 	pub load_balancer_idx: bool,
@@ -144,7 +148,12 @@ pub async fn load_hash_config(hash_fields: &str) -> Result<rivet_config::Config>
 	)?;
 	drop(file);
 
-	rivet_config::Config::load(&[path]).await
+	rivet_config::Config::load(
+		&[path],
+		rivet_config::BuildMeta::default(),
+		rivet_config::RuntimeProtocols::default(),
+	)
+	.await
 }
 
 pub async fn write_envoy(
@@ -152,15 +161,24 @@ pub async fn write_envoy(
 	last_ping_ts: i64,
 	virtual_nodes: Option<u8>,
 ) -> Result<EnvoyFixture> {
+	write_envoy_with_version(test_deps, last_ping_ts, virtual_nodes, VERSION).await
+}
+
+pub async fn write_envoy_with_version(
+	test_deps: &rivet_test_deps::TestDeps,
+	last_ping_ts: i64,
+	virtual_nodes: Option<u8>,
+	version: u32,
+) -> Result<EnvoyFixture> {
 	let namespace_id = Id::new_v1(test_deps.config().dc_label());
 	let envoy_key = Uuid::new_v4().to_string();
 	let pool_name = POOL_NAME.to_string();
 	let create_ts = util::timestamp::now();
-	let version = VERSION;
 
 	let fixture = EnvoyFixture {
 		namespace_id,
 		envoy_key,
+		envoy_conn_id: Some(Id::new_v1(test_deps.config().dc_label())),
 		pool_name,
 		version,
 		create_ts,
@@ -189,6 +207,29 @@ pub async fn write_hash_envoy(
 	hash_positions: Vec<[u8; 16]>,
 	slots: Option<i64>,
 ) -> Result<()> {
+	write_hash_envoy_with_version(
+		test_deps,
+		namespace_id,
+		pool_name,
+		envoy_key,
+		VERSION,
+		last_ping_ts,
+		hash_positions,
+		slots,
+	)
+	.await
+}
+
+pub async fn write_hash_envoy_with_version(
+	test_deps: &rivet_test_deps::TestDeps,
+	namespace_id: Id,
+	pool_name: &str,
+	envoy_key: &str,
+	version: u32,
+	last_ping_ts: i64,
+	hash_positions: Vec<[u8; 16]>,
+	slots: Option<i64>,
+) -> Result<()> {
 	let pool_name = pool_name.to_string();
 	let envoy_key = envoy_key.to_string();
 	test_deps
@@ -208,7 +249,7 @@ pub async fn write_hash_envoy(
 				)?;
 				tx.write(
 					&keys::envoy::VersionKey::new(namespace_id, envoy_key.clone()),
-					VERSION,
+					version,
 				)?;
 				tx.write(
 					&keys::envoy::CreateTsKey::new(namespace_id, envoy_key.clone()),
@@ -226,7 +267,7 @@ pub async fn write_hash_envoy(
 					&keys::ns::EnvoyLoadBalancerIdxKey::new(
 						namespace_id,
 						pool_name.clone(),
-						VERSION,
+						version,
 						last_ping_ts,
 						envoy_key.clone(),
 					),
@@ -258,7 +299,7 @@ pub async fn write_hash_envoy(
 						&keys::ns::EnvoyHashIdxKey::new(
 							namespace_id,
 							pool_name.clone(),
-							VERSION,
+							version,
 							hash_pos,
 							envoy_key.clone(),
 						),
@@ -539,10 +580,126 @@ pub async fn expire(
 		&pegboard::ops::envoy::expire::Input {
 			namespace_id: fixture.namespace_id,
 			envoy_key: fixture.envoy_key.clone(),
+			expected_envoy_conn_id: if skip_if_fresh {
+				None
+			} else {
+				fixture.envoy_conn_id
+			},
 			skip_if_fresh,
 		},
 	)
 	.await
+}
+
+pub async fn expire_as(
+	test_deps: &rivet_test_deps::TestDeps,
+	fixture: &EnvoyFixture,
+	expected_envoy_conn_id: Option<Id>,
+	skip_if_fresh: bool,
+) -> Result<pegboard::ops::envoy::expire::Output> {
+	pegboard::ops::envoy::expire::expire_with_pools(
+		test_deps.config(),
+		test_deps.pools(),
+		&pegboard::ops::envoy::expire::Input {
+			namespace_id: fixture.namespace_id,
+			envoy_key: fixture.envoy_key.clone(),
+			expected_envoy_conn_id,
+			skip_if_fresh,
+		},
+	)
+	.await
+}
+
+pub async fn update_ping(
+	test_deps: &rivet_test_deps::TestDeps,
+	fixture: &EnvoyFixture,
+) -> Result<pegboard::ops::envoy::update_ping::Output> {
+	update_ping_as(test_deps, fixture, fixture.envoy_conn_id, false).await
+}
+
+pub async fn update_ping_as(
+	test_deps: &rivet_test_deps::TestDeps,
+	fixture: &EnvoyFixture,
+	envoy_conn_id: Option<Id>,
+	is_stopping: bool,
+) -> Result<pegboard::ops::envoy::update_ping::Output> {
+	update_ping_as_with_rtt(test_deps, fixture, envoy_conn_id, is_stopping, 1).await
+}
+
+pub async fn update_ping_as_with_rtt(
+	test_deps: &rivet_test_deps::TestDeps,
+	fixture: &EnvoyFixture,
+	envoy_conn_id: Option<Id>,
+	is_stopping: bool,
+	rtt: u32,
+) -> Result<pegboard::ops::envoy::update_ping::Output> {
+	let ctx = build_ctx(test_deps, "envoy_update_ping_test").await?;
+
+	ctx.op(pegboard::ops::envoy::update_ping::Input {
+		namespace_id: fixture.namespace_id,
+		envoy_key: fixture.envoy_key.clone(),
+		envoy_conn_id,
+		update_lb: true,
+		rtt,
+		is_stopping,
+	})
+	.await
+}
+
+pub async fn build_ctx(
+	test_deps: &rivet_test_deps::TestDeps,
+	test_name: &str,
+) -> Result<StandaloneCtx> {
+	let cache = rivet_cache::CacheInner::from_env(test_deps.config(), test_deps.pools().clone())?;
+
+	Ok(StandaloneCtx::new(
+		db::DatabaseKv::new(test_deps.config().clone(), test_deps.pools().clone()).await?,
+		test_deps.config().clone(),
+		test_deps.pools().clone(),
+		cache,
+		test_name,
+		Id::new_v1(test_deps.config().dc_label()),
+		Id::new_v1(test_deps.config().dc_label()),
+	)?)
+}
+
+pub async fn reregister_envoy(
+	test_deps: &rivet_test_deps::TestDeps,
+	fixture: &EnvoyFixture,
+	envoy_conn_id: Id,
+	last_ping_ts: i64,
+) -> Result<EnvoyFixture> {
+	let mut replacement = fixture.clone();
+	replacement.envoy_conn_id = Some(envoy_conn_id);
+	replacement.last_ping_ts = last_ping_ts;
+
+	write_envoy_fixture_inner(test_deps, &replacement, Some(fixture.last_ping_ts), true).await?;
+
+	Ok(replacement)
+}
+
+pub async fn set_envoy_conn_id(
+	test_deps: &rivet_test_deps::TestDeps,
+	fixture: &EnvoyFixture,
+	envoy_conn_id: Option<Id>,
+) -> Result<()> {
+	test_deps
+		.pools()
+		.udb()?
+		.txn("test_set_envoy_conn_id", |tx| {
+			let fixture = fixture.clone();
+			async move {
+				let tx = tx.with_subspace(keys::subspace());
+				let key = keys::envoy::EnvoyConnIdKey::new(fixture.namespace_id, fixture.envoy_key);
+				if let Some(envoy_conn_id) = envoy_conn_id {
+					tx.write(&key, envoy_conn_id)?;
+				} else {
+					tx.delete(&key);
+				}
+				Ok(())
+			}
+		})
+		.await
 }
 
 pub async fn read_key_state(
@@ -579,6 +736,15 @@ pub async fn read_key_state(
 				}
 
 				Ok(EnvoyKeyState {
+					envoy_conn_id: tx
+						.read_opt(
+							&keys::envoy::EnvoyConnIdKey::new(
+								fixture.namespace_id,
+								fixture.envoy_key.clone(),
+							),
+							Serializable,
+						)
+						.await?,
 					pool_name: tx
 						.exists(
 							&keys::envoy::PoolNameKey::new(
@@ -609,6 +775,24 @@ pub async fn read_key_state(
 					last_ping_ts: tx
 						.exists(
 							&keys::envoy::LastPingTsKey::new(
+								fixture.namespace_id,
+								fixture.envoy_key.clone(),
+							),
+							Serializable,
+						)
+						.await?,
+					last_ping_ts_value: tx
+						.read_opt(
+							&keys::envoy::LastPingTsKey::new(
+								fixture.namespace_id,
+								fixture.envoy_key.clone(),
+							),
+							Serializable,
+						)
+						.await?,
+					last_rtt: tx
+						.read_opt(
+							&keys::envoy::LastRttKey::new(
 								fixture.namespace_id,
 								fixture.envoy_key.clone(),
 							),
@@ -674,6 +858,7 @@ pub async fn read_key_state(
 }
 
 pub fn assert_registration_keys_present(state: &EnvoyKeyState, expected_hash_entries: usize) {
+	assert!(state.envoy_conn_id.is_some(), "EnvoyConnIdKey should exist");
 	assert!(state.pool_name, "PoolNameKey should exist");
 	assert!(state.version, "VersionKey should exist");
 	assert!(state.create_ts, "CreateTsKey should exist");
@@ -694,6 +879,15 @@ async fn write_envoy_fixture(
 	test_deps: &rivet_test_deps::TestDeps,
 	fixture: &EnvoyFixture,
 ) -> Result<()> {
+	write_envoy_fixture_inner(test_deps, fixture, None, false).await
+}
+
+async fn write_envoy_fixture_inner(
+	test_deps: &rivet_test_deps::TestDeps,
+	fixture: &EnvoyFixture,
+	previous_last_ping_ts: Option<i64>,
+	clear_expired: bool,
+) -> Result<()> {
 	test_deps
 		.pools()
 		.udb()?
@@ -701,6 +895,33 @@ async fn write_envoy_fixture(
 			let fixture = fixture.clone();
 			async move {
 				let tx = tx.with_subspace(keys::subspace());
+
+				if let Some(previous_last_ping_ts) = previous_last_ping_ts {
+					tx.delete(&keys::ns::EnvoyLoadBalancerIdxKey::new(
+						fixture.namespace_id,
+						fixture.pool_name.clone(),
+						fixture.version,
+						previous_last_ping_ts,
+						fixture.envoy_key.clone(),
+					));
+				}
+
+				if clear_expired {
+					tx.delete(&keys::envoy::ExpiredTsKey::new(
+						fixture.namespace_id,
+						fixture.envoy_key.clone(),
+					));
+				}
+
+				if let Some(envoy_conn_id) = fixture.envoy_conn_id {
+					tx.write(
+						&keys::envoy::EnvoyConnIdKey::new(
+							fixture.namespace_id,
+							fixture.envoy_key.clone(),
+						),
+						envoy_conn_id,
+					)?;
+				}
 
 				tx.write(
 					&keys::envoy::PoolNameKey::new(fixture.namespace_id, fixture.envoy_key.clone()),

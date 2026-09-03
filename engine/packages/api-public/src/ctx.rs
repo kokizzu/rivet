@@ -32,7 +32,10 @@ impl ApiCtx {
 		self.authentication_handled.store(true, Ordering::Relaxed);
 
 		let Some(token) = &self.token else {
-			return Err(rivet_api_builder::ApiForbidden.build());
+			return Err(rivet_api_builder::ApiForbidden {
+				reason: "Token not provided".into(),
+			}
+			.build());
 		};
 
 		if token
@@ -40,7 +43,10 @@ impl ApiCtx {
 			.ct_ne(auth.admin_token.read().as_bytes())
 			.into()
 		{
-			return Err(rivet_api_builder::ApiForbidden.build());
+			return Err(rivet_api_builder::ApiForbidden {
+				reason: "Invalid token".into(),
+			}
+			.build());
 		}
 
 		Ok(())

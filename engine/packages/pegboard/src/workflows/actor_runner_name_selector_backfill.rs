@@ -100,7 +100,7 @@ pub async fn mark_complete(ctx: &ActivityCtx, input: &MarkCompleteInput) -> Resu
 		.custom_instrument(tracing::info_span!("mark_backfill_complete_tx"))
 		.await?;
 
-	tracing::info!(name = %input.name, "marked backfill as complete");
+	tracing::debug!(name = %input.name, "marked backfill as complete");
 
 	Ok(())
 }

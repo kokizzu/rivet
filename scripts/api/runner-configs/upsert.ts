@@ -84,7 +84,7 @@ const endpoint =
 	(await ask("Rivet endpoint", { default: "http://localhost:6420" }));
 const namespace = await ask("Namespace", { default: "default" });
 const datacenter = await ask("Datacenter", { default: "default" });
-const runnerName = await ask("Runner name", { default: "serverless" });
+const runnerName = await ask("Runner name", { default: "default" });
 const runnerType = (
 	await ask("Runner config type (normal/serverless)", {
 		default: "serverless",
@@ -110,13 +110,21 @@ if (metadataInput) {
 let dcRunnerConfig: Record<string, unknown>;
 
 if (runnerType === "normal") {
+	const actorEvictionDelay = await askNumber("Actor eviction delay", 5);
+	const actorEvictionPeriod = await askNumber("Actor eviction period", 60);
+	const actorEvictionRate = await askNumber("Actor eviction rate", 1);
+
 	dcRunnerConfig = {
-		normal: {},
+		normal: {
+			actor_eviction_delay: actorEvictionDelay,
+			actor_eviction_period: actorEvictionPeriod,
+			actor_eviction_rate: actorEvictionRate,
+		},
 		...(metadata !== undefined ? { metadata } : {}),
 	};
 } else {
 	const serverlessUrl = await ask("Serverless URL", {
-		default: "http://localhost:3000/api/rivet/start",
+		default: "http://localhost:3000/api/rivet",
 	});
 	const headersInput = await ask("Serverless headers JSON", {
 		default: "{}",
@@ -129,20 +137,20 @@ if (runnerType === "normal") {
 		"Request lifespan (seconds)",
 		15 * 60,
 	);
-	const slotsPerRunner = await askNumber("Slots per runner", 100);
-	const minRunners = await askNumber("Min runners", 1);
-	const maxRunners = await askNumber("Max runners", 3);
-	const runnersMargin = await askNumber("Runners margin", 1);
+	const maxConcurrentActors = await askNumber("Max concurrent actors", 10000);
+	const actorEvictionDelay = await askNumber("Actor eviction delay", 5);
+	const actorEvictionPeriod = await askNumber("Actor eviction period", 60);
+	const actorEvictionRate = await askNumber("Actor eviction rate", 1);
 
 	dcRunnerConfig = {
 		serverless: {
 			url: serverlessUrl,
 			headers,
 			request_lifespan: requestLifespan,
-			slots_per_runner: slotsPerRunner,
-			min_runners: minRunners,
-			max_runners: maxRunners,
-			runners_margin: runnersMargin,
+			max_concurrent_actors: maxConcurrentActors,
+			actor_eviction_delay: actorEvictionDelay,
+			actor_eviction_period: actorEvictionPeriod,
+			actor_eviction_rate: actorEvictionRate,
 		},
 		...(metadata !== undefined ? { metadata } : {}),
 	};

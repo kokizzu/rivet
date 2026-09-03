@@ -1,12 +1,8 @@
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Result, bail};
 use clap::Parser;
-use indoc::formatdoc;
 use rivet_service_manager::RunConfig;
-use universaldb::utils::IsolationLevel::*;
-
-use crate::keys;
 
 // 7 day logs retention
 const LOGS_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
@@ -74,50 +70,11 @@ impl Opts {
 
 		let pools = rivet_pools::Pools::new(config.clone()).await?;
 
-		verify_engine_version(&config, &pools).await?;
+		// Check admission before starting
+		rivet_version_management::check_engine_admission(&config, &pools).await?;
 
-		// Start server
 		rivet_service_manager::start(config, pools, services).await?;
 
 		Ok(())
 	}
-}
-
-/// Verifies that no rollback has occurred (if allowing rollback is disabled).
-async fn verify_engine_version(
-	config: &rivet_config::Config,
-	pools: &rivet_pools::Pools,
-) -> Result<()> {
-	if config.runtime.allow_version_rollback() {
-		return Ok(());
-	}
-
-	pools
-		.udb()?
-		.txn("engine_check_version_rollback", |tx| async move {
-			let current_version = semver::Version::parse(env!("CARGO_PKG_VERSION")).context("failed to parse cargo pkg version as semver")?;
-
-			if let Some(existing_version) = tx.read_opt(&keys::EngineVersionKey {}, Serializable).await? {
-				if current_version < existing_version {
-					return Ok(Err(anyhow!(
-						"{}",
-						formatdoc!(
-							"
-						Rivet Engine has been rolled back to a previous version:
-						  - Last Used Version: {existing_version}
-						  - Current Version:   {current_version}
-						Cannot proceed without potential data corruption.
-						
-						(If you know what you're doing, this error can be disabled in the Rivet config via `allow_version_rollback: true`)
-						"
-						)
-					)));
-				}
-			}
-
-			tx.write(&keys::EngineVersionKey {}, current_version)?;
-
-			Ok(Ok(()))
-		})
-		.await?
 }

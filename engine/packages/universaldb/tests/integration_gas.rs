@@ -6,6 +6,24 @@ use universaldb::{
 };
 use uuid::Uuid;
 
+/// A config carrying the compiled universaldb commit protocol version.
+///
+/// `RuntimeProtocols::default()` reports version 0 so that a process which never negotiated cannot
+/// silently reach the wire, which means a test has to supply the real version itself.
+fn test_config() -> rivet_config::Config {
+	rivet_config::Config::from_root_with_build_meta(
+		rivet_config::config::Root::default(),
+		rivet_config::BuildMeta::default(),
+		rivet_config::RuntimeProtocols {
+			universaldb_commit: rivet_config::RuntimeProtocol::new(
+				rivet_config::RuntimeProtocolKind::UniversaldbCommit,
+				rivet_universaldb_commit::PROTOCOL_VERSION,
+			),
+			..Default::default()
+		},
+	)
+}
+
 #[tokio::test]
 async fn test_postgres_gasoline() {
 	let _ = tracing_subscriber::fmt::try_init();
@@ -17,7 +35,10 @@ async fn test_postgres_gasoline() {
 	let mut docker_config = docker_config.unwrap();
 	docker_config.start().await.unwrap();
 
-	tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+	TestDatabase::Postgres
+		.wait_for_ready(&docker_config)
+		.await
+		.unwrap();
 
 	let rivet_config::config::Database::Postgres(postgres_config) = db_config else {
 		unreachable!();
@@ -27,6 +48,7 @@ async fn test_postgres_gasoline() {
 	let connection_string = postgres_config.url.read().clone();
 
 	let driver = universaldb::driver::PostgresDatabaseDriver::new_with_config(
+		test_config(),
 		universaldb::driver::postgres::PostgresConfig::new(connection_string),
 	)
 	.await

@@ -287,6 +287,24 @@ pub fn stringify_to_rivet(message: &protocol::ToRivet) -> String {
 				val.request_id
 			)
 		}
+		protocol::ToRivet::ToRivetSqliteCommitStageBeginRequest(val) => {
+			format!(
+				"ToRivetSqliteCommitStageBeginRequest{{requestId: {}}}",
+				val.request_id
+			)
+		}
+		protocol::ToRivet::ToRivetSqliteCommitStageSegmentRequest(val) => {
+			format!(
+				"ToRivetSqliteCommitStageSegmentRequest{{requestId: {}, firstPgno: {}}}",
+				val.request_id, val.data.first_pgno
+			)
+		}
+		protocol::ToRivet::ToRivetSqliteCommitFinalizeRequest(val) => {
+			format!(
+				"ToRivetSqliteCommitFinalizeRequest{{requestId: {}, txid: {}}}",
+				val.request_id, val.data.txid
+			)
+		}
 		protocol::ToRivet::ToRivetSqliteCommitRequest(val) => {
 			format!(
 				"ToRivetSqliteCommitRequest{{requestId: {}}}",
@@ -357,6 +375,24 @@ pub fn stringify_to_envoy(message: &protocol::ToEnvoy) -> String {
 		protocol::ToEnvoy::ToEnvoySqliteGetPagesResponse(val) => {
 			format!(
 				"ToEnvoySqliteGetPagesResponse{{requestId: {}}}",
+				val.request_id
+			)
+		}
+		protocol::ToEnvoy::ToEnvoySqliteCommitStageBeginResponse(val) => {
+			format!(
+				"ToEnvoySqliteCommitStageBeginResponse{{requestId: {}}}",
+				val.request_id
+			)
+		}
+		protocol::ToEnvoy::ToEnvoySqliteCommitStageSegmentResponse(val) => {
+			format!(
+				"ToEnvoySqliteCommitStageSegmentResponse{{requestId: {}}}",
+				val.request_id
+			)
+		}
+		protocol::ToEnvoy::ToEnvoySqliteCommitFinalizeResponse(val) => {
+			format!(
+				"ToEnvoySqliteCommitFinalizeResponse{{requestId: {}}}",
 				val.request_id
 			)
 		}

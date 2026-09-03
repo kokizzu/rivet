@@ -676,13 +676,11 @@ pub fn convert_to_envoy_request_start_v6_to_v7(
 ) -> Result<v7::ToEnvoyRequestStart> {
 	Ok(v7::ToEnvoyRequestStart {
 		actor_id: x.actor_id,
-		actor_generation: None,
 		method: x.method,
 		path: x.path,
 		headers: x.headers,
 		body: x.body,
 		stream: x.stream,
-		response_stream: false,
 	})
 }
 
@@ -720,7 +718,6 @@ pub fn convert_to_envoy_web_socket_open_v6_to_v7(
 ) -> Result<v7::ToEnvoyWebSocketOpen> {
 	Ok(v7::ToEnvoyWebSocketOpen {
 		actor_id: x.actor_id,
-		actor_generation: None,
 		path: x.path,
 		headers: x.headers,
 	})
@@ -792,12 +789,7 @@ pub fn convert_to_rivet_tunnel_message_kind_v6_to_v7(
 			)
 		}
 		v6::ToRivetTunnelMessageKind::ToRivetResponseAbort => {
-			v7::ToRivetTunnelMessageKind::ToRivetResponseAbort(v7::ToRivetResponseAbort {
-				reason: v7::HttpStreamAbortReason {
-					kind: v7::HttpStreamAbortReasonKind::Unknown,
-					detail: None,
-				},
-			})
+			v7::ToRivetTunnelMessageKind::ToRivetResponseAbort
 		}
 		v6::ToRivetTunnelMessageKind::ToRivetWebSocketOpen(v) => {
 			v7::ToRivetTunnelMessageKind::ToRivetWebSocketOpen(
@@ -846,14 +838,7 @@ pub fn convert_to_envoy_tunnel_message_kind_v6_to_v7(
 			)
 		}
 		v6::ToEnvoyTunnelMessageKind::ToEnvoyRequestAbort => {
-			v7::ToEnvoyTunnelMessageKind::ToEnvoyRequestAbort(v7::ToEnvoyRequestAbort {
-				actor_id: None,
-				actor_generation: None,
-				reason: v7::HttpStreamAbortReason {
-					kind: v7::HttpStreamAbortReasonKind::Unknown,
-					detail: None,
-				},
-			})
+			v7::ToEnvoyTunnelMessageKind::ToEnvoyRequestAbort
 		}
 		v6::ToEnvoyTunnelMessageKind::ToEnvoyWebSocketOpen(v) => {
 			v7::ToEnvoyTunnelMessageKind::ToEnvoyWebSocketOpen(

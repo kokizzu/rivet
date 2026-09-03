@@ -44,3 +44,6 @@ vbare.workspace = true
 
 pegboard.workspace = true
 namespace.workspace = true
+
+[dev-dependencies]
+rivet-ups-protocol.workspace = true

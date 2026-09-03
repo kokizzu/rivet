@@ -9,7 +9,11 @@ mod allocate_hash_k2;
 mod conn_init;
 #[path = "envoy/expire_removes_hash_entries.rs"]
 mod expire_removes_hash_entries;
+#[path = "envoy/heartbeat_repairs_membership.rs"]
+mod heartbeat_repairs_membership;
 #[path = "envoy/read_path_expire.rs"]
 mod read_path_expire;
 #[path = "envoy/read_path_expire_vs_graceful_race.rs"]
 mod read_path_expire_vs_graceful_race;
+#[path = "envoy/version_ordering.rs"]
+mod version_ordering;

@@ -978,8 +978,14 @@ function isTransientConnectError(error: unknown) {
 	return (
 		message.includes("actor.stopping") ||
 		message.includes("guard.actor_ready_timeout") ||
+		message.includes("guard.actor_wake_retries_exceeded") ||
 		message.includes("guard.service_unavailable") ||
-		message.includes("guard.websocket_service_unavailable")
+		message.includes("guard.websocket_closed_before_open") ||
+		message.includes("guard.actor_stopped_while_waiting_for_websocket_open") ||
+		message.includes("guard.websocket_open_dropped") ||
+		message.includes("guard.websocket_open_response_closed") ||
+		message.includes("guard.websocket_open_timeout") ||
+		message.includes("guard.websocket_tunnel_subscription_closed")
 	);
 }
 

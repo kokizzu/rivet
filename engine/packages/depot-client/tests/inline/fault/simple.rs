@@ -36,6 +36,7 @@ fn fault_scenario_runs_setup_workload_reload_and_verify() -> Result<()> {
 			let result = ctx
 				.force_compaction(ForceCompactionWork {
 					hot: false,
+					cold: false,
 					reclaim: false,
 					final_settle: true,
 				})
@@ -305,6 +306,7 @@ fn simple_forced_compaction_noops_report_all_requested_work() -> Result<()> {
 			let settle = ctx
 				.force_compaction(ForceCompactionWork {
 					hot: true,
+					cold: false,
 					reclaim: true,
 					final_settle: true,
 				})
@@ -314,6 +316,7 @@ fn simple_forced_compaction_noops_report_all_requested_work() -> Result<()> {
 			let noop = ctx
 				.force_compaction(ForceCompactionWork {
 					hot: true,
+					cold: false,
 					reclaim: true,
 					final_settle: true,
 				})
@@ -486,7 +489,7 @@ fn simple_thread_actor_schema_survives_forced_compaction_reload() -> Result<()> 
 					ctx.reload_database().await?;
 				}
 			}
-			thread_actor_assert_reads(&ctx, "before-hot").await?;
+			thread_actor_assert_reads(&ctx, "before-hot-cold").await?;
 			let before_pages = page_count(&ctx).await?;
 			assert!(
 				before_pages > depot::keys::SHARD_SIZE,
@@ -494,19 +497,20 @@ fn simple_thread_actor_schema_survives_forced_compaction_reload() -> Result<()> 
 			);
 
 			let restore_point = ctx.create_restore_point().await?;
-			let hot = ctx
+			let hot_cold = ctx
 				.force_compaction(ForceCompactionWork {
 					hot: true,
+					cold: false,
 					reclaim: false,
 					final_settle: true,
 				})
 				.await?;
 			assert!(
-				hot.terminal_error.is_none(),
-				"forced hot compaction should succeed: {hot:?}"
+				hot_cold.terminal_error.is_none(),
+				"forced hot/cold compaction should succeed: {hot_cold:?}"
 			);
 			ctx.reload_database().await?;
-			thread_actor_assert_reads(&ctx, "after-hot-reload").await?;
+			thread_actor_assert_reads(&ctx, "after-hot-cold-reload").await?;
 
 			for cycle in 24..32 {
 				thread_actor_write_cycle(&ctx, cycle, 128 * 1024).await?;
@@ -515,6 +519,7 @@ fn simple_thread_actor_schema_survives_forced_compaction_reload() -> Result<()> 
 			let reclaim = ctx
 				.force_compaction(ForceCompactionWork {
 					hot: true,
+					cold: false,
 					reclaim: true,
 					final_settle: true,
 				})
@@ -523,13 +528,14 @@ fn simple_thread_actor_schema_survives_forced_compaction_reload() -> Result<()> 
 				reclaim.terminal_error.is_none(),
 				"forced reclaim compaction should succeed: {reclaim:?}"
 			);
-			ctx.checkpoint("after-thread-actor-hot-reclaim").await?;
+			ctx.checkpoint("after-thread-actor-hot-cold-reclaim")
+				.await?;
 			ctx.reload_database().await?;
 			thread_actor_assert_reads(&ctx, "after-reclaim-reload").await
 		})
 		.verify(|ctx| async move {
 			thread_actor_assert_reads(&ctx, "verify").await?;
-			verify_simple_replay(&ctx, 1_249, &["after-thread-actor-hot-reclaim"], &[]).await
+			verify_simple_replay(&ctx, 1_249, &["after-thread-actor-hot-cold-reclaim"], &[]).await
 		})
 		.run()
 }
@@ -550,6 +556,7 @@ fn simple_hot_compaction_window_cap_reopens_cleanly() -> Result<()> {
 			let result = ctx
 				.force_compaction(ForceCompactionWork {
 					hot: true,
+					cold: false,
 					reclaim: false,
 					final_settle: true,
 				})
@@ -694,6 +701,42 @@ fn high_risk_fault_matrix_cases() -> Vec<HighRiskFaultMatrixCase> {
 			expected_hex: "D1",
 		},
 		HighRiskFaultMatrixCase {
+			name: "reclaim_before_cold_retire",
+			seed: 1_242,
+			point: DepotFaultPoint::Reclaim(ReclaimFaultPoint::BeforeColdRetire),
+			boundary: FaultBoundary::WorkflowOnly,
+			workload: Reclaim,
+			value: &[0xd2],
+			expected_hex: "D2",
+		},
+		HighRiskFaultMatrixCase {
+			name: "reclaim_after_cold_retire",
+			seed: 1_243,
+			point: DepotFaultPoint::Reclaim(ReclaimFaultPoint::AfterColdRetire),
+			boundary: FaultBoundary::WorkflowOnly,
+			workload: Reclaim,
+			value: &[0xd3],
+			expected_hex: "D3",
+		},
+		HighRiskFaultMatrixCase {
+			name: "reclaim_before_cold_delete",
+			seed: 1_244,
+			point: DepotFaultPoint::Reclaim(ReclaimFaultPoint::BeforeColdDelete),
+			boundary: FaultBoundary::WorkflowOnly,
+			workload: Reclaim,
+			value: &[0xd4],
+			expected_hex: "D4",
+		},
+		HighRiskFaultMatrixCase {
+			name: "reclaim_after_cold_delete",
+			seed: 1_245,
+			point: DepotFaultPoint::Reclaim(ReclaimFaultPoint::AfterColdDelete),
+			boundary: FaultBoundary::WorkflowOnly,
+			workload: Reclaim,
+			value: &[0xd5],
+			expected_hex: "D5",
+		},
+		HighRiskFaultMatrixCase {
 			name: "reclaim_before_cleanup_rows",
 			seed: 1_246,
 			point: DepotFaultPoint::Reclaim(ReclaimFaultPoint::BeforeCleanupRows),
@@ -777,6 +820,7 @@ fn run_high_risk_fault_matrix_case(case: HighRiskFaultMatrixCase) -> Result<()> 
 						let settle = ctx
 							.force_compaction(ForceCompactionWork {
 								hot: true,
+								cold: false,
 								reclaim: false,
 								final_settle: false,
 							})
@@ -791,6 +835,7 @@ fn run_high_risk_fault_matrix_case(case: HighRiskFaultMatrixCase) -> Result<()> 
 						let result = ctx
 							.force_compaction(ForceCompactionWork {
 								hot: true,
+								cold: false,
 								reclaim: true,
 								final_settle: false,
 							})

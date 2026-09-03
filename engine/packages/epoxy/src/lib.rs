@@ -7,6 +7,7 @@ pub mod http_routes;
 pub mod keys;
 pub mod metrics;
 pub mod ops;
+pub mod protocol_version;
 pub mod replica;
 pub mod types;
 pub mod utils;

@@ -91,6 +91,7 @@ import {
 // Testing
 import { churnDb } from "./actors/testing/churn-db.ts";
 import { growDb } from "./actors/testing/grow-db.ts";
+import { largeCommitDb } from "./actors/testing/large-commit-db.ts";
 import { inlineClientActor } from "./actors/testing/inline-client.ts";
 import { largeCommitDb } from "./actors/testing/large-commit-db.ts";
 import { loadTestAgent } from "./actors/testing/load-test-agent.ts";

@@ -39,7 +39,7 @@ impl TaskGroup {
 		);
 	}
 
-	#[tracing::instrument(skip_all)]
+	#[tracing::instrument(level = "debug", skip_all)]
 	pub async fn wait_idle(&self) {
 		// Fast path
 		if self.running_count.load(Ordering::Acquire) == 0 {

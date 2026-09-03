@@ -22,6 +22,11 @@ pub enum WsError {
 	#[error("timed_out", "Ping timed out.")]
 	TimedOut,
 	#[error(
+		"registration_expired",
+		"The envoy registration expired while its connection was still active. The websocket should reconnect."
+	)]
+	RegistrationExpired,
+	#[error(
 		"invalid_request",
 		"The websocket could not open due to an invalid request.",
 		"Invalid websocket request: {0}."

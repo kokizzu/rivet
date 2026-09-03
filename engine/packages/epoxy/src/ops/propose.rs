@@ -239,7 +239,7 @@ pub async fn epoxy_propose(ctx: &OperationCtx, input: &Input) -> Result<Proposal
 		.txn("epoxy_propose_read_config", |tx| async move {
 			utils::read_config(&tx, replica_id).await
 		})
-		.custom_instrument(tracing::info_span!("read_config_tx"))
+		.custom_instrument(tracing::debug_span!("read_config_tx"))
 		.await
 		.context("failed reading config")?;
 
@@ -262,7 +262,7 @@ pub async fn epoxy_propose(ctx: &OperationCtx, input: &Input) -> Result<Proposal
 			let mutable = proposal.mutable;
 			async move { ballot::ballot_selection(&tx, replica_id, key, mutable).await }
 		})
-		.custom_instrument(tracing::info_span!("ballot_selection_tx"))
+		.custom_instrument(tracing::debug_span!("ballot_selection_tx"))
 		.await
 		.context("failed selecting ballot")?
 	{
@@ -482,7 +482,7 @@ async fn run_accept_path(
 				commit_kv::commit_kv(&tx, replica_id, key, value, ballot, mutable, version).await
 			}
 		})
-		.custom_instrument(tracing::info_span!("commit_kv_tx"))
+		.custom_instrument(tracing::debug_span!("commit_kv_tx"))
 		.await
 		.context("failed committing locally")?;
 
@@ -1015,7 +1015,7 @@ async fn store_prepare_ballot(
 			let key = key.clone();
 			async move { ballot::store_ballot(&tx, replica_id, key, ballot) }
 		})
-		.custom_instrument(tracing::info_span!("store_prepare_ballot_tx"))
+		.custom_instrument(tracing::debug_span!("store_prepare_ballot_tx"))
 		.await
 }
 

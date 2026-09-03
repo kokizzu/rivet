@@ -10,6 +10,6 @@ pub use controller::{
 	DepotFaultReplayEvent, DepotFaultReplayEventKind, DepotFaultRuleId,
 };
 pub use points::{
-	CommitFaultPoint, DepotFaultPoint, FaultBoundary, HotCompactionFaultPoint, ReadFaultPoint,
-	ReclaimFaultPoint,
+	ColdCompactionFaultPoint, ColdTierFaultPoint, CommitFaultPoint, DepotFaultPoint, FaultBoundary,
+	HotCompactionFaultPoint, ReadFaultPoint, ReclaimFaultPoint, ShardCacheFillFaultPoint,
 };

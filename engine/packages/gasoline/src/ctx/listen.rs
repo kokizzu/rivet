@@ -1,4 +1,4 @@
-use std::{ops::Deref, time::Duration};
+use std::ops::Deref;
 
 use crate::{
 	ctx::WorkflowCtx,
@@ -16,7 +16,6 @@ pub struct ListenCtx<'a> {
 	last_attempt: bool,
 	// HACK: Prevent `ListenCtx::listen_any` from being called more than once
 	used: bool,
-	wakeup_to_pull: Option<Duration>,
 	related_sleep_location: Option<&'a Location>,
 }
 
@@ -27,7 +26,6 @@ impl<'a> ListenCtx<'a> {
 			location,
 			last_attempt: false,
 			used: false,
-			wakeup_to_pull: None,
 			related_sleep_location: None,
 		}
 	}
@@ -42,15 +40,13 @@ impl<'a> ListenCtx<'a> {
 			location,
 			last_attempt: false,
 			used: false,
-			wakeup_to_pull: None,
 			related_sleep_location: Some(related_sleep_location),
 		}
 	}
 
-	pub(crate) fn reset(&mut self, last_attempt: bool, wakeup_to_pull: Option<Duration>) {
+	pub(crate) fn reset(&mut self, last_attempt: bool) {
 		self.used = false;
 		self.last_attempt = last_attempt;
-		self.wakeup_to_pull = wakeup_to_pull;
 	}
 
 	/// Checks for a signal to this workflow with any of the given signal names.
@@ -73,6 +69,7 @@ impl<'a> ListenCtx<'a> {
 			.ctx
 			.db()
 			.pull_next_signals(
+				self.ctx.worker_id(),
 				self.ctx.workflow_id(),
 				self.ctx.name(),
 				signal_names,
@@ -99,21 +96,6 @@ impl<'a> ListenCtx<'a> {
 			metrics::SIGNAL_RECV_LAG
 				.with_label_values(&[self.ctx.name(), signal.signal_name.as_str()])
 				.observe(recv_lag);
-
-			if recv_lag > 3.0 {
-				// We print an error here so the trace of this workflow does not get dropped
-				tracing::error!(
-					?recv_lag,
-					send_db_ms = Option::<f64>::None,
-					wakeup_to_pull_ms = self
-						.wakeup_to_pull
-						.map(|duration| duration.as_secs_f64() * 1000.0),
-					db_pull_ms = db_pull_duration.as_secs_f64() * 1000.0,
-					signal_id=%signal.signal_id,
-					signal_name=%signal.signal_name,
-					"long signal recv time",
-				);
-			}
 
 			tracing::debug!(
 				signal_id=%signal.signal_id,

@@ -1,108 +1,61 @@
-mod common;
-
-use std::sync::atomic::{AtomicUsize, Ordering};
-
-use anyhow::Result;
-use depot::{
-	keys::{pidx_delta_key, pidx_delta_prefix},
-	page_index::DeltaPageIndex,
-};
-use universaldb::Subspace;
-use uuid::Uuid;
-
-const TEST_DATABASE: &str = "test-database";
+use depot::page_index::{DeltaPageIndex, PageOwner};
 
 #[test]
 fn insert_get_and_remove_round_trip() {
 	let index = DeltaPageIndex::new();
 
 	assert_eq!(index.get(7), None);
+	assert!(index.is_empty());
 
-	index.insert(7, 11);
-	index.insert(9, 15);
+	index.insert_owner(7, 11);
+	index.insert_owner(9, 15);
 
-	assert_eq!(index.get(7), Some(11));
-	assert_eq!(index.get(9), Some(15));
-	assert_eq!(index.remove(7), Some(11));
+	assert_eq!(index.get(7), Some(PageOwner::Owner(11)));
+	assert_eq!(index.get(9), Some(PageOwner::Owner(15)));
+	assert!(!index.is_empty());
+
+	index.remove(7);
 	assert_eq!(index.get(7), None);
-	assert_eq!(index.remove(99), None);
+	// Removing an unknown page is a no-op.
+	index.remove(99);
+	assert_eq!(index.get(9), Some(PageOwner::Owner(15)));
 }
 
 #[test]
-fn insert_overwrites_existing_txid() {
+fn insert_owner_overwrites_existing_txid() {
 	let index = DeltaPageIndex::new();
 
-	index.insert(4, 20);
-	index.insert(4, 21);
+	index.insert_owner(4, 20);
+	index.insert_owner(4, 21);
 
-	assert_eq!(index.get(4), Some(21));
+	assert_eq!(index.get(4), Some(PageOwner::Owner(21)));
 }
 
 #[test]
-fn range_returns_sorted_pages_within_bounds() {
+fn absent_entry_is_distinct_from_unknown() {
 	let index = DeltaPageIndex::new();
-	index.insert(12, 1200);
-	index.insert(3, 300);
-	index.insert(7, 700);
-	index.insert(15, 1500);
 
-	assert_eq!(index.range(4, 12), vec![(7, 700), (12, 1200)]);
-	assert_eq!(index.range(20, 10), Vec::<(u32, u64)>::new());
+	// A page never touched is unknown.
+	assert_eq!(index.get(5), None);
+
+	// A proven-absent owner is a known entry, distinct from unknown.
+	index.insert_absent(5);
+	assert_eq!(index.get(5), Some(PageOwner::NoOwner));
+	assert!(!index.is_empty());
+
+	// A later commit can promote a proven-absent page to an owner.
+	index.insert_owner(5, 42);
+	assert_eq!(index.get(5), Some(PageOwner::Owner(42)));
 }
 
-#[tokio::test]
-async fn load_from_store_reads_scan_prefix_entries() -> Result<()> {
-	common::test_matrix("depot-page-index-load", |_tier, ctx| {
-		Box::pin(async move {
-			let db = ctx.udb.clone();
-			let subspace = Subspace::new(&("depot-page-index", Uuid::new_v4().to_string()));
-			db.txn("test_depotconveyer_page_index", {
-				let subspace = subspace.clone();
-				move |tx| {
-					let subspace = subspace.clone();
-					async move {
-						let key = |logical_key: Vec<u8>| {
-							[subspace.bytes(), logical_key.as_slice()].concat()
-						};
-						tx.informal().set(
-							&key(pidx_delta_key(TEST_DATABASE, 8)),
-							&81_u64.to_be_bytes(),
-						);
-						tx.informal().set(
-							&key(pidx_delta_key(TEST_DATABASE, 2)),
-							&21_u64.to_be_bytes(),
-						);
-						tx.informal().set(
-							&key(pidx_delta_key(TEST_DATABASE, 17)),
-							&171_u64.to_be_bytes(),
-						);
-						tx.informal().set(
-							&key(pidx_delta_key("other-database", 2)),
-							&999_u64.to_be_bytes(),
-						);
-						Ok(())
-					}
-				}
-			})
-			.await?;
+#[test]
+fn known_owners_returns_positive_owners_sorted() {
+	let index = DeltaPageIndex::new();
+	index.insert_owner(12, 1200);
+	index.insert_owner(3, 300);
+	index.insert_owner(7, 700);
+	// Proven-absent owners are not reported as owners.
+	index.insert_absent(9);
 
-			let counter = AtomicUsize::new(0);
-			let index = DeltaPageIndex::load_from_store(
-				&db,
-				&subspace,
-				&counter,
-				pidx_delta_prefix(TEST_DATABASE),
-			)
-			.await?;
-
-			assert_eq!(index.get(2), Some(21));
-			assert_eq!(index.get(8), Some(81));
-			assert_eq!(index.get(17), Some(171));
-			assert_eq!(index.range(1, 20), vec![(2, 21), (8, 81), (17, 171)]);
-			assert_eq!(counter.load(Ordering::SeqCst), 1);
-
-			Ok(())
-		})
-	})
-	.await
+	assert_eq!(index.known_owners(), vec![(3, 300), (7, 700), (12, 1200)]);
 }

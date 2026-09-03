@@ -60,7 +60,9 @@ function finiteInt(value: number | undefined, fallback: number): number {
 }
 
 async function queryOne<T>(
-	database: { execute: (sql: string, ...args: unknown[]) => Promise<unknown[]> },
+	database: {
+		execute: (sql: string, ...args: unknown[]) => Promise<unknown[]>;
+	},
 	sql: string,
 ): Promise<T> {
 	const rows = await database.execute(sql);
@@ -172,10 +174,12 @@ export const growDb = actor({
 		// called during seeding, where it would cost O(current size) per call.
 		integrityCheck: async (
 			c,
-		): Promise<{ ok: boolean; result: string; rows: number } & StorageStats> => {
-			const rows = (await c.db.execute("PRAGMA integrity_check")) as Array<
-				Record<string, unknown>
-			>;
+		): Promise<
+			{ ok: boolean; result: string; rows: number } & StorageStats
+		> => {
+			const rows = (await c.db.execute(
+				"PRAGMA integrity_check",
+			)) as Array<Record<string, unknown>>;
 			const messages = rows.map((row) => String(Object.values(row)[0]));
 			const result = messages.join("; ");
 			const counted = (await c.db.execute(

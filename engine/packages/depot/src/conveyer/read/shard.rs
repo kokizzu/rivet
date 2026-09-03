@@ -1,77 +1,128 @@
-use anyhow::{Context, Result, ensure};
-use futures_util::{TryStreamExt, future::try_join_all};
-use universaldb::{
-	RangeOption,
-	options::StreamingMode,
-	utils::{IsolationLevel::Serializable, end_of_key_range},
+use std::{
+	collections::{BTreeMap, BTreeSet},
+	sync::Arc,
 };
 
-use crate::conveyer::{db::LtxBlobCache, keys};
+use anyhow::Result;
+use futures_util::{StreamExt, TryStreamExt, future::try_join_all, stream};
+use universaldb::utils::IsolationLevel::Serializable;
+
+use crate::conveyer::{
+	db::{DeltaSegmentLayoutCache, LtxBlobCache},
+	delta_blob, keys, shard_blob,
+	types::{DatabaseBranchId, decode_compaction_root},
+};
 
 use super::plan::{ReadSource, StorageScope};
 
+/// Maximum number of concurrent shard-version floor reads issued while bounding a source's
+/// DELTA-history walk. Each read is a single-row reverse range read, so this only caps how many
+/// shards of one read are probed at once.
+const SHARD_FOLD_FLOOR_FETCH_CONCURRENCY: usize = 32;
+
+/// Loads the blobs of one commit that can hold `pgnos`, in ascending page-range order.
+///
+/// A pre-segmentation commit yields one blob covering everything it wrote; a segmented commit yields
+/// one per shard-aligned page range, and only the ranges covering a requested page are materialized.
+/// The caller picks among them with `delta_blob::segment_for_page`, so it never has to know which
+/// layout the commit used.
+///
+/// A commit already in cache costs no FDB read: its cached layout says which blob holds each page
+/// and the blob cache holds those blobs. Both caches are keyed by immutable content, so a hit is
+/// always current. If any blob the caller needs has been evicted, the whole commit is re-read rather
+/// than served partially, since a missing blob is indistinguishable from a page the commit never
+/// wrote.
+///
+/// On a cache miss the whole txid is scanned rather than range-read to the covering segments,
+/// because at the current commit size cap a commit's segments are few and the scan costs what the
+/// pre-segmentation scan cost. Once commits can be large, this is where a reverse range read on
+/// `branch_delta_segment_prefix` belongs.
 pub(super) async fn tx_load_delta_blob(
 	tx: &universaldb::Transaction,
-	delta_prefix: &[u8],
-	cache: &LtxBlobCache,
+	source: ReadSource,
+	txid: u64,
+	pgnos: &[u32],
+	blob_cache: &LtxBlobCache,
+	layout_cache: &DeltaSegmentLayoutCache,
 ) -> Result<DeltaBlobLoad> {
-	// Serve immutable delta blobs from the per-database cache without re-fetching
-	// from FDB. The delta prefix includes the owning txid, so the key uniquely
-	// identifies immutable content.
-	if let Some(cached) = cache.get(delta_prefix).await {
+	let ReadSource::Branch(branch_source) = source;
+	let branch_id = branch_source.branch_id;
+	let delta_prefix = keys::branch_delta_chunk_prefix(branch_id, txid);
+
+	if let Some(layout) = layout_cache.get(&delta_prefix).await
+		&& let Some(segments) = load_cached_segments(&layout, pgnos, blob_cache).await
+	{
 		return Ok(DeltaBlobLoad {
-			blob: Some(cached.bytes().to_vec()),
+			segments,
 			chunk_rows_scanned: 0,
 		});
 	}
 
-	let delta_chunks = super::tx::tx_scan_prefix_values(tx, delta_prefix).await?;
-	if delta_chunks.is_empty() {
-		return Ok(DeltaBlobLoad {
-			blob: None,
-			chunk_rows_scanned: 0,
-		});
-	}
+	let delta_chunks = super::tx::tx_scan_prefix_values(tx, &delta_prefix).await?;
 	let chunk_rows_scanned = delta_chunks.len();
-
-	// FDB returns rows in key order, and the chunk index is the big-endian u32
-	// key suffix, so the natural scan order already matches chunk order. The
-	// contiguity check below relies on that order without re-sorting.
-	let mut delta_blob = Vec::new();
-	for (expected_idx, (key, chunk)) in delta_chunks.into_iter().enumerate() {
-		let chunk_idx = decode_delta_chunk_idx(delta_prefix, &key)?;
-		ensure!(
-			chunk_idx == u32::try_from(expected_idx).unwrap_or(u32::MAX),
-			"sqlite delta chunks must be contiguous from chunk 0"
-		);
-		delta_blob.extend_from_slice(&chunk);
+	let segments = delta_blob::reassemble_delta_segments(branch_id, txid, delta_chunks)?;
+	if !segments.is_empty() {
+		layout_cache
+			.insert(
+				delta_prefix,
+				Arc::new(
+					segments
+						.iter()
+						.map(|segment| (segment.first_pgno, segment.key.clone()))
+						.collect(),
+				),
+			)
+			.await;
 	}
 
 	Ok(DeltaBlobLoad {
-		blob: Some(delta_blob),
+		segments,
 		chunk_rows_scanned,
 	})
 }
 
-pub(super) struct DeltaBlobLoad {
-	pub(super) blob: Option<Vec<u8>>,
-	pub(super) chunk_rows_scanned: usize,
+/// Rebuilds the segments covering `pgnos` from a cached layout, or `None` when the blob cache no
+/// longer holds one of them and the commit has to be re-read.
+///
+/// Only the covering segments are materialized. A commit that wrote a wide page range holds many
+/// blobs, and a read that wants one page must not pay to copy the rest.
+async fn load_cached_segments(
+	layout: &[(Option<u32>, Vec<u8>)],
+	pgnos: &[u32],
+	blob_cache: &LtxBlobCache,
+) -> Option<Vec<delta_blob::DeltaSegment>> {
+	let mut needed = BTreeSet::new();
+	for pgno in pgnos {
+		// Mirrors `delta_blob::segment_for_page`: the last entry starting at or below the page is
+		// the only one that can hold it, and a legacy entry covers every page.
+		if let Some(idx) = layout
+			.iter()
+			.rposition(|(first_pgno, _)| first_pgno.is_none_or(|first| first <= *pgno))
+		{
+			needed.insert(idx);
+		}
+	}
+	if needed.is_empty() {
+		return None;
+	}
+
+	let mut segments = Vec::with_capacity(needed.len());
+	for idx in needed {
+		let (first_pgno, key) = &layout[idx];
+		let blob = blob_cache.get(key).await?;
+		segments.push(delta_blob::DeltaSegment {
+			first_pgno: *first_pgno,
+			key: key.clone(),
+			blob: blob.bytes().to_vec(),
+		});
+	}
+
+	Some(segments)
 }
 
-fn decode_delta_chunk_idx(delta_prefix: &[u8], key: &[u8]) -> Result<u32> {
-	let suffix = key
-		.strip_prefix(delta_prefix)
-		.context("sqlite delta chunk key did not start with expected prefix")?;
-	ensure!(
-		suffix.len() == std::mem::size_of::<u32>(),
-		"sqlite delta chunk key suffix had {} bytes, expected {}",
-		suffix.len(),
-		std::mem::size_of::<u32>()
-	);
-
-	Ok(u32::from_be_bytes(suffix.try_into().context(
-		"sqlite delta chunk suffix should decode as u32",
-	)?))
+pub(super) struct DeltaBlobLoad {
+	pub(super) segments: Vec<delta_blob::DeltaSegment>,
+	pub(super) chunk_rows_scanned: usize,
 }
 
 pub(super) async fn tx_load_latest_shard_blob(
@@ -108,40 +159,109 @@ pub(super) async fn tx_load_latest_shard_blob(
 	})
 }
 
+/// Reads the txid below which each shard's pages are already covered by a shard version, without
+/// materializing any shard blob. The DELTA-history walk uses these as its lower bound, so a floor may
+/// only be reported where the shard image is known to hold every page written at or below it:
+///
+/// - the newest shard version at or below the source's cap bounds it from above, because that version
+///   is the one the SHARD fallback will serve, and
+/// - the source's hot compaction watermark bounds it too, because that watermark is what licenses
+///   compaction to clear a folded page's PIDX row in the first place. Hand-written or half-installed
+///   shard versions sit above the watermark and yield no floor, so the walk still reads the history
+///   they would otherwise hide.
+///
+/// A shard with no version, or a branch that has never folded, maps to no entry: no floor at all.
+pub(super) async fn tx_load_source_shard_fold_floors(
+	tx: &universaldb::Transaction,
+	source: ReadSource,
+	shard_ids: &BTreeSet<u32>,
+) -> Result<BTreeMap<u32, u64>> {
+	let ReadSource::Branch(branch_source) = source;
+
+	let hot_watermark_txid = tx_load_branch_hot_watermark_txid(tx, branch_source.branch_id).await?;
+	if hot_watermark_txid == 0 {
+		return Ok(BTreeMap::new());
+	}
+
+	let floors: Vec<(u32, Option<u64>)> = stream::iter(shard_ids.iter().copied())
+		.map(|shard_id| async move {
+			let as_of_txid = shard_blob::read_latest_shard_version_txid(
+				tx,
+				branch_source.branch_id,
+				shard_id,
+				branch_source.max_txid,
+				// TODO: This can probably be made Snapshot again to reduce contention if
+				// read side freshness is not worth the cost.
+				Serializable,
+			)
+			.await?;
+			Result::<(u32, Option<u64>)>::Ok((shard_id, as_of_txid))
+		})
+		.buffer_unordered(SHARD_FOLD_FLOOR_FETCH_CONCURRENCY)
+		.try_collect()
+		.await?;
+
+	Ok(floors
+		.into_iter()
+		.filter_map(|(shard_id, as_of_txid)| {
+			let floor = as_of_txid?.min(hot_watermark_txid);
+			(floor > 0).then_some((shard_id, floor))
+		})
+		.collect())
+}
+
+/// The source branch's installed hot fold watermark, or zero when it has never folded.
+async fn tx_load_branch_hot_watermark_txid(
+	tx: &universaldb::Transaction,
+	branch_id: DatabaseBranchId,
+) -> Result<u64> {
+	let root_bytes =
+		super::tx::tx_get_value(tx, &keys::branch_compaction_root_key(branch_id)).await?;
+	let Some(root_bytes) = root_bytes else {
+		return Ok(0);
+	};
+
+	Ok(decode_compaction_root(&root_bytes)?.hot_watermark_txid)
+}
+
 async fn tx_load_source_shard_blob(
 	tx: &universaldb::Transaction,
 	source: ReadSource,
 	shard_id: u32,
-) -> Result<(Option<(Vec<u8>, Vec<u8>)>, usize)> {
+) -> Result<(Option<(DatabaseBranchId, Vec<u8>, Vec<u8>)>, usize)> {
 	let ReadSource::Branch(source) = source;
-	let prefix = keys::branch_shard_version_prefix(source.branch_id, shard_id);
-	let end_key = keys::branch_shard_key(source.branch_id, shard_id, source.max_txid);
-	let end = end_of_key_range(&end_key);
 
-	let informal = tx.informal();
-	let mut stream = informal.get_ranges_keyvalues(
-		RangeOption {
-			mode: StreamingMode::Iterator,
-			reverse: true,
-			limit: Some(1),
-			..(prefix.as_slice(), end.as_slice()).into()
-		},
+	// One reverse range scan that stops once the version txid changes, so only the newest
+	// version's chunk rows (or its single legacy row) are materialized and reassembled.
+	let load = shard_blob::read_latest_shard_blob(
+		tx,
+		source.branch_id,
+		shard_id,
+		source.max_txid,
 		// TODO: This can probably be made Snapshot again to reduce contention if
 		// read side freshness is not worth the cost.
 		Serializable,
-	);
+	)
+	.await?;
 
-	let mut rows_scanned = 0usize;
-	let mut latest = None;
-	while let Some(entry) = stream.try_next().await? {
-		rows_scanned += 1;
-		latest = Some((entry.key().to_vec(), entry.value().to_vec()));
-	}
+	// Downstream keys blobs by the bare version key regardless of the on-disk row format.
+	let latest = load.version.map(|(as_of_txid, version)| {
+		(
+			source.branch_id,
+			keys::branch_shard_key(source.branch_id, shard_id, as_of_txid),
+			version.blob,
+		)
+	});
 
-	Ok((latest, rows_scanned))
+	Ok((latest, load.rows_scanned))
 }
 
 pub(super) struct ShardBlobLoad {
-	pub(super) source: Option<(Vec<u8>, Vec<u8>)>,
+	/// The winning `SHARD` row, as `(the branch that owns it, key, blob)`.
+	///
+	/// A read walks its fork ancestry, so the winner often belongs to an ancestor rather than to the
+	/// branch being read, and its key carries that ancestor's prefix. Anything that decodes the key,
+	/// or looks up the branch's compaction state, has to use this branch id and not the read's own.
+	pub(super) source: Option<(DatabaseBranchId, Vec<u8>, Vec<u8>)>,
 	pub(super) rows_scanned: usize,
 }

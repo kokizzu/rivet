@@ -1,18 +1,28 @@
 //! In-memory page index support for delta lookups.
+//!
+//! The index is a per-connection performance cache populated lazily as pages are
+//! requested. Each entry records what is known about a page's PIDX owner at the
+//! cached head: `Owner(txid)` for a page with a live PIDX row, or `NoOwner` for a
+//! page proven to have no PIDX owner (so reads fall through to SHARD without
+//! re-reading the store). A page absent from the index is simply unknown and must
+//! be point-read.
 
-use anyhow::{Context, Result, ensure};
 use scc::HashMap;
-use std::sync::atomic::AtomicUsize;
-use universaldb::Subspace;
 
-use crate::udb;
-
-const PGNO_BYTES: usize = std::mem::size_of::<u32>();
-const TXID_BYTES: usize = std::mem::size_of::<u64>();
+/// What the cache knows about a page's PIDX owner at the cached head.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PageOwner {
+	/// The page is owned by this txid's delta.
+	Owner(u64),
+	/// The page has no PIDX owner and resolves through SHARD/cold fallback.
+	NoOwner,
+}
 
 #[derive(Debug, Default)]
 pub struct DeltaPageIndex {
-	entries: HashMap<u32, u64>,
+	// `Some(txid)` is a positive owner; `None` is a proven-absent owner. A missing
+	// key is unknown and forces a point read.
+	entries: HashMap<u32, Option<u64>>,
 }
 
 impl DeltaPageIndex {
@@ -22,89 +32,44 @@ impl DeltaPageIndex {
 		}
 	}
 
-	pub async fn load_from_store(
-		db: &universaldb::Database,
-		subspace: &Subspace,
-		op_counter: &AtomicUsize,
-		prefix: Vec<u8>,
-	) -> Result<Self> {
-		let rows = udb::scan_prefix_values(db, subspace, op_counter, prefix.clone()).await?;
-		let index = Self::new();
-
-		for (key, value) in rows {
-			let pgno = decode_pgno(&key, &prefix)?;
-			let txid = decode_txid(&value)?;
-			let _ = index.entries.upsert_sync(pgno, txid);
-		}
-
-		Ok(index)
+	pub fn get(&self, pgno: u32) -> Option<PageOwner> {
+		self.entries.read_sync(&pgno, |_, owner| match owner {
+			Some(txid) => PageOwner::Owner(*txid),
+			None => PageOwner::NoOwner,
+		})
 	}
 
-	pub fn get(&self, pgno: u32) -> Option<u64> {
-		self.entries.read_sync(&pgno, |_, txid| *txid)
+	pub fn insert_owner(&self, pgno: u32, txid: u64) {
+		let _ = self.entries.upsert_sync(pgno, Some(txid));
 	}
 
-	pub fn insert(&self, pgno: u32, txid: u64) {
-		let _ = self.entries.upsert_sync(pgno, txid);
+	pub fn insert_absent(&self, pgno: u32) {
+		let _ = self.entries.upsert_sync(pgno, None);
 	}
 
-	pub fn remove(&self, pgno: u32) -> Option<u64> {
-		self.entries.remove_sync(&pgno).map(|(_, txid)| txid)
+	pub fn remove(&self, pgno: u32) {
+		self.entries.remove_sync(&pgno);
 	}
 
 	pub fn clear(&self) {
 		self.entries.clear_sync();
 	}
 
-	pub fn range(&self, start: u32, end: u32) -> Vec<(u32, u64)> {
-		if start > end {
-			return Vec::new();
-		}
+	pub fn is_empty(&self) -> bool {
+		self.entries.is_empty()
+	}
 
-		let mut pages = Vec::new();
-		self.entries.iter_sync(|pgno, txid| {
-			if *pgno >= start && *pgno <= end {
-				pages.push((*pgno, *txid));
+	/// Positive owners currently cached, sorted by page number. Used by debug
+	/// accessors; absent-owner entries are not included.
+	pub fn known_owners(&self) -> Vec<(u32, u64)> {
+		let mut owners = Vec::new();
+		self.entries.iter_sync(|pgno, owner| {
+			if let Some(txid) = owner {
+				owners.push((*pgno, *txid));
 			}
 			true
 		});
-		pages.sort_unstable_by_key(|(pgno, _)| *pgno);
-		pages
+		owners.sort_unstable_by_key(|(pgno, _)| *pgno);
+		owners
 	}
-}
-
-fn decode_pgno(key: &[u8], prefix: &[u8]) -> Result<u32> {
-	ensure!(
-		key.starts_with(prefix),
-		"pidx key did not start with expected prefix"
-	);
-
-	let suffix = &key[prefix.len()..];
-	ensure!(
-		suffix.len() == PGNO_BYTES,
-		"pidx key suffix had {} bytes, expected {}",
-		suffix.len(),
-		PGNO_BYTES
-	);
-
-	Ok(u32::from_be_bytes(
-		suffix
-			.try_into()
-			.context("pidx key suffix should decode as u32")?,
-	))
-}
-
-fn decode_txid(value: &[u8]) -> Result<u64> {
-	ensure!(
-		value.len() == TXID_BYTES,
-		"pidx value had {} bytes, expected {}",
-		value.len(),
-		TXID_BYTES
-	);
-
-	Ok(u64::from_be_bytes(
-		value
-			.try_into()
-			.context("pidx value should decode as u64")?,
-	))
 }

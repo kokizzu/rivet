@@ -2,14 +2,20 @@ use std::sync::Arc;
 
 use anyhow::{Result, ensure};
 use clap::{Parser, ValueEnum};
-use gas::db::{
-	self, Database,
-	debug::{DatabaseDebug, WorkflowState as DebugWorkflowState},
+use gas::{
+	db::{
+		self, Database,
+		debug::{
+			DatabaseDebug, RepairVariant as DebugRepairVariant, WorkflowState as DebugWorkflowState,
+		},
+	},
+	history::location::Location,
 };
 use rivet_util::Id;
 
 use crate::util::{self, wf::KvPair};
 
+mod repair;
 mod signal;
 
 #[derive(Parser)]
@@ -41,8 +47,6 @@ pub enum SubCommand {
 		error: Vec<String>,
 		#[clap(short = 'd', long)]
 		dry_run: bool,
-		#[clap(short = 'p', long)]
-		parallelization: Option<u16>,
 	},
 	/// Deletes the history for completed workflows that match the name and before filter.
 	PruneHistory {
@@ -71,6 +75,29 @@ pub enum SubCommand {
 		/// Includes create timestamps for events in graph. Two of this flag enables millisecond display.
 		#[clap(short = 't', action = clap::ArgAction::Count, long)]
 		print_ts: u8,
+	},
+	/// Repairs a dead workflow that has a known history defect.
+	///
+	/// Determines which repair applies by validating the workflow's raw history, prints every check
+	/// it ran, then applies the repair, wakes the workflow, and verifies that it replayed. Repair
+	/// one workflow at a time and confirm it is healthy before moving to the next.
+	Repair {
+		#[clap(index = 1)]
+		workflow_id: Id,
+		/// Only inspects and applies this repair instead of every known repair. Use this when a
+		/// workflow matches a detect-only symptom that would otherwise block an automatic repair.
+		#[clap(long, short = 'v')]
+		variant: Option<RepairVariant>,
+		/// Exact history location to repair. Only needed when a repair reports more than one
+		/// candidate location.
+		#[clap(long, short = 'l')]
+		location: Option<Location>,
+		/// Skips the confirmation prompt.
+		#[clap(long, short = 'y')]
+		yes: bool,
+		/// Only inspects and prints the diagnosis, never changes anything.
+		#[clap(long, short = 'd')]
+		dry_run: bool,
 	},
 	Signal {
 		#[clap(subcommand)]
@@ -114,7 +141,6 @@ impl SubCommand {
 				name,
 				error,
 				dry_run,
-				parallelization,
 			} => {
 				ensure!(!name.is_empty(), "must provide at least one name");
 
@@ -123,7 +149,6 @@ impl SubCommand {
 						&name.iter().map(|x| x.as_str()).collect::<Vec<_>>(),
 						&error.iter().map(|x| x.as_str()).collect::<Vec<_>>(),
 						dry_run,
-						parallelization.unwrap_or(1),
 					)
 					.await?;
 
@@ -170,9 +195,26 @@ impl SubCommand {
 					.await?;
 				util::wf::print_history(history, exclude_json, print_location, print_ts).await
 			}
+			Self::Repair {
+				workflow_id,
+				variant,
+				location,
+				yes,
+				dry_run,
+			} => {
+				repair::execute(
+					&*db,
+					workflow_id,
+					variant.map(Into::into),
+					location,
+					yes,
+					dry_run,
+				)
+				.await
+			}
 			Self::Signal { command } => command.execute(db).await,
 			Self::Registry {} => {
-				let reg = rivet_workflow_worker::registry()?;
+				let reg = rivet_workflow_worker::registry(&config)?;
 				let mut names = reg.names();
 				names.sort();
 
@@ -184,6 +226,34 @@ impl SubCommand {
 				}
 
 				Ok(())
+			}
+		}
+	}
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+#[clap(rename_all = "kebab_case")]
+pub enum RepairVariant {
+	DeallocateSetError,
+	OrphanedSleepState,
+	SleepStateMismatch,
+	DuplicateIterationHistory,
+	LoopIterationMismatch,
+	IterationTimestampInversion,
+}
+
+impl From<RepairVariant> for DebugRepairVariant {
+	fn from(variant: RepairVariant) -> Self {
+		match variant {
+			RepairVariant::DeallocateSetError => DebugRepairVariant::DeallocateSetError,
+			RepairVariant::OrphanedSleepState => DebugRepairVariant::OrphanedSleepState,
+			RepairVariant::SleepStateMismatch => DebugRepairVariant::SleepStateMismatch,
+			RepairVariant::DuplicateIterationHistory => {
+				DebugRepairVariant::DuplicateIterationHistory
+			}
+			RepairVariant::LoopIterationMismatch => DebugRepairVariant::LoopIterationMismatch,
+			RepairVariant::IterationTimestampInversion => {
+				DebugRepairVariant::IterationTimestampInversion
 			}
 		}
 	}

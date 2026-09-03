@@ -5,6 +5,7 @@ use pegboard::pubsub_subjects::ServerlessOutboundSubject;
 use reqwest::header::{HeaderName, HeaderValue};
 use reqwest_eventsource as sse;
 use rivet_envoy_protocol::{self as protocol, PROTOCOL_VERSION, versioned};
+use rivet_metrics::GaugeGuardExt;
 use rivet_runtime::TermSignal;
 use rivet_types::actor::RunnerPoolError;
 use rivet_types::runner_configs::RunnerConfigKind;
@@ -97,7 +98,7 @@ pub async fn start(config: rivet_config::Config, pools: rivet_pools::Pools) -> R
 	res
 }
 
-#[tracing::instrument(skip_all)]
+#[tracing::instrument(level = "debug", skip_all)]
 async fn inner(ctx: &StandaloneCtx, conns: &mut Vec<OutboundHandler>) -> Result<()> {
 	let mut sub = ctx
 		.ups()?
@@ -153,7 +154,7 @@ impl OutboundHandler {
 	}
 }
 
-#[tracing::instrument(skip_all, fields(namespace_id = tracing::field::Empty, pool_name = tracing::field::Empty, actor_id = tracing::field::Empty, url = tracing::field::Empty))]
+#[tracing::instrument(level = "debug", skip_all, fields(namespace_id = tracing::field::Empty, pool_name = tracing::field::Empty, actor_id = tracing::field::Empty, url = tracing::field::Empty))]
 async fn handle(ctx: &StandaloneCtx, packet: protocol::ToOutbound) -> Result<()> {
 	let (namespace_id, pool_name, checkpoint, actor_config) = match packet {
 		protocol::ToOutbound::ToOutboundActorStart(protocol::ToOutboundActorStart {
@@ -271,9 +272,9 @@ async fn handle(ctx: &StandaloneCtx, packet: protocol::ToOutbound) -> Result<()>
 			None
 		};
 
-		metrics::REQ_ACTIVE
+		let _active_guard = metrics::REQ_ACTIVE
 			.with_label_values(&[&namespace_id.to_string(), &pool_name])
-			.inc();
+			.inc_guard();
 
 		let res = serverless_outbound_req(
 			ctx,
@@ -290,10 +291,6 @@ async fn handle(ctx: &StandaloneCtx, packet: protocol::ToOutbound) -> Result<()>
 			token,
 		)
 		.await;
-
-		metrics::REQ_ACTIVE
-			.with_label_values(&[&namespace_id.to_string(), &pool_name])
-			.dec();
 
 		res
 	}
@@ -395,7 +392,7 @@ fn observe_req_duration(
 		.observe(req_start.elapsed().as_secs_f64());
 }
 
-#[tracing::instrument(skip_all)]
+#[tracing::instrument(level = "debug", skip_all)]
 async fn serverless_outbound_req(
 	ctx: &StandaloneCtx,
 	namespace_id: Id,
@@ -715,7 +712,7 @@ async fn serverless_outbound_req(
 }
 
 /// Report an error to the error tracker workflow.
-#[tracing::instrument(skip_all)]
+#[tracing::instrument(level = "debug", skip_all)]
 async fn report_error(
 	ctx: &StandaloneCtx,
 	namespace_id: Id,

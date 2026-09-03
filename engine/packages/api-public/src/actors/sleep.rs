@@ -37,7 +37,7 @@ pub async fn sleep(
 	}
 }
 
-#[tracing::instrument(skip_all)]
+#[tracing::instrument(level = "debug", skip_all)]
 async fn sleep_inner(
 	ctx: ApiCtx,
 	path: SleepPath,

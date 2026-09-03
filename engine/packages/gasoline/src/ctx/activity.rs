@@ -40,7 +40,7 @@ pub struct ActivityCtx {
 }
 
 impl ActivityCtx {
-	#[tracing::instrument(skip_all, fields(activity_name=%name))]
+	#[tracing::instrument(level = "debug", skip_all, fields(activity_name=%name))]
 	pub fn new(
 		workflow_id: Id,
 		workflow_state: Box<serde_json::value::RawValue>,

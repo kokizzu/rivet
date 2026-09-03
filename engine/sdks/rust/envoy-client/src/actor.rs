@@ -1086,7 +1086,7 @@ async fn handle_hws_restore(
 			.any(|req| req.gateway_id == meta.gateway_id && req.request_id == meta.request_id);
 
 		if !is_connected {
-			tracing::warn!(
+			tracing::debug!(
 				request_id = id_to_str(&meta.request_id),
 				"removing stale persisted websocket"
 			);

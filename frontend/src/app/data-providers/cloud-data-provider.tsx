@@ -19,77 +19,23 @@ import {
 } from "./engine-data-provider";
 import { no404Retry } from "./utilities";
 
-type CloudFetchFunction = NonNullable<RivetClient.Options["fetcher"]>;
-type CloudFetchResult = Awaited<ReturnType<CloudFetchFunction>>;
-type CloudRawResponse = CloudFetchResult["rawResponse"];
-
-async function resolveCloudHeaders(
-	headers: Parameters<CloudFetchFunction>[0]["headers"],
-): Promise<Record<string, string | undefined>> {
-	const resolvedHeaders: Record<string, string | undefined> = {};
-	for (const [key, value] of Object.entries(headers ?? {})) {
-		if (key.toLowerCase().startsWith("x-fern-") || value == null) {
-			continue;
-		}
-		const resolved =
-			typeof value === "function" ? await value() : await value;
-		if (resolved != null) {
-			resolvedHeaders[key] = resolved;
-		}
-	}
-	return resolvedHeaders;
-}
-
-function cloudRawResponse(
-	url: string,
-	result: Awaited<ReturnType<typeof fetcher>>,
-): CloudRawResponse {
-	const status = result.ok
-		? 200
-		: result.error.reason === "status-code" ||
-				result.error.reason === "non-json"
-			? result.error.statusCode
-			: result.error.reason === "timeout"
-				? 499
-				: 0;
-	return {
-		headers: new Headers(result.ok ? result.headers : undefined),
-		redirected: false,
-		status,
-		statusText: result.ok ? "OK" : "",
-		type: result.ok ? "basic" : "error",
-		url,
-	};
-}
-
-const cloudFetcher: CloudFetchFunction = async <R = unknown>(
-	args: Parameters<CloudFetchFunction>[0],
-) => {
-	const result = await fetcher<R>({
-		...args,
-		headers: await resolveCloudHeaders(args.headers),
-		queryParameters: args.queryParameters as Parameters<
-			typeof fetcher
-		>[0]["queryParameters"],
-		responseType:
-			args.responseType === "binary-response"
-				? "arrayBuffer"
-				: args.responseType,
-		maxRetries: 1,
-		withCredentials: true,
-	});
-	return {
-		...result,
-		rawResponse: cloudRawResponse(args.url, result),
-	};
-};
-
 function createClient() {
 	return new RivetClient({
 		baseUrl: () => cloudEnv().VITE_APP_CLOUD_API_URL,
 		environment: "",
 		token: async () => "",
-		fetcher: cloudFetcher,
+		fetcher: async (args) => {
+			Object.keys(args.headers || {}).forEach((key) => {
+				if (key.toLowerCase().startsWith("x-fern-")) {
+					delete args.headers?.[key];
+				}
+			});
+			return await fetcher({
+				...args,
+				maxRetries: 1,
+				withCredentials: true,
+			});
+		},
 	});
 }
 
@@ -143,6 +89,9 @@ export const createGlobalContext = () => {
 				},
 			});
 		},
+		// Fully-computed usage breakdown (plan, period, per-metric usage/included/
+		// overage, total). The backend does all the billing math so the dashboard
+		// only renders the result.
 		billingUsageQueryOptions({
 			organization,
 			project,
@@ -152,11 +101,6 @@ export const createGlobalContext = () => {
 		}) {
 			return queryOptions({
 				queryKey: [{ organization, project }, "billing-usage"],
-				// The usage query is a slow (~10s) backend scan whose numbers
-				// barely move minute to minute, so serve it from cache rather
-				// than refetch on every mount.
-				staleTime: 5 * 60 * 1000, // 5 minutes
-				gcTime: 5 * 60 * 1000, // 5 minutes
 				queryFn: async () => {
 					const response = await client.billing.usage(project, {
 						org: organization,
@@ -1284,31 +1228,6 @@ export const createNamespaceContext = ({
 					);
 					const t = await f;
 					return t.token;
-				},
-			});
-		},
-		connectionTokenQueryOptions() {
-			return queryOptions({
-				staleTime: 5 * 60 * 1000, // 5 minutes
-				gcTime: 5 * 60 * 1000, // 5 minutes
-				queryKey: [
-					{
-						namespace,
-						project: parent.project,
-						organization: parent.organization,
-					},
-					"tokens",
-					"connection",
-				],
-				queryFn: async () => {
-					// The endpoint is get-or-create: it returns the
-					// namespace's existing connection token and only mints
-					// one on the first call.
-					return await parent.client.namespaces.createConnectionToken(
-						parent.project,
-						namespace,
-						{ org: parent.organization },
-					);
 				},
 			});
 		},

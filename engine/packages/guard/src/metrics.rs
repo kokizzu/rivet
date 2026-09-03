@@ -2,7 +2,7 @@ use lazy_static::lazy_static;
 use rivet_metrics::{BUCKETS, REGISTRY, prometheus::*};
 
 lazy_static! {
-	pub static ref ROUTE_TOTAL: IntGaugeVec = register_int_gauge_vec_with_registry!(
+	pub static ref ROUTE_TOTAL: IntCounterVec = register_int_counter_vec_with_registry!(
 		"guard_route_total",
 		"Total number of routing results handled.",
 		&["router"],

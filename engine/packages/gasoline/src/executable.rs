@@ -28,7 +28,7 @@ where
 {
 	type Output = T;
 
-	#[tracing::instrument(skip_all)]
+	#[tracing::instrument(level = "debug", skip_all)]
 	async fn execute(self, ctx: &mut WorkflowCtx) -> Result<Self::Output> {
 		let mut branch = ctx.branch().await?;
 
@@ -54,7 +54,7 @@ where
 impl<T: Executable> Executable for Option<T> {
 	type Output = Option<T::Output>;
 
-	#[tracing::instrument(skip_all)]
+	#[tracing::instrument(level = "debug", skip_all)]
 	async fn execute(self, ctx: &mut WorkflowCtx) -> Result<Self::Output> {
 		if let Some(inner) = self {
 			let mut branch = ctx.clone();
@@ -85,7 +85,7 @@ macro_rules! impl_tuple {
 		impl<$($args : Executable),*> Executable for ($($args),*) {
 			type Output = ($(<$args as Executable>::Output),*);
 
-			#[tracing::instrument(skip_all)]
+			#[tracing::instrument(level = "debug", skip_all)]
 			async fn execute(self, ctx: &mut WorkflowCtx) -> Result<Self::Output> {
 				#[allow(non_snake_case)]
 				let ($($args),*) = self;
@@ -143,7 +143,7 @@ struct TupleHelper<T: Executable> {
 impl<T: Executable> Executable for Vec<T> {
 	type Output = Vec<T::Output>;
 
-	#[tracing::instrument(skip_all)]
+	#[tracing::instrument(level = "debug", skip_all)]
 	async fn execute(self, ctx: &mut WorkflowCtx) -> Result<Self::Output> {
 		if self.is_empty() {
 			return Ok(Vec::new());

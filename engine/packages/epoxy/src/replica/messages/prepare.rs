@@ -7,7 +7,7 @@ use crate::{
 	replica::ballot::Ballot,
 };
 
-#[tracing::instrument(skip_all, fields(%replica_id, key = ?prepare_req.key))]
+#[tracing::instrument(level = "debug", skip_all, fields(%replica_id, key = ?prepare_req.key))]
 pub async fn prepare(
 	tx: &Transaction,
 	replica_id: protocol::ReplicaId,

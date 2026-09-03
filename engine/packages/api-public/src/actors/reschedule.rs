@@ -37,7 +37,7 @@ pub async fn reschedule(
 	}
 }
 
-#[tracing::instrument(skip_all)]
+#[tracing::instrument(level = "debug", skip_all)]
 async fn reschedule_inner(
 	ctx: ApiCtx,
 	path: ReschedulePath,

@@ -49,7 +49,7 @@ struct PreloadPrefixConfig {
 /// Prefix requests should be passed in descending priority order (highest priority
 /// first). When the global byte cap is reached, lower-priority prefixes are
 /// truncated first.
-#[tracing::instrument(skip_all)]
+#[tracing::instrument(level = "debug", skip_all)]
 pub(crate) async fn batch_preload(
 	db: &universaldb::Database,
 	actor_id: Id,
@@ -289,7 +289,7 @@ pub(crate) async fn batch_preload(
 			})
 		}
 	})
-	.custom_instrument(tracing::info_span!("kv_batch_preload_tx"))
+	.custom_instrument(tracing::debug_span!("kv_batch_preload_tx"))
 	.await
 	.map_err(Into::<anyhow::Error>::into)
 }
@@ -297,7 +297,7 @@ pub(crate) async fn batch_preload(
 /// Fetches preloaded KV data for an actor using engine config and actor name
 /// metadata. Returns `None` if preloading is disabled or missing from actor
 /// metadata. Fails if the FDB transaction fails (no silent fallback).
-#[tracing::instrument(skip_all)]
+#[tracing::instrument(level = "debug", skip_all)]
 pub async fn fetch_preloaded_kv(
 	db: &universaldb::Database,
 	config: &Pegboard,
@@ -312,7 +312,7 @@ pub async fn fetch_preloaded_kv(
 			let name_key = keys::ns::ActorNameKey::new(namespace_id, actor_name.to_string());
 			async move { tx.read_opt(&name_key, Snapshot).await }
 		})
-		.instrument(tracing::info_span!("read_actor_metadata_tx"))
+		.instrument(tracing::debug_span!("read_actor_metadata_tx"))
 		.await?;
 
 	let metadata_map = metadata

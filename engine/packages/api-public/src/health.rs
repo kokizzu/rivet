@@ -55,6 +55,7 @@ pub async fn fanout(Extension(ctx): Extension<ApiCtx>) -> impl IntoResponse {
 	}
 }
 
+#[tracing::instrument(level = "debug", skip_all)]
 async fn fanout_inner(ctx: ApiCtx) -> Result<FanoutResponse> {
 	// Require datacenter read permissions to access health status
 	ctx.auth().await?;

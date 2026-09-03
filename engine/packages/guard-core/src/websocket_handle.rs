@@ -25,7 +25,7 @@ pub struct WebSocketHandle {
 }
 
 impl WebSocketHandle {
-	#[tracing::instrument(skip_all)]
+	#[tracing::instrument(level = "debug", skip_all)]
 	pub async fn new(websocket: HyperWebsocket) -> Result<Self> {
 		let ws_stream = websocket.await?;
 		let (ws_tx, ws_rx) = ws_stream.split();
@@ -36,7 +36,7 @@ impl WebSocketHandle {
 		})
 	}
 
-	#[tracing::instrument(skip_all)]
+	#[tracing::instrument(level = "debug", skip_all)]
 	pub async fn send(&self, message: Message) -> Result<()> {
 		let message_kind = message_kind_label(&message);
 		let message_len = message.len();
@@ -68,7 +68,7 @@ impl WebSocketHandle {
 		Ok(())
 	}
 
-	#[tracing::instrument(skip_all)]
+	#[tracing::instrument(level = "debug", skip_all)]
 	pub async fn flush(&self) -> Result<()> {
 		let res = self.ws_tx.lock().await.flush().await;
 		self.record_write_pressure_metrics("flush");

@@ -119,9 +119,10 @@ impl PegboardGateway {
 			.context("failed to read body")?
 			.to_bytes();
 
-		let (mut stopped_sub, runner_protocol_version) = tokio::try_join!(
+		let (mut stopped_sub, runner_protocol_version, _) = tokio::try_join!(
 			ctx.subscribe::<pegboard::workflows::actor::Stopped>(("actor_id", self.actor_id)),
 			get_runner_protocol_version(&ctx, self.runner_id),
+			pegboard::utils::ensure_ns_metrics_exporter_for_runner(&ctx, self.runner_id),
 		)?;
 
 		// Build subject to publish to
@@ -266,9 +267,10 @@ impl PegboardGateway {
 			}
 		}
 
-		let (mut stopped_sub, runner_protocol_version) = tokio::try_join!(
+		let (mut stopped_sub, runner_protocol_version, _) = tokio::try_join!(
 			ctx.subscribe::<pegboard::workflows::actor::Stopped>(("actor_id", self.actor_id)),
 			get_runner_protocol_version(&ctx, self.runner_id),
+			pegboard::utils::ensure_ns_metrics_exporter_for_runner(&ctx, self.runner_id),
 		)?;
 
 		// Build subject to publish to
@@ -329,7 +331,7 @@ impl PegboardGateway {
 										return anyhow::Ok(msg);
 									}
 									protocol::mk2::ToServerTunnelMessageKind::ToServerWebSocketClose(close) => {
-										tracing::warn!(?close, "websocket closed before opening");
+										tracing::debug!(?close, "websocket closed before opening");
 										return Err(WebSocketClosedBeforeOpen {
 											close_code: close
 												.code
@@ -340,13 +342,13 @@ impl PegboardGateway {
 										.build());
 									}
 									_ => {
-										tracing::warn!(
+										tracing::debug!(
 											"received unexpected message while waiting for websocket open"
 										);
 									}
 								}
 							} else {
-								tracing::warn!(
+								tracing::debug!(
 									request_id=%protocol::util::id_to_string(&request_id),
 									"received no message response during ws init",
 								);
@@ -362,7 +364,7 @@ impl PegboardGateway {
 							.build());
 						}
 						_ = drop_rx.changed() => {
-							tracing::warn!(reason=?drop_rx.borrow(), "websocket open timeout");
+							tracing::debug!(reason=?drop_rx.borrow(), "websocket open timeout");
 							return Err(WebSocketOpenDropped {
 								phase: PHASE_WAITING_FOR_WEBSOCKET_OPEN.to_owned(),
 								reason: format!("{:?}", drop_rx.borrow().as_ref()),
@@ -608,7 +610,7 @@ impl PegboardGateway {
 				.send_message(request_id, close_message)
 				.await
 			{
-				tracing::error!(?err, "error sending close message");
+				tracing::warn!(?err, "error sending close message");
 			}
 		}
 

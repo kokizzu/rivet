@@ -2,6 +2,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use futures_util::StreamExt;
+use rivet_metrics::GaugeGuardExt;
 use rivet_util::Id;
 
 /// Time to delay a workflow from retrying after an error
@@ -98,9 +99,9 @@ where
 	tracing::debug!(?input, "operation call");
 
 	// Record metrics
-	crate::metrics::OPERATION_PENDING
+	let _pending_guard = crate::metrics::OPERATION_PENDING
 		.with_label_values(&[I::Operation::NAME])
-		.inc();
+		.inc_guard();
 	crate::metrics::OPERATION_TOTAL
 		.with_label_values(&[I::Operation::NAME])
 		.inc();
@@ -142,9 +143,6 @@ where
 
 		// Other request metrics
 		let dt = start_instant.elapsed().as_secs_f64();
-		crate::metrics::OPERATION_PENDING
-			.with_label_values(&[I::Operation::NAME])
-			.dec();
 		crate::metrics::OPERATION_DURATION
 			.with_label_values(&[I::Operation::NAME, error_str.as_str()])
 			.observe(dt);

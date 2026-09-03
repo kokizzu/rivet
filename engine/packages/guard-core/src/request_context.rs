@@ -4,9 +4,12 @@ use rivet_runner_protocol as protocol;
 use rivet_util::Id;
 use std::{
 	net::{IpAddr, SocketAddr},
+	sync::Arc,
 	time::{Duration, Instant},
 };
 use tokio_util::sync::CancellationToken;
+
+use crate::utils::InFlightPermit;
 
 #[derive(Clone)]
 pub struct RequestContext {
@@ -33,7 +36,9 @@ pub struct RequestContext {
 	pub(crate) retry: RetryConfig,
 	pub(crate) timeout: TimeoutConfig,
 
-	pub(crate) in_flight_request_id: Option<protocol::RequestId>,
+	/// Holds the client's in-flight slot and this request's unique request id. Released when the
+	/// last clone of the context is dropped.
+	pub(crate) in_flight_permit: Option<Arc<InFlightPermit>>,
 	pub(crate) cors: Option<CorsConfig>,
 }
 
@@ -84,7 +89,7 @@ impl RequestContext {
 				request_timeout: 30, // 30 seconds for requests
 			},
 
-			in_flight_request_id: None,
+			in_flight_permit: None,
 			cors: None,
 		}
 	}
@@ -147,7 +152,9 @@ impl RequestContext {
 	}
 
 	pub fn in_flight_request_id(&self) -> Result<protocol::RequestId> {
-		self.in_flight_request_id
+		self.in_flight_permit
+			.as_ref()
+			.map(|permit| permit.request_id())
 			.context("no in flight request id acquired")
 	}
 

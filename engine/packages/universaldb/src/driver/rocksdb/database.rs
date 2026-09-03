@@ -21,6 +21,10 @@ use crate::conflict_tracker::TransactionConflictTracker;
 
 use super::transaction::RocksDbTransactionDriver;
 
+/// Sentinel for "the transaction closure set no per-transaction retry limit", so the database-wide
+/// limit applies.
+pub const RETRY_LIMIT_UNSET: i32 = -1;
+
 pub struct RocksDbDatabaseDriver {
 	db: Arc<OptimisticTransactionDB>,
 	max_retries: AtomicI32,
@@ -69,9 +73,29 @@ impl DatabaseDriver for RocksDbDatabaseDriver {
 		Box::pin(async move {
 			let mut maybe_committed = MaybeCommitted(false);
 			let max_retries = self.max_retries.load(Ordering::SeqCst);
+			// Owned here rather than per attempt: each attempt builds a fresh transaction driver, so a
+			// limit the closure sets has to outlive the attempt that set it to bound the next one.
+			let retry_limit = Arc::new(AtomicI32::new(RETRY_LIMIT_UNSET));
 
-			for attempt in 0..max_retries {
-				let tx = self.create_txn()?;
+			let mut attempt = 0;
+			loop {
+				// Re-read every iteration. The first attempt always runs, because nothing has called
+				// `retry_limit` yet; from then on the closure's limit wins over the database-wide one.
+				let limit = retry_limit.load(Ordering::SeqCst);
+				let max_attempts = if limit == RETRY_LIMIT_UNSET {
+					max_retries
+				} else {
+					limit.saturating_add(1)
+				};
+				if attempt >= max_attempts {
+					break;
+				}
+
+				let tx = Transaction::new(Arc::new(RocksDbTransactionDriver::with_retry_limit(
+					self.db.clone(),
+					self.txn_conflict_tracker.clone(),
+					retry_limit.clone(),
+				)));
 				let mut retryable = RetryableTransaction::new(tx);
 				retryable.maybe_committed = maybe_committed;
 
@@ -99,6 +123,7 @@ impl DatabaseDriver for RocksDbDatabaseDriver {
 
 						let backoff_ms = calculate_tx_retry_backoff(attempt as usize);
 						tokio::time::sleep(tokio::time::Duration::from_millis(backoff_ms)).await;
+						attempt += 1;
 						continue;
 					}
 				}

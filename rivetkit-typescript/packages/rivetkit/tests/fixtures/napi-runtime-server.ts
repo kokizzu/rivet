@@ -163,7 +163,9 @@ const {
 	registry: nativeRegistry,
 	serveConfig,
 } = await buildNativeRegistry(registry.parseConfig());
-serveConfig.engineBinaryPath = resolveEngineBinaryPath();
+if (!process.env.RIVETKIT_TEST_ENDPOINT) {
+	serveConfig.engineBinaryPath = resolveEngineBinaryPath();
+}
 
 const shutdown = () => {
 	void nativeRuntime.shutdownRegistry(nativeRegistry);

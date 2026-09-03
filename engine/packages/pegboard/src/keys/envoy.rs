@@ -597,6 +597,68 @@ impl<'de> TupleUnpack<'de> for ConnectedTsKey {
 }
 
 #[derive(Debug)]
+/// Identifies the connection that currently owns an Envoy registration.
+///
+/// This additive key is ignored by older binaries. Deployments must drain connections running
+/// versions that do not enforce it before relying on the fence for handoff safety.
+pub struct EnvoyConnIdKey {
+	namespace_id: Id,
+	envoy_key: String,
+}
+
+impl EnvoyConnIdKey {
+	pub fn new(namespace_id: Id, envoy_key: String) -> Self {
+		EnvoyConnIdKey {
+			namespace_id,
+			envoy_key,
+		}
+	}
+}
+
+impl FormalKey for EnvoyConnIdKey {
+	type Value = Id;
+
+	fn deserialize(&self, raw: &[u8]) -> Result<Self::Value> {
+		Ok(Id::from_slice(raw)?)
+	}
+
+	fn serialize(&self, value: Self::Value) -> Result<Vec<u8>> {
+		Ok(value.as_bytes().to_vec())
+	}
+}
+
+impl TuplePack for EnvoyConnIdKey {
+	fn pack<W: std::io::Write>(
+		&self,
+		w: &mut W,
+		tuple_depth: TupleDepth,
+	) -> std::io::Result<VersionstampOffset> {
+		let t = (
+			NAMESPACE,
+			ENVOY,
+			DATA,
+			self.namespace_id,
+			&self.envoy_key,
+			ENVOY_CONN_ID,
+		);
+		t.pack(w, tuple_depth)
+	}
+}
+
+impl<'de> TupleUnpack<'de> for EnvoyConnIdKey {
+	fn unpack(input: &[u8], tuple_depth: TupleDepth) -> PackResult<(&[u8], Self)> {
+		let (input, (_, _, _, namespace_id, envoy_key, _)) =
+			<(usize, usize, usize, Id, String, usize)>::unpack(input, tuple_depth)?;
+		let v = EnvoyConnIdKey {
+			namespace_id,
+			envoy_key,
+		};
+
+		Ok((input, v))
+	}
+}
+
+#[derive(Debug)]
 pub struct LastPingTsKey {
 	namespace_id: Id,
 	envoy_key: String,

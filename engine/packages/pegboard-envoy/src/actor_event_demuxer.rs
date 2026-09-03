@@ -50,10 +50,15 @@ impl ActorEventDemuxer {
 
 	/// Process an event by routing it to the appropriate actor's queue
 	pub fn ingest(&mut self, actor_id: Id, event: protocol::EventWrapper) {
-		tracing::debug!(envoy_key=%self.envoy_key, ?actor_id, index=?event.checkpoint.index, "actor demuxer ingest");
+		let index = event.checkpoint.index;
+
+		tracing::debug!(envoy_key=%self.envoy_key, ?actor_id, %index, "actor demuxer ingest");
 
 		if let Some(channel) = self.channels.get_mut(&actor_id) {
-			let _ = channel.tx.send(event);
+			if channel.tx.send(event).is_err() {
+				tracing::warn!(envoy_key=%self.envoy_key, ?actor_id, %index, "failed to ingest event, channel closed");
+			}
+
 			channel.last_seen = Instant::now();
 		} else {
 			let (tx, rx) = mpsc::unbounded_channel();
@@ -67,7 +72,9 @@ impl ActorEventDemuxer {
 			));
 
 			// Send initial event
-			let _ = tx.send(event);
+			if tx.send(event).is_err() {
+				tracing::warn!(envoy_key=%self.envoy_key, ?actor_id, %index, "failed to ingest event, channel closed");
+			}
 
 			self.channels.insert(
 				actor_id,
@@ -87,15 +94,16 @@ impl ActorEventDemuxer {
 
 			// This will drop the tx side of the channel and it's task will exit automatically. No abort
 			// required.
-			self.channels
-				.retain(|_, channel| channel.last_seen.elapsed() < self.max_last_seen);
+			self.channels.retain(|_, channel| {
+				!channel.handle.is_finished() && channel.last_seen.elapsed() < self.max_last_seen
+			});
 
 			metrics::EVENT_DEMUXER_COUNT.set(self.channels.len() as i64);
 		}
 	}
 
 	/// Shutdown all tasks and wait for them to complete
-	#[tracing::instrument(skip_all)]
+	#[tracing::instrument(level = "debug", skip_all)]
 	pub async fn shutdown(self) {
 		tracing::debug!(channels=?self.channels.len(), "shutting down actor demuxer");
 
@@ -134,7 +142,7 @@ async fn channel_handler(
 				}
 
 				if let Err(err) = dispatch_events(&ctx, &envoy_key, actor_id, buffer).await {
-					tracing::error!(?err, "actor event processor failed");
+					tracing::error!(%envoy_key, ?actor_id, ?err, "actor event processor failed");
 					break;
 				}
 			}
@@ -143,14 +151,14 @@ async fn channel_handler(
 	}
 }
 
-#[tracing::instrument(skip_all, fields(%envoy_key, ?actor_id))]
+#[tracing::instrument(level = "debug", skip_all, fields(%envoy_key, ?actor_id))]
 async fn dispatch_events(
 	ctx: &StandaloneCtx,
 	envoy_key: &str,
 	actor_id: Id,
 	events: Vec<protocol::EventWrapper>,
 ) -> Result<()> {
-	tracing::debug!(count=?events.len(), "actor demuxer dispatch");
+	tracing::debug!(%envoy_key, ?actor_id, count=?events.len(), "actor demuxer dispatch");
 
 	let res = ctx
 		.signal(pegboard::workflows::actor2::Events {
@@ -169,6 +177,8 @@ async fn dispatch_events(
 			"failed to send signal to actor workflow, likely already stopped"
 		);
 	}
+
+	tracing::debug!(%envoy_key, ?actor_id, "actor demuxer dispatch success");
 
 	Ok(())
 }

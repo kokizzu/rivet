@@ -30,7 +30,7 @@ impl<M> PubsubMessage<M>
 where
 	M: Message,
 {
-	#[tracing::instrument(skip_all)]
+	#[tracing::instrument(level = "debug", skip_all)]
 	pub(crate) fn deserialize_from_wrapper(
 		wrapper: PubsubMessageWrapper<'_>,
 	) -> WorkflowResult<Self> {
@@ -47,7 +47,7 @@ where
 	}
 
 	// Only returns the message wrapper
-	#[tracing::instrument(skip_all)]
+	#[tracing::instrument(level = "debug", skip_all)]
 	pub(crate) fn deserialize_wrapper<'a>(
 		buf: &'a [u8],
 	) -> WorkflowResult<PubsubMessageWrapper<'a>> {

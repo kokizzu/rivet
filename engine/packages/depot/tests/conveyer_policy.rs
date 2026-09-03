@@ -12,9 +12,9 @@ use depot::{
 		set_database_pitr_policy_override, set_database_shard_cache_policy_override,
 	},
 	types::{
-		DEFAULT_PITR_INTERVAL_MS, DEFAULT_PITR_RETENTION_MS, DEFAULT_SHARD_CACHE_RETENTION_MS,
-		PitrPolicy, SQLITE_STORAGE_META_VERSION, ShardCachePolicy, decode_pitr_policy,
-		decode_shard_cache_policy, encode_pitr_policy, encode_shard_cache_policy,
+		DEFAULT_SHARD_CACHE_RETENTION_MS, PitrPolicy, SQLITE_STORAGE_META_VERSION,
+		ShardCachePolicy, decode_pitr_policy, decode_shard_cache_policy, encode_pitr_policy,
+		encode_shard_cache_policy,
 	},
 };
 use universaldb::utils::IsolationLevel::Snapshot;
@@ -22,6 +22,15 @@ use uuid::Uuid;
 
 fn bucket_id() -> depot::types::BucketId {
 	depot::types::BucketId::from_uuid(Uuid::from_u128(0x1020_3040_5060_7080_90a0_b0c0_d0e0_f000))
+}
+
+/// Sqlite config with PITR turned on at its built-in interval and retention. PITR is disabled when
+/// the config block is absent, so cases that exercise policy resolution have to opt in.
+fn enabled_pitr_config() -> rivet_config::config::Sqlite {
+	rivet_config::config::Sqlite {
+		pitr: Some(rivet_config::config::SqlitePitr::default()),
+		..Default::default()
+	}
 }
 
 fn assert_embedded_version(encoded: &[u8]) {
@@ -82,6 +91,9 @@ async fn policy_lookup_falls_back_from_database_to_bucket_to_defaults() -> Resul
 			let db = ctx.udb.clone();
 			let bucket_id = bucket_id();
 			let database_id = ctx.database_id.clone();
+			// The override precedence chain only runs when PITR is enabled, so this case configures
+			// it on. `pitr_disabled_ignores_overrides` covers the disabled short-circuit.
+			let default_pitr = PitrPolicy::from_config(&enabled_pitr_config());
 			let bucket_pitr = PitrPolicy {
 				interval_ms: 120_000,
 				retention_ms: 2_400_000,
@@ -98,15 +110,12 @@ async fn policy_lookup_falls_back_from_database_to_bucket_to_defaults() -> Resul
 			};
 
 			assert_eq!(
-				get_bucket_pitr_policy(&db, bucket_id).await?,
-				PitrPolicy {
-					interval_ms: DEFAULT_PITR_INTERVAL_MS,
-					retention_ms: DEFAULT_PITR_RETENTION_MS,
-				}
+				get_bucket_pitr_policy(&db, bucket_id, default_pitr).await?,
+				default_pitr
 			);
 			assert_eq!(
-				get_effective_pitr_policy(&db, bucket_id, &database_id).await?,
-				PitrPolicy::default()
+				get_effective_pitr_policy(&db, bucket_id, &database_id, default_pitr).await?,
+				default_pitr
 			);
 			assert_eq!(
 				get_effective_shard_cache_policy(&db, bucket_id, &database_id).await?,
@@ -122,8 +131,8 @@ async fn policy_lookup_falls_back_from_database_to_bucket_to_defaults() -> Resul
 			set_bucket_pitr_policy(&db, bucket_id, bucket_pitr).await?;
 			set_bucket_shard_cache_policy(&db, bucket_id, bucket_shard_cache).await?;
 			assert_eq!(
-				get_effective_pitr_policy(&db, bucket_id, &database_id).await?,
-				bucket_pitr
+				get_effective_pitr_policy(&db, bucket_id, &database_id, default_pitr).await?,
+				Some(bucket_pitr)
 			);
 			assert_eq!(
 				get_effective_shard_cache_policy(&db, bucket_id, &database_id).await?,
@@ -147,8 +156,8 @@ async fn policy_lookup_falls_back_from_database_to_bucket_to_defaults() -> Resul
 				Some(database_shard_cache)
 			);
 			assert_eq!(
-				get_effective_pitr_policy(&db, bucket_id, &database_id).await?,
-				database_pitr
+				get_effective_pitr_policy(&db, bucket_id, &database_id, default_pitr).await?,
+				Some(database_pitr)
 			);
 			assert_eq!(
 				get_effective_shard_cache_policy(&db, bucket_id, &database_id).await?,
@@ -166,12 +175,63 @@ async fn policy_lookup_falls_back_from_database_to_bucket_to_defaults() -> Resul
 				None
 			);
 			assert_eq!(
-				get_effective_pitr_policy(&db, bucket_id, &database_id).await?,
-				bucket_pitr
+				get_effective_pitr_policy(&db, bucket_id, &database_id, default_pitr).await?,
+				Some(bucket_pitr)
 			);
 			assert_eq!(
 				get_effective_shard_cache_policy(&db, bucket_id, &database_id).await?,
 				bucket_shard_cache
+			);
+
+			Ok(())
+		})
+	})
+	.await
+}
+
+#[tokio::test]
+async fn pitr_disabled_ignores_overrides() -> Result<()> {
+	common::test_matrix("conveyer-policy-pitr-disabled", |_tier, ctx| {
+		Box::pin(async move {
+			let db = ctx.udb.clone();
+			let bucket_id = bucket_id();
+			let database_id = ctx.database_id.clone();
+			let disabled = PitrPolicy::from_config(&rivet_config::config::Sqlite::default());
+			let stored = PitrPolicy {
+				interval_ms: 120_000,
+				retention_ms: 2_400_000,
+			};
+
+			// PITR is off unless the config block is present.
+			assert_eq!(disabled, None);
+
+			set_bucket_pitr_policy(&db, bucket_id, stored).await?;
+			set_database_pitr_policy_override(&db, bucket_id, &database_id, stored).await?;
+
+			// A disabled cluster resolves to no policy even with both overrides stored.
+			assert_eq!(
+				get_bucket_pitr_policy(&db, bucket_id, disabled).await?,
+				None
+			);
+			assert_eq!(
+				get_effective_pitr_policy(&db, bucket_id, &database_id, disabled).await?,
+				None
+			);
+
+			// The override rows survive, so re-enabling PITR restores them as they were.
+			assert_eq!(
+				get_database_pitr_policy_override(&db, bucket_id, &database_id).await?,
+				Some(stored)
+			);
+			assert_eq!(
+				get_effective_pitr_policy(
+					&db,
+					bucket_id,
+					&database_id,
+					PitrPolicy::from_config(&enabled_pitr_config())
+				)
+				.await?,
+				Some(stored)
 			);
 
 			Ok(())

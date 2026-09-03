@@ -318,7 +318,9 @@ impl SqliteTransport for DirectDepotTransport {
 				request.now_ms,
 				depot::types::CommitOptions {
 					expected_head_txid: request.expected_head_txid,
-					..Default::default()
+					// Inline tests drive deliberately large transactions to exercise pager spill and
+					// shard boundaries. The engine-side size cap has its own coverage in depot.
+					disable_size_cap: true,
 				},
 			)
 			.await
@@ -334,6 +336,91 @@ impl SqliteTransport for DirectDepotTransport {
 				))
 			}
 			Err(err) => Ok(protocol::SqliteCommitResponse::SqliteErrorResponse(
+				sqlite_error_response(&err),
+			)),
+		}
+	}
+
+	async fn commit_stage_begin(
+		&self,
+		request: protocol::SqliteCommitStageBeginRequest,
+	) -> Result<protocol::SqliteCommitStageBeginResponse> {
+		let actor_db = self.storage.actor_db(request.actor_id).await;
+		match actor_db
+			.commit_stage_begin(
+				request.expected_generation.unwrap_or_default(),
+				request.expected_head_txid,
+			)
+			.await
+		{
+			Ok(txid) => Ok(
+				protocol::SqliteCommitStageBeginResponse::SqliteCommitStageBeginOk(
+					protocol::SqliteCommitStageBeginOk { txid },
+				),
+			),
+			Err(err) => Ok(
+				protocol::SqliteCommitStageBeginResponse::SqliteErrorResponse(
+					sqlite_error_response(&err),
+				),
+			),
+		}
+	}
+
+	async fn commit_stage_segment(
+		&self,
+		request: protocol::SqliteCommitStageSegmentRequest,
+	) -> Result<protocol::SqliteCommitStageSegmentResponse> {
+		let dirty_pages = request
+			.dirty_pages
+			.into_iter()
+			.map(storage_dirty_page)
+			.collect::<Vec<_>>();
+		let actor_db = self.storage.actor_db(request.actor_id).await;
+		match actor_db
+			.commit_stage_segment(
+				request.expected_generation.unwrap_or_default(),
+				request.txid,
+				request.first_pgno,
+				dirty_pages,
+			)
+			.await
+		{
+			Ok(staged_bytes) => Ok(
+				protocol::SqliteCommitStageSegmentResponse::SqliteCommitStageSegmentOk(
+					protocol::SqliteCommitStageSegmentOk { staged_bytes },
+				),
+			),
+			Err(err) => Ok(
+				protocol::SqliteCommitStageSegmentResponse::SqliteErrorResponse(
+					sqlite_error_response(&err),
+				),
+			),
+		}
+	}
+
+	async fn commit_finalize(
+		&self,
+		request: protocol::SqliteCommitFinalizeRequest,
+	) -> Result<protocol::SqliteCommitFinalizeResponse> {
+		let actor_db = self.storage.actor_db(request.actor_id).await;
+		match actor_db
+			.commit_finalize(
+				request.expected_generation.unwrap_or_default(),
+				request.txid,
+				request.new_db_size_pages,
+				request.now_ms,
+				request.segment_first_pgnos,
+			)
+			.await
+		{
+			Ok(result) => Ok(
+				protocol::SqliteCommitFinalizeResponse::SqliteCommitFinalizeOk(
+					protocol::SqliteCommitFinalizeOk {
+						head_txid: Some(result.head_txid),
+					},
+				),
+			),
+			Err(err) => Ok(protocol::SqliteCommitFinalizeResponse::SqliteErrorResponse(
 				sqlite_error_response(&err),
 			)),
 		}
@@ -404,6 +491,30 @@ impl SqliteTransport for DirectMirrorTransport {
 				sqlite_error_response(&err),
 			)),
 		}
+	}
+
+	/// Not supported: the mirror is an in-memory page map with no depot behind it, so there is no
+	/// staging area to write segments into. A test that needs a large commit through the mirror has to
+	/// give it one rather than get a silent single-shot fallback.
+	async fn commit_stage_begin(
+		&self,
+		_request: protocol::SqliteCommitStageBeginRequest,
+	) -> Result<protocol::SqliteCommitStageBeginResponse> {
+		anyhow::bail!("the in-memory mirror transport does not implement staged commits")
+	}
+
+	async fn commit_stage_segment(
+		&self,
+		_request: protocol::SqliteCommitStageSegmentRequest,
+	) -> Result<protocol::SqliteCommitStageSegmentResponse> {
+		anyhow::bail!("the in-memory mirror transport does not implement staged commits")
+	}
+
+	async fn commit_finalize(
+		&self,
+		_request: protocol::SqliteCommitFinalizeRequest,
+	) -> Result<protocol::SqliteCommitFinalizeResponse> {
+		anyhow::bail!("the in-memory mirror transport does not implement staged commits")
 	}
 }
 

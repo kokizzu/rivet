@@ -45,7 +45,6 @@ export interface DiscoverPackagesOptions {
 export const EXCLUDED = new Set<string>([
 	"@rivetkit/shared-data",
 	"@rivetkit/engine-frontend",
-	"@rivetkit/mcp-hub",
 	"@rivetkit/sqlite-native",
 	"@rivetkit/sqlite-wasm",
 	"example-agent-os",
@@ -83,6 +82,13 @@ export const META_PACKAGES: readonly MetaPackageSpec[] = [
 		platformPrefix: "@rivetkit/cli-",
 	},
 ];
+
+/**
+ * Publishable `@rivet-dev/*` workspace packages. Unlike `@rivetkit/*`, this
+ * scope is mostly private infrastructure, so it is opt-in by name rather than
+ * by prefix. Absent from a workspace (OSS checkouts) they are simply skipped.
+ */
+export const RIVET_DEV_PACKAGES = new Set<string>(["@rivet-dev/workflow-world"]);
 
 export const RELEASE_ONLY_PACKAGES = new Set<string>([
 	"@rivetkit/rivetkit-napi-win32-x64-msvc",
@@ -171,7 +177,7 @@ export function discoverPackages(
 		if (
 			!p.name.startsWith("@rivetkit/") &&
 			p.name !== "rivetkit" &&
-			p.name !== "@rivet-dev/workflow-world"
+			!RIVET_DEV_PACKAGES.has(p.name)
 		) continue;
 		add(p.path);
 	}

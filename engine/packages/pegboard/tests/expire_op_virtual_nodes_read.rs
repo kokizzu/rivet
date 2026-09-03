@@ -32,6 +32,7 @@ async fn expire_deletes_hash_positions_from_persisted_virtual_node_count() -> Re
 		&pegboard::ops::envoy::expire::Input {
 			namespace_id: fixture.namespace_id,
 			envoy_key: fixture.envoy_key.clone(),
+			expected_envoy_conn_id: None,
 			skip_if_fresh: true,
 		},
 	)

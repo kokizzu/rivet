@@ -5,6 +5,24 @@ use tokio_postgres::NoTls;
 use universaldb::{Database, driver::postgres::NatsConfig, utils::IsolationLevel::*};
 use uuid::Uuid;
 
+/// A config carrying the compiled universaldb commit protocol version.
+///
+/// `RuntimeProtocols::default()` reports version 0 so that a process which never negotiated cannot
+/// silently reach the wire, which means a test has to supply the real version itself.
+fn test_config() -> rivet_config::Config {
+	rivet_config::Config::from_root_with_build_meta(
+		rivet_config::config::Root::default(),
+		rivet_config::BuildMeta::default(),
+		rivet_config::RuntimeProtocols {
+			universaldb_commit: rivet_config::RuntimeProtocol::new(
+				rivet_config::RuntimeProtocolKind::UniversaldbCommit,
+				rivet_universaldb_commit::PROTOCOL_VERSION,
+			),
+			..Default::default()
+		},
+	)
+}
+
 const ALPHA_KEY: &[u8] = b"failover/alpha";
 const BETA_KEY: &[u8] = b"failover/beta";
 
@@ -37,9 +55,10 @@ async fn make_db(connection_string: &str, nats: &NatsConfig) -> Database {
 	let mut config =
 		universaldb::driver::postgres::PostgresConfig::new(connection_string.to_string());
 	config.nats = Some(nats.clone());
-	let driver = universaldb::driver::PostgresDatabaseDriver::new_with_config(config)
-		.await
-		.unwrap();
+	let driver =
+		universaldb::driver::PostgresDatabaseDriver::new_with_config(test_config(), config)
+			.await
+			.unwrap();
 	Database::new(Arc::new(driver))
 }
 

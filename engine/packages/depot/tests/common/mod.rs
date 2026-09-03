@@ -4,10 +4,11 @@ use std::{future::Future, pin::Pin, sync::Arc};
 
 use anyhow::{Context, Result};
 use depot::conveyer::Db;
+use futures_util::TryStreamExt;
 use gas::prelude::Id;
 use rivet_pools::NodeId;
 use tempfile::{Builder, TempDir};
-use universaldb::utils::IsolationLevel::Snapshot;
+use universaldb::utils::IsolationLevel::{Serializable, Snapshot};
 
 pub async fn test_db(prefix: &str) -> Result<universaldb::Database> {
 	let path = Builder::new().prefix(prefix).tempdir()?.keep();
@@ -23,8 +24,34 @@ pub async fn test_db_with_dir(prefix: &str) -> Result<(Arc<universaldb::Database
 	Ok((Arc::new(universaldb::Database::new(Arc::new(driver))), dir))
 }
 
+/// A test database with depot's compaction throttle enabled at a fixed budget and a pinned clock, so
+/// a charge lands in a known window. No background flusher: the test drives the flush itself, so the
+/// counter is exact rather than eventually right.
+pub async fn test_db_with_throttle(
+	prefix: &str,
+	bytes_per_second: u64,
+	now_ms: i64,
+) -> Result<universaldb::Database> {
+	let config =
+		universaldb::ThrottleConfig::new(Arc::new(move |_name, _kind| Some(bytes_per_second)))
+			.without_flusher()
+			.with_clock(Arc::new(move || now_ms));
+
+	Ok(test_db(prefix).await?.with_throttle(config))
+}
+
 pub async fn test_db_arc(prefix: &str) -> Result<Arc<universaldb::Database>> {
 	Ok(Arc::new(test_db(prefix).await?))
+}
+
+pub async fn test_db_with_throttle_arc(
+	prefix: &str,
+	bytes_per_second: u64,
+	now_ms: i64,
+) -> Result<Arc<universaldb::Database>> {
+	Ok(Arc::new(
+		test_db_with_throttle(prefix, bytes_per_second, now_ms).await?,
+	))
 }
 
 pub fn make_db(
@@ -43,7 +70,7 @@ pub enum TierMode {
 impl TierMode {
 	pub fn label(self) -> &'static str {
 		match self {
-			TierMode::Disabled => "fdb_only",
+			TierMode::Disabled => "cold_disabled",
 		}
 	}
 }
@@ -89,15 +116,43 @@ pub async fn test_matrix<F>(prefix: &str, body: F) -> Result<()>
 where
 	F: Fn(TierMode, TestDb) -> Pin<Box<dyn Future<Output = Result<()>> + Send>>,
 {
-	let tier = TierMode::Disabled;
-	let ctx = build_test_db(prefix, tier)
-		.await
-		.with_context(|| format!("[{}] failed to build TestDb", tier.label()))?;
-	body(tier, ctx)
-		.await
-		.with_context(|| format!("[{}] body failed", tier.label()))?;
+	for tier in [TierMode::Disabled] {
+		let ctx = build_test_db(prefix, tier)
+			.await
+			.with_context(|| format!("[{}] failed to build TestDb", tier.label()))?;
+		body(tier, ctx)
+			.await
+			.with_context(|| format!("[{}] body failed", tier.label()))?;
+	}
 
 	Ok(())
+}
+
+/// Reads every key/value under `prefix`, ascending. Test-only; production reads bound their ranges.
+pub async fn read_range(
+	db: &universaldb::Database,
+	prefix: Vec<u8>,
+) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+	db.txn("test_depotcommon_read_range", move |tx| {
+		let prefix = prefix.clone();
+		async move {
+			let subspace = universaldb::Subspace::from(universaldb::tuple::Subspace::from_bytes(
+				prefix.clone(),
+			));
+			let informal = tx.informal();
+			let mut stream = informal.get_ranges_keyvalues(
+				universaldb::range_option::RangeOption::from(&subspace),
+				Snapshot,
+			);
+			let mut rows = Vec::new();
+			while let Some(entry) = futures_util::TryStreamExt::try_next(&mut stream).await? {
+				rows.push((entry.key().to_vec(), entry.value().to_vec()));
+			}
+
+			Ok(rows)
+		}
+	})
+	.await
 }
 
 pub async fn read_value(db: &universaldb::Database, key: Vec<u8>) -> Result<Option<Vec<u8>>> {
@@ -109,6 +164,32 @@ pub async fn read_value(db: &universaldb::Database, key: Vec<u8>) -> Result<Opti
 				.get(&key, Snapshot)
 				.await?
 				.map(Vec::<u8>::from))
+		}
+	})
+	.await
+}
+
+/// Every key under `prefix`, for tests that must act on a row set whose exact keys depend on
+/// encoding decisions they should not restate.
+pub async fn read_prefix_keys(db: &universaldb::Database, prefix: Vec<u8>) -> Result<Vec<Vec<u8>>> {
+	db.txn("test_depotconveyer_read", move |tx| {
+		let prefix = prefix.clone();
+		async move {
+			let prefix_subspace =
+				universaldb::Subspace::from(universaldb::tuple::Subspace::from_bytes(prefix));
+			let informal = tx.informal();
+			let mut stream = informal.get_ranges_keyvalues(
+				universaldb::RangeOption {
+					mode: universaldb::options::StreamingMode::WantAll,
+					..universaldb::RangeOption::from(&prefix_subspace)
+				},
+				Serializable,
+			);
+			let mut keys = Vec::new();
+			while let Some(entry) = stream.try_next().await? {
+				keys.push(entry.key().to_vec());
+			}
+			Ok(keys)
 		}
 	})
 	.await

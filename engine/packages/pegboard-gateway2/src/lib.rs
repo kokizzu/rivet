@@ -146,9 +146,10 @@ impl PegboardGateway2 {
 			.context("failed to read body")?
 			.to_bytes();
 
-		let mut stopped_sub = ctx
-			.subscribe::<pegboard::workflows::actor2::Stopped>(("actor_id", self.actor_id))
-			.await?;
+		let (mut stopped_sub, _) = tokio::try_join!(
+			ctx.subscribe::<pegboard::workflows::actor2::Stopped>(("actor_id", self.actor_id)),
+			pegboard::utils::ensure_ns_metrics_exporter_for_namespace(ctx, self.namespace_id),
+		)?;
 
 		// Verify envoy key is still the same after stopped sub is open to prevent race conditions with
 		// actor reallocation
@@ -191,6 +192,7 @@ impl PegboardGateway2 {
 		let InFlightRequestCtx {
 			mut msg_rx,
 			mut drop_rx,
+			created: _,
 			handle: in_flight_req,
 		} = self
 			.shared_state
@@ -294,7 +296,7 @@ impl PegboardGateway2 {
 					}
 				}
 			}
-			.instrument(tracing::info_span!("wait_for_tunnel_response"));
+			.instrument(tracing::debug_span!("wait_for_tunnel_response"));
 			let response_start_timeout = Duration::from_millis(
 				self.ctx
 					.config()
@@ -359,9 +361,10 @@ impl PegboardGateway2 {
 			}
 		}
 
-		let mut stopped_sub = ctx
-			.subscribe::<pegboard::workflows::actor2::Stopped>(("actor_id", self.actor_id))
-			.await?;
+		let (mut stopped_sub, _) = tokio::try_join!(
+			ctx.subscribe::<pegboard::workflows::actor2::Stopped>(("actor_id", self.actor_id)),
+			pegboard::utils::ensure_ns_metrics_exporter_for_namespace(ctx, self.namespace_id),
+		)?;
 
 		// Verify envoy key is still the same after stopped sub is open to prevent race conditions with
 		// actor reallocation
@@ -404,6 +407,7 @@ impl PegboardGateway2 {
 		let InFlightRequestCtx {
 			mut msg_rx,
 			mut drop_rx,
+			created,
 			handle: in_flight_req,
 		} = self
 			.shared_state
@@ -421,9 +425,14 @@ impl PegboardGateway2 {
 			)
 			.await?;
 
+		// Guard keeps `after_hibernation` set for the rest of the connection, so a retry that
+		// happens after a hibernation can land here once the in flight entry is already gone. The
+		// envoy has no record of the request in that case, so the websocket has to be opened again.
+		let resumed_from_hibernation = after_hibernation && !created;
+
 		let res = async {
 			// If we are reconnecting after hibernation, don't send an open message
-			let can_hibernate = if after_hibernation {
+			let can_hibernate = if resumed_from_hibernation {
 				true
 			} else {
 				// Send WebSocket open message
@@ -872,7 +881,7 @@ impl PegboardGateway2 {
 				);
 
 				if let Err(err) = in_flight_req.send_message(close_message, true).await {
-					tracing::error!(?err, "error sending close message");
+					tracing::warn!(?err, "error sending close message");
 				} else {
 					metrics::CLOSE_SENT_TOTAL
 						.with_label_values(&[
@@ -1041,6 +1050,7 @@ impl CustomServeTrait for PegboardGateway2 {
 		let InFlightRequestCtx {
 			msg_rx,
 			drop_rx,
+			created: _,
 			handle: in_flight_req,
 		} = self
 			.shared_state
@@ -1239,7 +1249,7 @@ enum Metric {
 	WebsocketStopHibernate,
 }
 
-#[tracing::instrument(skip_all, fields(?actor_id, ?metric))]
+#[tracing::instrument(level = "debug", skip_all, fields(?actor_id, ?metric))]
 async fn record_req_metrics(
 	ctx: &StandaloneCtx,
 	actor_id: Id,
@@ -1261,7 +1271,7 @@ async fn record_req_metrics(
 
 				Ok(())
 			})
-			.instrument(tracing::info_span!("record_req_metrics_tx")),
+			.instrument(tracing::debug_span!("record_req_metrics_tx")),
 	)
 	.await
 	.context("timed out recording req metrics")??;

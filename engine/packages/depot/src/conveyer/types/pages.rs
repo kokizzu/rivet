@@ -18,6 +18,22 @@ pub struct GetPagesResult {
 	pub head_txid: u64,
 	pub db_size_pages: u32,
 	pub provenance: Vec<PageSourceProvenance>,
+	pub read_stats: GetPagesReadStats,
+}
+
+/// Work the read did to resolve its pages, for tests and read-cost debugging. Counters only; the
+/// read's result never depends on them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GetPagesReadStats {
+	/// DELTA chunk rows read while walking ancestor sources' delta history.
+	pub historical_delta_chunk_rows_scanned: usize,
+	/// Delta files decoded during that walk.
+	pub historical_delta_txids_decoded: usize,
+	/// Highest txid the walk was allowed to stop at because a shard version covers the pages
+	/// below it. Zero when no source had a shard version for the requested pages.
+	pub historical_delta_scan_floor_txid: u64,
+	/// Page slots the walk stopped searching because a shard version already covers them.
+	pub historical_delta_pages_shard_superseded: usize,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -72,8 +88,8 @@ pub enum PageSourceKind {
 	PidxDelta,
 	HistoricalDelta,
 	MissingDelta,
-	StaleDelta,
 	HotShard,
+	Cold,
 	ZeroFill,
 	OutOfRange,
 }

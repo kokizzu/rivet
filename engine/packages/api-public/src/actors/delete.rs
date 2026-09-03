@@ -40,7 +40,7 @@ pub async fn delete(
 	}
 }
 
-#[tracing::instrument(skip_all)]
+#[tracing::instrument(level = "debug", skip_all)]
 async fn delete_inner(ctx: ApiCtx, path: DeletePath, query: DeleteQuery) -> Result<Response> {
 	ctx.auth().await?;
 

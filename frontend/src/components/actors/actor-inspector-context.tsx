@@ -668,6 +668,19 @@ export const createDefaultActorInspectorContext = ({
 const computeActorUrl = ({ url, actorId }: { url: string; actorId: ActorId }) =>
 	new URL(`gateway/${actorId}`, url.endsWith("/") ? url : `${url}/`).href;
 
+function transformWorkflowHistoryFromJson(raw: number[] | null): {
+	history: WorkflowHistory | null;
+	isEnabled: boolean;
+} {
+	if (!raw) {
+		return { history: null, isEnabled: true };
+	}
+
+	return transformWorkflowHistoryFromInspector(
+		new Uint8Array(raw).buffer as ArrayBuffer,
+	);
+}
+
 const replayWorkflowFromStepHttp = async ({
 	actorId,
 	credentials,

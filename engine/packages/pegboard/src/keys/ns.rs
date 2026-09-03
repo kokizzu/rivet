@@ -3,6 +3,20 @@ use gas::prelude::*;
 use universaldb::prelude::*;
 use vbare::OwnedVersionedData;
 
+/// Encodes a full-range `u32` in the legacy reverse-version tuple representation.
+///
+/// This representation predates the hash index and is persisted in both Envoy indexes. Keep the
+/// wrapping explicit: versions with the high bit set encode as positive `i32` values, and existing
+/// production keys rely on that exact layout.
+pub(crate) fn encode_reverse_u32(value: u32) -> i32 {
+	(value as i32).wrapping_neg()
+}
+
+/// Decodes the legacy reverse-version tuple representation over the full `u32` domain.
+pub(crate) fn decode_reverse_u32(value: i32) -> u32 {
+	value.wrapping_neg() as u32
+}
+
 #[derive(Debug)]
 pub struct RunnerAllocIdxKey {
 	pub namespace_id: Id,
@@ -1574,7 +1588,7 @@ impl TuplePack for EnvoyLoadBalancerIdxKey {
 			self.namespace_id,
 			&self.pool_name,
 			// Stored in reverse order (higher versions are first)
-			-(self.version as i32),
+			encode_reverse_u32(self.version),
 			self.last_ping_ts,
 			&self.envoy_key,
 		);
@@ -1590,7 +1604,7 @@ impl<'de> TupleUnpack<'de> for EnvoyLoadBalancerIdxKey {
 		let v = EnvoyLoadBalancerIdxKey {
 			namespace_id,
 			pool_name,
-			version: -version as u32,
+			version: decode_reverse_u32(version),
 			last_ping_ts,
 			envoy_key,
 		};
@@ -1669,7 +1683,7 @@ impl TuplePack for EnvoyLoadBalancerIdxSubspaceKey {
 
 			if let Some(version) = &self.version {
 				// Stored in reverse order (higher versions are first)
-				offset += (-(*version as i32)).pack(w, tuple_depth)?;
+				offset += encode_reverse_u32(*version).pack(w, tuple_depth)?;
 
 				if let Some(last_ping_ts) = &self.last_ping_ts {
 					offset += last_ping_ts.pack(w, tuple_depth)?;
@@ -1736,7 +1750,7 @@ impl TuplePack for EnvoyHashIdxKey {
 			self.namespace_id,
 			&self.pool_name,
 			// Stored in reverse order (higher versions are first)
-			-(self.version as i32),
+			encode_reverse_u32(self.version),
 			&self.hash_pos[..],
 			&self.envoy_key,
 		);
@@ -1752,14 +1766,10 @@ impl<'de> TupleUnpack<'de> for EnvoyHashIdxKey {
 			.try_into()
 			.map_err(|_| PackError::Message("expected 16 byte hash position".into()))?;
 
-		// Negate in i64 to avoid the i32::MIN overflow case, then narrow to u32.
-		let version = u32::try_from(-(version as i64))
-			.map_err(|_| PackError::Message("envoy hash idx version out of u32 range".into()))?;
-
 		let v = EnvoyHashIdxKey {
 			namespace_id,
 			pool_name,
-			version,
+			version: decode_reverse_u32(version),
 			hash_pos,
 			envoy_key,
 		};
@@ -1796,7 +1806,7 @@ impl TuplePack for EnvoyHashIdxSubspaceKey {
 			self.namespace_id,
 			&self.pool_name,
 			// Stored in reverse order (higher versions are first)
-			-(self.version as i32),
+			encode_reverse_u32(self.version),
 		);
 		t.pack(w, tuple_depth)
 	}
@@ -2036,5 +2046,46 @@ impl TuplePack for ActiveEnvoyByNameSubspaceKey {
 		}
 
 		Ok(offset)
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	const U32_BOUNDARIES: [u32; 6] = [
+		0,
+		1,
+		i32::MAX as u32,
+		i32::MAX as u32 + 1,
+		i32::MAX as u32 + 2,
+		u32::MAX,
+	];
+
+	#[test]
+	fn reverse_u32_round_trips_full_domain_boundaries() {
+		for version in U32_BOUNDARIES {
+			assert_eq!(decode_reverse_u32(encode_reverse_u32(version)), version);
+		}
+	}
+
+	#[test]
+	fn envoy_hash_idx_round_trips_full_u32_versions() {
+		for version in U32_BOUNDARIES {
+			let key = EnvoyHashIdxKey::new(
+				Id::new_v1(1),
+				"default".into(),
+				version,
+				[version as u8; 16],
+				format!("envoy-{version}"),
+			);
+			let decoded = EnvoyHashIdxKey::unpack_root(&key.pack_to_vec()).unwrap();
+
+			assert_eq!(decoded.namespace_id, key.namespace_id);
+			assert_eq!(decoded.pool_name, key.pool_name);
+			assert_eq!(decoded.version, version);
+			assert_eq!(decoded.hash_pos, key.hash_pos);
+			assert_eq!(decoded.envoy_key, key.envoy_key);
+		}
 	}
 }

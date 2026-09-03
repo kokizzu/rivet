@@ -1,8 +1,5 @@
 use anyhow::{Context, Result, bail};
-use epoxy_protocol::{
-	PROTOCOL_VERSION,
-	protocol::{self, ReplicaId},
-};
+use epoxy_protocol::protocol::{self, ReplicaId};
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use gas::prelude::*;
 use rivet_api_builder::ApiCtx;
@@ -98,7 +95,7 @@ where
 	Ok(successful_responses)
 }
 
-#[tracing::instrument(skip_all)]
+#[tracing::instrument(level = "debug", skip_all)]
 pub async fn send_message(
 	ctx: &ApiCtx,
 	config: &protocol::ClusterConfig,
@@ -108,7 +105,7 @@ pub async fn send_message(
 	send_message_to_address(ctx, replica_url, request).await
 }
 
-#[tracing::instrument(skip_all, fields(%from_replica_id, %to_replica_id, count))]
+#[tracing::instrument(level = "debug", skip_all, fields(%from_replica_id, %to_replica_id, count))]
 pub async fn read_changelog(
 	ctx: &ApiCtx,
 	config: &protocol::ClusterConfig,
@@ -167,8 +164,12 @@ async fn send_request_to_address(
 		return crate::replica::message_request::message_request(&ctx, request).await;
 	}
 
+	// The peer decodes at whatever version the path names, so send at one it actually speaks. Its
+	// heartbeats are in another datacenter's database, so ask the replica itself.
+	let protocol_version = crate::protocol_version::negotiate(ctx.config(), &replica_url);
+
 	let mut replica_url = url::Url::parse(&replica_url)?;
-	replica_url.set_path(&format!("/v{PROTOCOL_VERSION}/epoxy/{endpoint}"));
+	replica_url.set_path(&format!("/v{protocol_version}/epoxy/{endpoint}"));
 
 	tracing::debug!(
 		to_replica = to_replica_id,
@@ -187,7 +188,7 @@ async fn send_request_to_address(
 		.post(replica_url.to_string())
 		.body(request)
 		.send()
-		.custom_instrument(tracing::info_span!("http_request"))
+		.custom_instrument(tracing::debug_span!("http_request"))
 		.await;
 
 	let response = match response_result {

@@ -78,6 +78,7 @@ impl<'a, S: Serialize + DeserializeOwned> LoopBuilder<'a, S> {
 				// Clone data to move into future
 				let loop_location = loop_location.clone();
 				let db2 = ctx.db().clone();
+				let worker_id = ctx.worker_id();
 				let workflow_id = ctx.workflow_id();
 				let name = ctx.name().to_string();
 				let version = ctx.version();
@@ -86,6 +87,7 @@ impl<'a, S: Serialize + DeserializeOwned> LoopBuilder<'a, S> {
 				// This future is deferred until later for parallelization
 				let loop_event_init_fut = async move {
 					db2.upsert_workflow_loop_event(
+						worker_id,
 						workflow_id,
 						&name,
 						&loop_location,
@@ -179,6 +181,7 @@ impl<'a, S: Serialize + DeserializeOwned> LoopBuilder<'a, S> {
 							// Insert event if iteration is not a replay
 							if !loop_branch.cursor().compare_loop_branch(iteration)? {
 								db2.commit_workflow_branch_event(
+									ctx.worker_id(),
 									ctx.workflow_id(),
 									&iteration_branch_root,
 									ctx.version(),
@@ -225,6 +228,7 @@ impl<'a, S: Serialize + DeserializeOwned> LoopBuilder<'a, S> {
 								// Clone data to move into future
 								let loop_location = loop_location.clone();
 								let db2 = ctx.db().clone();
+								let worker_id = ctx.worker_id();
 								let workflow_id = ctx.workflow_id();
 								let name = ctx.name();
 								let version = ctx.version();
@@ -233,6 +237,7 @@ impl<'a, S: Serialize + DeserializeOwned> LoopBuilder<'a, S> {
 								// Defer upsertion to next iteration so it runs in parallel
 								loop_event_upsert_fut = Some(async move {
 									db2.upsert_workflow_loop_event(
+										worker_id,
 										workflow_id,
 										&name,
 										&loop_location,
@@ -260,6 +265,7 @@ impl<'a, S: Serialize + DeserializeOwned> LoopBuilder<'a, S> {
 							// there will be no more loop iterations afterwards.
 							ctx.db()
 								.upsert_workflow_loop_event(
+									ctx.worker_id(),
 									ctx.workflow_id(),
 									&ctx.name(),
 									&loop_location,

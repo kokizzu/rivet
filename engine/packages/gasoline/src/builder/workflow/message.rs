@@ -91,6 +91,7 @@ impl<'a, M: Message> MessageBuilder<'a, M> {
 			self.ctx
 				.db()
 				.commit_workflow_message_send_event(
+					self.ctx.worker_id(),
 					self.ctx.workflow_id(),
 					&location,
 					self.version,

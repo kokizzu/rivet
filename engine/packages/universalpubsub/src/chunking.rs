@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
 use rivet_ups_protocol::versioned::UpsMessage;
-use rivet_ups_protocol::{MessageBody, MessageChunk, MessageStart, PROTOCOL_VERSION};
+use rivet_ups_protocol::{MessageBody, MessageChunk, MessageStart};
 use scc::HashMap;
 use uuid::Uuid;
 use vbare::OwnedVersionedData;
@@ -213,6 +213,9 @@ fn bare_uint_len(n: usize) -> usize {
 /// - Maximum payload utilization in each chunk
 /// - Efficient bandwidth usage for multi-chunk messages
 ///
+/// Overhead is measured against `protocol_version`, which must be the same version the chunks are
+/// later encoded at, otherwise the sizing is wrong.
+///
 /// # Returns
 /// A vector of payload chunks, where each chunk is sized to fit within the message limit
 /// after accounting for protocol overhead.
@@ -222,6 +225,7 @@ pub fn split_payload_into_chunks(
 	message_id: Uuid,
 	reply_subject: Option<&str>,
 	request_deadline_at: Option<i64>,
+	protocol_version: u16,
 ) -> Result<Vec<Vec<u8>>> {
 	let message_id_buf = *message_id.as_bytes();
 
@@ -238,7 +242,7 @@ pub fn split_payload_into_chunks(
 		body: MessageBody::MessageStart(start_message),
 	};
 	let start_overhead = UpsMessage::wrap_latest(start_ups_message)
-		.serialize_with_embedded_version(*PROTOCOL_VERSION)?
+		.serialize_with_embedded_version(protocol_version)?
 		.len();
 
 	// Calculate overhead for MessageChunk (subsequent chunks)
@@ -252,7 +256,7 @@ pub fn split_payload_into_chunks(
 		body: MessageBody::MessageChunk(chunk_message),
 	};
 	let chunk_overhead = UpsMessage::wrap_latest(chunk_ups_message)
-		.serialize_with_embedded_version(*PROTOCOL_VERSION)?
+		.serialize_with_embedded_version(protocol_version)?
 		.len();
 
 	// Calculate max payload sizes, correcting for the variable-length encoding of the
@@ -302,7 +306,10 @@ pub fn split_payload_into_chunks(
 	Ok(chunks)
 }
 
-/// Encodes a chunk to the resulting BARE message.
+/// Encodes a chunk to the resulting BARE message at `protocol_version`.
+///
+/// This is the version negotiated across the engine fleet, not the version this binary was compiled
+/// against, so that a subscriber running older code can still decode what we publish.
 pub fn encode_chunk(
 	payload: Vec<u8>,
 	chunk_idx: u32,
@@ -310,6 +317,7 @@ pub fn encode_chunk(
 	message_id: Uuid,
 	reply_subject: Option<Cow<str>>,
 	request_deadline_at: Option<i64>,
+	protocol_version: u16,
 ) -> Result<Vec<u8>> {
 	let message_id_buf = *message_id.as_bytes();
 
@@ -334,5 +342,5 @@ pub fn encode_chunk(
 	};
 
 	let ups_message = rivet_ups_protocol::UpsMessage { body };
-	UpsMessage::wrap_latest(ups_message).serialize_with_embedded_version(*PROTOCOL_VERSION)
+	UpsMessage::wrap_latest(ups_message).serialize_with_embedded_version(protocol_version)
 }

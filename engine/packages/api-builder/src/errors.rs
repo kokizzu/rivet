@@ -9,9 +9,11 @@ pub struct ApiNotFound;
 #[error("api", "unauthorized", "Authentication required")]
 pub struct ApiUnauthorized;
 
-#[derive(RivetError)]
-#[error("api", "forbidden", "Access denied")]
-pub struct ApiForbidden;
+#[derive(RivetError, Serialize)]
+#[error("api", "forbidden", "Access denied", "Access denied: {reason}")]
+pub struct ApiForbidden {
+	pub reason: String,
+}
 
 #[derive(RivetError)]
 #[error("api", "internal_error", "An internal server error occurred")]
@@ -27,3 +29,7 @@ pub struct ApiInternalError;
 pub struct ApiBadRequest {
 	pub reason: String,
 }
+
+#[derive(RivetError)]
+#[error("api", "bad_token", "Invalid token provided")]
+pub struct ApiBadToken;

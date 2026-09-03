@@ -1,6 +1,7 @@
 // Internal types
 #[doc(hidden)]
 pub use rivet_cache;
+pub use rivet_metrics::{FloatGaugeGuard, GaugeGuard, GaugeGuardExt, IntGaugeGuard};
 #[doc(hidden)]
 pub use rivet_pools::{self, prelude::*};
 pub use rivet_util::{Id, future::CustomInstrumentExt, timestamp::DateTimeExt};

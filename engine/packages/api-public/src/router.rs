@@ -1,3 +1,4 @@
+use anyhow::Result;
 use axum::{
 	extract::Request,
 	middleware::{self, Next},
@@ -45,11 +46,11 @@ use crate::{
 )]
 pub struct ApiDoc;
 
-#[tracing::instrument(skip_all)]
+#[tracing::instrument(level = "debug", skip_all)]
 pub async fn router(
 	config: rivet_config::Config,
 	pools: rivet_pools::Pools,
-) -> anyhow::Result<axum::Router> {
+) -> Result<axum::Router> {
 	tracing::debug!("creating api-public router");
 
 	create_router("api-public", config, pools, |router| {
@@ -121,6 +122,7 @@ pub async fn router(
 			.route("/ui", axum::routing::get(ui::serve_index))
 			.route("/ui/", axum::routing::get(ui::serve_index))
 			.route("/ui/{*path}", axum::routing::get(ui::serve_ui))
+			// MARK: ACL
 			// MARK: Middleware (must go after all routes)
 			// Add CORS layer that mirrors the request origin
 			.layer(
@@ -137,7 +139,7 @@ pub async fn router(
 
 /// Middleware to wrap ApiCtx with auth handling capabilities and to throw an error if auth was not explicitly
 // handled in an endpoint
-#[tracing::instrument(skip_all)]
+#[tracing::instrument(level = "debug", skip_all)]
 async fn auth_middleware(
 	headers: HeaderMap,
 	mut req: Request,

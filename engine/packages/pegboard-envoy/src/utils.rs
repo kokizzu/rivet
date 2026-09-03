@@ -1,7 +1,9 @@
 use gas::prelude::*;
-use rivet_envoy_protocol::PROTOCOL_VERSION;
 
 use crate::errors::WsError;
+
+/// Oldest envoy protocol version this engine still speaks.
+const MIN_PROTOCOL_VERSION: u16 = 2;
 
 #[derive(Clone)]
 pub struct UrlData {
@@ -13,7 +15,12 @@ pub struct UrlData {
 }
 
 impl UrlData {
-	pub fn parse_url(url: url::Url) -> Result<UrlData> {
+	/// Parses the envoy handshake URL.
+	///
+	/// `max_protocol_version` is the version negotiated across the engine fleet, not this binary's
+	/// compiled ceiling. An envoy accepted at a version an older pod cannot speak would break as
+	/// soon as its actor commands landed on that pod.
+	pub fn parse_url(url: url::Url, max_protocol_version: u16) -> Result<UrlData> {
 		// Read protocol version from query parameters
 		let protocol_version = url
 			.query_pairs()
@@ -25,7 +32,7 @@ impl UrlData {
 			.context(
 				WsError::InvalidRequest("invalid `protocol_version` query parameter").build(),
 			)?;
-		if protocol_version < 2 || protocol_version > PROTOCOL_VERSION {
+		if protocol_version < MIN_PROTOCOL_VERSION || protocol_version > max_protocol_version {
 			return Err(
 				WsError::InvalidRequest("unsupported `protocol_version` query parameter").build(),
 			);

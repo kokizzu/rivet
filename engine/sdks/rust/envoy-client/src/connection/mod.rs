@@ -333,6 +333,11 @@ fn to_rivet_kind(message: &protocol::ToRivet) -> &'static str {
 		protocol::ToRivet::ToRivetKvRequest(_) => "kv_request",
 		protocol::ToRivet::ToRivetSqliteGetPagesRequest(_) => "sqlite_get_pages",
 		protocol::ToRivet::ToRivetSqliteCommitRequest(_) => "sqlite_commit",
+		protocol::ToRivet::ToRivetSqliteCommitStageBeginRequest(_) => "sqlite_commit_stage_begin",
+		protocol::ToRivet::ToRivetSqliteCommitStageSegmentRequest(_) => {
+			"sqlite_commit_stage_segment"
+		}
+		protocol::ToRivet::ToRivetSqliteCommitFinalizeRequest(_) => "sqlite_commit_finalize",
 		protocol::ToRivet::ToRivetSqliteExecRequest(_) => "sqlite_exec",
 		protocol::ToRivet::ToRivetSqliteExecuteRequest(_) => "sqlite_execute",
 		protocol::ToRivet::ToRivetSqliteExecuteBatchRequest(_) => "sqlite_execute_batch",

@@ -179,6 +179,15 @@ pub enum WorkflowError {
 
 	#[error("flush channel closed")]
 	FlushChannelClosed,
+
+	#[error(
+		"lease fence mismatch for workflow {workflow_id}: leased by {current_worker_id:?}, not {worker_id}"
+	)]
+	LeaseFenceMismatch {
+		workflow_id: Id,
+		worker_id: Id,
+		current_worker_id: Option<Id>,
+	},
 }
 
 impl WorkflowError {
@@ -218,6 +227,12 @@ impl WorkflowError {
 			WorkflowError::Udb(_) => Some(rivet_util::timestamp::now() + 30_000),
 			_ => None,
 		}
+	}
+
+	/// Whether this error means the worker no longer holds the lease for the workflow. Nothing can be
+	/// written for the workflow anymore, including its own error state.
+	pub(crate) fn is_lease_fence_mismatch(&self) -> bool {
+		matches!(self, WorkflowError::LeaseFenceMismatch { .. })
 	}
 
 	/// Any error that the workflow can continue on with its execution from.

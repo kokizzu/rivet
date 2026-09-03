@@ -36,17 +36,7 @@
 		"handlebars": "^4.7.9"
 	},
 	"resolutions": {
-		"rivetkit": "workspace:*",
-		"@rivetkit/react": "workspace:*",
-		"@rivetkit/next-js": "workspace:*",
-		"@rivetkit/cloudflare-workers": "workspace:*",
-		"@rivetkit/supabase": "workspace:*",
-		"@rivetkit/db": "workspace:*",
 		"@rivetkit/engine-api-full": "workspace:*",
-		"@rivetkit/rivetkit-napi": "workspace:*",
-		"@rivetkit/rivetkit-wasm": "workspace:*",
-		"@rivetkit/engine-cli": "workspace:*",
-		"@rivetkit/effect": "workspace:*",
 		"@types/react": "^19",
 		"@types/react-dom": "^19"
 	},

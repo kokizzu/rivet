@@ -1,4 +1,12 @@
 // from: v7.bare, to: v6.bare
+// Downgrades of the staged-commit messages return an error rather than panicking: a v6 peer has no
+// staged-commit path at all, so the only correct answer is to refuse the conversion.
+//
+// There is no client-side fallback behind this. The client stages purely on dirty page count and
+// never inspects the negotiated version, so a large commit against a v6 peer fails here rather than
+// taking the single-shot path. That is the intended behavior for now, since the single-shot path
+// would be refused by the engine at this size anyway, but it means this error is reachable and not
+// merely defensive.
 
 #![allow(dead_code, unused_variables)]
 
@@ -674,12 +682,6 @@ pub fn convert_message_id_v7_to_v6(x: v7::MessageId) -> Result<v6::MessageId> {
 pub fn convert_to_envoy_request_start_v7_to_v6(
 	x: v7::ToEnvoyRequestStart,
 ) -> Result<v6::ToEnvoyRequestStart> {
-	if x.actor_generation.is_some() {
-		bail!("actor generation routing requires envoy protocol v7");
-	}
-	if x.response_stream {
-		bail!("streaming HTTP responses require envoy protocol v7");
-	}
 	Ok(v6::ToEnvoyRequestStart {
 		actor_id: x.actor_id,
 		method: x.method,
@@ -722,9 +724,6 @@ pub fn convert_to_rivet_response_chunk_v7_to_v6(
 pub fn convert_to_envoy_web_socket_open_v7_to_v6(
 	x: v7::ToEnvoyWebSocketOpen,
 ) -> Result<v6::ToEnvoyWebSocketOpen> {
-	if x.actor_generation.is_some() {
-		bail!("actor generation routing requires envoy protocol v7");
-	}
 	Ok(v6::ToEnvoyWebSocketOpen {
 		actor_id: x.actor_id,
 		path: x.path,
@@ -797,14 +796,8 @@ pub fn convert_to_rivet_tunnel_message_kind_v7_to_v6(
 				convert_to_rivet_response_chunk_v7_to_v6(v)?,
 			)
 		}
-		v7::ToRivetTunnelMessageKind::ToRivetResponseAbort(_) => {
+		v7::ToRivetTunnelMessageKind::ToRivetResponseAbort => {
 			v6::ToRivetTunnelMessageKind::ToRivetResponseAbort
-		}
-		v7::ToRivetTunnelMessageKind::ToRivetRequestBodyWindowUpdate(_) => {
-			bail!("HTTP request body window updates require envoy protocol v7");
-		}
-		v7::ToRivetTunnelMessageKind::ToRivetRequestBodyCancel => {
-			bail!("HTTP request body cancellation requires envoy protocol v7");
 		}
 		v7::ToRivetTunnelMessageKind::ToRivetWebSocketOpen(v) => {
 			v6::ToRivetTunnelMessageKind::ToRivetWebSocketOpen(
@@ -852,17 +845,8 @@ pub fn convert_to_envoy_tunnel_message_kind_v7_to_v6(
 				convert_to_envoy_request_chunk_v7_to_v6(v)?,
 			)
 		}
-		v7::ToEnvoyTunnelMessageKind::ToEnvoyRequestAbort(abort) => {
-			if abort.actor_id.is_some() || abort.actor_generation.is_some() {
-				bail!("exact HTTP cancellation identity requires envoy protocol v7");
-			}
+		v7::ToEnvoyTunnelMessageKind::ToEnvoyRequestAbort => {
 			v6::ToEnvoyTunnelMessageKind::ToEnvoyRequestAbort
-		}
-		v7::ToEnvoyTunnelMessageKind::ToEnvoyRequestBodyCancel => {
-			bail!("HTTP request body cancellation requires envoy protocol v7");
-		}
-		v7::ToEnvoyTunnelMessageKind::ToEnvoyResponseBodyWindowUpdate(_) => {
-			bail!("HTTP response body window updates require envoy protocol v7");
 		}
 		v7::ToEnvoyTunnelMessageKind::ToEnvoyWebSocketOpen(v) => {
 			v6::ToEnvoyTunnelMessageKind::ToEnvoyWebSocketOpen(
@@ -1011,6 +995,15 @@ pub fn convert_to_rivet_v7_to_v6(x: v7::ToRivet) -> Result<v6::ToRivet> {
 		v7::ToRivet::ToRivetSqliteCommitRequest(v) => v6::ToRivet::ToRivetSqliteCommitRequest(
 			convert_to_rivet_sqlite_commit_request_v7_to_v6(v)?,
 		),
+		v7::ToRivet::ToRivetSqliteCommitStageBeginRequest(_) => {
+			bail!("staged commit begin cannot be represented in envoy protocol v6")
+		}
+		v7::ToRivet::ToRivetSqliteCommitStageSegmentRequest(_) => {
+			bail!("staged commit segment cannot be represented in envoy protocol v6")
+		}
+		v7::ToRivet::ToRivetSqliteCommitFinalizeRequest(_) => {
+			bail!("staged commit finalize cannot be represented in envoy protocol v6")
+		}
 		v7::ToRivet::ToRivetSqliteExecRequest(v) => {
 			v6::ToRivet::ToRivetSqliteExecRequest(convert_to_rivet_sqlite_exec_request_v7_to_v6(v)?)
 		}
@@ -1135,6 +1128,15 @@ pub fn convert_to_envoy_v7_to_v6(x: v7::ToEnvoy) -> Result<v6::ToEnvoy> {
 		v7::ToEnvoy::ToEnvoySqliteCommitResponse(v) => v6::ToEnvoy::ToEnvoySqliteCommitResponse(
 			convert_to_envoy_sqlite_commit_response_v7_to_v6(v)?,
 		),
+		v7::ToEnvoy::ToEnvoySqliteCommitStageBeginResponse(_) => {
+			bail!("staged commit begin response cannot be represented in envoy protocol v6")
+		}
+		v7::ToEnvoy::ToEnvoySqliteCommitStageSegmentResponse(_) => {
+			bail!("staged commit segment response cannot be represented in envoy protocol v6")
+		}
+		v7::ToEnvoy::ToEnvoySqliteCommitFinalizeResponse(_) => {
+			bail!("staged commit finalize response cannot be represented in envoy protocol v6")
+		}
 		v7::ToEnvoy::ToEnvoySqliteExecResponse(v) => v6::ToEnvoy::ToEnvoySqliteExecResponse(
 			convert_to_envoy_sqlite_exec_response_v7_to_v6(v)?,
 		),

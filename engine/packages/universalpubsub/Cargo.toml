@@ -13,6 +13,7 @@ async-trait.workspace = true
 futures-util.workspace = true
 lazy_static.workspace = true
 rand.workspace = true
+rivet-config.workspace = true
 rivet-error.workspace = true
 rivet-metrics.workspace = true
 rivet-perf.workspace = true
@@ -28,7 +29,6 @@ uuid.workspace = true
 vbare.workspace = true
 
 [dev-dependencies]
-rivet-config.workspace = true
 rivet-env.workspace = true
 tabled.workspace = true
 tempfile.workspace = true

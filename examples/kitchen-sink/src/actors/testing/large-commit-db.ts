@@ -27,6 +27,16 @@ interface WriteInput {
 	// equivalence test writes identical content with 1 and with many, so the
 	// staged path can be compared against the single-shot path it replaces.
 	batches?: number;
+	// Fill rows with random bytes instead of the deterministic payload.
+	//
+	// The deterministic payload is a repeating id, which compresses by around
+	// forty times, so a commit that is a hundred megabytes of pages is only a
+	// couple of megabytes once staged. That is fine for correctness and useless
+	// for anything measuring byte volume: a throttle sees the compressed size.
+	// Random rows make a commit cost what its page count implies, at the price
+	// of losing per-row verification, which `verify` falls back to length and
+	// row counting for.
+	random?: boolean;
 }
 
 interface StorageStats {
@@ -65,12 +75,18 @@ function finiteInt(value: number | undefined, fallback: number): number {
 // The payload every row is expected to hold, as a SQL expression over `id`.
 // Repeating a zero-padded id fills the row deterministically and lets the
 // verifier recompute the same bytes without shipping them anywhere.
+function randomPayloadExpr(rowBytes: number): string {
+	return `substr(hex(randomblob(${Math.ceil(rowBytes / 2)})), 1, ${rowBytes})`;
+}
+
 function payloadExpr(idExpr: string, rowBytes: number): string {
-	return `substr(replace(hex(zeroblob(${Math.ceil(rowBytes / 16)})), '00', printf('%08d', ${idExpr})), 1, ${rowBytes})`;
+	return `substr(replace(hex(zeroblob(${Math.ceil(rowBytes / 8)})), '00', printf('%08d', ${idExpr})), 1, ${rowBytes})`;
 }
 
 async function queryOne<T>(
-	database: { execute: (sql: string, ...args: unknown[]) => Promise<unknown[]> },
+	database: {
+		execute: (sql: string, ...args: unknown[]) => Promise<unknown[]>;
+	},
 	sql: string,
 ): Promise<T> {
 	const rows = await database.execute(sql);
@@ -124,8 +140,13 @@ export const largeCommitDb = actor({
 			const rows = finiteInt(input.rows, DEFAULT_ROWS);
 			const rowBytes = finiteInt(input.rowBytes, DEFAULT_ROW_BYTES);
 			const batches = finiteInt(input.batches, 1);
+			const payload = input.random
+				? randomPayloadExpr(rowBytes)
+				: payloadExpr("id", rowBytes);
 			if (rows % batches !== 0) {
-				throw new Error(`rows ${rows} must divide evenly into ${batches} batches`);
+				throw new Error(
+					`rows ${rows} must divide evenly into ${batches} batches`,
+				);
 			}
 
 			const before = await storageStats(c.db);
@@ -148,7 +169,7 @@ export const largeCommitDb = actor({
 							 SELECT ?
 							 UNION ALL SELECT id + 1 FROM seq WHERE id < ?
 						 )
-						 SELECT id, ${payloadExpr("id", rowBytes)} FROM seq`,
+						 SELECT id, ${payload} FROM seq`,
 						batchStart,
 						batchStart + perBatch - 1,
 					);
@@ -185,6 +206,9 @@ export const largeCommitDb = actor({
 		rewriteAll: async (c, input: WriteInput = {}): Promise<WriteResult> => {
 			const startedAt = performance.now();
 			const rowBytes = finiteInt(input.rowBytes, DEFAULT_ROW_BYTES);
+			const payload = input.random
+				? randomPayloadExpr(rowBytes)
+				: payloadExpr("id", rowBytes);
 			const before = await storageStats(c.db);
 
 			const batchStartedAt = performance.now();
@@ -193,15 +217,15 @@ export const largeCommitDb = actor({
 				// Same expression the writer used, so a rewrite is a no-op in
 				// content and any difference the verifier sees afterwards came
 				// from the storage layer rather than from the SQL.
-				await c.db.execute(
-					`UPDATE big_rows SET payload = ${payloadExpr("id", rowBytes)}`,
-				);
+				await c.db.execute(`UPDATE big_rows SET payload = ${payload}`);
 				await c.db.execute("COMMIT");
 			} catch (err) {
 				await c.db.execute("ROLLBACK").catch(() => undefined);
 				throw err;
 			}
-			const slowestBatchMs = Math.round(performance.now() - batchStartedAt);
+			const slowestBatchMs = Math.round(
+				performance.now() - batchStartedAt,
+			);
 
 			const after = await storageStats(c.db);
 			return {
@@ -223,7 +247,7 @@ export const largeCommitDb = actor({
 		// version passes it; comparing content catches that.
 		verify: async (
 			c,
-			input: { rowBytes?: number } = {},
+			input: { rowBytes?: number; random?: boolean } = {},
 		): Promise<
 			{
 				ok: boolean;
@@ -241,8 +265,14 @@ export const largeCommitDb = actor({
 			);
 			const integrity = messages.join("; ");
 
+			// Random rows cannot be recomputed, so the strongest check left is that
+			// every row is the length it was written at. A page served from a
+			// stale version still shows up, because a stale page holds different
+			// rows entirely and the id gap check below catches that.
 			const mismatched = (await c.db.execute(
-				`SELECT count(*) AS n FROM big_rows WHERE payload != ${payloadExpr("id", rowBytes)}`,
+				input.random
+					? `SELECT count(*) AS n FROM big_rows WHERE length(payload) != ${rowBytes}`
+					: `SELECT count(*) AS n FROM big_rows WHERE payload != ${payloadExpr("id", rowBytes)}`,
 			)) as Array<{ n: number }>;
 			// Ids are dense from 1, so max(id) over count(*) catches a row that
 			// vanished entirely, which a per-row comparison cannot see.
@@ -262,6 +292,56 @@ export const largeCommitDb = actor({
 				integrity,
 				mismatchedRows,
 				idGaps,
+			};
+		},
+
+		// Deletes down to `keepRows` and reclaims the freed space, which is the
+		// shape truncate cleanup exists for: a commit with a small dirty set and
+		// a large drop in database size.
+		//
+		// VACUUM rewrites the database into its compacted form, so the commit it
+		// produces dirties only the pages that survive while the file's EOF falls
+		// by everything that did not. The engine has to clear one PIDX row per
+		// page above the new EOF inside the commit transaction, and nothing bounds
+		// that by the dirty page cap.
+		shrink: async (
+			c,
+			input: { keepRows?: number; deleteBatch?: number } = {},
+		): Promise<{
+			pagesBefore: number;
+			pagesAfter: number;
+			pagesDropped: number;
+			rowsBefore: number;
+			rowsAfter: number;
+			deleteMs: number;
+			vacuumMs: number;
+		}> => {
+			const keepRows = finiteInt(input.keepRows, 1_000);
+			const deleteBatch = finiteInt(input.deleteBatch, 2_000);
+			const before = await storageStats(c.db);
+
+			// Batched so the deletes themselves stay under the single commit cap.
+			// The point of the test is the shrink, not a large delete.
+			const deleteStartedAt = performance.now();
+			for (let id = before.rows; id > keepRows; id -= deleteBatch) {
+				const lower = Math.max(keepRows, id - deleteBatch);
+				await c.db.execute("DELETE FROM big_rows WHERE id > ? AND id <= ?", lower, id);
+			}
+			const deleteMs = Math.round(performance.now() - deleteStartedAt);
+
+			const vacuumStartedAt = performance.now();
+			await c.db.execute("VACUUM");
+			const vacuumMs = Math.round(performance.now() - vacuumStartedAt);
+
+			const after = await storageStats(c.db);
+			return {
+				pagesBefore: before.pageCount,
+				pagesAfter: after.pageCount,
+				pagesDropped: before.pageCount - after.pageCount,
+				rowsBefore: before.rows,
+				rowsAfter: after.rows,
+				deleteMs,
+				vacuumMs,
 			};
 		},
 

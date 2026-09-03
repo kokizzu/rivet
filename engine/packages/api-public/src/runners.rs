@@ -83,7 +83,7 @@ pub async fn list_names(
 	}
 }
 
-#[tracing::instrument(skip_all)]
+#[tracing::instrument(level = "debug", skip_all)]
 async fn list_names_inner(ctx: ApiCtx, query: ListNamesQuery) -> Result<ListNamesResponse> {
 	ctx.auth().await?;
 

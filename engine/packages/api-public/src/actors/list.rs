@@ -39,6 +39,7 @@ use crate::{actors::utils::fetch_actors_by_ids, ctx::ApiCtx, errors};
 	responses(
 		(status = 200, body = ListResponse),
 	),
+	security(("bearer_auth" = [])),
 )]
 pub async fn list(Extension(ctx): Extension<ApiCtx>, Query(query): Query<ListQuery>) -> Response {
 	match list_inner(ctx, query).await {
@@ -48,12 +49,7 @@ pub async fn list(Extension(ctx): Extension<ApiCtx>, Query(query): Query<ListQue
 }
 
 async fn list_inner(ctx: ApiCtx, query: ListQuery) -> Result<ListResponse> {
-	// Reading is allowed, list requires auth
-	if query.actor_ids.is_none() && query.actor_id.is_empty() && query.key.is_none() {
-		ctx.auth().await?;
-	} else {
-		ctx.skip_auth();
-	}
+	ctx.auth().await?;
 
 	// Parse query
 	let actor_ids = [

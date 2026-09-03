@@ -1,4 +1,4 @@
-use std::str::FromStr;
+use std::{str::FromStr, sync::Arc};
 
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
@@ -6,6 +6,7 @@ use tokio::sync::mpsc;
 
 use super::{
 	codec,
+	shared::PostgresShared,
 	transport::{CommitJob, DedupKey, Responder},
 };
 
@@ -89,6 +90,7 @@ pub async fn connect(config: &NatsConfig) -> Result<async_nats::Client> {
 /// [`CommitJob`], and forward it into the drain loop's job queue. Returns when the subscription ends
 /// (client closed) or the drain loop's receiver is dropped (step-down).
 pub async fn run_commit_subscriber(
+	shared: &Arc<PostgresShared>,
 	client: async_nats::Client,
 	subject: String,
 	jobs_tx: mpsc::Sender<CommitJob>,
@@ -123,6 +125,7 @@ pub async fn run_commit_subscriber(
 			responder: Responder::Nats {
 				client: client.clone(),
 				reply,
+				protocol_version: shared.commit_protocol_version(),
 			},
 		};
 

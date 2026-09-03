@@ -9,6 +9,7 @@ use depot::{
 };
 use gas::prelude::{Id, util::timestamp};
 use pegboard::actor_kv::Recipient;
+use pegboard::actor_sqlite::MIGRATION_COMMIT_PAGES;
 use rivet_pools::NodeId;
 use rusqlite::{Connection, params};
 use tempfile::tempdir;
@@ -508,4 +509,114 @@ async fn rejects_v1_files_that_exceed_migration_limit() -> Result<()> {
 	);
 
 	Ok(())
+}
+
+#[tokio::test]
+async fn migrates_v1_sqlite_larger_than_one_commit() -> Result<()> {
+	let db = test_db().await?;
+	let actor_id = Id::new_v1(1);
+	let recipient = recipient(actor_id);
+	let notes = large_notes(400);
+	let fixture = build_fixture_db(&notes.iter().map(String::as_str).collect::<Vec<_>>())?;
+	assert!(
+		fixture.len() / SQLITE_PAGE_SIZE as usize > MIGRATION_COMMIT_PAGES,
+		"fixture should not fit in a single import batch, got {} bytes",
+		fixture.len()
+	);
+	seed_v1_file(&db, &recipient, FILE_TAG_MAIN, &fixture).await?;
+
+	assert!(migrate(&db, actor_id).await?.migrated);
+
+	let actor_id_str = actor_id.to_string();
+	assert_eq!(
+		query_note_values(&load_v2_bytes(&db, &actor_id_str).await?)?,
+		notes
+	);
+	assert_eq!(read_migration_marker(&db, actor_id).await?, None);
+
+	// The database is complete, so a second pass has nothing to do.
+	assert!(!migrate(&db, actor_id).await?.migrated);
+
+	Ok(())
+}
+
+#[tokio::test]
+async fn resumes_v1_import_left_unfinished_by_a_failed_attempt() -> Result<()> {
+	let db = test_db().await?;
+	let actor_id = Id::new_v1(1);
+	let recipient = recipient(actor_id);
+	let actor_id_str = actor_id.to_string();
+	let notes = large_notes(400);
+	let fixture = build_fixture_db(&notes.iter().map(String::as_str).collect::<Vec<_>>())?;
+	let total_pages = (fixture.len() / SQLITE_PAGE_SIZE as usize) as u32;
+	seed_v1_file(&db, &recipient, FILE_TAG_MAIN, &fixture).await?;
+
+	// Stand in for an attempt that died after its first commit: pages 2 through
+	// the batch size are published, page 1 is not, and the marker is still set.
+	write_migration_marker(&db, actor_id, Some(total_pages)).await?;
+	let batch_end = MIGRATION_COMMIT_PAGES as u32 + 1;
+	let partial_pages = (2..=batch_end)
+		.map(|pgno| DirtyPage {
+			pgno,
+			bytes: fixture[(pgno as usize - 1) * SQLITE_PAGE_SIZE as usize..]
+				[..SQLITE_PAGE_SIZE as usize]
+				.to_vec(),
+		})
+		.collect::<Vec<_>>();
+	actor_db(&db, &actor_id_str)
+		.commit(partial_pages, batch_end, timestamp::now())
+		.await?;
+
+	// The unfinished import must not be mistaken for a complete database.
+	assert!(migrate(&db, actor_id).await?.migrated);
+
+	assert_eq!(
+		query_note_values(&load_v2_bytes(&db, &actor_id_str).await?)?,
+		notes
+	);
+	assert_eq!(read_migration_marker(&db, actor_id).await?, None);
+
+	Ok(())
+}
+
+fn large_notes(count: usize) -> Vec<String> {
+	(0..count)
+		.map(|idx| format!("{idx:05}-{}", "x".repeat(4000)))
+		.collect()
+}
+
+async fn write_migration_marker(
+	db: &universaldb::Database,
+	actor_id: Id,
+	total_pages: Option<u32>,
+) -> Result<()> {
+	db.txn("test_pegboard_actor_sqlite_write_marker", move |tx| {
+		let total_pages = total_pages;
+		async move {
+			let tx = tx.with_subspace(pegboard::keys::subspace());
+			let key = pegboard::keys::actor::SqliteMigrationKey::new(actor_id);
+			match total_pages {
+				Some(total_pages) => tx.write(&key, total_pages)?,
+				None => tx.delete(&key),
+			}
+
+			Ok(())
+		}
+	})
+	.await
+}
+
+async fn read_migration_marker(db: &universaldb::Database, actor_id: Id) -> Result<Option<u32>> {
+	db.txn(
+		"test_pegboard_actor_sqlite_read_marker",
+		move |tx| async move {
+			tx.with_subspace(pegboard::keys::subspace())
+				.read_opt(
+					&pegboard::keys::actor::SqliteMigrationKey::new(actor_id),
+					universaldb::utils::IsolationLevel::Serializable,
+				)
+				.await
+		},
+	)
+	.await
 }

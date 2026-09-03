@@ -80,7 +80,7 @@ use rivet_guard_core::CertResolverFn;
 ///
 /// It follows the same routing logic as the main routing function to ensure
 /// consistent behavior between routing and certificate selection.
-#[tracing::instrument(skip_all)]
+#[tracing::instrument(level = "debug", skip_all)]
 pub async fn create_cert_resolver(
 	_ctx: &gas::prelude::StandaloneCtx,
 ) -> Result<Option<CertResolverFn>> {

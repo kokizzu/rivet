@@ -4,18 +4,15 @@ use std::collections::BTreeMap;
 
 use anyhow::{Context, Result};
 use futures_util::TryStreamExt;
-use universaldb::{
-	RangeOption,
-	options::StreamingMode,
-	utils::{IsolationLevel::Snapshot, end_of_key_range},
-};
+use universaldb::{RangeOption, options::StreamingMode, utils::IsolationLevel::Snapshot};
 
 use crate::{
 	conveyer::{
 		Db, branch,
 		db::load_branch_ancestry,
-		keys,
+		delta_blob, keys,
 		ltx::{DecodedLtx, decode_ltx_v3},
+		shard_blob,
 		types::{
 			CommitRow, DatabaseBranchId, FetchedPage, RestorePointIndexEntry,
 			SQLITE_STORAGE_COLD_SCHEMA_VERSION, decode_commit_row, decode_restore_point_record,
@@ -173,7 +170,7 @@ pub async fn read_at(db: &Db, versionstamp: [u8; 16]) -> Result<PageState> {
 		})
 		.await?;
 
-	let pages = fill_missing_pages(read_plan.db_size_pages, read_plan.pages);
+	let pages = materialize_pages(read_plan.db_size_pages, read_plan.pages);
 
 	Ok(PageState {
 		branch_id: read_plan.branch_id,
@@ -182,6 +179,23 @@ pub async fn read_at(db: &Db, versionstamp: [u8; 16]) -> Result<PageState> {
 		db_size_pages: read_plan.db_size_pages,
 		pages,
 	})
+}
+
+/// Turns the hot-tier page map into a dense page list. A page the hot tier does not hold reads back
+/// as zeroes, which is what a page with no source has always meant here.
+fn materialize_pages(
+	db_size_pages: u32,
+	mut pages: BTreeMap<u32, Option<Vec<u8>>>,
+) -> Vec<FetchedPage> {
+	(1..=db_size_pages)
+		.map(|pgno| FetchedPage {
+			pgno,
+			bytes: pages
+				.remove(&pgno)
+				.flatten()
+				.or_else(|| Some(vec![0; keys::PAGE_SIZE as usize])),
+		})
+		.collect()
 }
 
 struct DebugReadPlan {
@@ -266,20 +280,6 @@ async fn load_pages_from_hot_tier(
 	Ok(pages)
 }
 
-fn fill_missing_pages(
-	db_size_pages: u32,
-	mut pages: BTreeMap<u32, Option<Vec<u8>>>,
-) -> Vec<FetchedPage> {
-	(1..=db_size_pages)
-		.map(|pgno| FetchedPage {
-			pgno,
-			bytes: pages
-				.remove(&pgno)
-				.unwrap_or_else(|| Some(vec![0; keys::PAGE_SIZE as usize])),
-		})
-		.collect()
-}
-
 async fn read_commit_row(
 	tx: &universaldb::Transaction,
 	branch_id: DatabaseBranchId,
@@ -342,30 +342,29 @@ async fn tx_load_delta_blobs(
 	tx: &universaldb::Transaction,
 	source: DebugReadSource,
 ) -> Result<Vec<(u64, Vec<u8>)>> {
-	let mut chunks_by_txid = BTreeMap::<u64, Vec<(u32, Vec<u8>)>>::new();
-	for (key, chunk) in scan_prefix(tx, &keys::branch_delta_prefix(source.branch_id)).await? {
-		let txid = keys::decode_branch_delta_chunk_txid(source.branch_id, &key)?;
-		if txid > source.max_txid {
-			continue;
-		}
-		let chunk_idx = keys::decode_branch_delta_chunk_idx(source.branch_id, txid, &key)?;
-		chunks_by_txid
-			.entry(txid)
-			.or_default()
-			.push((chunk_idx, chunk));
-	}
+	let rows = scan_prefix(tx, &keys::branch_delta_prefix(source.branch_id))
+		.await?
+		.into_iter()
+		.filter(|(key, _)| {
+			keys::decode_branch_delta_chunk_txid(source.branch_id, key)
+				.is_ok_and(|txid| txid <= source.max_txid)
+		})
+		.collect::<Vec<_>>();
 
-	let mut blobs = Vec::new();
-	for (txid, mut chunks) in chunks_by_txid.into_iter().rev() {
-		chunks.sort_by_key(|(chunk_idx, _)| *chunk_idx);
-		let mut blob = Vec::new();
-		for (_, chunk) in chunks {
-			blob.extend_from_slice(&chunk);
-		}
-		blobs.push((txid, blob));
-	}
-
-	Ok(blobs)
+	// Descending, so the caller walks history newest first and stops at the first blob holding a
+	// page it still needs. A segmented commit contributes one entry per segment; segments of one
+	// txid are disjoint, so their relative order among themselves does not matter.
+	Ok(
+		delta_blob::reassemble_delta_segments_by_txid(source.branch_id, &rows)?
+			.into_iter()
+			.rev()
+			.flat_map(|(txid, segments)| {
+				segments
+					.into_iter()
+					.map(move |segment| (txid, segment.blob))
+			})
+			.collect(),
+	)
 }
 
 async fn tx_load_latest_shard_blob(
@@ -374,25 +373,19 @@ async fn tx_load_latest_shard_blob(
 	shard_id: u32,
 ) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
 	for source in sources {
-		let prefix = keys::branch_shard_version_prefix(source.branch_id, shard_id);
-		let end_key = keys::branch_shard_key(source.branch_id, shard_id, source.max_txid);
-		let end = end_of_key_range(&end_key);
-		let informal = tx.informal();
-		let mut stream = informal.get_ranges_keyvalues(
-			RangeOption {
-				mode: StreamingMode::WantAll,
-				..(prefix.as_slice(), end.as_slice()).into()
-			},
+		let load = shard_blob::read_latest_shard_blob(
+			tx,
+			source.branch_id,
+			shard_id,
+			source.max_txid,
 			Snapshot,
-		);
-
-		let mut latest = None;
-		while let Some(entry) = stream.try_next().await? {
-			latest = Some((entry.key().to_vec(), entry.value().to_vec()));
-		}
-
-		if latest.is_some() {
-			return Ok(latest);
+		)
+		.await?;
+		if let Some((as_of_txid, version)) = load.version {
+			return Ok(Some((
+				keys::branch_shard_key(source.branch_id, shard_id, as_of_txid),
+				version.blob,
+			)));
 		}
 	}
 

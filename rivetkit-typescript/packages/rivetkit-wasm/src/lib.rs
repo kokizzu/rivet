@@ -7,7 +7,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use js_sys::{Array, Function, Object, Promise, Reflect, Uint8Array};
 use rivet_error::{
 	ActorSpecifier, MacroMarker, RivetError as RivetTransportError, RivetErrorKind,
@@ -16,8 +16,8 @@ use rivet_error::{
 use rivetkit_core::error::public_error_status_code;
 use rivetkit_core::inspector::InspectorAuth;
 use rivetkit_core::{
-	ActorConfig, ActorConfigInput, ActorEvent, ActorFactory as CoreActorFactory, ActorStart,
-	ActorHttpResponse, ActorWorkKind, BindParam, ColumnValue, CoreRegistry as NativeCoreRegistry,
+	ActorConfig, ActorConfigInput, ActorEvent, ActorFactory as CoreActorFactory, ActorHttpResponse,
+	ActorStart, ActorWorkKind, BindParam, ColumnValue, CoreRegistry as NativeCoreRegistry,
 	CoreServerlessRuntime, EngineSpawnMode, EnqueueAndWaitOpts, KeepAwakeRegion, ListOpts,
 	QueueMessage, QueueNextBatchOpts, QueueSendResult, QueueSendStatus, QueueTryNextBatchOpts,
 	QueueWaitOpts, Request, RequestSaveOpts, Response, RuntimeSpawner, SerializeStateReason,
@@ -28,7 +28,7 @@ use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken as CoreCancellationToken;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::{JsCast, UnwrapThrowExt};
-use wasm_bindgen_futures::{spawn_local, JsFuture};
+use wasm_bindgen_futures::{JsFuture, spawn_local};
 
 const BRIDGE_RIVET_ERROR_PREFIX: &str = "__RIVET_ERROR_JSON__:";
 
@@ -3405,18 +3405,24 @@ mod tests {
 		assert_eq!(max_id, u32::MAX);
 		assert_eq!(wrapped_id, 2);
 		assert_eq!(context.websocket_callback_regions.borrow().len(), 3);
-		assert!(context
-			.websocket_callback_regions
-			.borrow()
-			.contains_key(&first_id));
-		assert!(context
-			.websocket_callback_regions
-			.borrow()
-			.contains_key(&max_id));
-		assert!(context
-			.websocket_callback_regions
-			.borrow()
-			.contains_key(&wrapped_id));
+		assert!(
+			context
+				.websocket_callback_regions
+				.borrow()
+				.contains_key(&first_id)
+		);
+		assert!(
+			context
+				.websocket_callback_regions
+				.borrow()
+				.contains_key(&max_id)
+		);
+		assert!(
+			context
+				.websocket_callback_regions
+				.borrow()
+				.contains_key(&wrapped_id)
+		);
 
 		context.end_websocket_callback(first_id);
 		context.end_websocket_callback(max_id);

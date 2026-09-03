@@ -35,9 +35,21 @@ pub fn config(_rivet_config: rivet_config::Config) -> Result<RunConfigData> {
 		),
 		// Core services
 		Service::new(
-			"tracing_reconfigure",
+			"dynamic_config",
 			ServiceKind::Core,
-			|config, pools| Box::pin(rivet_tracing_reconfigure::start(config, pools)),
+			|config, pools| Box::pin(rivet_dynamic_config::start(config, pools)),
+			false,
+		),
+		Service::new(
+			"version_management",
+			ServiceKind::Core,
+			|config, pools| Box::pin(rivet_version_management::start(config, pools)),
+			false,
+		),
+		Service::new(
+			"epoxy_protocol_version",
+			ServiceKind::Core,
+			|config, pools| Box::pin(epoxy::protocol_version::start(config, pools)),
 			false,
 		),
 		Service::new(

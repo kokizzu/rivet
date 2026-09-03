@@ -34,6 +34,52 @@ pub enum Operation {
 	},
 }
 
+/// Per-entry overhead FoundationDB charges for a mutation, beyond the key and value it carries.
+///
+/// See [`approximate_size`] for where these two numbers come from and what they are worth.
+const MUTATION_FRAMING_BYTES: i64 = 44;
+
+/// Per-entry overhead FoundationDB charges for a conflict range, beyond its two boundary keys.
+const CONFLICT_RANGE_FRAMING_BYTES: i64 = 32;
+
+/// Approximates the transaction size FoundationDB would charge for these mutations and conflict
+/// ranges, for drivers that have no such accounting of their own.
+///
+/// This is what the 10 MB transaction limit is measured against, and it is nothing like the keys and
+/// values a caller submitted. Every `set` also adds an implicit write conflict range, and each entry
+/// carries a fixed per-entry cost that dwarfs a small key, so a transaction of many small writes
+/// costs several times what its contents suggest.
+///
+/// The two framing constants are calibrated against the one point where the limit has actually been
+/// observed: depot's staged commit finalize, which writes a 29 byte key and an 8 byte value per
+/// page, publishes at 60,146 pages on a live cluster and fails with a non-retryable
+/// `transaction_too_large` at 62,152. That places the limit near 172 bytes per page against 37 bytes
+/// of key and value, and the constants are set so this function reproduces it.
+///
+/// So this is a calibrated model, not an accounting. On FoundationDB the cluster's own figure is
+/// authoritative and this function is not used. It exists so a bound measured on the FileSystem or
+/// Postgres drivers means roughly the same thing, and it is deliberately shaped to over-estimate for
+/// keys longer than the calibration point rather than under-estimate.
+fn approximate_size(
+	operations: &[Operation],
+	conflict_ranges: &[(Vec<u8>, Vec<u8>, ConflictRangeType)],
+) -> i64 {
+	let mut size = 0i64;
+	for operation in operations {
+		let (key_len, payload_len) = match operation {
+			Operation::SetValue { key, value } => (key.len(), value.len()),
+			Operation::Clear { key } => (key.len(), 0),
+			Operation::ClearRange { begin, end } => (begin.len(), end.len()),
+			Operation::AtomicOp { key, param, .. } => (key.len(), param.len()),
+		};
+		size += key_len as i64 + payload_len as i64 + MUTATION_FRAMING_BYTES;
+	}
+	for (begin, end, _) in conflict_ranges {
+		size += begin.len() as i64 + end.len() as i64 + CONFLICT_RANGE_FRAMING_BYTES;
+	}
+	size
+}
+
 /// Whether a transaction has nothing to commit: no mutations and no explicitly added write conflict
 /// ranges. FDB never commits a read-only transaction, so it can never conflict and never causes
 /// another transaction to conflict. Drivers use this to skip the commit path entirely.
@@ -79,6 +125,14 @@ impl TransactionOperations {
 
 	pub fn operations(&self) -> MutexGuard<'_, Vec<Operation>> {
 		self.operations.lock().unwrap()
+	}
+
+	/// See [`approximate_size`].
+	pub fn approximate_size(&self) -> i64 {
+		approximate_size(
+			&self.operations.lock().unwrap(),
+			&self.conflict_ranges.lock().unwrap(),
+		)
 	}
 
 	pub fn set(&self, key: &[u8], value: &[u8]) {
@@ -416,13 +470,26 @@ impl TransactionOperations {
 			}
 		}
 
-		// Build result respecting the limit
-		let mut keyvalues = Vec::new();
+		// Build result respecting the scan direction and the limit. The merged map is ordered
+		// ascending, so a reverse scan has to drain it back to front: otherwise the merge silently
+		// flips a reverse scan to ascending, and a limit takes the lowest keys instead of the
+		// highest. Reads with no local operations return above and never reach this path, so the
+		// direction only ever went wrong once the transaction held a pending write.
 		let limit = opt.limit.unwrap_or(usize::MAX);
-
-		for (key, value) in result_map.into_iter().take(limit) {
-			keyvalues.push(KeyValue::new(key, value));
-		}
+		let keyvalues = if opt.reverse {
+			result_map
+				.into_iter()
+				.rev()
+				.take(limit)
+				.map(|(key, value)| KeyValue::new(key, value))
+				.collect::<Vec<_>>()
+		} else {
+			result_map
+				.into_iter()
+				.take(limit)
+				.map(|(key, value)| KeyValue::new(key, value))
+				.collect::<Vec<_>>()
+		};
 
 		Ok(Values::new(keyvalues))
 	}

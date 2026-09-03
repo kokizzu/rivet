@@ -42,7 +42,7 @@ where
 {
 	type Output = <I::Activity as Activity>::Output;
 
-	#[tracing::instrument(skip_all)]
+	#[tracing::instrument(level = "debug", skip_all)]
 	async fn execute(self, ctx: &mut WorkflowCtx) -> Result<Self::Output> {
 		if let Some(version) = self.version {
 			ctx.v(version).activity(self.inner).await
@@ -102,7 +102,7 @@ pub struct RemovedStub<T: Removed>(PhantomData<T>);
 impl<T: Removed + Send + Sync> Executable for RemovedStub<T> {
 	type Output = ();
 
-	#[tracing::instrument(skip_all)]
+	#[tracing::instrument(level = "debug", skip_all)]
 	async fn execute(self, ctx: &mut WorkflowCtx) -> Result<Self::Output> {
 		ctx.removed::<T>().await
 	}

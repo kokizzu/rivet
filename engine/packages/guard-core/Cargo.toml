@@ -25,6 +25,7 @@ lazy_static.workspace = true
 moka = { workspace = true, features = ["future"] }
 opentelemetry.workspace = true
 opentelemetry-http.workspace = true
+parking_lot.workspace = true
 rand.workspace = true
 regex.workspace = true
 rivet-api-builder.workspace = true
@@ -37,6 +38,7 @@ rivet-runtime.workspace = true
 rivet-util.workspace = true
 rustls-pemfile.workspace = true
 rustls.workspace = true
+scc.workspace = true
 serde_json.workspace = true
 serde.workspace = true
 tokio-rustls.workspace = true

@@ -3,7 +3,7 @@ use std::{
 	pin::Pin,
 	sync::{
 		Arc,
-		atomic::{AtomicBool, Ordering},
+		atomic::{AtomicBool, AtomicI32, Ordering},
 	},
 };
 
@@ -23,7 +23,10 @@ use crate::{
 
 use crate::conflict_tracker::TransactionConflictTracker;
 
-use super::transaction_task::{TransactionCommand, TransactionTask};
+use super::{
+	database::RETRY_LIMIT_UNSET,
+	transaction_task::{TransactionCommand, TransactionTask},
+};
 
 pub struct RocksDbTransactionDriver {
 	db: Arc<OptimisticTransactionDB>,
@@ -32,12 +35,29 @@ pub struct RocksDbTransactionDriver {
 	tx_sender: OnceCell<mpsc::UnboundedSender<TransactionCommand>>,
 	txn_conflict_tracker: TransactionConflictTracker,
 	start_version: u64,
+	/// Per-transaction retry limit, shared with the `run` loop that owns the retries. `-1` means the
+	/// closure set none and the database-wide limit applies. Owned by the loop rather than this
+	/// driver because each attempt gets a fresh driver, and the limit has to outlive the attempt that
+	/// set it.
+	retry_limit: Arc<AtomicI32>,
 }
 
 impl RocksDbTransactionDriver {
 	pub fn new(
 		db: Arc<OptimisticTransactionDB>,
 		txn_conflict_tracker: TransactionConflictTracker,
+	) -> Self {
+		Self::with_retry_limit(
+			db,
+			txn_conflict_tracker,
+			Arc::new(AtomicI32::new(RETRY_LIMIT_UNSET)),
+		)
+	}
+
+	pub fn with_retry_limit(
+		db: Arc<OptimisticTransactionDB>,
+		txn_conflict_tracker: TransactionConflictTracker,
+		retry_limit: Arc<AtomicI32>,
 	) -> Self {
 		let start_version = txn_conflict_tracker.next_global_version();
 
@@ -48,6 +68,7 @@ impl RocksDbTransactionDriver {
 			tx_sender: OnceCell::new(),
 			txn_conflict_tracker,
 			start_version,
+			retry_limit,
 		}
 	}
 
@@ -73,6 +94,11 @@ impl RocksDbTransactionDriver {
 }
 
 impl TransactionDriver for RocksDbTransactionDriver {
+	fn retry_limit(&self, limit: i32) -> Result<()> {
+		self.retry_limit.store(limit.max(0), Ordering::SeqCst);
+		Ok(())
+	}
+
 	fn atomic_op(&self, key: &[u8], param: &[u8], op_type: MutationType) {
 		self.operations.atomic_op(key, param, op_type);
 	}
@@ -281,6 +307,11 @@ impl TransactionDriver for RocksDbTransactionDriver {
 			.add_conflict_range(begin, end, conflict_type);
 
 		Ok(())
+	}
+
+	fn approximate_size<'a>(&'a self) -> Pin<Box<dyn Future<Output = Result<i64>> + Send + 'a>> {
+		let size = self.operations.approximate_size();
+		Box::pin(async move { Ok(size) })
 	}
 
 	fn get_estimated_range_size_bytes<'a>(

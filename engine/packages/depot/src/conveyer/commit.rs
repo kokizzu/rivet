@@ -4,6 +4,8 @@ mod apply;
 mod branch_init;
 mod dirty;
 mod helpers;
+mod publish;
+mod stage;
 mod truncate;
 
 #[cfg(debug_assertions)]

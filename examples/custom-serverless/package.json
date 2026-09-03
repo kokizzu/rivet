@@ -16,7 +16,7 @@
 		"vitest": "^3.1.1"
 	},
 	"dependencies": {
-		"rivetkit": "*"
+		"rivetkit": "workspace:*"
 	},
 	"stableVersion": "0.8.0",
 	"template": {

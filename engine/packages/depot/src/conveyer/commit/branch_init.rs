@@ -2,10 +2,12 @@ use anyhow::{Context, Result};
 use universaldb::{options::MutationType, utils::IsolationLevel::Serializable};
 
 use crate::conveyer::{
-	branch, keys,
+	branch,
+	error::SqliteStorageError,
+	keys,
 	types::{
 		BranchState, BucketBranchId, BucketId, DatabaseBranchId, DatabaseBranchRecord,
-		DatabasePointer, encode_database_branch_record, encode_database_pointer,
+		DatabasePointer, decode_database_branch_record, encode_database_branch_record,
 	},
 	udb,
 };
@@ -47,6 +49,7 @@ pub(super) async fn resolve_or_allocate_branch(
 pub(super) async fn write_root_branch_metadata(
 	tx: &universaldb::Transaction,
 	branch_id: DatabaseBranchId,
+	bucket_id: BucketId,
 	bucket_branch: BucketBranchId,
 	database_id: &str,
 	now_ms: i64,
@@ -92,16 +95,51 @@ pub(super) async fn write_root_branch_metadata(
 			.await?;
 	}
 
-	let pointer = DatabasePointer {
-		current_branch: branch_id,
-		last_swapped_at_ms: now_ms,
-	};
-	let encoded_pointer =
-		encode_database_pointer(pointer).context("encode sqlite database pointer")?;
-	tx.informal().set(
-		&keys::database_pointer_cur_key(bucket_branch, database_id),
-		&encoded_pointer,
-	);
+	branch::write_database_pointer(
+		tx,
+		bucket_id,
+		bucket_branch,
+		database_id,
+		DatabasePointer {
+			current_branch: branch_id,
+			last_swapped_at_ms: now_ms,
+		},
+	)?;
+
+	Ok(())
+}
+
+/// Refuses a write to a branch that is not `Live`.
+///
+/// A frozen branch is one a restore or rollback is rebuilding, and a commit landing on it would
+/// publish over state the restore is still assembling. Every path that publishes a commit has to
+/// check, including the staged one: staging spans several transactions, so a branch can also be
+/// frozen partway through one.
+///
+/// A branch this transaction just allocated has no record to read yet and is writable by
+/// definition.
+pub(super) async fn ensure_branch_writable(
+	tx: &universaldb::Transaction,
+	branch_id: DatabaseBranchId,
+	database_initialized: bool,
+) -> Result<()> {
+	if database_initialized {
+		return Ok(());
+	}
+
+	let branch_record =
+		super::helpers::tx_get_value(tx, &keys::branches_list_key(branch_id), Serializable)
+			.await?
+			.as_deref()
+			.map(decode_database_branch_record)
+			.transpose()
+			.context("decode sqlite database branch record for commit")?;
+	if !branch_record
+		.as_ref()
+		.is_some_and(|record| record.state == BranchState::Live)
+	{
+		return Err(SqliteStorageError::BranchNotWritable.into());
+	}
 
 	Ok(())
 }

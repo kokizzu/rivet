@@ -7,6 +7,7 @@ pub fn registry() -> WorkflowResult<Registry> {
 
 	let mut registry = Registry::new();
 	registry.register_workflow::<pruner::Workflow>()?;
+	registry.register_workflow::<dead_wf_backfill::Workflow>()?;
 
 	Ok(registry)
 }

@@ -91,7 +91,7 @@ pub async fn task(
 				}
 			}
 			_ = drop_rx.changed() => {
-				tracing::warn!(reason=?drop_rx.borrow().as_ref(), "garbage collected");
+				tracing::debug!(reason=?drop_rx.borrow().as_ref(), "garbage collected");
 				return Err(WebSocketGarbageCollected {
 					phase: "active_websocket".to_owned(),
 					reason: format!("{:?}", drop_rx.borrow().as_ref()),

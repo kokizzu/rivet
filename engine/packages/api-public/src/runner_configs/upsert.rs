@@ -48,7 +48,7 @@ pub async fn upsert(
 	}
 }
 
-#[tracing::instrument(skip_all)]
+#[tracing::instrument(level = "debug", skip_all)]
 async fn upsert_inner(
 	ctx: ApiCtx,
 	path: UpsertPath,

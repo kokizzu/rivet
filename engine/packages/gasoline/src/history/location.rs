@@ -1,5 +1,15 @@
 use serde::{Deserialize, Serialize};
-use std::ops::Deref;
+use std::{ops::Deref, str::FromStr};
+
+#[derive(thiserror::Error, Debug)]
+pub enum ParseLocationError {
+	#[error("locations must be wrapped in braces on both sides (ex: {{1, 2}})")]
+	UnbalancedBraces,
+	#[error("locations must have at least one coordinate")]
+	Empty,
+	#[error("coordinates must be dot separated integers (ex: 1.2)")]
+	InvalidCoordinate,
+}
 
 /// Represents the location of an event in history.
 #[derive(Debug, Clone, Hash, PartialOrd, Ord, PartialEq, Eq, Serialize, Deserialize)]
@@ -48,6 +58,32 @@ impl std::fmt::Display for Location {
 		}
 
 		write!(f, "}}")
+	}
+}
+
+/// Inverse of `Display`. Braces are optional so that locations can be passed as CLI arguments
+/// without quoting.
+impl FromStr for Location {
+	type Err = ParseLocationError;
+
+	fn from_str(s: &str) -> Result<Self, Self::Err> {
+		let s = s.trim();
+
+		let inner = if let Some(inner) = s.strip_prefix('{') {
+			inner
+				.strip_suffix('}')
+				.ok_or(ParseLocationError::UnbalancedBraces)?
+		} else if s.ends_with('}') {
+			return Err(ParseLocationError::UnbalancedBraces);
+		} else {
+			s
+		};
+
+		if inner.trim().is_empty() {
+			return Err(ParseLocationError::Empty);
+		}
+
+		inner.split(',').map(str::parse::<Coordinate>).collect()
 	}
 }
 
@@ -132,6 +168,26 @@ impl std::fmt::Display for Coordinate {
 		}
 
 		Ok(())
+	}
+}
+
+impl FromStr for Coordinate {
+	type Err = ParseLocationError;
+
+	fn from_str(s: &str) -> Result<Self, Self::Err> {
+		let s = s.trim();
+
+		if s.is_empty() {
+			return Err(ParseLocationError::InvalidCoordinate);
+		}
+
+		s.split('.')
+			.map(|part| {
+				part.trim()
+					.parse::<usize>()
+					.map_err(|_| ParseLocationError::InvalidCoordinate)
+			})
+			.collect()
 	}
 }
 

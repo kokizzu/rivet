@@ -22,6 +22,8 @@ async function main(): Promise<void> {
 }
 
 main().catch((err) => {
-	console.log(JSON.stringify({ event: "error", error: err?.message ?? String(err) }));
+	console.log(
+		JSON.stringify({ event: "error", error: err?.message ?? String(err) }),
+	);
 	process.exitCode = 1;
 });

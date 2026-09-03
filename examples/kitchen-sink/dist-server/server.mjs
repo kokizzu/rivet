@@ -746,16 +746,16 @@ var rawFetchCounter = actor14({
 function createCounterRouter() {
   const app2 = new Hono();
   app2.get("/count", (c) => {
-    const { actor: actor62 } = c.env;
+    const { actor: actor64 } = c.env;
     return c.json({
-      count: actor62.state.count
+      count: actor64.state.count
     });
   });
   app2.post("/increment", (c) => {
-    const { actor: actor62 } = c.env;
-    actor62.state.count++;
+    const { actor: actor64 } = c.env;
+    actor64.state.count++;
     return c.json({
-      count: actor62.state.count
+      count: actor64.state.count
     });
   });
   return app2;
@@ -2218,14 +2218,14 @@ var parallelismTest = actor33({
     stateCount: 0
   },
   db: db({
-    onMigrate: async (db17) => {
-      await db17.execute(`
+    onMigrate: async (db19) => {
+      await db19.execute(`
 				CREATE TABLE IF NOT EXISTS counter (
 					id INTEGER PRIMARY KEY CHECK (id = 1),
 					count INTEGER NOT NULL DEFAULT 0
 				)
 			`);
-      await db17.execute(`
+      await db19.execute(`
 				INSERT OR IGNORE INTO counter (id, count) VALUES (1, 0)
 			`);
     }
@@ -2344,8 +2344,8 @@ import { actor as actor35 } from "rivetkit";
 import { db as db3 } from "rivetkit/db";
 var sqliteRawActor = actor35({
   db: db3({
-    onMigrate: async (db17) => {
-      await db17.execute(`
+    onMigrate: async (db19) => {
+      await db19.execute(`
 				CREATE TABLE IF NOT EXISTS todos (
 					id INTEGER PRIMARY KEY AUTOINCREMENT,
 					title TEXT NOT NULL,
@@ -2470,14 +2470,24 @@ var driverCtxActor = actor36({
   }
 });
 
-// src/actors/testing/grow-db.ts
+// src/actors/testing/churn-db.ts
 import { actor as actor37 } from "rivetkit";
 import { db as db4 } from "rivetkit/db";
-var DEFAULT_TARGET_MB = 64;
-var DEFAULT_BATCH_ROWS = 128;
-var DEFAULT_ROW_BYTES = 8 * 1024;
+var DEFAULT_WORKING_SET_ROWS = 16;
+var DEFAULT_ROW_BYTES = 256;
+var DEFAULT_TARGET_TXIDS = 25e3;
 var DEFAULT_BUDGET_MS = 12e4;
-var MEBIBYTE = 1024 * 1024;
+var DEFAULT_COMMIT_DELAY_MS = 25;
+function nonNegativeInt(value, fallback) {
+  if (value === void 0) return fallback;
+  if (!Number.isFinite(value) || value < 0) {
+    throw new Error(`expected a non-negative finite number, got ${value}`);
+  }
+  return Math.floor(value);
+}
+function sleep3(ms) {
+  return new Promise((resolve2) => setTimeout(resolve2, ms));
+}
 function finiteInt(value, fallback) {
   if (value === void 0) return fallback;
   if (!Number.isFinite(value) || value <= 0) {
@@ -2503,13 +2513,164 @@ async function storageStats(database) {
     sizeBytes: pageCount.page_count * pageSize.page_size
   };
 }
-var growDb = actor37({
+async function ensureWorkingSet(database, workingSetRows, rowBytes) {
+  const existing = await queryOne(
+    database,
+    "SELECT COUNT(*) AS n FROM churn_rows"
+  );
+  if (existing.n >= workingSetRows) return;
+  await database.execute("BEGIN");
+  try {
+    for (let id = existing.n + 1; id <= workingSetRows; id += 1) {
+      await database.execute(
+        "INSERT INTO churn_rows (id, payload, rev) VALUES (?, randomblob(?), 0)",
+        id,
+        rowBytes
+      );
+    }
+    await database.execute("COMMIT");
+  } catch (err) {
+    await database.execute("ROLLBACK").catch(() => void 0);
+    throw err;
+  }
+}
+var churnDb = actor37({
+  options: {
+    // Generous per-action timeout. churn() self-limits with budgetMs and
+    // returns done=false before this fires.
+    actionTimeout: 3e5
+  },
+  db: db4({
+    onMigrate: async (database) => {
+      await database.execute(`
+				CREATE TABLE IF NOT EXISTS churn_rows (
+					id INTEGER PRIMARY KEY,
+					payload BLOB NOT NULL,
+					rev INTEGER NOT NULL
+				)
+			`);
+      await database.execute(`
+				CREATE TABLE IF NOT EXISTS churn_meta (
+					id INTEGER PRIMARY KEY CHECK (id = 0),
+					txid_count INTEGER NOT NULL
+				)
+			`);
+      await database.execute(
+        "INSERT OR IGNORE INTO churn_meta (id, txid_count) VALUES (0, 0)"
+      );
+    }
+  }),
+  actions: {
+    churn: async (c, input = {}) => {
+      const startedAt = performance.now();
+      const workingSetRows = finiteInt(
+        input.workingSetRows,
+        DEFAULT_WORKING_SET_ROWS
+      );
+      const rowBytes = finiteInt(input.rowBytes, DEFAULT_ROW_BYTES);
+      const targetTxids = finiteInt(
+        input.targetTxids,
+        DEFAULT_TARGET_TXIDS
+      );
+      const budgetMs = finiteInt(input.budgetMs, DEFAULT_BUDGET_MS);
+      const commitDelayMs = nonNegativeInt(
+        input.commitDelayMs,
+        DEFAULT_COMMIT_DELAY_MS
+      );
+      await ensureWorkingSet(c.db, workingSetRows, rowBytes);
+      let { txid_count: txidCount } = await queryOne(c.db, "SELECT txid_count FROM churn_meta WHERE id = 0");
+      let commitsThisCall = 0;
+      while (txidCount < targetTxids) {
+        if (performance.now() - startedAt >= budgetMs) {
+          const stats2 = await storageStats(c.db);
+          return {
+            ...stats2,
+            done: false,
+            txidCount,
+            targetTxids,
+            commitsThisCall,
+            elapsedMs: Math.round(performance.now() - startedAt)
+          };
+        }
+        await c.db.execute("BEGIN");
+        try {
+          await c.db.execute(
+            "UPDATE churn_rows SET payload = randomblob(?), rev = rev + 1",
+            rowBytes
+          );
+          await c.db.execute(
+            "UPDATE churn_meta SET txid_count = txid_count + 1 WHERE id = 0"
+          );
+          await c.db.execute("COMMIT");
+        } catch (err) {
+          await c.db.execute("ROLLBACK").catch(() => void 0);
+          throw err;
+        }
+        txidCount += 1;
+        commitsThisCall += 1;
+        if (commitDelayMs > 0) await sleep3(commitDelayMs);
+      }
+      const stats = await storageStats(c.db);
+      return {
+        ...stats,
+        done: true,
+        txidCount,
+        targetTxids,
+        commitsThisCall,
+        elapsedMs: Math.round(performance.now() - startedAt)
+      };
+    },
+    stats: async (c) => {
+      const stats = await storageStats(c.db);
+      const meta = await queryOne(
+        c.db,
+        "SELECT txid_count FROM churn_meta WHERE id = 0"
+      );
+      return { ...stats, txidCount: meta.txid_count };
+    }
+  }
+});
+
+// src/actors/testing/grow-db.ts
+import { actor as actor38 } from "rivetkit";
+import { db as db5 } from "rivetkit/db";
+var DEFAULT_TARGET_MB = 64;
+var DEFAULT_BATCH_ROWS = 64;
+var DEFAULT_ROW_BYTES2 = 8 * 1024;
+var DEFAULT_BUDGET_MS2 = 12e4;
+var MEBIBYTE = 1024 * 1024;
+function finiteInt2(value, fallback) {
+  if (value === void 0) return fallback;
+  if (!Number.isFinite(value) || value <= 0) {
+    throw new Error(`expected a positive finite number, got ${value}`);
+  }
+  return Math.floor(value);
+}
+async function queryOne2(database, sql) {
+  const rows = await database.execute(sql);
+  if (!rows[0]) throw new Error(`query returned no rows: ${sql}`);
+  return rows[0];
+}
+async function storageStats2(database) {
+  const [pageCount, pageSize, freelistCount] = await Promise.all([
+    queryOne2(database, "PRAGMA page_count"),
+    queryOne2(database, "PRAGMA page_size"),
+    queryOne2(database, "PRAGMA freelist_count")
+  ]);
+  return {
+    pageCount: pageCount.page_count,
+    pageSize: pageSize.page_size,
+    freelistCount: freelistCount.freelist_count,
+    sizeBytes: pageCount.page_count * pageSize.page_size
+  };
+}
+var growDb = actor38({
   options: {
     // Generous per-action timeout. grow() self-limits with budgetMs and
     // returns done=false before this fires.
     actionTimeout: 3e5
   },
-  db: db4({
+  db: db5({
     onMigrate: async (database) => {
       await database.execute(`
 				CREATE TABLE IF NOT EXISTS grow_rows (
@@ -2524,15 +2685,15 @@ var growDb = actor37({
   actions: {
     grow: async (c, input = {}) => {
       const startedAt = performance.now();
-      const targetMb = finiteInt(input.targetMb, DEFAULT_TARGET_MB);
-      const batchRows = finiteInt(input.batchRows, DEFAULT_BATCH_ROWS);
-      const rowBytes = finiteInt(input.rowBytes, DEFAULT_ROW_BYTES);
-      const budgetMs = finiteInt(input.budgetMs, DEFAULT_BUDGET_MS);
+      const targetMb = finiteInt2(input.targetMb, DEFAULT_TARGET_MB);
+      const batchRows = finiteInt2(input.batchRows, DEFAULT_BATCH_ROWS);
+      const rowBytes = finiteInt2(input.rowBytes, DEFAULT_ROW_BYTES2);
+      const budgetMs = finiteInt2(input.budgetMs, DEFAULT_BUDGET_MS2);
       const targetBytes = targetMb * MEBIBYTE;
       const placeholders = new Array(batchRows).fill("(?, randomblob(?), ?)").join(", ");
       let batchesThisCall = 0;
       let rowsThisCall = 0;
-      let stats = await storageStats(c.db);
+      let stats = await storageStats2(c.db);
       while (stats.sizeBytes < targetBytes) {
         if (performance.now() - startedAt >= budgetMs) {
           return {
@@ -2562,7 +2723,7 @@ var growDb = actor37({
         }
         batchesThisCall += 1;
         rowsThisCall += batchRows;
-        stats = await storageStats(c.db);
+        stats = await storageStats2(c.db);
       }
       return {
         ...stats,
@@ -2573,12 +2734,32 @@ var growDb = actor37({
         elapsedMs: Math.round(performance.now() - startedAt)
       };
     },
-    stats: async (c) => storageStats(c.db)
+    stats: async (c) => storageStats2(c.db),
+    // Full-database verification for the compaction rig. This reads every
+    // page through the depot VFS, so it exercises PIDX resolution across
+    // folded shards and any remaining unfolded deltas. Deliberately not
+    // called during seeding, where it would cost O(current size) per call.
+    integrityCheck: async (c) => {
+      const rows = await c.db.execute(
+        "PRAGMA integrity_check"
+      );
+      const messages = rows.map((row) => String(Object.values(row)[0]));
+      const result = messages.join("; ");
+      const counted = await c.db.execute(
+        "SELECT count(*) AS n FROM grow_rows"
+      );
+      return {
+        ...await storageStats2(c.db),
+        ok: messages.length === 1 && messages[0] === "ok",
+        result,
+        rows: counted[0]?.n ?? -1
+      };
+    }
   }
 });
 
 // src/actors/testing/inline-client.ts
-import { actor as actor38 } from "rivetkit";
+import { actor as actor39 } from "rivetkit";
 function isDynamicSandboxRuntime() {
   return false;
 }
@@ -2599,7 +2780,7 @@ async function waitForConnectionOpen(connection) {
     });
   });
 }
-var inlineClientActor = actor38({
+var inlineClientActor = actor39({
   state: { messages: [] },
   actions: {
     // Action that uses client to call another actor (stateless)
@@ -2659,11 +2840,250 @@ var inlineClientActor = actor38({
   }
 });
 
+// src/actors/testing/large-commit-db.ts
+import { actor as actor40 } from "rivetkit";
+import { db as db6 } from "rivetkit/db";
+var DEFAULT_ROWS = 1e3;
+var DEFAULT_ROW_BYTES3 = 4e3;
+function finiteInt3(value, fallback) {
+  if (value === void 0) return fallback;
+  if (!Number.isFinite(value) || value <= 0) {
+    throw new Error(`expected a positive finite number, got ${value}`);
+  }
+  return Math.floor(value);
+}
+function randomPayloadExpr(rowBytes) {
+  return `substr(hex(randomblob(${Math.ceil(rowBytes / 2)})), 1, ${rowBytes})`;
+}
+function payloadExpr(idExpr, rowBytes) {
+  return `substr(replace(hex(zeroblob(${Math.ceil(rowBytes / 8)})), '00', printf('%08d', ${idExpr})), 1, ${rowBytes})`;
+}
+async function queryOne3(database, sql) {
+  const rows = await database.execute(sql);
+  if (!rows[0]) throw new Error(`query returned no rows: ${sql}`);
+  return rows[0];
+}
+async function storageStats3(database) {
+  const [pageCount, pageSize, freelistCount, rows] = await Promise.all([
+    queryOne3(database, "PRAGMA page_count"),
+    queryOne3(database, "PRAGMA page_size"),
+    queryOne3(database, "PRAGMA freelist_count"),
+    queryOne3(database, "SELECT count(*) AS n FROM big_rows")
+  ]);
+  return {
+    pageCount: pageCount.page_count,
+    pageSize: pageSize.page_size,
+    freelistCount: freelistCount.freelist_count,
+    sizeBytes: pageCount.page_count * pageSize.page_size,
+    rows: rows.n
+  };
+}
+var largeCommitDb = actor40({
+  options: {
+    // A commit at the top of the range crosses the tunnel as a couple of
+    // hundred staged segments, each its own round trip, so the write calls
+    // need far more headroom than an ordinary action.
+    actionTimeout: 6e5
+  },
+  db: db6({
+    onMigrate: async (database) => {
+      await database.execute(`
+				CREATE TABLE IF NOT EXISTS big_rows (
+					id INTEGER PRIMARY KEY,
+					payload TEXT NOT NULL
+				)
+			`);
+    }
+  }),
+  actions: {
+    // Appends `rows` deterministic rows, in `batches` transactions.
+    //
+    // With batches=1 this is the whole point of the actor: one commit whose
+    // dirty page count is chosen by the caller, which depot then has to
+    // stage in segments once it passes 320.
+    write: async (c, input = {}) => {
+      const startedAt = performance.now();
+      const rows = finiteInt3(input.rows, DEFAULT_ROWS);
+      const rowBytes = finiteInt3(input.rowBytes, DEFAULT_ROW_BYTES3);
+      const batches = finiteInt3(input.batches, 1);
+      const payload2 = input.random ? randomPayloadExpr(rowBytes) : payloadExpr("id", rowBytes);
+      if (rows % batches !== 0) {
+        throw new Error(
+          `rows ${rows} must divide evenly into ${batches} batches`
+        );
+      }
+      const before = await storageStats3(c.db);
+      const firstId = before.rows + 1;
+      const perBatch = rows / batches;
+      let slowestBatchMs = 0;
+      for (let batch2 = 0; batch2 < batches; batch2 += 1) {
+        const batchStart = firstId + batch2 * perBatch;
+        const batchStartedAt = performance.now();
+        await c.db.execute("BEGIN");
+        try {
+          await c.db.execute(
+            `INSERT INTO big_rows (id, payload)
+						 WITH RECURSIVE seq(id) AS (
+							 SELECT ?
+							 UNION ALL SELECT id + 1 FROM seq WHERE id < ?
+						 )
+						 SELECT id, ${payload2} FROM seq`,
+            batchStart,
+            batchStart + perBatch - 1
+          );
+          await c.db.execute("COMMIT");
+        } catch (err) {
+          await c.db.execute("ROLLBACK").catch(() => void 0);
+          throw err;
+        }
+        slowestBatchMs = Math.max(
+          slowestBatchMs,
+          performance.now() - batchStartedAt
+        );
+      }
+      const after = await storageStats3(c.db);
+      return {
+        ...after,
+        pagesBefore: before.pageCount,
+        pagesDirtied: after.pageCount - before.pageCount,
+        batches,
+        rowsWritten: rows,
+        elapsedMs: Math.round(performance.now() - startedAt),
+        slowestBatchMs: Math.round(slowestBatchMs)
+      };
+    },
+    // Rewrites every existing row in one transaction, which dirties pages
+    // already in the database rather than appending new ones.
+    //
+    // Appending only ever stages pages at the end of the page space. An
+    // overwrite scatters the dirty set across the whole file, so the commit
+    // cuts into many more segments and finalize rewrites PIDX rows that
+    // already had owners. That is the shape a fold can get wrong.
+    rewriteAll: async (c, input = {}) => {
+      const startedAt = performance.now();
+      const rowBytes = finiteInt3(input.rowBytes, DEFAULT_ROW_BYTES3);
+      const payload2 = input.random ? randomPayloadExpr(rowBytes) : payloadExpr("id", rowBytes);
+      const before = await storageStats3(c.db);
+      const batchStartedAt = performance.now();
+      await c.db.execute("BEGIN");
+      try {
+        await c.db.execute(`UPDATE big_rows SET payload = ${payload2}`);
+        await c.db.execute("COMMIT");
+      } catch (err) {
+        await c.db.execute("ROLLBACK").catch(() => void 0);
+        throw err;
+      }
+      const slowestBatchMs = Math.round(
+        performance.now() - batchStartedAt
+      );
+      const after = await storageStats3(c.db);
+      return {
+        ...after,
+        pagesBefore: before.pageCount,
+        pagesDirtied: after.pageCount - before.pageCount,
+        batches: 1,
+        rowsWritten: before.rows,
+        elapsedMs: Math.round(performance.now() - startedAt),
+        slowestBatchMs
+      };
+    },
+    // Full correctness gate: SQLite validates its own b-trees, and every row
+    // is compared against the payload its id implies.
+    //
+    // The second half is the part that matters here. `integrity_check` walks
+    // structure, so a page served from a stale but structurally valid
+    // version passes it; comparing content catches that.
+    verify: async (c, input = {}) => {
+      const rowBytes = finiteInt3(input.rowBytes, DEFAULT_ROW_BYTES3);
+      const integrityRows = await c.db.execute(
+        "PRAGMA integrity_check"
+      );
+      const messages = integrityRows.map(
+        (row) => String(Object.values(row)[0])
+      );
+      const integrity = messages.join("; ");
+      const mismatched = await c.db.execute(
+        input.random ? `SELECT count(*) AS n FROM big_rows WHERE length(payload) != ${rowBytes}` : `SELECT count(*) AS n FROM big_rows WHERE payload != ${payloadExpr("id", rowBytes)}`
+      );
+      const gaps = await c.db.execute(
+        "SELECT coalesce(max(id), 0) - count(*) AS n FROM big_rows"
+      );
+      const mismatchedRows = mismatched[0]?.n ?? -1;
+      const idGaps = gaps[0]?.n ?? -1;
+      return {
+        ...await storageStats3(c.db),
+        ok: messages.length === 1 && messages[0] === "ok" && mismatchedRows === 0 && idGaps === 0,
+        integrity,
+        mismatchedRows,
+        idGaps
+      };
+    },
+    // Deletes down to `keepRows` and reclaims the freed space, which is the
+    // shape truncate cleanup exists for: a commit with a small dirty set and
+    // a large drop in database size.
+    //
+    // VACUUM rewrites the database into its compacted form, so the commit it
+    // produces dirties only the pages that survive while the file's EOF falls
+    // by everything that did not. The engine has to clear one PIDX row per
+    // page above the new EOF inside the commit transaction, and nothing bounds
+    // that by the dirty page cap.
+    shrink: async (c, input = {}) => {
+      const keepRows = finiteInt3(input.keepRows, 1e3);
+      const deleteBatch = finiteInt3(input.deleteBatch, 2e3);
+      const before = await storageStats3(c.db);
+      const deleteStartedAt = performance.now();
+      for (let id = before.rows; id > keepRows; id -= deleteBatch) {
+        const lower = Math.max(keepRows, id - deleteBatch);
+        await c.db.execute("DELETE FROM big_rows WHERE id > ? AND id <= ?", lower, id);
+      }
+      const deleteMs = Math.round(performance.now() - deleteStartedAt);
+      const vacuumStartedAt = performance.now();
+      await c.db.execute("VACUUM");
+      const vacuumMs = Math.round(performance.now() - vacuumStartedAt);
+      const after = await storageStats3(c.db);
+      return {
+        pagesBefore: before.pageCount,
+        pagesAfter: after.pageCount,
+        pagesDropped: before.pageCount - after.pageCount,
+        rowsBefore: before.rows,
+        rowsAfter: after.rows,
+        deleteMs,
+        vacuumMs
+      };
+    },
+    stats: async (c) => storageStats3(c.db),
+    // Content fingerprint that does not depend on page layout, so a database
+    // built with one big commit can be compared against one built with many
+    // small commits without assuming the two allocate pages identically.
+    //
+    // Folded to scalars in SQL rather than concatenated, because a digest
+    // over a database at the commit cap would itself be about a megabyte on
+    // the wire. Sampling one byte per row at an id-dependent offset makes the
+    // fold sensitive to content, not just to lengths.
+    fingerprint: async (c) => {
+      const row = await queryOne3(
+        c.db,
+        `SELECT count(*) AS n,
+				        coalesce(sum(length(payload)), 0) AS total,
+				        coalesce(sum((id * 1000003 + length(payload)) % 2147483647), 0) AS checksum,
+				        coalesce(sum(unicode(substr(payload, 1 + (id % 64), 1))), 0) AS sample_sum
+				 FROM big_rows`
+      );
+      return {
+        rows: row.n,
+        totalBytes: row.total,
+        checksum: row.checksum,
+        sampleSum: row.sample_sum
+      };
+    }
+  }
+});
+
 // src/actors/testing/load-test-agent.ts
 import {
-  actor as actor39
+  actor as actor41
 } from "rivetkit";
-import { db as db5 } from "rivetkit/db";
+import { db as db7 } from "rivetkit/db";
 var DEFAULT_TOKENS_PER_SECOND = 20;
 var DEFAULT_DURATION_MS = 5e3;
 function send(websocket, payload2) {
@@ -2678,7 +3098,7 @@ function parsePositiveNumber(value, name, fallback) {
   }
   return parsed;
 }
-function sleep3(ms, signal) {
+function sleep4(ms, signal) {
   if (signal.aborted) return Promise.resolve();
   return new Promise((resolve2) => {
     const timeout = setTimeout(resolve2, ms);
@@ -2692,14 +3112,14 @@ function sleep3(ms, signal) {
     );
   });
 }
-var loadTestAgent = actor39({
+var loadTestAgent = actor41({
   options: {
     canHibernateWebSocket: false,
     sleepGracePeriod: 5e3
   },
-  db: db5({
-    onMigrate: async (db17) => {
-      await db17.execute(`
+  db: db7({
+    onMigrate: async (db19) => {
+      await db19.execute(`
 				CREATE TABLE IF NOT EXISTS messages (
 					id INTEGER PRIMARY KEY AUTOINCREMENT,
 					connection_id TEXT NOT NULL,
@@ -2709,7 +3129,7 @@ var loadTestAgent = actor39({
 					created_at INTEGER NOT NULL
 				)
 			`);
-      await db17.execute(`
+      await db19.execute(`
 				CREATE INDEX IF NOT EXISTS messages_request_idx
 				ON messages (request_id, token_index)
 			`);
@@ -2804,7 +3224,7 @@ var loadTestAgent = actor39({
                 nextAt - performance.now()
               );
               if (delayMs > 0) {
-                await sleep3(delayMs, c.abortSignal);
+                await sleep4(delayMs, c.abortSignal);
               }
             }
             send(websocket, {
@@ -2842,9 +3262,9 @@ var loadTestAgent = actor39({
 
 // src/actors/testing/load-test-agent-2.ts
 import {
-  actor as actor40
+  actor as actor42
 } from "rivetkit";
-import { db as db6 } from "rivetkit/db";
+import { db as db8 } from "rivetkit/db";
 var AsyncMutex = class {
   locked = false;
   waiters = [];
@@ -2942,7 +3362,7 @@ function send2(websocket, message) {
     websocket.send(JSON.stringify(message));
   }
 }
-var loadTestAgent2 = actor40({
+var loadTestAgent2 = actor42({
   options: {
     canHibernateWebSocket: false,
     sleepGracePeriod: 5e3
@@ -2952,7 +3372,7 @@ var loadTestAgent2 = actor40({
     wakeCount: 0,
     queryStats: createAgentConcurrent2QueryStats()
   },
-  db: db6({
+  db: db8({
     onMigrate: async (database) => {
       await createAgentConcurrent2Schema(database);
       await seedAgentConcurrent2Data(database);
@@ -3123,13 +3543,13 @@ function numberField(record, field) {
   }
   return value;
 }
-function createAgentConcurrent2Db(db17) {
+function createAgentConcurrent2Db(db19) {
   return createSerializedDb(
     async (query, ...values) => {
       const converted = values.map(
         (value) => typeof value === "boolean" ? value ? 1 : 0 : value
       );
-      return await db17.execute(query, ...converted);
+      return await db19.execute(query, ...converted);
     }
   );
 }
@@ -3165,8 +3585,8 @@ function createAgentConcurrent2QueryStats() {
     byTable: {}
   };
 }
-function createAgentConcurrent2StatsSet(cycle, wake, actor62) {
-  return { cycle, wake, actor: actor62 };
+function createAgentConcurrent2StatsSet(cycle, wake, actor64) {
+  return { cycle, wake, actor: actor64 };
 }
 function snapshotAgentConcurrent2Stats(c, cycle) {
   return {
@@ -4156,13 +4576,13 @@ function safeId(value) {
 
 // src/actors/testing/mock-agentic-loop.ts
 import {
-  actor as actor41
+  actor as actor43
 } from "rivetkit";
-import { db as db7 } from "rivetkit/db";
+import { db as db9 } from "rivetkit/db";
 var DEFAULT_SLEEP_GRACE_PERIOD_MS = 12e4;
 var DEFAULT_ON_SLEEP_DELAY_MS = 0;
 var debugSocketsByActorId = /* @__PURE__ */ new Map();
-function sleep4(ms) {
+function sleep5(ms) {
   return new Promise((resolve2) => setTimeout(resolve2, ms));
 }
 function positiveInteger(value, name) {
@@ -4326,12 +4746,12 @@ function verifyAllRows(rows, expectedRequests) {
     ok
   };
 }
-var mockAgenticLoop = actor41({
+var mockAgenticLoop = actor43({
   options: {
     canHibernateWebSocket: false,
     sleepGracePeriod: DEFAULT_SLEEP_GRACE_PERIOD_MS
   },
-  db: db7({
+  db: db9({
     onMigrate: async (database) => {
       await database.execute(`
 				CREATE TABLE IF NOT EXISTS mock_agentic_entries (
@@ -4397,7 +4817,7 @@ var mockAgenticLoop = actor41({
       delayMs,
       sleepStartedAt
     });
-    await sleep4(delayMs);
+    await sleep5(delayMs);
     await recordDebugEvent(c, {
       name: "onSleepEnd",
       details: {
@@ -4491,7 +4911,7 @@ var mockAgenticLoop = actor41({
         requestId
       );
       for (let idx = 1; idx <= seconds; idx += 1) {
-        await sleep4(1e3);
+        await sleep5(1e3);
         const createdAt = Date.now();
         await c.db.execute(
           "INSERT INTO mock_agentic_entries (request_id, idx, created_at) VALUES (?, ?, ?)",
@@ -4649,8 +5069,8 @@ var mockAgenticLoop = actor41({
 });
 
 // src/actors/testing/raw-sqlite-fuzzer.ts
-import { actor as actor42 } from "rivetkit";
-import { db as db8 } from "rivetkit/db";
+import { actor as actor44 } from "rivetkit";
+import { db as db10 } from "rivetkit/db";
 var ACCOUNT_COUNT = 8;
 var ACCOUNT_INITIAL_BALANCE = 1e5;
 var DEFAULT_KEY_SPACE = 64;
@@ -4705,7 +5125,7 @@ function payloadFor(seed, phase, index, bytes) {
   if (bytes <= prefix.length) return prefix.slice(0, bytes);
   return prefix + "x".repeat(bytes - prefix.length);
 }
-async function queryOne2(database, sql, ...args) {
+async function queryOne4(database, sql, ...args) {
   const rows = await database.execute(sql, ...args);
   return rows[0];
 }
@@ -4802,7 +5222,7 @@ async function upsertLiveItem(database, row, payload2) {
 async function applyItemOperation(database, opts) {
   let current;
   try {
-    current = await queryOne2(
+    current = await queryOne4(
       database,
       "SELECT item_key, value, version, update_count, payload, payload_checksum, payload_bytes FROM fuzz_items WHERE item_key = ?",
       opts.itemKey
@@ -4941,7 +5361,7 @@ async function applyHotUpdates(database, opts) {
 }
 async function applyTransfer(database, opts) {
   await transaction(database, async () => {
-    const before = await queryOne2(
+    const before = await queryOne4(
       database,
       "SELECT COALESCE(SUM(balance), 0) AS total FROM fuzz_accounts"
     );
@@ -4955,7 +5375,7 @@ async function applyTransfer(database, opts) {
       opts.amount,
       opts.toAccount
     );
-    const after = await queryOne2(
+    const after = await queryOne4(
       database,
       "SELECT COALESCE(SUM(balance), 0) AS total FROM fuzz_accounts"
     );
@@ -5285,7 +5705,7 @@ async function applySchemaChurn(database, phase) {
       `ALTER TABLE ${table} ADD COLUMN altered_${phase} TEXT DEFAULT 'altered'`
     );
   } catch {
-    const column = await queryOne2(
+    const column = await queryOne4(
       database,
       `SELECT COUNT(*) AS count FROM pragma_table_info('${table}') WHERE name = ?`,
       `altered_${phase}`
@@ -5357,7 +5777,7 @@ async function applySchemaChurn(database, phase) {
     `CREATE INDEX IF NOT EXISTS ${dropIndex} ON fuzz_schema_registry(type)`
   );
   await database.execute(`DROP INDEX IF EXISTS ${dropIndex}`);
-  const dropped = await queryOne2(
+  const dropped = await queryOne4(
     database,
     "SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'index' AND name = ?",
     dropIndex
@@ -5476,7 +5896,7 @@ async function applyPreparedChurn(database, opts) {
   return rows * 2 + 1;
 }
 async function applyReadWriteProbe(database, opts) {
-  if ((await queryOne2(
+  if ((await queryOne4(
     database,
     "SELECT COUNT(*) AS count FROM fuzz_indexed"
   ))?.count === 0) {
@@ -5683,12 +6103,12 @@ async function applyTruncateRecreateProbe(database, opts) {
   return 5;
 }
 async function updateShadowChecksums(database, phase) {
-  const item = await queryOne2(
+  const item = await queryOne4(
     database,
     `SELECT COUNT(*) AS rows, COALESCE(SUM(payload_checksum + version + update_count), 0) AS value
 		FROM fuzz_items`
   );
-  const edge = await queryOne2(
+  const edge = await queryOne4(
     database,
     `SELECT COUNT(*) AS rows, COALESCE(SUM(payload_checksum + payload_bytes), 0) AS value
 		FROM fuzz_edge_payloads`
@@ -5716,7 +6136,7 @@ async function updateShadowChecksums(database, phase) {
 async function applyConstraintChaos(database, phase) {
   await database.execute("PRAGMA foreign_keys = ON");
   const validPrefix = `valid-${phase}`;
-  const existingValidRows = await queryOne2(
+  const existingValidRows = await queryOne4(
     database,
     "SELECT COUNT(*) AS count FROM fuzz_constraints WHERE id LIKE ?",
     `${validPrefix}-%`
@@ -5724,7 +6144,7 @@ async function applyConstraintChaos(database, phase) {
   const runSeq = existingValidRows?.count ?? 0;
   const validId = `${validPrefix}-${runSeq}`;
   const uniqValue = `uniq-${phase}-${runSeq}`;
-  const before = await queryOne2(
+  const before = await queryOne4(
     database,
     "SELECT COUNT(*) AS count FROM fuzz_constraints"
   );
@@ -5768,7 +6188,7 @@ async function applyConstraintChaos(database, phase) {
     }
   ];
   for (const attempt of attempts) {
-    const attemptBefore = await queryOne2(
+    const attemptBefore = await queryOne4(
       database,
       "SELECT COUNT(*) AS count FROM fuzz_constraints"
     );
@@ -5778,7 +6198,7 @@ async function applyConstraintChaos(database, phase) {
     } catch {
       failed = true;
     }
-    const attemptAfter = await queryOne2(
+    const attemptAfter = await queryOne4(
       database,
       "SELECT COUNT(*) AS count FROM fuzz_constraints"
     );
@@ -5792,7 +6212,7 @@ async function applyConstraintChaos(database, phase) {
       attemptAfter?.count ?? 0
     );
   }
-  const after = await queryOne2(
+  const after = await queryOne4(
     database,
     "SELECT COUNT(*) AS count FROM fuzz_constraints"
   );
@@ -5819,13 +6239,13 @@ async function applyConstraintChaos(database, phase) {
     childId,
     parentId
   );
-  const childBeforeDelete = await queryOne2(
+  const childBeforeDelete = await queryOne4(
     database,
     "SELECT COUNT(*) AS count FROM fuzz_fk_child WHERE parent_id = ?",
     parentId
   );
   await database.execute("DELETE FROM fuzz_fk_parent WHERE id = ?", parentId);
-  const childAfterDelete = await queryOne2(
+  const childAfterDelete = await queryOne4(
     database,
     "SELECT COUNT(*) AS count FROM fuzz_fk_child WHERE parent_id = ?",
     parentId
@@ -5839,7 +6259,7 @@ async function applyConstraintChaos(database, phase) {
     childAfterDelete?.count ?? -1,
     (childBeforeDelete?.count ?? 0) !== 1 || (childAfterDelete?.count ?? -1) !== 0
   );
-  const fkBefore = await queryOne2(
+  const fkBefore = await queryOne4(
     database,
     "SELECT COUNT(*) AS count FROM fuzz_fk_child"
   );
@@ -5853,7 +6273,7 @@ async function applyConstraintChaos(database, phase) {
   } catch {
     fkFailed = true;
   }
-  const fkAfter = await queryOne2(
+  const fkAfter = await queryOne4(
     database,
     "SELECT COUNT(*) AS count FROM fuzz_fk_child"
   );
@@ -5978,7 +6398,7 @@ async function applyIdempotentReplay(database, phase) {
     const amount = phase + i + 1;
     for (let attempt = 0; attempt < 3; attempt += 1) {
       await transaction(database, async () => {
-        const existing = await queryOne2(
+        const existing = await queryOne4(
           database,
           "SELECT op_id FROM fuzz_idempotent_ops WHERE op_id = ?",
           opId
@@ -6032,7 +6452,7 @@ async function ensureRelationalSeed(database) {
 async function applyRelationalOrder(database, opts) {
   await ensureRelationalSeed(database);
   const orderPrefix = `order-${opts.phase}-${opts.localIndex}`;
-  const existingOrders = await queryOne2(
+  const existingOrders = await queryOne4(
     database,
     "SELECT COUNT(*) AS count FROM fuzz_orders WHERE id LIKE ?",
     `${orderPrefix}-%`
@@ -6049,7 +6469,7 @@ async function applyRelationalOrder(database, opts) {
     );
     for (let i = 0; i < itemCount; i += 1) {
       const productId = `product-${intBetween(opts.rng, 0, 11)}`;
-      const product = await queryOne2(
+      const product = await queryOne4(
         database,
         "SELECT price FROM fuzz_rel_products WHERE id = ?",
         productId
@@ -6089,7 +6509,7 @@ async function applyRelationalOrder(database, opts) {
   return itemCount + 4;
 }
 async function applyRollbackProbe(database, phase, rowCount = 20) {
-  const before = await queryOne2(
+  const before = await queryOne4(
     database,
     "SELECT COUNT(*) AS count FROM fuzz_items WHERE item_key LIKE ?",
     `rollback-${phase}-%`
@@ -6114,7 +6534,7 @@ async function applyRollbackProbe(database, phase, rowCount = 20) {
   } catch {
     await database.execute("ROLLBACK");
   }
-  const after = await queryOne2(
+  const after = await queryOne4(
     database,
     "SELECT COUNT(*) AS count FROM fuzz_items WHERE item_key LIKE ?",
     `rollback-${phase}-%`
@@ -6252,7 +6672,7 @@ async function applyDeterministicNastyScript(database, opts) {
       ops += 1;
     }
   });
-  const counter2 = await queryOne2(
+  const counter2 = await queryOne4(
     database,
     "SELECT value FROM fuzz_nasty_counter WHERE id = ?",
     counterId
@@ -6289,7 +6709,7 @@ async function applyDeterministicNastyScript(database, opts) {
     ops += 1;
   });
   await database.execute("DROP INDEX IF EXISTS idx_fuzz_nasty_rows_group_n");
-  const remaining = await queryOne2(
+  const remaining = await queryOne4(
     database,
     "SELECT COUNT(*) AS count FROM fuzz_nasty_rows WHERE group_id = ?",
     groupId
@@ -6303,7 +6723,7 @@ async function applyDeterministicNastyScript(database, opts) {
     remaining?.count ?? -1,
     (remaining?.count ?? -1) !== 5e3
   );
-  const indexLeft = await queryOne2(
+  const indexLeft = await queryOne4(
     database,
     "SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'index' AND name = 'idx_fuzz_nasty_rows_group_n'"
   );
@@ -6317,7 +6737,7 @@ async function applyDeterministicNastyScript(database, opts) {
     (indexLeft?.count ?? -1) !== 0
   );
   const rollbackGroupId = `nasty-rollback-${opts.phase}`;
-  const beforeRollback = await queryOne2(
+  const beforeRollback = await queryOne4(
     database,
     "SELECT COUNT(*) AS count FROM fuzz_nasty_rows WHERE group_id = ?",
     rollbackGroupId
@@ -6338,7 +6758,7 @@ async function applyDeterministicNastyScript(database, opts) {
     await database.execute("ROLLBACK").catch(() => void 0);
     throw err;
   }
-  const afterRollback = await queryOne2(
+  const afterRollback = await queryOne4(
     database,
     "SELECT COUNT(*) AS count FROM fuzz_nasty_rows WHERE group_id = ?",
     rollbackGroupId
@@ -6511,15 +6931,15 @@ function chooseKind(mode2, rng) {
   return "transfer";
 }
 async function validate(database) {
-  const integrity = await queryOne2(
+  const integrity = await queryOne4(
     database,
     "PRAGMA integrity_check"
   );
-  const quick = await queryOne2(
+  const quick = await queryOne4(
     database,
     "PRAGMA quick_check"
   );
-  const totals = await queryOne2(
+  const totals = await queryOne4(
     database,
     `WITH latest AS (
 			SELECT e.*
@@ -6539,7 +6959,7 @@ async function validate(database) {
 			(SELECT COALESCE(SUM(payload_checksum), 0) FROM fuzz_items) AS actual_payload_checksum_sum,
 			(SELECT COALESCE(SUM(payload_checksum), 0) FROM latest WHERE present = 1) AS expected_payload_checksum_sum`
   );
-  const mismatches = await queryOne2(
+  const mismatches = await queryOne4(
     database,
     `WITH latest AS (
 			SELECT e.*
@@ -6586,7 +7006,7 @@ async function validate(database) {
 				)
 			) AS duplicate_keys`
   );
-  const accounts = await queryOne2(
+  const accounts = await queryOne4(
     database,
     `SELECT
 			COUNT(*) AS account_count,
@@ -6600,7 +7020,7 @@ async function validate(database) {
     ACCOUNT_COUNT * ACCOUNT_INITIAL_BALANCE,
     ACCOUNT_COUNT * ACCOUNT_INITIAL_BALANCE
   );
-  const edge = await queryOne2(
+  const edge = await queryOne4(
     database,
     `SELECT
 			(SELECT COUNT(*) FROM fuzz_edge_payloads) AS edge_rows,
@@ -6618,7 +7038,7 @@ async function validate(database) {
 					))
 			) AS edge_mismatches`
   );
-  const indexProbe = await queryOne2(
+  const indexProbe = await queryOne4(
     database,
     `SELECT
 			(SELECT COUNT(*) FROM fuzz_indexed) AS index_rows,
@@ -6642,7 +7062,7 @@ async function validate(database) {
 				)
 			) AS index_mismatches`
   );
-  const relational = await queryOne2(
+  const relational = await queryOne4(
     database,
     `SELECT
 			(SELECT COUNT(*) FROM fuzz_orders) AS relational_orders,
@@ -6671,7 +7091,7 @@ async function validate(database) {
 				WHERE initial_qty != sold_qty + stock_qty OR stock_qty < 0
 			) AS relational_mismatches`
   );
-  const constraints = await queryOne2(
+  const constraints = await queryOne4(
     database,
     `SELECT
 			COUNT(*) AS constraint_attempts,
@@ -6684,7 +7104,7 @@ async function validate(database) {
 			), 0) AS constraint_leaks
 		FROM fuzz_constraint_attempts`
   );
-  const savepoints = await queryOne2(
+  const savepoints = await queryOne4(
     database,
     `SELECT
 			(SELECT COUNT(*) FROM fuzz_savepoints) AS savepoint_rows,
@@ -6698,7 +7118,7 @@ async function validate(database) {
 					(e.present = 1 AND s.value != e.value)
 			) AS savepoint_mismatches`
   );
-  const idempotency = await queryOne2(
+  const idempotency = await queryOne4(
     database,
     `SELECT
 			(SELECT COUNT(*) FROM fuzz_idempotent_ops) AS idempotent_ops,
@@ -6713,7 +7133,7 @@ async function validate(database) {
 				WHERE t.value != COALESCE(o.expected, 0)
 			) AS idempotent_mismatches`
   );
-  const schema = await queryOne2(
+  const schema = await queryOne4(
     database,
     `SELECT
 			COUNT(*) AS schema_objects,
@@ -6721,14 +7141,14 @@ async function validate(database) {
 		FROM fuzz_schema_registry r
 		LEFT JOIN sqlite_master m ON m.name = r.name AND m.type = r.type`
   );
-  const probes = await queryOne2(
+  const probes = await queryOne4(
     database,
     `SELECT
 			COUNT(*) AS probe_rows,
 			COALESCE(SUM(mismatch), 0) AS probe_mismatches
 		FROM fuzz_probe_results`
   );
-  const prepared = await queryOne2(
+  const prepared = await queryOne4(
     database,
     `SELECT
 			(SELECT COUNT(*) FROM fuzz_prepared_churn) AS prepared_rows,
@@ -6742,7 +7162,7 @@ async function validate(database) {
 					p.payload_checksum != e.payload_checksum
 			) AS prepared_mismatches`
   );
-  const shadow = await queryOne2(
+  const shadow = await queryOne4(
     database,
     `WITH recomputed AS (
 			SELECT 'items' AS name,
@@ -6897,11 +7317,11 @@ async function debugItemMismatches(database, limit = 5) {
   }
   return { itemMismatches, recentEventsByKey };
 }
-var rawSqliteFuzzer = actor42({
+var rawSqliteFuzzer = actor44({
   options: {
     actionTimeout: 3e5
   },
-  db: db8({
+  db: db10({
     onMigrate: async (database) => {
       await database.execute(`
 				CREATE TABLE IF NOT EXISTS fuzz_items (
@@ -7338,23 +7758,23 @@ var rawSqliteFuzzer = actor42({
 
 // src/actors/testing/sigterm-sleep-probe.ts
 import {
-  actor as actor43
+  actor as actor45
 } from "rivetkit";
-import { db as db9 } from "rivetkit/db";
+import { db as db11 } from "rivetkit/db";
 var DEFAULT_ON_SLEEP_DURATION_MS = 5e3;
 var DEFAULT_ON_SLEEP_TICK_MS = 1e3;
 var SLEEP_TIMEOUT_MS = 10 * 60 * 1e3;
 var SLEEP_GRACE_PERIOD_MS = 30 * 60 * 1e3;
 var ACTOR_STOPPED_CLOSE_CODE = 1e3;
 var ACTOR_STOPPED_CLOSE_REASON = "actor stopped";
-function sleep5(ms) {
+function sleep6(ms) {
   return new Promise((resolve2) => setTimeout(resolve2, ms));
 }
 function formatError(error) {
   if (error instanceof Error) return error.stack ?? error.message;
   return String(error);
 }
-var sigtermSleepProbe = actor43({
+var sigtermSleepProbe = actor45({
   state: {
     label: "unprepared",
     wakeCount: 0,
@@ -7371,7 +7791,7 @@ var sigtermSleepProbe = actor43({
   createVars: () => ({
     websockets: /* @__PURE__ */ new Set()
   }),
-  db: db9({
+  db: db11({
     onMigrate: async (database) => {
       await database.execute(`
 				CREATE TABLE IF NOT EXISTS sigterm_sleep_log (
@@ -7502,7 +7922,7 @@ var sigtermSleepProbe = actor43({
           c.state.onSleepTickMs,
           Math.max(0, deadline - Date.now())
         );
-        if (waitMs > 0) await sleep5(waitMs);
+        if (waitMs > 0) await sleep6(waitMs);
         tickIndex += 1;
         const tickAt = Date.now();
         const detail = `tick=${tickIndex} elapsed-ms=${tickAt - startedAt}`;
@@ -7645,9 +8065,9 @@ var sigtermSleepProbe = actor43({
 
 // src/actors/testing/sleep-close-fuzz.ts
 import {
-  actor as actor44
+  actor as actor46
 } from "rivetkit";
-var sleepCloseFuzz = actor44({
+var sleepCloseFuzz = actor46({
   options: {
     canHibernateWebSocket: false
   },
@@ -7701,8 +8121,8 @@ var sleepCloseFuzz = actor44({
 });
 
 // src/actors/testing/slow-reconnect-actor.ts
-import { actor as actor45, setup } from "rivetkit";
-import { db as db10 } from "rivetkit/db";
+import { actor as actor47, setup } from "rivetkit";
+import { db as db12 } from "rivetkit/db";
 var AsyncMutex2 = class {
   locked = false;
   waiters = [];
@@ -7783,9 +8203,9 @@ var MESSAGE_CONTENT_BYTES2 = 10620;
 var THREAD_EVENT_PAYLOAD_BYTES2 = 4036;
 var TOOL_CALL_RESULT_BYTES2 = 10975;
 var EXECUTOR_TOOL_SCHEMA_BYTES2 = 2235;
-var slowReconnectActor = actor45({
+var slowReconnectActor = actor47({
   state: { runCount: 0 },
-  db: db10({
+  db: db12({
     onMigrate: async (database) => {
       await createSlowReconnectSchema(database);
     }
@@ -7939,13 +8359,13 @@ function sendJSON(sock, message) {
     sock.send(JSON.stringify(message));
   }
 }
-function createSlowReconnectDb(db17) {
+function createSlowReconnectDb(db19) {
   return createDb(
     async (query, ...values) => {
       const converted = values.map(
         (value) => typeof value === "boolean" ? value ? 1 : 0 : value
       );
-      return await db17.execute(query, ...converted);
+      return await db19.execute(query, ...converted);
     }
   );
 }
@@ -8642,10 +9062,10 @@ var registry = setup({
 
 // src/actors/testing/sqlite-cold-start-bench.ts
 import { randomBytes } from "crypto";
-import { actor as actor46 } from "rivetkit";
-import { db as db11 } from "rivetkit/db";
+import { actor as actor48 } from "rivetkit";
+import { db as db13 } from "rivetkit/db";
 var DEFAULT_TARGET_BYTES = 50 * 1024 * 1024;
-var DEFAULT_ROW_BYTES2 = 16 * 1024;
+var DEFAULT_ROW_BYTES4 = 16 * 1024;
 var DEFAULT_BATCH_ROWS2 = 8;
 var DEFAULT_TRANSACTION_BYTES = 64 * 1024;
 var READ_BATCH_ROWS = 64;
@@ -8760,11 +9180,11 @@ async function readPayloads(database, direction = "forward") {
     readBatchRows: READ_BATCH_ROWS
   };
 }
-var sqliteColdStartBench = actor46({
+var sqliteColdStartBench = actor48({
   options: {
     actionTimeout: 6e5
   },
-  db: db11({
+  db: db13({
     onMigrate: async (database) => {
       await database.execute(`
 				CREATE TABLE IF NOT EXISTS cold_start_payload (
@@ -8796,7 +9216,7 @@ var sqliteColdStartBench = actor46({
       );
       const rowBytes = positiveInteger2(
         input.rowBytes,
-        DEFAULT_ROW_BYTES2,
+        DEFAULT_ROW_BYTES4,
         "rowBytes"
       );
       const batchRows = positiveInteger2(
@@ -8927,13 +9347,13 @@ var sqliteColdStartBench = actor46({
 });
 
 // src/actors/testing/sqlite-memory-pressure.ts
-import { actor as actor47 } from "rivetkit";
-import { db as db12 } from "rivetkit/db";
+import { actor as actor49 } from "rivetkit";
+import { db as db14 } from "rivetkit/db";
 var DEFAULT_INSERT_ROWS = 128;
-var DEFAULT_ROW_BYTES3 = 16 * 1024;
+var DEFAULT_ROW_BYTES5 = 16 * 1024;
 var DEFAULT_SCAN_ROWS = 512;
 var INSERT_BATCH_ROWS = 32;
-function finiteInt2(value, fallback) {
+function finiteInt4(value, fallback) {
   if (value === void 0) return fallback;
   if (!Number.isFinite(value) || value < 0) {
     throw new Error(`expected a non-negative finite number, got ${value}`);
@@ -8967,16 +9387,16 @@ function copyNativeMetrics(metrics) {
     dbSizePages: numberField3("dbSizePages", "db_size_pages")
   };
 }
-async function queryOne3(database, sql, ...args) {
+async function queryOne5(database, sql, ...args) {
   const rows = await database.execute(sql, ...args);
   if (!rows[0]) throw new Error(`query returned no rows: ${sql}`);
   return rows[0];
 }
-async function storageStats2(database) {
+async function storageStats4(database) {
   const [pageCount, freelistCount, pageSize] = await Promise.all([
-    queryOne3(database, "PRAGMA page_count"),
-    queryOne3(database, "PRAGMA freelist_count"),
-    queryOne3(database, "PRAGMA page_size")
+    queryOne5(database, "PRAGMA page_count"),
+    queryOne5(database, "PRAGMA freelist_count"),
+    queryOne5(database, "PRAGMA page_size")
   ]);
   const nativeMetrics = await database.nativeMetrics?.();
   const copiedMetrics = copyNativeMetrics(nativeMetrics);
@@ -8987,14 +9407,14 @@ async function storageStats2(database) {
     vfs: copiedMetrics
   };
 }
-var sqliteMemoryPressure = actor47({
+var sqliteMemoryPressure = actor49({
   options: {
     actionTimeout: 3e5
   },
   state: {
     sleepCount: 0
   },
-  db: db12({
+  db: db14({
     onMigrate: async (database) => {
       await database.execute(`
 				CREATE TABLE IF NOT EXISTS pressure_rows (
@@ -9045,7 +9465,7 @@ var sqliteMemoryPressure = actor47({
       await c.db.execute("VACUUM");
       return {
         ok: true,
-        storage: await storageStats2(c.db)
+        storage: await storageStats4(c.db)
       };
     },
     goToSleep: (c) => {
@@ -9053,23 +9473,23 @@ var sqliteMemoryPressure = actor47({
       return { ok: true };
     },
     releaseStorage: async (c) => {
-      const before = await storageStats2(c.db);
+      const before = await storageStats4(c.db);
       return {
         ok: true,
         before,
-        after: await storageStats2(c.db)
+        after: await storageStats4(c.db)
       };
     },
     stats: async (c) => {
-      const rowStats = await queryOne3(
+      const rowStats = await queryOne5(
         c.db,
         "SELECT COUNT(*) AS active_rows, COALESCE(SUM(length(payload)), 0) AS active_bytes, COALESCE(SUM(touched_count), 0) AS touched_sum FROM pressure_rows"
       );
-      const cycles = await queryOne3(
+      const cycles = await queryOne5(
         c.db,
         "SELECT COUNT(*) AS count FROM pressure_cycles"
       );
-      const integrity = await queryOne3(
+      const integrity = await queryOne5(
         c.db,
         "PRAGMA integrity_check"
       );
@@ -9079,16 +9499,16 @@ var sqliteMemoryPressure = actor47({
         touchedCount: rowStats.touched_sum ?? 0,
         cycles: cycles.count,
         integrityCheck: integrity.integrity_check,
-        storage: await storageStats2(c.db)
+        storage: await storageStats4(c.db)
       };
     },
     runCycle: async (c, input) => {
       const startedAt = performance.now();
-      const insertRows = finiteInt2(input.insertRows, DEFAULT_INSERT_ROWS);
-      const rowBytes = finiteInt2(input.rowBytes, DEFAULT_ROW_BYTES3);
+      const insertRows = finiteInt4(input.insertRows, DEFAULT_INSERT_ROWS);
+      const rowBytes = finiteInt4(input.rowBytes, DEFAULT_ROW_BYTES5);
       const scanRows = Math.max(
         1,
-        finiteInt2(input.scanRows, DEFAULT_SCAN_ROWS)
+        finiteInt4(input.scanRows, DEFAULT_SCAN_ROWS)
       );
       const now = Date.now();
       let insertedRows = 0;
@@ -9214,7 +9634,7 @@ var sqliteMemoryPressure = actor47({
       );
       const storageStartedAt = performance.now();
       logStage("storage_stats", "start");
-      const storage = await storageStats2(c.db);
+      const storage = await storageStats4(c.db);
       logStage("storage_stats", "end", {
         durationMs: performance.now() - storageStartedAt,
         pageCount: storage.page_count,
@@ -9245,9 +9665,9 @@ var sqliteMemoryPressure = actor47({
 });
 
 // src/actors/testing/sqlite-realworld-bench.ts
-import { actor as actor48 } from "rivetkit";
-import { db as db13 } from "rivetkit/db";
-var DEFAULT_ROW_BYTES4 = 2 * 1024;
+import { actor as actor50 } from "rivetkit";
+import { db as db15 } from "rivetkit/db";
+var DEFAULT_ROW_BYTES6 = 2 * 1024;
 var ORDER_BATCH_ROWS = 50;
 var DOC_BATCH_ROWS = 75;
 var LEDGER_BATCH_ROWS = 100;
@@ -9803,12 +10223,12 @@ async function readRowidRange(database, direction) {
   }
   return { rows: scannedRows, bytes };
 }
-var sqliteRealworldBench = actor48({
+var sqliteRealworldBench = actor50({
   options: {
     actionTimeout: 12e5,
     sleepGracePeriod: 3e4
   },
-  db: db13({
+  db: db15({
     onMigrate: async (database) => {
       await database.execute(`CREATE TABLE IF NOT EXISTS rw_customers (
 				id INTEGER PRIMARY KEY,
@@ -9936,7 +10356,7 @@ var sqliteRealworldBench = actor48({
       assertWorkload(input.workload);
       const rowBytes = positiveInteger3(
         input.rowBytes,
-        DEFAULT_ROW_BYTES4,
+        DEFAULT_ROW_BYTES6,
         "rowBytes"
       );
       if (input.workload === "migration-ddl-small") {
@@ -10507,7 +10927,7 @@ var sqliteRealworldBench = actor48({
                 i % 128,
                 payload(
                   `wake-insert-${id}:`,
-                  DEFAULT_ROW_BYTES4
+                  DEFAULT_ROW_BYTES6
                 )
               );
             }
@@ -10632,8 +11052,8 @@ var sqliteRealworldBench = actor48({
 });
 
 // src/actors/testing/test-counter.ts
-import { actor as actor49 } from "rivetkit";
-var testCounter = actor49({
+import { actor as actor51 } from "rivetkit";
+var testCounter = actor51({
   state: { count: 0 },
   actions: {
     increment: (c, amount = 1) => {
@@ -10651,18 +11071,18 @@ var testCounter = actor49({
 });
 
 // src/actors/testing/test-counter-sqlite.ts
-import { actor as actor50 } from "rivetkit";
-import { db as db14 } from "rivetkit/db";
-var testCounterSqlite = actor50({
-  db: db14({
-    onMigrate: async (db17) => {
-      await db17.execute(`
+import { actor as actor52 } from "rivetkit";
+import { db as db16 } from "rivetkit/db";
+var testCounterSqlite = actor52({
+  db: db16({
+    onMigrate: async (db19) => {
+      await db19.execute(`
 				CREATE TABLE IF NOT EXISTS counter (
 					id INTEGER PRIMARY KEY CHECK (id = 1),
 					value INTEGER NOT NULL DEFAULT 0
 				)
 			`);
-      await db17.execute(
+      await db19.execute(
         "INSERT OR IGNORE INTO counter (id, value) VALUES (1, 0)"
       );
     }
@@ -10692,8 +11112,8 @@ var testCounterSqlite = actor50({
 });
 
 // src/actors/testing/test-sqlite-bench.ts
-import { actor as actor51 } from "rivetkit";
-import { db as db15 } from "rivetkit/db";
+import { actor as actor53 } from "rivetkit";
+import { db as db17 } from "rivetkit/db";
 var CHAT_LOG_CHUNK_BYTES2 = 4 * 1024;
 var CHAT_LOG_INSERT_BATCH_SIZE2 = 50;
 function buildChatLogMessage2(seq, targetBytes) {
@@ -10742,11 +11162,11 @@ async function seedChatLog2(database, targetBytes) {
   }
   return { threadId, rows, totalBytes: targetBytes };
 }
-var testSqliteBench = actor51({
+var testSqliteBench = actor53({
   options: {
     actionTimeout: 3e5
   },
-  db: db15({
+  db: db17({
     onMigrate: async (database) => {
       await database.execute(`CREATE TABLE IF NOT EXISTS bench (
 				id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -11633,21 +12053,21 @@ var testSqliteBench = actor51({
 });
 
 // src/actors/testing/test-sqlite-load.ts
-import { actor as actor52 } from "rivetkit";
-import { db as db16 } from "rivetkit/db";
-var testSqliteLoad = actor52({
-  db: db16({
-    onMigrate: async (db17) => {
-      await db17.execute(`
+import { actor as actor54 } from "rivetkit";
+import { db as db18 } from "rivetkit/db";
+var testSqliteLoad = actor54({
+  db: db18({
+    onMigrate: async (db19) => {
+      await db19.execute(`
 				CREATE TABLE IF NOT EXISTS schema_version (
 					id INTEGER PRIMARY KEY CHECK (id = 1),
 					version INTEGER NOT NULL DEFAULT 50
 				)
 			`);
-      await db17.execute(
+      await db19.execute(
         "INSERT OR IGNORE INTO schema_version (id, version) VALUES (1, 50)"
       );
-      await db17.execute(`
+      await db19.execute(`
 				CREATE TABLE IF NOT EXISTS users (
 					id INTEGER PRIMARY KEY AUTOINCREMENT,
 					name TEXT NOT NULL,
@@ -11655,7 +12075,7 @@ var testSqliteLoad = actor52({
 					created_at INTEGER NOT NULL
 				)
 			`);
-      await db17.execute(`
+      await db19.execute(`
 				CREATE TABLE IF NOT EXISTS products (
 					id INTEGER PRIMARY KEY AUTOINCREMENT,
 					name TEXT NOT NULL,
@@ -11663,7 +12083,7 @@ var testSqliteLoad = actor52({
 					created_at INTEGER NOT NULL
 				)
 			`);
-      await db17.execute(`
+      await db19.execute(`
 				CREATE TABLE IF NOT EXISTS orders (
 					id INTEGER PRIMARY KEY AUTOINCREMENT,
 					user_id INTEGER NOT NULL,
@@ -11673,7 +12093,7 @@ var testSqliteLoad = actor52({
 					FOREIGN KEY (user_id) REFERENCES users(id)
 				)
 			`);
-      await db17.execute(`
+      await db19.execute(`
 				CREATE TABLE IF NOT EXISTS order_items (
 					id INTEGER PRIMARY KEY AUTOINCREMENT,
 					order_id INTEGER NOT NULL,
@@ -11684,14 +12104,14 @@ var testSqliteLoad = actor52({
 					FOREIGN KEY (product_id) REFERENCES products(id)
 				)
 			`);
-      await db17.execute(`
+      await db19.execute(`
 				CREATE TABLE IF NOT EXISTS categories (
 					id INTEGER PRIMARY KEY AUTOINCREMENT,
 					name TEXT NOT NULL UNIQUE,
 					description TEXT
 				)
 			`);
-      await db17.execute(`
+      await db19.execute(`
 				CREATE TABLE IF NOT EXISTS product_categories (
 					product_id INTEGER NOT NULL,
 					category_id INTEGER NOT NULL,
@@ -11700,7 +12120,7 @@ var testSqliteLoad = actor52({
 					FOREIGN KEY (category_id) REFERENCES categories(id)
 				)
 			`);
-      await db17.execute(`
+      await db19.execute(`
 				CREATE TABLE IF NOT EXISTS reviews (
 					id INTEGER PRIMARY KEY AUTOINCREMENT,
 					user_id INTEGER NOT NULL,
@@ -11712,7 +12132,7 @@ var testSqliteLoad = actor52({
 					FOREIGN KEY (product_id) REFERENCES products(id)
 				)
 			`);
-      await db17.execute(`
+      await db19.execute(`
 				CREATE TABLE IF NOT EXISTS addresses (
 					id INTEGER PRIMARY KEY AUTOINCREMENT,
 					user_id INTEGER NOT NULL,
@@ -11724,7 +12144,7 @@ var testSqliteLoad = actor52({
 					FOREIGN KEY (user_id) REFERENCES users(id)
 				)
 			`);
-      await db17.execute(`
+      await db19.execute(`
 				CREATE TABLE IF NOT EXISTS payments (
 					id INTEGER PRIMARY KEY AUTOINCREMENT,
 					order_id INTEGER NOT NULL,
@@ -11735,7 +12155,7 @@ var testSqliteLoad = actor52({
 					FOREIGN KEY (order_id) REFERENCES orders(id)
 				)
 			`);
-      await db17.execute(`
+      await db19.execute(`
 				CREATE TABLE IF NOT EXISTS inventory (
 					product_id INTEGER PRIMARY KEY,
 					quantity INTEGER NOT NULL DEFAULT 0,
@@ -11744,7 +12164,7 @@ var testSqliteLoad = actor52({
 					FOREIGN KEY (product_id) REFERENCES products(id)
 				)
 			`);
-      await db17.execute(`
+      await db19.execute(`
 				CREATE TABLE IF NOT EXISTS coupons (
 					id INTEGER PRIMARY KEY AUTOINCREMENT,
 					code TEXT NOT NULL UNIQUE,
@@ -11754,7 +12174,7 @@ var testSqliteLoad = actor52({
 					expires_at INTEGER
 				)
 			`);
-      await db17.execute(`
+      await db19.execute(`
 				CREATE TABLE IF NOT EXISTS shipping (
 					id INTEGER PRIMARY KEY AUTOINCREMENT,
 					order_id INTEGER NOT NULL,
@@ -11767,13 +12187,13 @@ var testSqliteLoad = actor52({
 					FOREIGN KEY (address_id) REFERENCES addresses(id)
 				)
 			`);
-      await db17.execute(`
+      await db19.execute(`
 				CREATE TABLE IF NOT EXISTS tags (
 					id INTEGER PRIMARY KEY AUTOINCREMENT,
 					name TEXT NOT NULL UNIQUE
 				)
 			`);
-      await db17.execute(`
+      await db19.execute(`
 				CREATE TABLE IF NOT EXISTS product_tags (
 					product_id INTEGER NOT NULL,
 					tag_id INTEGER NOT NULL,
@@ -11782,7 +12202,7 @@ var testSqliteLoad = actor52({
 					FOREIGN KEY (tag_id) REFERENCES tags(id)
 				)
 			`);
-      await db17.execute(`
+      await db19.execute(`
 				CREATE TABLE IF NOT EXISTS wishlists (
 					id INTEGER PRIMARY KEY AUTOINCREMENT,
 					user_id INTEGER NOT NULL,
@@ -11791,7 +12211,7 @@ var testSqliteLoad = actor52({
 					FOREIGN KEY (user_id) REFERENCES users(id)
 				)
 			`);
-      await db17.execute(`
+      await db19.execute(`
 				CREATE TABLE IF NOT EXISTS wishlist_items (
 					wishlist_id INTEGER NOT NULL,
 					product_id INTEGER NOT NULL,
@@ -11801,7 +12221,7 @@ var testSqliteLoad = actor52({
 					FOREIGN KEY (product_id) REFERENCES products(id)
 				)
 			`);
-      await db17.execute(`
+      await db19.execute(`
 				CREATE TABLE IF NOT EXISTS notifications (
 					id INTEGER PRIMARY KEY AUTOINCREMENT,
 					user_id INTEGER NOT NULL,
@@ -11812,7 +12232,7 @@ var testSqliteLoad = actor52({
 					FOREIGN KEY (user_id) REFERENCES users(id)
 				)
 			`);
-      await db17.execute(`
+      await db19.execute(`
 				CREATE TABLE IF NOT EXISTS audit_log (
 					id INTEGER PRIMARY KEY AUTOINCREMENT,
 					entity_type TEXT NOT NULL,
@@ -11822,7 +12242,7 @@ var testSqliteLoad = actor52({
 					performed_at INTEGER NOT NULL
 				)
 			`);
-      await db17.execute(`
+      await db19.execute(`
 				CREATE TABLE IF NOT EXISTS sessions (
 					id TEXT PRIMARY KEY,
 					user_id INTEGER NOT NULL,
@@ -11832,37 +12252,37 @@ var testSqliteLoad = actor52({
 					FOREIGN KEY (user_id) REFERENCES users(id)
 				)
 			`);
-      await db17.execute(
+      await db19.execute(
         "CREATE INDEX IF NOT EXISTS idx_users_email ON users(email)"
       );
-      await db17.execute(
+      await db19.execute(
         "CREATE INDEX IF NOT EXISTS idx_orders_user ON orders(user_id)"
       );
-      await db17.execute(
+      await db19.execute(
         "CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status)"
       );
-      await db17.execute(
+      await db19.execute(
         "CREATE INDEX IF NOT EXISTS idx_reviews_product ON reviews(product_id)"
       );
-      await db17.execute(
+      await db19.execute(
         "CREATE INDEX IF NOT EXISTS idx_reviews_user ON reviews(user_id)"
       );
-      await db17.execute(
+      await db19.execute(
         "CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id)"
       );
-      await db17.execute(
+      await db19.execute(
         "CREATE INDEX IF NOT EXISTS idx_audit_entity ON audit_log(entity_type, entity_id)"
       );
-      await db17.execute(
+      await db19.execute(
         "CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id)"
       );
-      await db17.execute(
+      await db19.execute(
         "CREATE INDEX IF NOT EXISTS idx_sessions_token ON sessions(token)"
       );
-      await db17.execute(
+      await db19.execute(
         "CREATE INDEX IF NOT EXISTS idx_inventory_quantity ON inventory(quantity)"
       );
-      await db17.execute(`
+      await db19.execute(`
 				CREATE TABLE IF NOT EXISTS returns (
 					id INTEGER PRIMARY KEY AUTOINCREMENT,
 					order_id INTEGER NOT NULL,
@@ -11873,7 +12293,7 @@ var testSqliteLoad = actor52({
 					FOREIGN KEY (order_id) REFERENCES orders(id)
 				)
 			`);
-      await db17.execute(`
+      await db19.execute(`
 				CREATE TABLE IF NOT EXISTS return_items (
 					return_id INTEGER NOT NULL,
 					order_item_id INTEGER NOT NULL,
@@ -11883,7 +12303,7 @@ var testSqliteLoad = actor52({
 					FOREIGN KEY (order_item_id) REFERENCES order_items(id)
 				)
 			`);
-      await db17.execute(`
+      await db19.execute(`
 				CREATE TABLE IF NOT EXISTS suppliers (
 					id INTEGER PRIMARY KEY AUTOINCREMENT,
 					name TEXT NOT NULL,
@@ -11891,7 +12311,7 @@ var testSqliteLoad = actor52({
 					country TEXT
 				)
 			`);
-      await db17.execute(`
+      await db19.execute(`
 				CREATE TABLE IF NOT EXISTS product_suppliers (
 					product_id INTEGER NOT NULL,
 					supplier_id INTEGER NOT NULL,
@@ -11902,7 +12322,7 @@ var testSqliteLoad = actor52({
 					FOREIGN KEY (supplier_id) REFERENCES suppliers(id)
 				)
 			`);
-      await db17.execute(`
+      await db19.execute(`
 				CREATE TABLE IF NOT EXISTS price_history (
 					id INTEGER PRIMARY KEY AUTOINCREMENT,
 					product_id INTEGER NOT NULL,
@@ -11912,7 +12332,7 @@ var testSqliteLoad = actor52({
 					FOREIGN KEY (product_id) REFERENCES products(id)
 				)
 			`);
-      await db17.execute(`
+      await db19.execute(`
 				CREATE TABLE IF NOT EXISTS user_preferences (
 					user_id INTEGER PRIMARY KEY,
 					theme TEXT NOT NULL DEFAULT 'dark',
@@ -11921,7 +12341,7 @@ var testSqliteLoad = actor52({
 					FOREIGN KEY (user_id) REFERENCES users(id)
 				)
 			`);
-      await db17.execute(`
+      await db19.execute(`
 				CREATE TABLE IF NOT EXISTS cart (
 					user_id INTEGER NOT NULL,
 					product_id INTEGER NOT NULL,
@@ -11932,7 +12352,7 @@ var testSqliteLoad = actor52({
 					FOREIGN KEY (product_id) REFERENCES products(id)
 				)
 			`);
-      await db17.execute(`
+      await db19.execute(`
 				CREATE TABLE IF NOT EXISTS saved_searches (
 					id INTEGER PRIMARY KEY AUTOINCREMENT,
 					user_id INTEGER NOT NULL,
@@ -11942,7 +12362,7 @@ var testSqliteLoad = actor52({
 					FOREIGN KEY (user_id) REFERENCES users(id)
 				)
 			`);
-      await db17.execute(`
+      await db19.execute(`
 				CREATE TABLE IF NOT EXISTS product_images (
 					id INTEGER PRIMARY KEY AUTOINCREMENT,
 					product_id INTEGER NOT NULL,
@@ -11952,7 +12372,7 @@ var testSqliteLoad = actor52({
 					FOREIGN KEY (product_id) REFERENCES products(id)
 				)
 			`);
-      await db17.execute(`
+      await db19.execute(`
 				CREATE TABLE IF NOT EXISTS discounts (
 					id INTEGER PRIMARY KEY AUTOINCREMENT,
 					product_id INTEGER NOT NULL,
@@ -11962,43 +12382,43 @@ var testSqliteLoad = actor52({
 					FOREIGN KEY (product_id) REFERENCES products(id)
 				)
 			`);
-      await db17.execute(
+      await db19.execute(
         "CREATE INDEX IF NOT EXISTS idx_order_items_order ON order_items(order_id)"
       );
-      await db17.execute(
+      await db19.execute(
         "CREATE INDEX IF NOT EXISTS idx_order_items_product ON order_items(product_id)"
       );
-      await db17.execute(
+      await db19.execute(
         "CREATE INDEX IF NOT EXISTS idx_payments_order ON payments(order_id)"
       );
-      await db17.execute(
+      await db19.execute(
         "CREATE INDEX IF NOT EXISTS idx_shipping_order ON shipping(order_id)"
       );
-      await db17.execute(
+      await db19.execute(
         "CREATE INDEX IF NOT EXISTS idx_returns_order ON returns(order_id)"
       );
-      await db17.execute(
+      await db19.execute(
         "CREATE INDEX IF NOT EXISTS idx_price_history_product ON price_history(product_id)"
       );
-      await db17.execute(
+      await db19.execute(
         "CREATE INDEX IF NOT EXISTS idx_product_images_product ON product_images(product_id)"
       );
-      await db17.execute(
+      await db19.execute(
         "CREATE INDEX IF NOT EXISTS idx_discounts_product ON discounts(product_id)"
       );
-      await db17.execute(
+      await db19.execute(
         "CREATE INDEX IF NOT EXISTS idx_cart_user ON cart(user_id)"
       );
-      await db17.execute(
+      await db19.execute(
         "CREATE INDEX IF NOT EXISTS idx_saved_searches_user ON saved_searches(user_id)"
       );
-      await db17.execute(`
+      await db19.execute(`
 				CREATE TABLE IF NOT EXISTS counter (
 					id INTEGER PRIMARY KEY CHECK (id = 1),
 					value INTEGER NOT NULL DEFAULT 0
 				)
 			`);
-      await db17.execute(
+      await db19.execute(
         "INSERT OR IGNORE INTO counter (id, value) VALUES (1, 0)"
       );
     }
@@ -12185,11 +12605,11 @@ var testSqliteLoad = actor52({
 });
 
 // src/actors/workflow/approval.ts
-import { actor as actor53, event as event11, queue as queue4 } from "rivetkit";
+import { actor as actor55, event as event11, queue as queue4 } from "rivetkit";
 import { Loop, workflow } from "rivetkit/workflow";
 var QUEUE_DECISION = "decision";
 var APPROVAL_TIMEOUT_MS = 3e4;
-var approval = actor53({
+var approval = actor55({
   createState: (c, input) => ({
     id: c.key[0],
     title: input?.title ?? "Untitled Request",
@@ -12271,7 +12691,7 @@ var approval = actor53({
 });
 
 // src/actors/workflow/batch.ts
-import { actor as actor54, event as event12 } from "rivetkit";
+import { actor as actor56, event as event12 } from "rivetkit";
 import { Loop as Loop2, workflow as workflow2 } from "rivetkit/workflow";
 function fetchBatch(cursor, batchSize, totalItems) {
   const start = cursor * batchSize;
@@ -12285,7 +12705,7 @@ function fetchBatch(cursor, batchSize, totalItems) {
     hasMore: end < totalItems
   };
 }
-var batch = actor54({
+var batch = actor56({
   createState: (c, input) => ({
     id: c.key[0],
     totalItems: input?.totalItems ?? 50,
@@ -12364,7 +12784,7 @@ var batch = actor54({
 });
 
 // src/actors/workflow/dashboard.ts
-import { actor as actor55, event as event13, queue as queue5 } from "rivetkit";
+import { actor as actor57, event as event13, queue as queue5 } from "rivetkit";
 import { Loop as Loop3, workflow as workflow3 } from "rivetkit/workflow";
 var QUEUE_REFRESH = "refresh";
 async function fetchUserStats() {
@@ -12393,7 +12813,7 @@ async function fetchMetricsStats() {
     bounceRate: Math.round(30 + Math.random() * 40)
   };
 }
-var dashboard = actor55({
+var dashboard = actor57({
   state: {
     data: null,
     loading: false,
@@ -12510,12 +12930,12 @@ var dashboard = actor55({
 });
 
 // src/actors/workflow/history-examples.ts
-import { actor as actor56, queue as queue6 } from "rivetkit";
+import { actor as actor58, queue as queue6 } from "rivetkit";
 import { Loop as Loop4, workflow as workflow4 } from "rivetkit/workflow";
 function delay3(ms) {
   return new Promise((resolve2) => setTimeout(resolve2, ms));
 }
-var workflowHistorySimple = actor56({
+var workflowHistorySimple = actor58({
   createState: (c) => ({
     id: c.key[0],
     status: "pending"
@@ -12551,7 +12971,7 @@ var workflowHistorySimple = actor56({
   })
 });
 var LOOP_ITEMS = ["A", "B", "C"];
-var workflowHistoryLoop = actor56({
+var workflowHistoryLoop = actor58({
   createState: (c) => ({
     id: c.key[0],
     status: "running",
@@ -12592,7 +13012,7 @@ var workflowHistoryLoop = actor56({
     });
   })
 });
-var workflowHistoryJoin = actor56({
+var workflowHistoryJoin = actor58({
   createState: (c) => ({
     id: c.key[0],
     status: "pending"
@@ -12645,7 +13065,7 @@ var workflowHistoryJoin = actor56({
     });
   })
 });
-var workflowHistoryRace = actor56({
+var workflowHistoryRace = actor58({
   createState: (c) => ({
     id: c.key[0],
     status: "running"
@@ -12706,7 +13126,7 @@ var FULL_WORKFLOW_ITEMS = [
   { id: "item-3", basePrice: 130, tax: 10 },
   { id: "item-4", basePrice: 145, tax: 12 }
 ];
-var workflowHistoryFull = actor56({
+var workflowHistoryFull = actor58({
   createState: (c) => ({
     id: c.key[0],
     status: "pending",
@@ -12903,7 +13323,7 @@ var workflowHistoryFull = actor56({
     });
   })
 });
-var workflowHistoryInProgress = actor56({
+var workflowHistoryInProgress = actor58({
   createState: (c, input) => ({
     id: c.key[0],
     status: "running",
@@ -12933,7 +13353,7 @@ var workflowHistoryInProgress = actor56({
   })
 });
 var RETRY_MAX_RETRIES = 20;
-var workflowHistoryRetrying = actor56({
+var workflowHistoryRetrying = actor58({
   createState: (c) => ({
     id: c.key[0],
     status: "running",
@@ -12971,7 +13391,7 @@ var workflowHistoryRetrying = actor56({
   })
 });
 var FAILED_MAX_RETRIES = 3;
-var workflowHistoryFailed = actor56({
+var workflowHistoryFailed = actor58({
   createState: (c) => ({
     id: c.key[0],
     status: "running",
@@ -13006,7 +13426,7 @@ var workflowHistoryFailed = actor56({
 });
 
 // src/actors/workflow/order.ts
-import { actor as actor57, event as event14 } from "rivetkit";
+import { actor as actor59, event as event14 } from "rivetkit";
 import { Loop as Loop5, workflow as workflow5 } from "rivetkit/workflow";
 async function simulateWork(name, failChance = 0.1) {
   await new Promise(
@@ -13016,7 +13436,7 @@ async function simulateWork(name, failChance = 0.1) {
     throw new Error(`${name} failed (simulated)`);
   }
 }
-var order = actor57({
+var order = actor59({
   createState: (c) => ({
     id: c.key[0],
     status: "pending",
@@ -13069,9 +13489,9 @@ var order = actor57({
 });
 
 // src/actors/workflow/payment.ts
-import { actor as actor58, event as event15 } from "rivetkit";
+import { actor as actor60, event as event15 } from "rivetkit";
 import { Loop as Loop6, workflow as workflow6 } from "rivetkit/workflow";
-var payment = actor58({
+var payment = actor60({
   createState: (c, input) => ({
     id: c.key[0],
     amount: input?.amount ?? 100,
@@ -13198,9 +13618,9 @@ var payment = actor58({
 });
 
 // src/actors/workflow/race.ts
-import { actor as actor59, event as event16 } from "rivetkit";
+import { actor as actor61, event as event16 } from "rivetkit";
 import { Loop as Loop7, workflow as workflow7 } from "rivetkit/workflow";
-var race = actor59({
+var race = actor61({
   createState: (c, input) => ({
     id: c.key[0],
     workDurationMs: input?.workDurationMs ?? 2e3,
@@ -13282,9 +13702,9 @@ var race = actor59({
 });
 
 // src/actors/workflow/timer.ts
-import { actor as actor60, event as event17 } from "rivetkit";
+import { actor as actor62, event as event17 } from "rivetkit";
 import { Loop as Loop8, workflow as workflow8 } from "rivetkit/workflow";
-var timer = actor60({
+var timer = actor62({
   createState: (c, input) => ({
     id: c.key[0],
     name: input?.name ?? "Timer",
@@ -13327,12 +13747,12 @@ var timer = actor60({
 });
 
 // src/actors/workflow/workflow-fixtures.ts
-import { actor as actor61, event as event18, queue as queue7 } from "rivetkit";
+import { actor as actor63, event as event18, queue as queue7 } from "rivetkit";
 import { Loop as Loop9, workflow as workflow9 } from "rivetkit/workflow";
 var WORKFLOW_GUARD_KV_KEY = "__rivet_actor_workflow_guard_triggered";
 var WORKFLOW_QUEUE_NAME = "workflow-default";
 var WORKFLOW_TIMEOUT_QUEUE_NAME = "workflow-timeout";
-var workflowCounterActor = actor61({
+var workflowCounterActor = actor63({
   state: {
     runCount: 0,
     guardTriggered: false,
@@ -13368,7 +13788,7 @@ var workflowCounterActor = actor61({
     sleepTimeout: 50
   }
 });
-var workflowQueueActor = actor61({
+var workflowQueueActor = actor63({
   state: {
     received: []
   },
@@ -13395,7 +13815,7 @@ var workflowQueueActor = actor61({
     getMessages: (c) => c.state.received
   }
 });
-var workflowSleepActor = actor61({
+var workflowSleepActor = actor63({
   state: {
     ticks: 0
   },
@@ -13415,7 +13835,7 @@ var workflowSleepActor = actor61({
     sleepTimeout: 50
   }
 });
-var workflowQueueTimeoutActor = actor61({
+var workflowQueueTimeoutActor = actor63({
   state: {
     processed: 0,
     ticks: 0,
@@ -13664,6 +14084,8 @@ var registry2 = setup2({
     rawSqliteFuzzer,
     sqliteMemoryPressure,
     growDb,
+    largeCommitDb,
+    churnDb,
     mockAgenticLoop,
     sleepCloseFuzz,
     loadTestAgent,

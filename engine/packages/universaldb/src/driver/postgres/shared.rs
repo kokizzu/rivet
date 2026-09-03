@@ -31,6 +31,7 @@ pub struct LeaseInfo {
 /// Process-wide state shared by the follower transaction tasks and the leader resolver. Every node is
 /// both a follower (it submits its own commits) and, in multi-node mode, a candidate leader.
 pub struct PostgresShared {
+	pub config: rivet_config::Config,
 	pub pool: Pool,
 	/// Unique per-process id. Names this node's commit subject and is the dedup `client_node_id`.
 	pub node_id: String,
@@ -47,9 +48,23 @@ pub struct PostgresShared {
 }
 
 impl PostgresShared {
-	pub fn new(pool: Pool, node_id: String, transport: Transport) -> Arc<Self> {
+	/// The commit protocol version agreed across the engine fleet.
+	///
+	/// A leader or follower running older code has to be able to decode what we send, so this is
+	/// the negotiated version rather than `rivet_universaldb_commit::PROTOCOL_VERSION`.
+	pub fn commit_protocol_version(&self) -> u16 {
+		self.config.protocols().universaldb_commit.version()
+	}
+
+	pub fn new(
+		config: rivet_config::Config,
+		pool: Pool,
+		node_id: String,
+		transport: Transport,
+	) -> Arc<Self> {
 		let (lease_tx, lease_rx) = watch::channel(None);
 		let shared = Arc::new(Self {
+			config,
 			pool,
 			node_id,
 			transport,

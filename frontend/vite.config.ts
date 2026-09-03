@@ -27,7 +27,7 @@ const getVariantForMode = (mode: string) => {
 	}
 };
 
-function _isFlagEnabled(
+function isFlagEnabled(
 	featureFlags: string | undefined,
 	flag: string,
 ): boolean {
@@ -41,6 +41,10 @@ function _isFlagEnabled(
 // https://vitejs.dev/config/
 export default defineConfig(({ mode }) => {
 	const env = commonEnvSchema.parse(loadEnv(mode, process.cwd(), ""));
+	const featureFlags = process.env.VITE_FEATURE_FLAGS;
+	const supportEnabled = isFlagEnabled(featureFlags, "support");
+	const multitenancyEnabled = isFlagEnabled(featureFlags, "multitenancy");
+	const base = multitenancyEnabled ? "/" : "/ui/";
 
 	console.log(
 		env.SENTRY_AUTH_TOKEN
@@ -49,20 +53,20 @@ export default defineConfig(({ mode }) => {
 	);
 
 	return mergeConfig(baseViteConfig(), {
-		base: env.BASE_URL ?? "/",
+		base,
 		plugins: [
 			tanstackRouter({ target: "react", autoCodeSplitting: true }),
 			react(),
 			env.SENTRY_AUTH_TOKEN
 				? sentryVitePlugin({
-						org: "rivet-gaming",
-						project: env.SENTRY_PROJECT,
-						authToken: env.SENTRY_AUTH_TOKEN,
-						release:
-							GIT_BRANCH === "main"
-								? { name: GIT_SHA }
-								: undefined,
-					})
+					org: "rivet-gaming",
+					project: env.SENTRY_PROJECT,
+					authToken: env.SENTRY_AUTH_TOKEN,
+					release:
+						GIT_BRANCH === "main"
+							? { name: GIT_SHA }
+							: undefined,
+				})
 				: null,
 			favigo({
 				source: "./public/favicon.svg",
@@ -86,7 +90,10 @@ export default defineConfig(({ mode }) => {
 					rewrite: (path: string) => path.replace(/^\/api/, ""),
 				},
 			},
-			allowedHosts: ["local.staging.rivet.dev", ".e2b.app", ".onamp.dev"],
+			// Accept the shared dev tunnel hostname.
+			// See docs-internal/platform/dev-tunnel.md.
+			// allowedHosts: ["dashboard.dev.rivet.dev"],
+			allowedHosts: ["local.staging.rivet.dev"],
 		},
 		preview: {
 			port: 43708,

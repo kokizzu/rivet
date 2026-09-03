@@ -205,6 +205,22 @@ impl Drop for NativeSqliteOracle {
 	}
 }
 
+/// Reads the page count out of a page-1 SQLite header the same way the VFS does when it seeds its
+/// database size at open (`depot-client/src/vfs.rs`, `sqlite_header_db_size_pages`).
+pub(crate) fn page_one_db_size_pages(page: &[u8]) -> Result<u32> {
+	const SQLITE_HEADER_MAGIC: &[u8] = b"SQLite format 3\0";
+
+	if page.len() < 100 {
+		bail!("page 1 is {} bytes, too short to hold a header", page.len());
+	}
+	if &page[..SQLITE_HEADER_MAGIC.len()] != SQLITE_HEADER_MAGIC {
+		bail!("page 1 does not start with the sqlite header magic");
+	}
+
+	let db_size_pages = u32::from_be_bytes([page[28], page[29], page[30], page[31]]);
+	Ok(db_size_pages.max(1))
+}
+
 pub(crate) fn canonical_dump(db: *mut sqlite3) -> Result<CanonicalDump> {
 	let mut entries = Vec::new();
 	for row in query_rows(

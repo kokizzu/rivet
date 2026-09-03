@@ -75,11 +75,19 @@ async function main(): Promise<void> {
 	}
 
 	const verified = await handle.verify({ rowBytes: ROW_BYTES, random: true });
-	log({ event: "verified", ok: verified.ok, integrity: verified.integrity, rows: verified.rows });
+	log({
+		event: "verified",
+		ok: verified.ok,
+		integrity: verified.integrity,
+		rows: verified.rows,
+	});
 	if (!verified.ok) process.exitCode = 1;
 }
 
 main().catch((err) => {
-	log({ event: "fatal", error: err instanceof Error ? err.message : String(err) });
+	log({
+		event: "fatal",
+		error: err instanceof Error ? err.message : String(err),
+	});
 	process.exitCode = 1;
 });

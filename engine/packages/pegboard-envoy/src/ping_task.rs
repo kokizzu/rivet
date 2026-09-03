@@ -1,13 +1,15 @@
 use gas::prelude::*;
 use hyper_tungstenite::tungstenite::Message;
+use pegboard::ops::envoy::update_ping::Outcome;
 use rand::Rng;
 use rivet_envoy_protocol::{self as protocol, versioned};
+use rivet_metrics::GaugeGuardExt;
 use std::sync::{Arc, atomic::Ordering};
 use std::time::Duration;
 use tokio::sync::watch;
 use vbare::OwnedVersionedData;
 
-use crate::{LifecycleResult, conn::Conn, errors::WsError, metrics, ws_to_tunnel_task};
+use crate::{LifecycleResult, conn::Conn, errors::WsError, metrics};
 
 #[tracing::instrument(name = "ping_task", skip_all)]
 pub async fn task(
@@ -53,23 +55,54 @@ pub async fn task(
 }
 
 async fn send_ping(ctx: &StandaloneCtx, conn: &Conn) -> Result<()> {
-	ctx.op(pegboard::ops::envoy::update_ping::Input {
-		namespace_id: conn.namespace_id,
-		envoy_key: conn.envoy_key.clone(),
-		update_lb: !conn.is_serverless(),
-		rtt: conn.last_rtt.load(Ordering::Relaxed),
-	})
-	.await?;
+	let update = ctx
+		.op(pegboard::ops::envoy::update_ping::Input {
+			namespace_id: conn.namespace_id,
+			envoy_key: conn.envoy_key.clone(),
+			envoy_conn_id: Some(conn.envoy_conn_id),
+			update_lb: !conn.is_serverless(),
+			rtt: conn.last_rtt.load(Ordering::Relaxed),
+			is_stopping: conn.reported_stopping.load(Ordering::SeqCst),
+		})
+		.await?;
+
+	validate_registration_outcome(
+		update.outcome,
+		conn.reported_stopping.load(Ordering::SeqCst),
+	)?;
 
 	let ping_msg =
 		versioned::ToEnvoy::wrap_latest(protocol::ToEnvoy::ToEnvoyPing(protocol::ToEnvoyPing {
 			ts: util::timestamp::now(),
 		}));
 	let ping_msg_serialized = ping_msg.serialize(conn.protocol_version)?;
-	let _in_flight = ws_to_tunnel_task::WsResponseInFlightGuard::new();
+	let _in_flight = metrics::WS_RESPONSES_IN_FLIGHT.inc_guard();
 	conn.ws_handle
 		.send(Message::Binary(ping_msg_serialized.into()))
 		.await?;
 
 	Ok(())
 }
+
+fn validate_registration_outcome(outcome: Outcome, is_stopping: bool) -> Result<()> {
+	match outcome {
+		Outcome::Updated => {}
+		Outcome::StaleConnection => {
+			return Err(WsError::Eviction.build());
+		}
+		Outcome::Expired => {
+			// ToRivetStopping sets this flag before it expires scheduler membership. The flag may
+			// change while update_ping is in flight, so re-read it before treating Expired as an
+			// invariant violation.
+			if !is_stopping {
+				return Err(WsError::RegistrationExpired.build());
+			}
+		}
+	}
+
+	Ok(())
+}
+
+#[cfg(test)]
+#[path = "../tests/support/ping_task.rs"]
+mod tests;

@@ -140,8 +140,8 @@ example-name/
 
 ### Dependencies
 
-- Use `"rivetkit": "*"` for the main RivetKit package
-- Use `"@rivetkit/react": "*"` for React integration
+- Use `"rivetkit": "workspace:*"` for the main RivetKit package
+- Use `"@rivetkit/react": "workspace:*"` for React integration
 - In fresh worktrees, run `pnpm build -F rivetkit` before example typechecks if workspace `rivetkit` imports are unresolved because the package declarations are build outputs.
 - Common dev dependencies:
 - `tsx` for running TypeScript in development

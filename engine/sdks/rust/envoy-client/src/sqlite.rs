@@ -14,6 +14,9 @@ use crate::utils::{
 pub enum SqliteRequest {
 	GetPages(protocol::SqliteGetPagesRequest),
 	Commit(protocol::SqliteCommitRequest),
+	CommitStageBegin(protocol::SqliteCommitStageBeginRequest),
+	CommitStageSegment(protocol::SqliteCommitStageSegmentRequest),
+	CommitFinalize(protocol::SqliteCommitFinalizeRequest),
 }
 
 impl SqliteRequest {
@@ -21,6 +24,9 @@ impl SqliteRequest {
 		match self {
 			SqliteRequest::GetPages(_) => "get_pages",
 			SqliteRequest::Commit(_) => "commit",
+			SqliteRequest::CommitStageBegin(_) => "commit_stage_begin",
+			SqliteRequest::CommitStageSegment(_) => "commit_stage_segment",
+			SqliteRequest::CommitFinalize(_) => "commit_finalize",
 		}
 	}
 }
@@ -28,6 +34,9 @@ impl SqliteRequest {
 pub enum SqliteResponse {
 	GetPages(protocol::SqliteGetPagesResponse),
 	Commit(protocol::SqliteCommitResponse),
+	CommitStageBegin(protocol::SqliteCommitStageBeginResponse),
+	CommitStageSegment(protocol::SqliteCommitStageSegmentResponse),
+	CommitFinalize(protocol::SqliteCommitFinalizeResponse),
 }
 
 #[derive(Clone, Debug)]
@@ -160,6 +169,42 @@ pub async fn handle_sqlite_commit_response(
 	);
 }
 
+pub async fn handle_sqlite_commit_stage_begin_response(
+	ctx: &mut EnvoyContext,
+	response: protocol::ToEnvoySqliteCommitStageBeginResponse,
+) {
+	handle_sqlite_response(
+		ctx,
+		response.request_id,
+		SqliteResponse::CommitStageBegin(response.data),
+		"sqlite_commit_stage_begin",
+	);
+}
+
+pub async fn handle_sqlite_commit_stage_segment_response(
+	ctx: &mut EnvoyContext,
+	response: protocol::ToEnvoySqliteCommitStageSegmentResponse,
+) {
+	handle_sqlite_response(
+		ctx,
+		response.request_id,
+		SqliteResponse::CommitStageSegment(response.data),
+		"sqlite_commit_stage_segment",
+	);
+}
+
+pub async fn handle_sqlite_commit_finalize_response(
+	ctx: &mut EnvoyContext,
+	response: protocol::ToEnvoySqliteCommitFinalizeResponse,
+) {
+	handle_sqlite_response(
+		ctx,
+		response.request_id,
+		SqliteResponse::CommitFinalize(response.data),
+		"sqlite_commit_finalize",
+	);
+}
+
 pub async fn handle_remote_sqlite_exec_response(
 	ctx: &mut EnvoyContext,
 	response: protocol::ToEnvoySqliteExecResponse,
@@ -256,6 +301,21 @@ pub async fn send_single_sqlite_request(ctx: &mut EnvoyContext, request_id: u32)
 			SqliteRequest::Commit(data) => protocol::ToRivet::ToRivetSqliteCommitRequest(
 				protocol::ToRivetSqliteCommitRequest { request_id, data },
 			),
+			SqliteRequest::CommitStageBegin(data) => {
+				protocol::ToRivet::ToRivetSqliteCommitStageBeginRequest(
+					protocol::ToRivetSqliteCommitStageBeginRequest { request_id, data },
+				)
+			}
+			SqliteRequest::CommitStageSegment(data) => {
+				protocol::ToRivet::ToRivetSqliteCommitStageSegmentRequest(
+					protocol::ToRivetSqliteCommitStageSegmentRequest { request_id, data },
+				)
+			}
+			SqliteRequest::CommitFinalize(data) => {
+				protocol::ToRivet::ToRivetSqliteCommitFinalizeRequest(
+					protocol::ToRivetSqliteCommitFinalizeRequest { request_id, data },
+				)
+			}
 		};
 
 	ws_send(&ctx.shared, message).await;

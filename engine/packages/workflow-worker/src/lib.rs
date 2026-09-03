@@ -3,7 +3,7 @@ use gas::prelude::*;
 
 #[tracing::instrument(skip_all)]
 pub async fn start(config: rivet_config::Config, pools: rivet_pools::Pools) -> Result<()> {
-	let reg = registry()?;
+	let reg = registry(&config)?;
 	let db = db::DatabaseKv::new(config.clone(), pools.clone()).await?;
 	let worker = Worker::new(reg.handle(), db, config, pools);
 
@@ -11,12 +11,12 @@ pub async fn start(config: rivet_config::Config, pools: rivet_pools::Pools) -> R
 	worker.start(None).await
 }
 
-pub fn registry() -> Result<Registry> {
+pub fn registry(config: &rivet_config::Config) -> Result<Registry> {
 	pegboard::registry()?
 		.merge(namespace::registry()?)?
 		.merge(epoxy::registry()?)?
 		.merge(gasoline_runtime::registry()?)?
 		.merge(datacenter::registry()?)?
-		.merge(depot::registry()?)
+		.merge(depot::registry(config)?)
 		.map_err(Into::into)
 }

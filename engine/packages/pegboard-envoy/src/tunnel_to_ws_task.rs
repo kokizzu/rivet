@@ -3,6 +3,7 @@ use gas::prelude::*;
 use hyper_tungstenite::tungstenite::Message;
 use pegboard::pubsub_subjects::GatewayReceiverSubject;
 use rivet_envoy_protocol::{self as protocol, PROTOCOL_VERSION, versioned};
+use rivet_metrics::GaugeGuardExt;
 use std::{future::Future, sync::Arc, time::Instant};
 use tokio::sync::watch;
 use universalpubsub as ups;
@@ -11,7 +12,7 @@ use vbare::OwnedVersionedData;
 
 use crate::{
 	LifecycleResult, actor_lifecycle, conn::Conn, hibernating_requests, metrics,
-	tunnel_message_task, ws_to_tunnel_task,
+	tunnel_message_task,
 };
 
 #[tracing::instrument(name = "tunnel_to_ws_task", skip_all, fields(ray_id=?ctx.ray_id(), req_id=?ctx.req_id(), namespace_id=%conn.namespace_id, pool_name=%conn.pool_name, envoy_key=%conn.envoy_key, protocol_version=%conn.protocol_version))]
@@ -42,50 +43,62 @@ pub async fn task(
 	}
 }
 
-#[tracing::instrument(skip_all)]
+#[tracing::instrument(level = "debug", skip_all)]
 async fn recv_msg(
 	conn: &Conn,
 	tunnel_sub: &mut Subscriber,
 	eviction_sub: &mut Subscriber,
 	tunnel_to_ws_abort_rx: &mut watch::Receiver<()>,
 ) -> Result<std::result::Result<ups::Message, LifecycleResult>> {
-	let tunnel_msg = tokio::select! {
-		res = tunnel_sub.next() => {
-			if let NextOutput::Message(tunnel_msg) = res? {
-				tunnel_msg
-			} else {
-				tracing::debug!("tunnel sub closed");
-				bail!("tunnel sub closed");
+	loop {
+		let tunnel_msg = tokio::select! {
+			res = tunnel_sub.next() => {
+				if let NextOutput::Message(tunnel_msg) = res? {
+					tunnel_msg
+				} else {
+					tracing::debug!("tunnel sub closed");
+					bail!("tunnel sub closed");
+				}
 			}
-		}
-		_ = eviction_sub.next() => {
-			tracing::debug!("envoy evicted");
+			res = eviction_sub.next() => {
+				if !matches!(res?, NextOutput::Message(_)) {
+					bail!("eviction sub closed");
+				}
 
-			metrics::EVICTION_TOTAL
-				.with_label_values(&[
-					conn.namespace_id.to_string().as_str(),
-					&conn.pool_name,
-					conn.protocol_version.to_string().as_str(),
-				])
-				.inc();
+				// Every registration publishes this wakeup, including this connection's own, so the
+				// persisted owner decides whether this connection must exit.
+				if conn.is_current_registration().await? {
+					tracing::debug!("ignoring eviction wakeup for current envoy connection");
+					continue;
+				}
 
-			return Ok(Err(LifecycleResult::Evicted));
-		}
-		_ = tunnel_to_ws_abort_rx.changed() => {
-			tracing::debug!("task aborted");
-			return Ok(Err(LifecycleResult::Aborted));
-		}
-	};
+				tracing::debug!("envoy connection superseded");
+				metrics::EVICTION_TOTAL
+					.with_label_values(&[
+						conn.namespace_id.to_string().as_str(),
+						&conn.pool_name,
+						conn.protocol_version.to_string().as_str(),
+					])
+					.inc();
 
-	tracing::debug!(
-		payload_len = tunnel_msg.payload.len(),
-		"received message from pubsub, forwarding to WebSocket"
-	);
+				return Ok(Err(LifecycleResult::Evicted));
+			}
+			_ = tunnel_to_ws_abort_rx.changed() => {
+				tracing::debug!("task aborted");
+				return Ok(Err(LifecycleResult::Aborted));
+			}
+		};
 
-	Ok(Ok(tunnel_msg))
+		tracing::debug!(
+			payload_len = tunnel_msg.payload.len(),
+			"received message from pubsub, forwarding to WebSocket"
+		);
+
+		return Ok(Ok(tunnel_msg));
+	}
 }
 
-#[tracing::instrument(skip_all)]
+#[tracing::instrument(level = "debug", skip_all)]
 async fn handle_message(
 	ctx: &StandaloneCtx,
 	conn: &Conn,
@@ -228,7 +241,7 @@ async fn handle_message(
 			"sending tunnel message to actor websocket"
 		);
 	}
-	let _in_flight = ws_to_tunnel_task::WsResponseInFlightGuard::new();
+	let _in_flight = metrics::WS_RESPONSES_IN_FLIGHT.inc_guard();
 	let websocket_handoff = async {
 		conn.ws_handle
 			.send(ws_msg)

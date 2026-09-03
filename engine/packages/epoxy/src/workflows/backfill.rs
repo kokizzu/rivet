@@ -179,7 +179,7 @@ pub async fn backfill_chunk(
 				})
 			}
 		})
-		.custom_instrument(tracing::info_span!("epoxy_backfill_chunk_tx", %replica_id))
+		.custom_instrument(tracing::debug_span!("epoxy_backfill_chunk_tx", %replica_id))
 		.await
 }
 
@@ -202,10 +202,10 @@ pub async fn mark_complete(ctx: &ActivityCtx, input: &MarkCompleteInput) -> Resu
 				Ok(())
 			}
 		})
-		.custom_instrument(tracing::info_span!("mark_backfill_complete_tx"))
+		.custom_instrument(tracing::debug_span!("mark_backfill_complete_tx"))
 		.await?;
 
-	tracing::info!(name = %input.name, "marked backfill as complete");
+	tracing::debug!(name = %input.name, "marked backfill as complete");
 
 	Ok(())
 }

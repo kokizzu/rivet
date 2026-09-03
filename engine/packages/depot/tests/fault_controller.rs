@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use depot::fault::{
-	CommitFaultPoint, DepotFaultContext, DepotFaultController, DepotFaultPoint,
+	ColdTierFaultPoint, CommitFaultPoint, DepotFaultContext, DepotFaultController, DepotFaultPoint,
 	DepotFaultReplayEventKind, FaultBoundary, HotCompactionFaultPoint, ReadFaultPoint,
 };
 use depot::types::DatabaseBranchId;
@@ -84,19 +84,19 @@ async fn unready_rules_do_not_block_later_matching_rules() -> Result<()> {
 #[tokio::test]
 async fn fail_action_returns_error_and_records_replay() -> Result<()> {
 	let controller = DepotFaultController::new();
-	let point = DepotFaultPoint::Read(ReadFaultPoint::BeforeReturnPages);
+	let point = DepotFaultPoint::Read(ReadFaultPoint::ColdObjectMissing);
 
 	controller
 		.at(point.clone())
 		.once()
-		.fail("page load failed")?;
+		.fail("cold object disappeared")?;
 
 	let err = controller
 		.maybe_fire(point, DepotFaultContext::default())
 		.await
 		.expect_err("fail actions should return an error");
 
-	assert!(err.to_string().contains("page load failed"));
+	assert!(err.to_string().contains("cold object disappeared"));
 	assert_eq!(
 		controller.replay_log()[0].kind,
 		DepotFaultReplayEventKind::Fired
@@ -136,8 +136,7 @@ async fn pause_action_waits_for_release() -> Result<()> {
 #[tokio::test(start_paused = true)]
 async fn delay_action_is_bounded_and_fires() -> Result<()> {
 	let controller = DepotFaultController::new();
-	let point =
-		DepotFaultPoint::HotCompaction(HotCompactionFaultPoint::AfterStageBeforeFinishSignal);
+	let point = DepotFaultPoint::ColdTier(ColdTierFaultPoint::GetObject);
 
 	controller
 		.at(point.clone())

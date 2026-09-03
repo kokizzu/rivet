@@ -71,7 +71,7 @@ pub enum BallotSelection {
 	FreshBallot(Ballot),
 }
 
-#[tracing::instrument(skip_all, fields(%replica_id))]
+#[tracing::instrument(level = "debug", skip_all, fields(%replica_id))]
 pub async fn ballot_selection(
 	tx: &Transaction,
 	replica_id: protocol::ReplicaId,

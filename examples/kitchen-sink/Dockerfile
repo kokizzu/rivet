@@ -17,6 +17,8 @@ COPY rivetkit-typescript/packages/ ./rivetkit-typescript/packages/
 COPY engine/sdks/typescript/ ./engine/sdks/typescript/
 COPY shared/typescript/ ./shared/typescript/
 
+ENV SKIP_WASM_BUILD=1
+ENV SKIP_NAPI_BUILD=1
 RUN pnpm install --frozen-lockfile
 RUN mkdir -p rivetkit-openapi rivetkit-asyncapi
 RUN pnpm build --filter=kitchen-sink

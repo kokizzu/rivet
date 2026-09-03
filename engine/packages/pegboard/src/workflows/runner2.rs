@@ -84,6 +84,7 @@ pub async fn pegboard_runner2(ctx: &mut WorkflowCtx, input: &Input) -> Result<()
 			reset_actor_rescheduling: false,
 		})
 		.to_workflow_id(workflow_id)
+		.graceful_not_found()
 		.send()
 		.await?;
 	}
@@ -205,11 +206,19 @@ async fn check_queue(ctx: &mut WorkflowCtx, namespace_id: Id, name: &str) -> Res
 
 	// Dispatch pending allocs
 	for alloc in res.allocations {
-		ctx.signal(alloc.signal)
+		let res = ctx
+			.signal(alloc.signal)
 			.to_workflow::<crate::workflows::actor::Workflow>()
 			.tag("actor_id", alloc.actor_id)
+			.graceful_not_found()
 			.send()
 			.await?;
+		if res.is_none() {
+			tracing::warn!(
+				?alloc.actor_id,
+				"actor workflow not found, likely already stopped"
+			);
+		}
 	}
 
 	Ok(())

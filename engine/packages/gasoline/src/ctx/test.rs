@@ -47,7 +47,7 @@ impl TestCtx {
 	) -> Result<Self> {
 		setup_logging();
 
-		tracing::info!("setting up gasoline test environment");
+		tracing::info!(config=?**test_deps.config(), "setting up gasoline test environment");
 
 		let config = test_deps.config().clone();
 		let pools = test_deps.pools().clone();

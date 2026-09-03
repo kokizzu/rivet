@@ -4,6 +4,24 @@ use std::{sync::Arc, time::Duration};
 use universalpubsub::{NextOutput, PubSub, PublishOpts};
 use uuid::Uuid;
 
+/// A config carrying the compiled ups protocol version.
+///
+/// `RuntimeProtocols::default()` reports version 0 so that a process which never negotiated cannot
+/// silently reach the wire, which means a test has to supply the real version itself.
+fn test_config() -> rivet_config::Config {
+	rivet_config::Config::from_root_with_build_meta(
+		rivet_config::config::Root::default(),
+		rivet_config::BuildMeta::default(),
+		rivet_config::RuntimeProtocols {
+			ups: rivet_config::RuntimeProtocol::new(
+				rivet_config::RuntimeProtocolKind::Ups,
+				rivet_ups_protocol::PROTOCOL_VERSION,
+			),
+			..Default::default()
+		},
+	)
+}
+
 fn setup_logging() {
 	let _ = tracing_subscriber::fmt()
 		.with_env_filter("debug")
@@ -41,7 +59,7 @@ async fn test_nats_driver_with_memory_reconnect() {
 	)
 	.await
 	.unwrap();
-	let pubsub = PubSub::new_with_memory_optimization(Arc::new(driver), true);
+	let pubsub = PubSub::new_with_memory_optimization(test_config(), Arc::new(driver), true);
 
 	test_all_inner(&pubsub, &docker, true).await;
 }
@@ -75,7 +93,7 @@ async fn test_nats_driver_without_memory_reconnect() {
 	)
 	.await
 	.unwrap();
-	let pubsub = PubSub::new_with_memory_optimization(Arc::new(driver), false);
+	let pubsub = PubSub::new_with_memory_optimization(test_config(), Arc::new(driver), false);
 
 	test_all_inner(&pubsub, &docker, true).await;
 }

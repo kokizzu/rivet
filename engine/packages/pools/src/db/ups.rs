@@ -107,6 +107,7 @@ pub async fn setup(config: &Config, client_name: &str) -> Result<UpsPool> {
 		config::PubSub::Memory(memory) => memory.disable_memory_optimization,
 	};
 	Ok(ups::PubSub::new_with_memory_optimization(
+		config.clone(),
 		driver,
 		!disable_memory_optimization,
 	))

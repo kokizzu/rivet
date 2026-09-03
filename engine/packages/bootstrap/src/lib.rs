@@ -27,6 +27,8 @@ pub async fn start(config: rivet_config::Config, pools: rivet_pools::Pools) -> R
 		setup_datacenter_ping(&ctx),
 	)?;
 
+	// Must happen after coordinator is reconfigured
+
 	Ok(())
 }
 

@@ -4,7 +4,10 @@
 use std::{
 	collections::{HashMap, HashSet},
 	hash::{DefaultHasher, Hash, Hasher},
-	sync::Arc,
+	sync::{
+		Arc,
+		atomic::{AtomicI64, AtomicU64, Ordering},
+	},
 	time::{Duration, Instant},
 };
 
@@ -30,29 +33,123 @@ use crate::{
 		location::Location,
 	},
 	metrics,
-	worker::PING_INTERVAL,
+	worker::{PING_INTERVAL, WORKER_LOST_THRESHOLD_MS},
 	workflow::PruneVariant,
 };
 
 mod debug;
 mod keys;
+mod repair;
 mod subjects;
 mod system;
 
-/// How long before considering the leases of a given worker expired.
-const WORKER_LOST_THRESHOLD_MS: i64 = rivet_util::duration::seconds(30);
 /// How long before overwriting an existing metrics lock.
 const METRICS_LOCK_TIMEOUT_MS: i64 = rivet_util::duration::seconds(30);
 const EARLY_TXN_TIMEOUT: Duration = Duration::from_millis(2500);
+/// Half life used to decay the active worker count estimate.
+const ACTIVE_WORKER_COUNT_HALF_LIFE_MS: f64 = 30_000.0;
 
 pub struct DatabaseKv {
 	config: rivet_config::Config,
 	pools: rivet_pools::Pools,
 	subspace: universaldb::utils::Subspace,
 	system: Arc<Mutex<system::SystemInfo>>,
+	active_worker_count: ActiveWorkerCountEma,
+}
+
+/// Smoothed estimate of the cluster-wide active worker count.
+///
+/// Increases jump immediately (this behaves as a max), while decreases decay towards the latest
+/// observation with a fixed half life. This prevents a transient drop in observed workers from
+/// immediately loosening the cluster-wide workflow concurrency quota, while still recovering once
+/// workers actually go away.
+///
+/// The value and timestamp are stored as separate atomics. The observe read-modify-write is not
+/// strictly atomic across the pair, but a slightly stale estimate is acceptable here.
+struct ActiveWorkerCountEma {
+	/// Current smoothed value stored as `f64` bits.
+	value_bits: AtomicU64,
+	last_update_ts: AtomicI64,
+}
+
+impl ActiveWorkerCountEma {
+	fn new(initial: usize) -> Self {
+		ActiveWorkerCountEma {
+			value_bits: AtomicU64::new((initial as f64).to_bits()),
+			last_update_ts: AtomicI64::new(rivet_util::timestamp::now()),
+		}
+	}
+
+	/// Records a new observation. A higher value jumps immediately; a lower value decays the current
+	/// estimate towards the observation based on the elapsed time since the last observation.
+	fn observe(&self, count: usize, now: i64) {
+		let count = count as f64;
+		let prev = f64::from_bits(self.value_bits.load(Ordering::Relaxed));
+
+		let next = if count >= prev {
+			count
+		} else {
+			let prev_ts = self.last_update_ts.load(Ordering::Relaxed);
+			let dt = now.saturating_sub(prev_ts).max(0) as f64;
+			let decay = 0.5f64.powf(dt / ACTIVE_WORKER_COUNT_HALF_LIFE_MS);
+			count + (prev - count) * decay
+		};
+
+		self.value_bits.store(next.to_bits(), Ordering::Relaxed);
+		self.last_update_ts.store(now, Ordering::Relaxed);
+	}
+
+	/// Returns the current smoothed active worker count, rounded and floored at 1.
+	fn get(&self) -> usize {
+		(f64::from_bits(self.value_bits.load(Ordering::Relaxed)).round() as usize).max(1)
+	}
 }
 
 impl DatabaseKv {
+	/// Validates that `worker_id` still holds the lease for the given workflow.
+	///
+	/// Every write to a workflow's history, state, or completion must be fenced by this check. A
+	/// worker that lost its lease (via `clear_expired_leases` or a failover) can still have the
+	/// workflow running in memory, and its writes would corrupt history that another worker now owns.
+	/// The lease is read as `Serializable` so a concurrent lease change conflicts this transaction.
+	///
+	/// Must be called before any write in the transaction so a mismatch aborts without writing.
+	async fn validate_lease(
+		&self,
+		tx: &universaldb::Transaction,
+		workflow_id: Id,
+		worker_id: Id,
+	) -> Result<()> {
+		let tx = tx.with_subspace(self.subspace.clone());
+		let lease_key = keys::workflow::LeaseKey::new(workflow_id);
+
+		let current_worker_id = tx
+			.read_opt(&lease_key, Serializable)
+			.await?
+			.map(|(_workflow_name, lease_worker_id)| lease_worker_id);
+
+		if current_worker_id == Some(worker_id) {
+			Ok(())
+		} else {
+			Err(WorkflowError::LeaseFenceMismatch {
+				workflow_id,
+				worker_id,
+				current_worker_id,
+			}
+			.into())
+		}
+	}
+
+	/// Converts a transaction error into a `WorkflowError`. Errors the closure produced as a
+	/// `WorkflowError` (such as a failed lease fence check) are preserved instead of being flattened
+	/// into a udb error.
+	fn map_txn_err(err: anyhow::Error) -> WorkflowError {
+		match err.downcast::<WorkflowError>() {
+			Ok(err) => err,
+			Err(err) => WorkflowError::Udb(err),
+		}
+	}
+
 	/// Spawns a new thread and gracefully publishes a bump message to pubsub.
 	fn bump(&self, subject: BumpSubSubject) {
 		let Ok(pubsub) = self.pools.ups() else {
@@ -74,7 +171,7 @@ impl DatabaseKv {
 					tracing::warn!(?err, "failed to publish bump message");
 				}
 			}
-			.instrument(tracing::info_span!("bump_worker_publish")),
+			.instrument(tracing::debug_span!("bump_worker_publish")),
 		);
 		if let Err(err) = spawn_res {
 			tracing::error!(?err, "failed to spawn bump task");
@@ -92,12 +189,10 @@ impl DatabaseKv {
 	) -> Result<()> {
 		for signal_name in wake_signals {
 			// Write to wake signals list
-			let wake_signal_key =
-				keys::workflow::WakeSignalKey::new(workflow_id, signal_name.to_string());
-			tx.set(
-				&self.subspace.pack(&wake_signal_key),
-				&wake_signal_key.serialize(())?,
-			);
+			tx.write(
+				&keys::workflow::WakeSignalKey::new(workflow_id, signal_name.to_string()),
+				(),
+			)?;
 		}
 
 		Ok(())
@@ -110,17 +205,15 @@ impl DatabaseKv {
 		sub_workflow_id: Id,
 		tx: &universaldb::Transaction,
 	) -> Result<()> {
-		let sub_workflow_wake_key =
-			keys::wake::SubWorkflowWakeKey::new(sub_workflow_id, workflow_id);
-
-		tx.set(
-			&self.subspace.pack(&sub_workflow_wake_key),
-			&sub_workflow_wake_key.serialize(workflow_name.to_string())?,
-		);
+		tx.write(
+			&keys::wake::SubWorkflowWakeKey::new(sub_workflow_id, workflow_id),
+			workflow_name.to_string(),
+		)?;
 
 		Ok(())
 	}
 
+	/// Returns true if the workflow was not found.
 	async fn publish_signal_inner(
 		&self,
 		ray_id: Id,
@@ -129,7 +222,7 @@ impl DatabaseKv {
 		signal_name: &str,
 		body: &serde_json::value::RawValue,
 		tx: &universaldb::Transaction,
-	) -> Result<()> {
+	) -> Result<bool> {
 		tracing::debug!(
 			?ray_id,
 			?workflow_id,
@@ -150,7 +243,7 @@ impl DatabaseKv {
 		// TODO: This does not check if the workflow is silenced
 		// Check if the workflow exists
 		let Some(workflow_name_entry) = workflow_name_entry else {
-			return Err(WorkflowError::WorkflowNotFound.into());
+			return Ok(true);
 		};
 
 		let workflow_name = workflow_name_key.deserialize(&workflow_name_entry)?;
@@ -233,7 +326,7 @@ impl DatabaseKv {
 			)),
 		);
 
-		Ok(())
+		Ok(false)
 	}
 
 	async fn dispatch_workflow_inner(
@@ -442,10 +535,11 @@ impl Database for DatabaseKv {
 			pools,
 			subspace: universaldb::utils::Subspace::new(&(RIVET, GASOLINE, KV)),
 			system: system::SystemInfo::get(),
+			active_worker_count: ActiveWorkerCountEma::new(1),
 		}))
 	}
 
-	#[tracing::instrument(skip_all)]
+	#[tracing::instrument(level = "debug", skip_all)]
 	async fn bump_sub<'a, 'b>(
 		&'a self,
 		subject: BumpSubSubject,
@@ -477,7 +571,7 @@ impl Database for DatabaseKv {
 		Ok(stream.boxed())
 	}
 
-	#[tracing::instrument(skip_all)]
+	#[tracing::instrument(level = "debug", skip_all)]
 	async fn clear_expired_leases(&self, _worker_id: Id) -> WorkflowResult<()> {
 		let (lost_worker_ids, expired_workflow_count) = self
 			.pools
@@ -628,7 +722,7 @@ impl Database for DatabaseKv {
 		Ok(())
 	}
 
-	#[tracing::instrument(skip_all)]
+	#[tracing::instrument(level = "debug", skip_all)]
 	async fn publish_metrics(&self, worker_id: Id) -> WorkflowResult<()> {
 		// Attempt to be the only worker publishing metrics by writing to the lock key
 		let acquired_lock = self
@@ -791,22 +885,15 @@ impl Database for DatabaseKv {
 		Ok(())
 	}
 
-	#[tracing::instrument(skip_all)]
+	#[tracing::instrument(level = "debug", skip_all)]
 	async fn update_worker_ping(
 		&self,
 		worker_id: Id,
 		worker_version: i64,
 		update_active_idx: bool,
-	) -> WorkflowResult<()> {
-		// TODO: Temporarily don't record worker id to reduce metrics cardinality
-		// let worker_id_str = worker_id.to_string();
-		let worker_id_str = "worker".to_string();
-
-		metrics::WORKER_LAST_PING
-			.with_label_values(&[worker_id_str.as_str()])
-			.set(rivet_util::timestamp::now());
-
-		self.pools
+	) -> WorkflowResult<i64> {
+		let ping_ts = self
+			.pools
 			.udb()
 			.map_err(WorkflowError::PoolsGeneric)?
 			.txn("gas_update_worker_ping", |tx| async move {
@@ -841,17 +928,19 @@ impl Database for DatabaseKv {
 				tx.write(&last_ping_ts_key, ping_ts)?;
 				tx.write(&version_key, worker_version)?;
 
-				Ok(())
+				Ok(ping_ts)
 			})
 			.custom_instrument(tracing::info_span!("update_worker_ping_tx"))
 			.await
 			.context("failed to update worker ping")
 			.map_err(WorkflowError::Udb)?;
 
-		Ok(())
+		metrics::WORKER_LAST_PING.set(ping_ts);
+
+		Ok(ping_ts)
 	}
 
-	#[tracing::instrument(skip_all)]
+	#[tracing::instrument(level = "debug", skip_all)]
 	async fn mark_worker_inactive(&self, worker_id: Id) -> WorkflowResult<()> {
 		self.pools
 			.udb()
@@ -1094,10 +1183,31 @@ impl Database for DatabaseKv {
 		worker_id: Id,
 		worker_version: i64,
 		filter: &[&str],
+		running_workflows_by_name: &HashMap<String, usize>,
 	) -> WorkflowResult<Vec<PulledWorkflowData>> {
 		let start_instant = Instant::now();
+		let max_concurrent_workflows = self
+			.config
+			.dynamic()
+			.runtime
+			.worker_max_concurrent_workflows();
+		let last_active_worker_count = self.active_worker_count.get();
 		let owned_filter = filter
 			.into_iter()
+			// Apply wf concurrency quota to the filter itself so that we don't even read the subspace if the
+			// quota has been reached.
+			.filter(|x| {
+				if let (Some(current), Some(max)) = (
+					running_workflows_by_name.get(**x),
+					max_concurrent_workflows.get(**x),
+				) {
+					// We divide by the active worker count so the quota is cluster-wide. This is an estimate
+					// and assumes workflow spread is roughly even across workers (which it should be)
+					*current < (max / last_active_worker_count.max(1)).max(1)
+				} else {
+					true
+				}
+			})
 			.map(|x| x.to_string())
 			.collect::<Vec<_>>();
 
@@ -1107,6 +1217,12 @@ impl Database for DatabaseKv {
 			.map_err(WorkflowError::PoolsGeneric)?
 			.txn("gas_pull_workflows", |tx| {
 				let owned_filter = owned_filter.clone();
+				let max_concurrent_workflows = &max_concurrent_workflows;
+				let running_and_leased_workflows_by_name = scc::HashMap::<String, usize>::from_iter(
+					running_workflows_by_name
+						.iter()
+						.map(|(k, v)| (k.clone(), *v)),
+				);
 
 				async move {
 					tx.tag(&format!("pull_workflows:{worker_id}"))?;
@@ -1177,6 +1293,9 @@ impl Database for DatabaseKv {
 									tx.get_ranges_keyvalues(
 										universaldb::RangeOption {
 											mode: StreamingMode::WantAll,
+											// Limit to pulling 20k keys per name pull. If any are left behind
+											// they will be picked up on the next pull or by another worker
+											limit: Some(20_000),
 											..(wake_subspace_start, wake_subspace_end).into()
 										},
 										// This is Snapshot to reduce contention with any new wake conditions
@@ -1241,7 +1360,25 @@ impl Database for DatabaseKv {
 
 						0
 					};
-					let active_worker_count = active_workers.len().max(1) as u64;
+					let active_worker_count = active_workers.len().max(1);
+
+					// Save to cache (slight staleness is not important)
+					self.active_worker_count
+						.observe(active_worker_count, rivet_util::timestamp::now());
+
+					// Record how many wake condition keys were read for each workflow name. This counts every
+					// key that was read, including keys dropped by the dedup limit below.
+					let mut wake_keys_by_name = HashMap::<&str, usize>::new();
+					for wake_key in &wake_keys {
+						*wake_keys_by_name
+							.entry(wake_key.workflow_name.as_str())
+							.or_default() += 1;
+					}
+					for (workflow_name, count) in wake_keys_by_name {
+						metrics::WAKE_KEYS_PULLED
+							.with_label_values(&[workflow_name])
+							.observe(count as f64);
+					}
 
 					// Collect name and deadline ts for each wf id
 					let mut dedup_workflows = HashMap::<Id, MinimalPulledWorkflow>::new();
@@ -1256,7 +1393,6 @@ impl Database for DatabaseKv {
 							wake_key.condition,
 							keys::wake::WakeCondition::Deadline { .. }
 						) {
-							// TODO: This will record metrics even if the txn fails, which is wrong
 							metrics::WORKFLOW_WAKE_DELTA_DURATION
 								.with_label_values(&[&wake_key.workflow_name])
 								.observe(wake_age_ms as f64 / 1000.0);
@@ -1297,6 +1433,19 @@ impl Database for DatabaseKv {
 						}
 					}
 
+					// Record how many unique workflows are left after dedup for each workflow name
+					let mut dedup_workflows_by_name = HashMap::<&str, usize>::new();
+					for wf in dedup_workflows.values() {
+						*dedup_workflows_by_name
+							.entry(wf.workflow_name.as_str())
+							.or_default() += 1;
+					}
+					for (workflow_name, count) in dedup_workflows_by_name {
+						metrics::WORKFLOWS_DEDUPED
+							.with_label_values(&[workflow_name])
+							.observe(count as f64);
+					}
+
 					// Filter workflows in a way that spreads all current pending workflows across all active
 					// workers evenly
 					let assigned_workflows = dedup_workflows
@@ -1320,27 +1469,67 @@ impl Database for DatabaseKv {
 								return false;
 							}
 
-							let wf_worker_idx = wf_hash % active_worker_count;
+							let wf_worker_idx = wf_hash % active_worker_count as u64;
 
 							// Every worker pulls workflows that match the current worker idx as well as the next
 							// worker for redundancy. this results in increased txn conflicts but less chance of
 							// orphaned workflows
-							let next_worker_idx = (current_worker_idx + 1) % active_worker_count;
+							let next_worker_idx =
+								(current_worker_idx + 1) % active_worker_count as u64;
 
 							wf_worker_idx == current_worker_idx || wf_worker_idx == next_worker_idx
 						})
-						// Hard limit of 1000 workflows per pull
-						.take(1000);
+						// Hard limit per pull
+						.take(self.config.runtime.worker_max_workflows_per_pull());
 
 					// Check leases
 					let leased_workflows = futures_util::stream::iter(assigned_workflows)
 						.map(|wf| {
 							let tx = tx.clone();
+							let running_and_leased_workflows_by_name =
+								&running_and_leased_workflows_by_name;
+
 							async move {
+								let mut current = running_and_leased_workflows_by_name
+									.entry_async(wf.workflow_name.clone())
+									.await
+									.or_default();
+
+								// Apply wf concurrency quota. Divide by the max of the smoothed worker count
+								// and the real count from this txn. The smoothed count keeps the quota from
+								// loosening on a transient drop in active workers, while the real count lets
+								// the divisor jump up immediately when there are genuinely more workers than
+								// the last sample. The real count is also used above for evenly spreading
+								// workflows across worker indices.
+								if let Some(max) = max_concurrent_workflows.get(&wf.workflow_name) {
+									if *current
+										< (max / last_active_worker_count.max(active_worker_count))
+											.max(1)
+									{
+										*current += 1;
+									} else {
+										return Result::<_>::Ok(None);
+									}
+								}
+
+								drop(current);
+
 								let lease_key = keys::workflow::LeaseKey::new(wf.workflow_id);
 
 								// Check lease
 								if tx.exists(&lease_key, Serializable).await? {
+									// Decrement quota on failed lease acquisition as a best-effort attempt
+									// to not overconsume quota slots
+									if max_concurrent_workflows.contains_key(&wf.workflow_name) {
+										if let scc::hash_map::Entry::Occupied(mut entry) =
+											running_and_leased_workflows_by_name
+												.entry_async(wf.workflow_name.clone())
+												.await
+										{
+											*entry -= 1;
+										}
+									}
+
 									Result::<_>::Ok(None)
 								} else {
 									tx.write(&lease_key, (wf.workflow_name.clone(), worker_id))?;
@@ -1371,8 +1560,34 @@ impl Database for DatabaseKv {
 						.custom_instrument(tracing::debug_span!("map_to_leased_workflows"))
 						.await?;
 
+					// Record concurrency quota usage
+					for (name, max) in max_concurrent_workflows {
+						let current = running_and_leased_workflows_by_name
+							.get_async(name)
+							.await
+							.map(|x| *x.get())
+							.unwrap_or_default();
+
+						metrics::WORKFLOW_CONCURRENCY_QUOTA_USAGE
+							.with_label_values(&[name.as_str()])
+							.set(current as f64 / *max as f64);
+					}
+
+					if wake_keys.len()
+						> self
+							.config
+							.runtime
+							.worker_max_wake_condition_clears_per_pull()
+					{
+						tracing::warn!("capped pull workflows wake condition clears");
+					}
+
 					// Clear all wake conditions from workflows that we have leased
-					for wake_key in &wake_keys {
+					for wake_key in wake_keys.iter().take(
+						self.config
+							.runtime
+							.worker_max_wake_condition_clears_per_pull(),
+					) {
 						if !leased_workflows
 							.iter()
 							.any(|wf| wf.workflow_id == wake_key.workflow_id)
@@ -1393,16 +1608,9 @@ impl Database for DatabaseKv {
 			.context("failed to lease workflows")
 			.map_err(WorkflowError::Udb)?;
 
-		// TODO: Temporarily don't record worker id to reduce metrics cardinality
-		// let worker_id_str = worker_id.to_string();
-		let worker_id_str = "worker".to_string();
 		let dt = start_instant.elapsed().as_secs_f64();
-		metrics::LAST_PULL_WORKFLOWS_DURATION
-			.with_label_values(&[worker_id_str.as_str()])
-			.set(dt);
-		metrics::PULL_WORKFLOWS_DURATION
-			.with_label_values(&[worker_id_str.as_str()])
-			.observe(dt);
+		metrics::LAST_PULL_WORKFLOWS_DURATION.set(dt);
+		metrics::PULL_WORKFLOWS_DURATION.observe(dt);
 
 		if leased_workflows.is_empty() {
 			return Ok(Vec::new());
@@ -1730,7 +1938,7 @@ impl Database for DatabaseKv {
 												if current_event.indexed_names.len() != key.index {
 													tracing::error!(
 														?wf,
-														location=?partial_key.location,
+														location=%partial_key.location,
 														expected=%current_event.indexed_names.len(),
 														got=%key.index,
 														"corrupt history, indexed name doesn't exist yet or is out of order"
@@ -1759,7 +1967,7 @@ impl Database for DatabaseKv {
 												} else {
 													tracing::error!(
 														?wf,
-														location=?partial_key.location,
+														location=%partial_key.location,
 														expected=%current_event.indexed_input_chunks.len(),
 														got=%key.index,
 														"corrupt history, indexed chunk doesn't exist yet or is out of order"
@@ -1782,7 +1990,7 @@ impl Database for DatabaseKv {
 														.push(event);
 												}
 												Err(err) => {
-													tracing::error!(workflow_id=?wf.workflow_id, location=?loc, ?err, "failed building workflow history");
+													tracing::error!(workflow_id=?wf.workflow_id, location=%loc, ?err, "failed building workflow history");
 													return Ok(None);
 												}
 											}
@@ -1861,18 +2069,10 @@ impl Database for DatabaseKv {
 
 		let dt2 = start_instant2.elapsed().as_secs_f64();
 		let dt = start_instant.elapsed().as_secs_f64();
-		metrics::LAST_PULL_WORKFLOWS_FULL_DURATION
-			.with_label_values(&[worker_id_str.as_str()])
-			.set(dt);
-		metrics::PULL_WORKFLOWS_FULL_DURATION
-			.with_label_values(&[worker_id_str.as_str()])
-			.observe(dt);
-		metrics::LAST_PULL_WORKFLOWS_HISTORY_DURATION
-			.with_label_values(&[worker_id_str.as_str()])
-			.set(dt2);
-		metrics::PULL_WORKFLOWS_HISTORY_DURATION
-			.with_label_values(&[worker_id_str.as_str()])
-			.observe(dt2);
+		metrics::LAST_PULL_WORKFLOWS_FULL_DURATION.set(dt);
+		metrics::PULL_WORKFLOWS_FULL_DURATION.observe(dt);
+		metrics::LAST_PULL_WORKFLOWS_HISTORY_DURATION.set(dt2);
+		metrics::PULL_WORKFLOWS_HISTORY_DURATION.observe(dt2);
 
 		Ok(pulled_workflows)
 	}
@@ -1880,6 +2080,7 @@ impl Database for DatabaseKv {
 	#[tracing::instrument(skip_all)]
 	async fn complete_workflow(
 		&self,
+		worker_id: Id,
 		workflow_id: Id,
 		workflow_name: &str,
 		output: &serde_json::value::RawValue,
@@ -1887,193 +2088,222 @@ impl Database for DatabaseKv {
 	) -> WorkflowResult<()> {
 		let start_instant = Instant::now();
 
-		let (wrote_to_wake_idx, pending_signal_cleared_count) = self
-			.pools
-			.udb()
-			.map_err(WorkflowError::PoolsGeneric)?
-			.txn("gas_complete_workflow", |tx| {
-				async move {
-					let tx = tx.with_subspace(self.subspace.clone());
+		let (wrote_to_wake_idx, pending_signal_cleared_count) =
+			self.pools
+				.udb()
+				.map_err(WorkflowError::PoolsGeneric)?
+				.txn("gas_complete_workflow", |tx| {
+					async move {
+						let tx = tx.with_subspace(self.subspace.clone());
 
-					let sub_workflow_wake_subspace = self
-						.subspace
-						.subspace(&keys::wake::SubWorkflowWakeKey::subspace(workflow_id));
-					let tags_subspace = self
-						.subspace
-						.subspace(&keys::workflow::TagKey::subspace(workflow_id));
-					let wake_deadline_key = keys::workflow::WakeDeadlineKey::new(workflow_id);
+						self.validate_lease(&tx, workflow_id, worker_id).await?;
 
-					let mut stream = tx.get_ranges_keyvalues(
-						universaldb::RangeOption {
-							mode: StreamingMode::WantAll,
-							..(&sub_workflow_wake_subspace).into()
-						},
-						// NOTE: Must be Serializable to conflict with `get_sub_workflow`
-						Serializable,
-					);
+						let sub_workflow_wake_subspace = self
+							.subspace
+							.subspace(&keys::wake::SubWorkflowWakeKey::subspace(workflow_id));
+						let tags_subspace = self
+							.subspace
+							.subspace(&keys::workflow::TagKey::subspace(workflow_id));
+						let wake_deadline_key = keys::workflow::WakeDeadlineKey::new(workflow_id);
 
-					let (wrote_to_wake_idx, tag_keys, wake_deadline) = tokio::try_join!(
-						// Check for other workflows waiting on this one, wake all
-						async {
-							let mut wrote_to_wake_idx = false;
-
-							while let Some(entry) = stream.try_next().await? {
-								let (sub_workflow_wake_key, workflow_name) =
-									tx.read_entry::<keys::wake::SubWorkflowWakeKey>(&entry)?;
-
-								// Add wake condition for workflow
-								tx.write(
-									&keys::wake::WorkflowWakeConditionKey::new(
-										workflow_name,
-										sub_workflow_wake_key.workflow_id,
-										keys::wake::WakeCondition::SubWorkflow {
-											sub_workflow_id: workflow_id,
-										},
-									),
-									(),
-								)?;
-
-								// Clear secondary index
-								tx.delete(&sub_workflow_wake_key);
-
-								wrote_to_wake_idx = true;
-							}
-
-							Ok(wrote_to_wake_idx)
-						},
-						// Read tags
-						tx.get_ranges_keyvalues(
+						let mut stream = tx.get_ranges_keyvalues(
 							universaldb::RangeOption {
 								mode: StreamingMode::WantAll,
-								..(&tags_subspace).into()
+								..(&sub_workflow_wake_subspace).into()
+							},
+							// NOTE: Must be Serializable to conflict with `get_sub_workflow`
+							Serializable,
+						);
+
+						let (wrote_to_wake_idx, tag_keys, wake_deadline) = tokio::try_join!(
+							// Check for other workflows waiting on this one, wake all
+							async {
+								let mut wrote_to_wake_idx = false;
+
+								while let Some(entry) = stream.try_next().await? {
+									let (sub_workflow_wake_key, workflow_name) =
+										tx.read_entry::<keys::wake::SubWorkflowWakeKey>(&entry)?;
+
+									// Add wake condition for workflow
+									tx.write(
+										&keys::wake::WorkflowWakeConditionKey::new(
+											workflow_name,
+											sub_workflow_wake_key.workflow_id,
+											keys::wake::WakeCondition::SubWorkflow {
+												sub_workflow_id: workflow_id,
+											},
+										),
+										(),
+									)?;
+
+									// Clear secondary index
+									tx.delete(&sub_workflow_wake_key);
+
+									wrote_to_wake_idx = true;
+								}
+
+								Ok(wrote_to_wake_idx)
+							},
+							// Read tags
+							tx.get_ranges_keyvalues(
+								universaldb::RangeOption {
+									mode: StreamingMode::WantAll,
+									..(&tags_subspace).into()
+								},
+								Serializable,
+							)
+							.map(|res| {
+								tx.unpack::<keys::workflow::TagKey>(res?.key())
+									.map_err(anyhow::Error::from)
+							})
+							.try_collect::<Vec<_>>(),
+							tx.read_opt(&wake_deadline_key, Serializable),
+						)?;
+
+						for key in tag_keys {
+							tx.delete(&keys::workflow::ByNameAndTagKey::new(
+								workflow_name.to_string(),
+								key.k,
+								key.v,
+								workflow_id,
+							));
+						}
+
+						// Clear null key
+						tx.delete(&keys::workflow::ByNameAndTagKey::null(
+							workflow_name.to_string(),
+							workflow_id,
+						));
+
+						// Get and clear the pending deadline wake condition, if any. This could be put in the
+						// `pull_workflows` function (where we clear secondary indexes) but we chose to clear it
+						// here and in `commit_workflow` because its not a secondary index so theres no worry of
+						// it inserting more wake conditions. This reduces the load on `pull_workflows`. The
+						// reason this isn't immediately cleared in `pull_workflows` along with the rest of the
+						// wake conditions is because it might be in the future.
+						if let Some(deadline_ts) = wake_deadline {
+							tx.delete(&keys::wake::WorkflowWakeConditionKey::new(
+								workflow_name.to_string(),
+								workflow_id,
+								keys::wake::WakeCondition::Deadline { deadline_ts },
+							));
+						}
+
+						// Clear "has wake condition"
+						tx.delete(&keys::workflow::HasWakeConditionKey::new(workflow_id));
+
+						// Write output
+						let output_key = keys::workflow::OutputKey::new(workflow_id);
+
+						for (i, chunk) in output_key.split_ref(output)?.into_iter().enumerate() {
+							let chunk_key = output_key.chunk(i);
+
+							tx.set(&tx.pack(&chunk_key), &chunk);
+						}
+
+						// Clear lease
+						tx.delete(&keys::workflow::LeaseKey::new(workflow_id));
+						tx.delete(&keys::workflow::WorkerIdKey::new(workflow_id));
+
+						// Clear pending signals metric for observability
+						let metrics_subspace = self
+							.subspace
+							.subspace(&keys::workflow::MetricKey::subspace(workflow_id));
+						let mut stream = tx.get_ranges_keyvalues(
+							universaldb::RangeOption {
+								mode: StreamingMode::WantAll,
+								..(&metrics_subspace).into()
 							},
 							Serializable,
-						)
-						.map(|res| {
-							tx.unpack::<keys::workflow::TagKey>(res?.key())
-								.map_err(anyhow::Error::from)
-						})
-						.try_collect::<Vec<_>>(),
-						tx.read_opt(&wake_deadline_key, Serializable),
-					)?;
+						);
 
-					for key in tag_keys {
-						tx.delete(&keys::workflow::ByNameAndTagKey::new(
-							workflow_name.to_string(),
-							key.k,
-							key.v,
-							workflow_id,
-						));
-					}
+						let mut pending_signal_cleared_count = 0;
+						loop {
+							let Some(entry) = stream.try_next().await? else {
+								break;
+							};
 
-					// Clear null key
-					tx.delete(&keys::workflow::ByNameAndTagKey::null(
-						workflow_name.to_string(),
-						workflow_id,
-					));
+							let (key, metric_count) =
+								tx.read_entry::<keys::workflow::MetricKey>(&entry)?;
 
-					// Get and clear the pending deadline wake condition, if any. This could be put in the
-					// `pull_workflows` function (where we clear secondary indexes) but we chose to clear it
-					// here and in `commit_workflow` because its not a secondary index so theres no worry of
-					// it inserting more wake conditions. This reduces the load on `pull_workflows`. The
-					// reason this isn't immediately cleared in `pull_workflows` along with the rest of the
-					// wake conditions is because it might be in the future.
-					if let Some(deadline_ts) = wake_deadline {
-						tx.delete(&keys::wake::WorkflowWakeConditionKey::new(
-							workflow_name.to_string(),
-							workflow_id,
-							keys::wake::WakeCondition::Deadline { deadline_ts },
-						));
-					}
+							// Ignore negatives and zero
+							if metric_count as isize <= 0 {
+								continue;
+							}
 
-					// Clear "has wake condition"
-					tx.delete(&keys::workflow::HasWakeConditionKey::new(workflow_id));
-
-					// Write output
-					let output_key = keys::workflow::OutputKey::new(workflow_id);
-
-					for (i, chunk) in output_key.split_ref(output)?.into_iter().enumerate() {
-						let chunk_key = output_key.chunk(i);
-
-						tx.set(&tx.pack(&chunk_key), &chunk);
-					}
-
-					// Clear lease
-					tx.delete(&keys::workflow::LeaseKey::new(workflow_id));
-					tx.delete(&keys::workflow::WorkerIdKey::new(workflow_id));
-
-					// Clear pending signals metric for observability
-					let metrics_subspace = self
-						.subspace
-						.subspace(&keys::workflow::MetricKey::subspace(workflow_id));
-					let mut stream = tx.get_ranges_keyvalues(
-						universaldb::RangeOption {
-							mode: StreamingMode::WantAll,
-							..(&metrics_subspace).into()
-						},
-						Serializable,
-					);
-
-					let mut pending_signal_cleared_count = 0;
-					loop {
-						let Some(entry) = stream.try_next().await? else {
-							break;
-						};
-
-						let (key, metric_count) =
-							tx.read_entry::<keys::workflow::MetricKey>(&entry)?;
-
-						// Ignore negatives and zero
-						if metric_count as isize <= 0 {
-							continue;
-						}
-
-						match key.metric {
-							keys::workflow::Metric::SignalPending(signal_name) => {
-								update_metric_by(
-									&tx,
-									Some(keys::metric::Metric::SignalPending2(signal_name)),
-									None,
-									metric_count,
-								);
-								pending_signal_cleared_count += metric_count;
+							match key.metric {
+								keys::workflow::Metric::SignalPending(signal_name) => {
+									update_metric_by(
+										&tx,
+										Some(keys::metric::Metric::SignalPending2(signal_name)),
+										None,
+										metric_count,
+									);
+									pending_signal_cleared_count += metric_count;
+								}
 							}
 						}
-					}
 
-					// Insert into prune idx if applicable
-					match prune_variant {
-						PruneVariant::All | PruneVariant::History => {
+						// Clear any signals that were never consumed. The workflow is complete so
+						// nothing will ever ack them, so they are indexed for pruning here instead of
+						// at ack time.
+						let pending_signals_subspace = self.subspace.subspace(
+							&keys::workflow::PendingSignalKey::entire_subspace(workflow_id),
+						);
+						let mut stream = tx.get_ranges_keyvalues(
+							universaldb::RangeOption {
+								mode: StreamingMode::WantAll,
+								..(&pending_signals_subspace).into()
+							},
+							// NOTE: Must be Serializable to conflict with `publish_signal`
+							Serializable,
+						);
+
+						while let Some(entry) = stream.try_next().await? {
+							let pending_signal_key =
+								tx.unpack::<keys::workflow::PendingSignalKey>(entry.key())?;
+
 							tx.write(
-								&keys::workflow::PruneIdxKey::new(workflow_id, prune_variant),
+								&keys::signal::PruneIdxKey::new(pending_signal_key.signal_id),
 								(),
 							)?;
 						}
-						PruneVariant::None => {}
+
+						tx.clear_subspace_range(&pending_signals_subspace);
+
+						// Insert into prune idx if applicable
+						match prune_variant {
+							PruneVariant::All | PruneVariant::History => {
+								tx.write(
+									&keys::workflow::PruneIdxKey::new(workflow_id, prune_variant),
+									(),
+								)?;
+							}
+							PruneVariant::None => {}
+						}
+
+						tx.write(
+							&keys::workflow::CompleteTsKey::new(workflow_id),
+							rivet_util::timestamp::now(),
+						)?;
+
+						update_metric(
+							&tx,
+							Some(keys::metric::Metric::WorkflowActive(
+								workflow_name.to_string(),
+							)),
+							Some(keys::metric::Metric::WorkflowComplete(
+								workflow_name.to_string(),
+							)),
+						);
+
+						Ok((wrote_to_wake_idx, pending_signal_cleared_count))
 					}
-
-					tx.write(
-						&keys::workflow::CompleteTsKey::new(workflow_id),
-						rivet_util::timestamp::now(),
-					)?;
-
-					update_metric(
-						&tx,
-						Some(keys::metric::Metric::WorkflowActive(
-							workflow_name.to_string(),
-						)),
-						Some(keys::metric::Metric::WorkflowComplete(
-							workflow_name.to_string(),
-						)),
-					);
-
-					Ok((wrote_to_wake_idx, pending_signal_cleared_count))
-				}
-			})
-			.custom_instrument(tracing::info_span!("complete_workflows_tx"))
-			.await
-			.context("failed to complete workflow")
-			.map_err(WorkflowError::Udb)?;
+				})
+				.custom_instrument(tracing::info_span!("complete_workflows_tx"))
+				.await
+				.context("failed to complete workflow")
+				.map_err(Self::map_txn_err)?;
 
 		// Wake worker again in case some other workflow was waiting for this one to complete
 		if wrote_to_wake_idx {
@@ -2096,6 +2326,7 @@ impl Database for DatabaseKv {
 	#[tracing::instrument(skip_all)]
 	async fn commit_workflow(
 		&self,
+		worker_id: Id,
 		workflow_id: Id,
 		workflow_name: &str,
 		wake_immediate: bool,
@@ -2111,11 +2342,23 @@ impl Database for DatabaseKv {
 			.map_err(WorkflowError::PoolsGeneric)?
 			.txn("gas_commit_workflow", |tx| {
 				async move {
-					let wake_deadline_key = keys::workflow::WakeDeadlineKey::new(workflow_id);
+					let tx = tx.with_subspace(self.subspace.clone());
 
-					let wake_deadline_entry = tx
-						.get(&self.subspace.pack(&wake_deadline_key), Serializable)
+					self.validate_lease(&tx, workflow_id, worker_id).await?;
+
+					// Read the error this workflow last committed with
+					let prev_error = tx
+						.read_opt(&keys::workflow::ErrorKey::new(workflow_id), Serializable)
 						.await?;
+
+					// Clear the previous dead index entry, if any
+					if let Some(prev_error) = &prev_error {
+						tx.delete(&keys::workflow::DeadIdxKey::new(
+							workflow_name.to_string(),
+							prev_error.clone(),
+							workflow_id,
+						));
+					}
 
 					// Add immediate wake for workflow
 					if wake_immediate {
@@ -2136,37 +2379,37 @@ impl Database for DatabaseKv {
 					// it inserting more wake conditions. This reduces the load on `pull_workflows`. The
 					// reason this isn't immediately cleared in `pull_workflows` along with the rest of the
 					// wake conditions is because it might be in the future.
-					if let Some(raw) = wake_deadline_entry {
-						let deadline_ts = wake_deadline_key.deserialize(&raw)?;
-
-						let wake_condition_key = keys::wake::WorkflowWakeConditionKey::new(
+					let wake_deadline = tx
+						.read_opt(
+							&keys::workflow::WakeDeadlineKey::new(workflow_id),
+							Serializable,
+						)
+						.await?;
+					if let Some(deadline_ts) = wake_deadline {
+						tx.delete(&keys::wake::WorkflowWakeConditionKey::new(
 							workflow_name.to_string(),
 							workflow_id,
 							keys::wake::WakeCondition::Deadline { deadline_ts },
-						);
-
-						tx.clear(&self.subspace.pack(&wake_condition_key));
+						));
 					}
 
 					// Write deadline wake index
 					if let Some(deadline_ts) = wake_deadline_ts {
-						let wake_condition_key = keys::wake::WorkflowWakeConditionKey::new(
-							workflow_name.to_string(),
-							workflow_id,
-							keys::wake::WakeCondition::Deadline { deadline_ts },
-						);
-
 						// Add wake condition for workflow
-						tx.set(
-							&self.subspace.pack(&wake_condition_key),
-							&wake_condition_key.serialize(())?,
-						);
+						tx.write(
+							&keys::wake::WorkflowWakeConditionKey::new(
+								workflow_name.to_string(),
+								workflow_id,
+								keys::wake::WakeCondition::Deadline { deadline_ts },
+							),
+							(),
+						)?;
 
 						// Write to wake deadline
-						tx.set(
-							&self.subspace.pack(&wake_deadline_key),
-							&wake_deadline_key.serialize(deadline_ts)?,
-						);
+						tx.write(
+							&keys::workflow::WakeDeadlineKey::new(workflow_id),
+							deadline_ts,
+						)?;
 					}
 
 					self.write_signal_wake_idxs(workflow_id, wake_signals, &tx)?;
@@ -2182,36 +2425,39 @@ impl Database for DatabaseKv {
 					}
 
 					// Update "has wake condition"
-					let has_wake_condition_key =
-						keys::workflow::HasWakeConditionKey::new(workflow_id);
 					let has_wake_condition = wake_immediate
 						|| wake_deadline_ts.is_some()
 						|| !wake_signals.is_empty()
 						|| wake_sub_workflow_id.is_some();
 					if has_wake_condition {
-						tx.set(
-							&self.subspace.pack(&has_wake_condition_key),
-							&has_wake_condition_key.serialize(())?,
-						);
+						tx.write(&keys::workflow::HasWakeConditionKey::new(workflow_id), ())?;
 					} else {
-						tx.clear(&self.subspace.pack(&has_wake_condition_key));
+						// Workflow died
+
+						tx.delete(&keys::workflow::HasWakeConditionKey::new(workflow_id));
+
+						tx.write(
+							&keys::workflow::DeadIdxKey::new(
+								workflow_name.to_string(),
+								error.to_string(),
+								workflow_id,
+							),
+							(),
+						)?;
 					}
 
 					// Write error
-					let error_key = keys::workflow::ErrorKey::new(workflow_id);
-					tx.set(
-						&self.subspace.pack(&error_key),
-						&error_key.serialize(error.to_string())?,
-					);
+					tx.write(
+						&keys::workflow::ErrorKey::new(workflow_id),
+						error.to_string(),
+					)?;
 
 					// Clear lease
-					let lease_key = keys::workflow::LeaseKey::new(workflow_id);
-					tx.clear(&self.subspace.pack(&lease_key));
-					let worker_id_key = keys::workflow::WorkerIdKey::new(workflow_id);
-					tx.clear(&self.subspace.pack(&worker_id_key));
+					tx.delete(&keys::workflow::LeaseKey::new(workflow_id));
+					tx.delete(&keys::workflow::WorkerIdKey::new(workflow_id));
 
 					update_metric(
-						&tx.with_subspace(self.subspace.clone()),
+						&tx,
 						Some(keys::metric::Metric::WorkflowActive(
 							workflow_name.to_string(),
 						)),
@@ -2231,7 +2477,7 @@ impl Database for DatabaseKv {
 			.custom_instrument(tracing::info_span!("commit_workflow_tx"))
 			.await
 			.context("failed to commit workflow")
-			.map_err(WorkflowError::Udb)?;
+			.map_err(Self::map_txn_err)?;
 
 		// Always wake the worker immediately again. This is an IMPORTANT implementation detail to prevent
 		// race conditions with workflow sleep. Imagine the scenario:
@@ -2263,6 +2509,7 @@ impl Database for DatabaseKv {
 	#[tracing::instrument(skip_all, fields(?workflow_id, %location))]
 	async fn pull_next_signals(
 		&self,
+		worker_id: Id,
 		workflow_id: Id,
 		workflow_name: &str,
 		filter: &[&str],
@@ -2290,6 +2537,8 @@ impl Database for DatabaseKv {
 
 					async move {
 						tx.tag(&format!("pull_next_signals:{workflow_name}"))?;
+
+						self.validate_lease(&tx, workflow_id, worker_id).await?;
 
 						// Fetch signals from all streams at the same time
 						let mut signals = futures_util::stream::iter(owned_filter.clone())
@@ -2334,6 +2583,7 @@ impl Database for DatabaseKv {
 							keys::history::insert::signals_event(
 								&self.subspace,
 								&tx,
+								worker_id,
 								workflow_id,
 								&location,
 								version,
@@ -2364,6 +2614,15 @@ impl Database for DatabaseKv {
 									tx.set(
 										&self.subspace.pack(&ack_ts_key),
 										&ack_ts_key.serialize(now)?,
+									);
+
+									// Insert into prune idx so the pruner can reclaim this signal
+									// once it is old enough
+									let prune_idx_key =
+										keys::signal::PruneIdxKey::new(key.signal_id);
+									tx.set(
+										&self.subspace.pack(&prune_idx_key),
+										&prune_idx_key.serialize(())?,
 									);
 
 									update_metric(
@@ -2432,6 +2691,7 @@ impl Database for DatabaseKv {
 								keys::history::insert::update_sleep_event(
 									&self.subspace,
 									&tx,
+									worker_id,
 									workflow_id,
 									related_sleep_location,
 									SleepState::Interrupted,
@@ -2454,6 +2714,7 @@ impl Database for DatabaseKv {
 							// write signal wake indexes before going to sleep (with err `NoSignalFound`) and
 							// not during a retry.
 							if last_attempt {
+								let tx = tx.with_subspace(self.subspace.clone());
 								self.write_signal_wake_idxs(
 									workflow_id,
 									&owned_filter.iter().map(|x| x.as_str()).collect::<Vec<_>>(),
@@ -2480,7 +2741,7 @@ impl Database for DatabaseKv {
 							"failed pulling workflows due to large txn, trying again with lower limit"
 						);
 					} else {
-						return Err(WorkflowError::Udb(err.context("failed to pull signals")));
+						return Err(Self::map_txn_err(err.context("failed to pull signals")));
 					}
 				}
 			}
@@ -2565,6 +2826,7 @@ impl Database for DatabaseKv {
 							// unnecessary wake condition inserted causing the workflow to wake up again, but this
 							// is not as big of an issue because workflow wakes should be idempotent if no events
 							// happen.
+							let tx = tx.with_subspace(self.subspace.clone());
 							self.write_sub_workflow_wake_idx(
 								workflow_id,
 								workflow_name,
@@ -2629,6 +2891,7 @@ impl Database for DatabaseKv {
 	#[tracing::instrument(skip_all)]
 	async fn publish_signal_from_workflow(
 		&self,
+		worker_id: Id,
 		from_workflow_id: Id,
 		location: &Location,
 		version: usize,
@@ -2639,26 +2902,29 @@ impl Database for DatabaseKv {
 		body: &serde_json::value::RawValue,
 		_loop_location: Option<&Location>,
 	) -> WorkflowResult<()> {
-		self.pools
+		let workflow_not_found = self
+			.pools
 			.udb()
 			.map_err(WorkflowError::PoolsGeneric)?
 			.txn("gas_publish_signal_from_workflow", |tx| async move {
 				tx.tag(&format!("publish_signal:{from_workflow_id}"))?;
 
-				self.publish_signal_inner(
-					ray_id,
-					to_workflow_id,
-					signal_id,
-					signal_name,
-					body,
-					&tx,
-				)
-				.await?;
+				self.validate_lease(&tx, from_workflow_id, worker_id)
+					.await?;
+
+				if self
+					.publish_signal_inner(ray_id, to_workflow_id, signal_id, signal_name, body, &tx)
+					.await?
+				{
+					// Workflow not found
+					return Ok(true);
+				}
 
 				// Insert history event
 				keys::history::insert::signal_send_event(
 					&self.subspace,
 					&tx,
+					worker_id,
 					from_workflow_id,
 					&location,
 					version,
@@ -2669,12 +2935,16 @@ impl Database for DatabaseKv {
 					to_workflow_id,
 				)?;
 
-				Ok(())
+				Ok(false)
 			})
 			.custom_instrument(tracing::info_span!("publish_signal_from_workflow_tx"))
 			.await
 			.context("failed to publish signal from workflow")
-			.map_err(WorkflowError::Udb)?;
+			.map_err(Self::map_txn_err)?;
+
+		if workflow_not_found {
+			return Err(WorkflowError::WorkflowNotFound);
+		}
 
 		self.bump(BumpSubSubject::SignalPublish { to_workflow_id });
 		self.bump(BumpSubSubject::Worker);
@@ -2685,6 +2955,7 @@ impl Database for DatabaseKv {
 	#[tracing::instrument(skip_all, fields(%sub_workflow_id, %sub_workflow_name, unique))]
 	async fn dispatch_sub_workflow(
 		&self,
+		worker_id: Id,
 		ray_id: Id,
 		from_workflow_id: Id,
 		location: &Location,
@@ -2703,6 +2974,9 @@ impl Database for DatabaseKv {
 			.txn("gas_dispatch_sub_workflow", |tx| async move {
 				tx.tag(&format!("dispatch_workflow:{sub_workflow_name}"))?;
 
+				self.validate_lease(&tx, from_workflow_id, worker_id)
+					.await?;
+
 				let sub_workflow_id = self
 					.dispatch_workflow_inner(
 						ray_id,
@@ -2719,6 +2993,7 @@ impl Database for DatabaseKv {
 				keys::history::insert::sub_workflow_event(
 					&self.subspace,
 					&tx,
+					worker_id,
 					from_workflow_id,
 					&location,
 					version,
@@ -2734,7 +3009,7 @@ impl Database for DatabaseKv {
 			.custom_instrument(tracing::info_span!("dispatch_sub_workflow_tx"))
 			.await
 			.context("failed to dispatch sub workflow")
-			.map_err(WorkflowError::Udb)?;
+			.map_err(Self::map_txn_err)?;
 
 		self.bump(BumpSubSubject::Worker);
 
@@ -2744,6 +3019,7 @@ impl Database for DatabaseKv {
 	#[tracing::instrument(skip_all)]
 	async fn update_workflow_state(
 		&self,
+		worker_id: Id,
 		workflow_id: Id,
 		state: &serde_json::value::RawValue,
 	) -> WorkflowResult<()> {
@@ -2753,6 +3029,8 @@ impl Database for DatabaseKv {
 			.txn("gas_update_workflow_state", |tx| {
 				async move {
 					tx.tag(&format!("workflow_state_update:{workflow_id}"))?;
+
+					self.validate_lease(&tx, workflow_id, worker_id).await?;
 
 					let state_key = keys::workflow::StateKey::new(workflow_id);
 					let state_subspace = self.subspace.subspace(&state_key);
@@ -2773,7 +3051,7 @@ impl Database for DatabaseKv {
 			.custom_instrument(tracing::info_span!("update_workflow_state_tx"))
 			.await
 			.context("failed to update workflow state")
-			.map_err(WorkflowError::Udb)?;
+			.map_err(Self::map_txn_err)?;
 
 		Ok(())
 	}
@@ -2781,6 +3059,7 @@ impl Database for DatabaseKv {
 	#[tracing::instrument(skip_all)]
 	async fn commit_workflow_activity_event(
 		&self,
+		worker_id: Id,
 		from_workflow_id: Id,
 		location: &Location,
 		version: usize,
@@ -2796,9 +3075,13 @@ impl Database for DatabaseKv {
 			.txn("gas_commit_workflow_activity_event", |tx| async move {
 				tx.tag(&format!("update_workflow_history:{from_workflow_id}"))?;
 
+				self.validate_lease(&tx, from_workflow_id, worker_id)
+					.await?;
+
 				keys::history::insert::activity_event(
 					&self.subspace,
 					&tx,
+					worker_id,
 					from_workflow_id,
 					location,
 					version,
@@ -2813,7 +3096,7 @@ impl Database for DatabaseKv {
 			.custom_instrument(tracing::info_span!("commit_workflow_activity_event_tx"))
 			.await
 			.context("failed to commit activity event")
-			.map_err(WorkflowError::Udb)?;
+			.map_err(Self::map_txn_err)?;
 
 		Ok(())
 	}
@@ -2821,6 +3104,7 @@ impl Database for DatabaseKv {
 	#[tracing::instrument(skip_all)]
 	async fn commit_workflow_message_send_event(
 		&self,
+		worker_id: Id,
 		from_workflow_id: Id,
 		location: &Location,
 		version: usize,
@@ -2835,9 +3119,13 @@ impl Database for DatabaseKv {
 			.txn("gas_commit_workflow_message_send_event", |tx| async move {
 				tx.tag(&format!("update_workflow_history:{from_workflow_id}"))?;
 
+				self.validate_lease(&tx, from_workflow_id, worker_id)
+					.await?;
+
 				keys::history::insert::message_send_event(
 					&self.subspace,
 					&tx,
+					worker_id,
 					from_workflow_id,
 					location,
 					version,
@@ -2852,7 +3140,7 @@ impl Database for DatabaseKv {
 			.custom_instrument(tracing::info_span!("commit_workflow_message_send_event_tx"))
 			.await
 			.context("failed to commit message send event")
-			.map_err(WorkflowError::Udb)?;
+			.map_err(Self::map_txn_err)?;
 
 		Ok(())
 	}
@@ -2860,8 +3148,9 @@ impl Database for DatabaseKv {
 	#[tracing::instrument(skip_all)]
 	async fn upsert_workflow_loop_event(
 		&self,
+		worker_id: Id,
 		from_workflow_id: Id,
-		_workflow_name: &str,
+		workflow_name: &str,
 		location: &Location,
 		version: usize,
 		iteration: usize,
@@ -2875,10 +3164,14 @@ impl Database for DatabaseKv {
 			.txn("gas_upsert_workflow_loop_event", |tx| async move {
 				tx.tag(&format!("update_workflow_history:{from_workflow_id}"))?;
 
+				self.validate_lease(&tx, from_workflow_id, worker_id)
+					.await?;
+
 				if iteration == 0 {
 					keys::history::insert::loop_event(
 						&self.subspace,
 						&tx,
+						worker_id,
 						from_workflow_id,
 						location,
 						version,
@@ -2891,6 +3184,7 @@ impl Database for DatabaseKv {
 					keys::history::insert::update_loop_event(
 						&self.subspace,
 						&tx,
+						worker_id,
 						from_workflow_id,
 						location,
 						iteration,
@@ -2966,8 +3260,12 @@ impl Database for DatabaseKv {
 
 					tx.clear_range(&loop_events_subspace_start, &loop_events_subspace_end);
 
-					// Only retain last 100 events in forgotten history
-					if iteration > 100 {
+					// Only retain last X events in forgotten history
+					let iteration_retention_count = self
+						.config
+						.runtime
+						.gasoline_loop_history_iteration_retention_count(workflow_name);
+					if iteration > iteration_retention_count {
 						let old_forgotten_subspace_start =
 							self.subspace
 								.pack(&keys::history::EventHistorySubspaceKey::new(
@@ -2981,7 +3279,7 @@ impl Database for DatabaseKv {
 								.pack(&keys::history::EventHistorySubspaceKey::new(
 									from_workflow_id,
 									location.clone(),
-									iteration - 100,
+									iteration - iteration_retention_count,
 									true,
 								));
 
@@ -2994,7 +3292,7 @@ impl Database for DatabaseKv {
 			.custom_instrument(tracing::info_span!("upsert_loop_event_tx"))
 			.await
 			.context("failed to upsert loop event")
-			.map_err(WorkflowError::Udb)?;
+			.map_err(Self::map_txn_err)?;
 
 		Ok(())
 	}
@@ -3002,6 +3300,7 @@ impl Database for DatabaseKv {
 	#[tracing::instrument(skip_all)]
 	async fn commit_workflow_sleep_event(
 		&self,
+		worker_id: Id,
 		from_workflow_id: Id,
 		location: &Location,
 		version: usize,
@@ -3014,9 +3313,13 @@ impl Database for DatabaseKv {
 			.txn("gas_commit_workflow_sleep_event", |tx| async move {
 				tx.tag(&format!("update_workflow_history:{from_workflow_id}"))?;
 
+				self.validate_lease(&tx, from_workflow_id, worker_id)
+					.await?;
+
 				keys::history::insert::sleep_event(
 					&self.subspace,
 					&tx,
+					worker_id,
 					from_workflow_id,
 					location,
 					version,
@@ -3030,7 +3333,7 @@ impl Database for DatabaseKv {
 			.custom_instrument(tracing::info_span!("commit_workflow_sleep_event_tx"))
 			.await
 			.context("failed to commit sleep event")
-			.map_err(WorkflowError::Udb)?;
+			.map_err(Self::map_txn_err)?;
 
 		Ok(())
 	}
@@ -3038,6 +3341,7 @@ impl Database for DatabaseKv {
 	#[tracing::instrument(skip_all)]
 	async fn update_workflow_sleep_event_state(
 		&self,
+		worker_id: Id,
 		from_workflow_id: Id,
 		location: &Location,
 		state: SleepState,
@@ -3048,9 +3352,13 @@ impl Database for DatabaseKv {
 			.txn("gas_update_workflow_sleep_state", |tx| async move {
 				tx.tag(&format!("update_workflow_history:{from_workflow_id}"))?;
 
+				self.validate_lease(&tx, from_workflow_id, worker_id)
+					.await?;
+
 				keys::history::insert::update_sleep_event(
 					&self.subspace,
 					&tx,
+					worker_id,
 					from_workflow_id,
 					location,
 					state,
@@ -3061,7 +3369,7 @@ impl Database for DatabaseKv {
 			.custom_instrument(tracing::info_span!("update_workflow_sleep_state_tx"))
 			.await
 			.context("failed to update sleep state")
-			.map_err(WorkflowError::Udb)?;
+			.map_err(Self::map_txn_err)?;
 
 		Ok(())
 	}
@@ -3069,6 +3377,7 @@ impl Database for DatabaseKv {
 	#[tracing::instrument(skip_all)]
 	async fn commit_workflow_branch_event(
 		&self,
+		worker_id: Id,
 		from_workflow_id: Id,
 		location: &Location,
 		version: usize,
@@ -3080,9 +3389,13 @@ impl Database for DatabaseKv {
 			.txn("gas_commit_workflow_branch_event", |tx| async move {
 				tx.tag(&format!("update_workflow_history:{from_workflow_id}"))?;
 
+				self.validate_lease(&tx, from_workflow_id, worker_id)
+					.await?;
+
 				keys::history::insert::branch_event(
 					&self.subspace,
 					&tx,
+					worker_id,
 					from_workflow_id,
 					location,
 					version,
@@ -3094,7 +3407,7 @@ impl Database for DatabaseKv {
 			.custom_instrument(tracing::info_span!("commit_workflow_branch_event_tx"))
 			.await
 			.context("failed to commit branch event")
-			.map_err(WorkflowError::Udb)?;
+			.map_err(Self::map_txn_err)?;
 
 		Ok(())
 	}
@@ -3102,6 +3415,7 @@ impl Database for DatabaseKv {
 	#[tracing::instrument(skip_all)]
 	async fn commit_workflow_removed_event(
 		&self,
+		worker_id: Id,
 		from_workflow_id: Id,
 		location: &Location,
 		event_type: EventType,
@@ -3114,9 +3428,13 @@ impl Database for DatabaseKv {
 			.txn("gas_commit_workflow_removed_event", |tx| async move {
 				tx.tag(&format!("update_workflow_history:{from_workflow_id}"))?;
 
+				self.validate_lease(&tx, from_workflow_id, worker_id)
+					.await?;
+
 				keys::history::insert::removed_event(
 					&self.subspace,
 					&tx,
+					worker_id,
 					from_workflow_id,
 					location,
 					1, // Default
@@ -3130,7 +3448,7 @@ impl Database for DatabaseKv {
 			.custom_instrument(tracing::info_span!("commit_workflow_removed_event_tx"))
 			.await
 			.context("failed to commit removed event")
-			.map_err(WorkflowError::Udb)?;
+			.map_err(Self::map_txn_err)?;
 
 		Ok(())
 	}
@@ -3138,6 +3456,7 @@ impl Database for DatabaseKv {
 	#[tracing::instrument(skip_all)]
 	async fn commit_workflow_version_check_event(
 		&self,
+		worker_id: Id,
 		from_workflow_id: Id,
 		location: &Location,
 		version: usize,
@@ -3150,9 +3469,13 @@ impl Database for DatabaseKv {
 			.txn("gas_commit_workflow_version_check_event", |tx| async move {
 				tx.tag(&format!("update_workflow_history:{from_workflow_id}"))?;
 
+				self.validate_lease(&tx, from_workflow_id, worker_id)
+					.await?;
+
 				keys::history::insert::version_check_event(
 					&self.subspace,
 					&tx,
+					worker_id,
 					from_workflow_id,
 					location,
 					version,
@@ -3167,7 +3490,7 @@ impl Database for DatabaseKv {
 			))
 			.await
 			.context("failed to commit version check event")
-			.map_err(WorkflowError::Udb)?;
+			.map_err(Self::map_txn_err)?;
 
 		Ok(())
 	}

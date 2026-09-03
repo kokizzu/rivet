@@ -46,8 +46,11 @@ pub async fn setup(config: &Config) -> Result<Option<UdbPool>> {
 			};
 
 			Arc::new(
-				universaldb::driver::PostgresDatabaseDriver::new_with_config(postgres_config)
-					.await?,
+				universaldb::driver::PostgresDatabaseDriver::new_with_config(
+					config.clone(),
+					postgres_config,
+				)
+				.await?,
 			) as universaldb::DatabaseDriverHandle
 		}
 		config::Database::FileSystem(fs) => {
@@ -58,7 +61,19 @@ pub async fn setup(config: &Config) -> Result<Option<UdbPool>> {
 
 	tracing::debug!("udb started");
 
-	Ok(Some(UdbPool {
-		db: universaldb::Database::new(db_driver),
+	let db = universaldb::Database::new(db_driver).with_throttle(throttle_config(config));
+
+	Ok(Some(UdbPool { db }))
+}
+
+/// Resolves throttle budgets from the dynamic config on every check, so an operator retuning a budget
+/// reaches transactions already in flight.
+fn throttle_config(config: &Config) -> universaldb::ThrottleConfig {
+	let config = config.clone();
+
+	universaldb::ThrottleConfig::new(Arc::new(move |name, kind| {
+		config
+			.dynamic()
+			.udb_throttle_bytes_per_second(name, kind.as_str())
 	}))
 }

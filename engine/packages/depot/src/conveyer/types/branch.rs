@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use vbare::OwnedVersionedData;
 
-use super::ids::{BucketBranchId, BucketIdUuid, DatabaseBranchId, DatabaseIdStr};
+use super::ids::{BucketBranchId, BucketId, BucketIdUuid, DatabaseBranchId, DatabaseIdStr};
 use super::restore_points::RestorePointRef;
 use super::serialization::{SQLITE_DATABASE_BRANCH_RECORD_VERSION, SQLITE_STORAGE_META_VERSION};
 
@@ -48,6 +48,20 @@ pub struct BucketPointer {
 pub struct DatabasePointer {
 	pub current_branch: DatabaseBranchId,
 	pub last_swapped_at_ms: i64,
+}
+
+/// Reverse of a `DBPTR` row: the bucket branch and database id whose pointer currently names a
+/// database branch. Written in the same transaction as the pointer it mirrors.
+///
+/// `bucket_id` is the bucket the pointer was written under. It is recorded rather than derived
+/// because deriving it means walking the bucket branch to its root and finding the bucket pointing
+/// at that root, which is ambiguous once a bucket has been rolled back (nothing points at the root
+/// anymore) or forked (the fork shares the source bucket's root).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DatabaseBranchOwner {
+	pub bucket_id: BucketId,
+	pub bucket_branch_id: BucketBranchId,
+	pub database_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -116,6 +130,37 @@ impl OwnedVersionedData for VersionedDatabasePointer {
 	fn serialize_version(self, _version: u16) -> Result<Vec<u8>> {
 		match self {
 			Self::V1(data) => rivet_util::serde::bare_to_vec!(&data).map_err(Into::into),
+		}
+	}
+}
+
+enum VersionedDatabaseBranchOwner {
+	V1(DatabaseBranchOwner),
+}
+
+impl OwnedVersionedData for VersionedDatabaseBranchOwner {
+	type Latest = DatabaseBranchOwner;
+
+	fn wrap_latest(latest: Self::Latest) -> Self {
+		Self::V1(latest)
+	}
+
+	fn unwrap_latest(self) -> Result<Self::Latest> {
+		match self {
+			Self::V1(data) => Ok(data),
+		}
+	}
+
+	fn deserialize_version(payload: &[u8], version: u16) -> Result<Self> {
+		match version {
+			1 => Ok(Self::V1(serde_bare::from_slice(payload)?)),
+			_ => bail!("invalid depot DatabaseBranchOwner version: {version}"),
+		}
+	}
+
+	fn serialize_version(self, _version: u16) -> Result<Vec<u8>> {
+		match self {
+			Self::V1(data) => serde_bare::to_vec(&data).map_err(Into::into),
 		}
 	}
 }
@@ -233,6 +278,17 @@ pub fn encode_database_pointer(pointer: DatabasePointer) -> Result<Vec<u8>> {
 pub fn decode_database_pointer(payload: &[u8]) -> Result<DatabasePointer> {
 	VersionedDatabasePointer::deserialize_with_embedded_version(payload)
 		.context("decode sqlite database pointer")
+}
+
+pub fn encode_database_branch_owner(owner: DatabaseBranchOwner) -> Result<Vec<u8>> {
+	VersionedDatabaseBranchOwner::wrap_latest(owner)
+		.serialize_with_embedded_version(SQLITE_STORAGE_META_VERSION)
+		.context("encode sqlite database branch owner")
+}
+
+pub fn decode_database_branch_owner(payload: &[u8]) -> Result<DatabaseBranchOwner> {
+	VersionedDatabaseBranchOwner::deserialize_with_embedded_version(payload)
+		.context("decode sqlite database branch owner")
 }
 
 pub fn encode_bucket_branch_record(record: BucketBranchRecord) -> Result<Vec<u8>> {

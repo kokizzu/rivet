@@ -17,6 +17,7 @@ use pegboard::keys::{envoy::VirtualNodesKey, ns::EnvoyHashIdxKey};
 use rivet_config::config::pegboard::EnvoyLoadBalancer;
 use rivet_envoy_protocol::{self as protocol, versioned};
 use rivet_guard_core::WebSocketHandle;
+use rivet_metrics::GaugeGuardExt;
 use rivet_pools::NodeId;
 use rivet_types::runner_configs::{RunnerConfig, RunnerConfigKind};
 use scc::HashMap;
@@ -24,9 +25,7 @@ use universaldb::prelude::*;
 use vbare::OwnedVersionedData;
 use xxhash_rust::xxh3::xxh3_128_with_seed;
 
-use crate::{
-	actor_lifecycle, errors, hibernating_requests, metrics, utils::UrlData, ws_to_tunnel_task,
-};
+use crate::{actor_lifecycle, errors, hibernating_requests, metrics, utils::UrlData};
 
 pub type RemoteSqliteExecutors =
 	HashMap<(String, u64), Arc<tokio::sync::OnceCell<NativeDatabaseHandle>>>;
@@ -36,6 +35,7 @@ pub struct Conn {
 	pub namespace_name: String,
 	pub pool_name: String,
 	pub envoy_key: String,
+	pub envoy_conn_id: Id,
 	pub protocol_version: u16,
 	pub ws_handle: WebSocketHandle,
 	pub authorized_tunnel_routes: HashMap<(protocol::GatewayId, protocol::RequestId), ()>,
@@ -61,6 +61,30 @@ pub struct Conn {
 impl Conn {
 	pub fn is_serverless(&self) -> bool {
 		matches!(self.pool.kind, RunnerConfigKind::Serverless { .. })
+	}
+
+	/// Returns whether this websocket still owns the persisted envoy registration.
+	///
+	/// Eviction pubsub messages are only wakeups: concurrent connections can observe messages in a
+	/// different order than their registration transactions committed, so the database owner is the
+	/// authority for deciding which connection must exit.
+	pub async fn is_current_registration(&self) -> Result<bool> {
+		self.udb
+			.txn("envoy_conn_is_current", |tx| async move {
+				let tx = tx.with_subspace(pegboard::keys::subspace());
+				let current_envoy_conn_id = tx
+					.read_opt(
+						&pegboard::keys::envoy::EnvoyConnIdKey::new(
+							self.namespace_id,
+							self.envoy_key.clone(),
+						),
+						Serializable,
+					)
+					.await?;
+
+				Ok(current_envoy_conn_id == Some(self.envoy_conn_id))
+			})
+			.await
 	}
 }
 
@@ -113,8 +137,14 @@ pub async fn init_conn(
 		.observe(start.elapsed().as_secs_f64());
 
 	let udb = ctx.udb()?;
+	let envoy_conn_id = Id::new_v1(ctx.config().dc_label());
 	let conn_udb = Arc::new((*udb).clone());
 	let node_id = ctx.pools().node_id();
+	// Only populate the hash-ring index when the operator has selected the Hash strategy.
+	let virtual_nodes = match ctx.config().pegboard().envoy_load_balancer() {
+		EnvoyLoadBalancer::Hash { virtual_nodes, .. } => Some(virtual_nodes),
+		_ => None,
+	};
 	let (_, (mut missed_commands, runner_config_protocol_changed)) = tokio::try_join!(
 		// Send init packet as soon as possible
 		async {
@@ -135,161 +165,15 @@ pub async fn init_conn(
 				.send(Message::Binary(init_msg_serialized.into()))
 				.await
 		},
-		udb.txn("envoy_conn_register", |tx| {
+		udb.txn("envoy_conn_prepare", |tx| {
 			let namespace_id = namespace.namespace_id;
 			let envoy_key = &envoy_key;
 			let pool_name = &pool_name;
-			// Only populate the hash-ring index when the operator has selected the
-			// Hash strategy. Writing V hash positions + a VirtualNodesKey on every
-			// envoy connect under legacy strategies is pure FDB write waste. If
-			// the operator later toggles to Hash, the next heartbeat-driven
-			// reconnect backfills the entries.
-			let virtual_nodes = match ctx.config().pegboard().envoy_load_balancer() {
-				EnvoyLoadBalancer::Hash { virtual_nodes, .. } => Some(virtual_nodes),
-				_ => None,
-			};
 			async move {
 				let tx = tx.with_subspace(pegboard::keys::subspace());
 
-				let create_ts_key =
-					pegboard::keys::envoy::CreateTsKey::new(namespace_id, envoy_key.to_string());
-				let last_ping_ts_key =
-					pegboard::keys::envoy::LastPingTsKey::new(namespace_id, envoy_key.to_string());
-				let version_key =
-					pegboard::keys::envoy::VersionKey::new(namespace_id, envoy_key.to_string());
-
-				// Read existing data
-				let (create_ts_entry, old_last_ping_ts_entry, version_entry) = tokio::try_join!(
-					tx.read_opt(&create_ts_key, Serializable),
-					tx.read_opt(&last_ping_ts_key, Serializable),
-					tx.read_opt(&version_key, Serializable),
-				)?;
-
-				if let Some(old_version) = version_entry {
-					if old_version != version {
-						tracing::warn!(
-							?namespace_id,
-							%envoy_key,
-							old_version = old_version,
-							new_version = version,
-							"envoy_key reconnected with changed version; operationally prohibited - investigate"
-						);
-					}
-				}
-
-				// Write init data
-				tx.write(
-					&pegboard::keys::envoy::PoolNameKey::new(namespace_id, envoy_key.to_string()),
-					pool_name.to_string(),
-				)?;
-				tx.write(
-					&pegboard::keys::envoy::VersionKey::new(namespace_id, envoy_key.to_string()),
-					version,
-				)?;
-				tx.atomic_op(
-					&pegboard::keys::envoy::SlotsKey::new(namespace_id, envoy_key.to_string()),
-					&0i64.to_le_bytes(),
-					MutationType::Add,
-				);
-				let create_ts = if let Some(create_ts) = create_ts_entry {
-					create_ts
-				} else {
-					let create_ts = util::timestamp::now();
-					tx.write(&create_ts_key, util::timestamp::now())?;
-
-					create_ts
-				};
-				tx.write(
-					&pegboard::keys::envoy::LastPingTsKey::new(namespace_id, envoy_key.to_string()),
-					util::timestamp::now(),
-				)?;
-				tx.write(
-					&pegboard::keys::envoy::ProtocolVersionKey::new(
-						namespace_id,
-						envoy_key.to_string(),
-					),
-					protocol_version,
-				)?;
-				let last_ping_ts = util::timestamp::now();
-				// Write new ping
-				tx.write(&last_ping_ts_key, last_ping_ts)?;
-
-				// Populate ns indexes
-				tx.write(
-					&pegboard::keys::ns::ActiveEnvoyKey::new(
-						namespace_id,
-						create_ts,
-						envoy_key.to_string(),
-					),
-					(),
-				)?;
-				tx.write(
-					&pegboard::keys::ns::ActiveEnvoyByNameKey::new(
-						namespace_id,
-						pool_name.to_string(),
-						create_ts,
-						envoy_key.to_string(),
-					),
-					(),
-				)?;
-
-				// Unset expired (upon reconnection)
-				if create_ts_entry.is_some() {
-					tx.delete(&pegboard::keys::envoy::ExpiredTsKey::new(
-						namespace_id,
-						envoy_key.to_string(),
-					));
-				}
-
-				// Remove old LB entry if exists
-				if let (Some(old_last_ping_ts), Some(version)) =
-					(old_last_ping_ts_entry, version_entry)
-				{
-					let old_lb_key = pegboard::keys::ns::EnvoyLoadBalancerIdxKey::new(
-						namespace_id,
-						pool_name.to_string(),
-						version,
-						old_last_ping_ts,
-						envoy_key.to_string(),
-					);
-
-					tx.add_conflict_key(&old_lb_key, ConflictRangeType::Read)?;
-					tx.delete(&old_lb_key);
-				}
-
-				// Insert into LB
-				tx.write(
-					&pegboard::keys::ns::EnvoyLoadBalancerIdxKey::new(
-						namespace_id,
-						pool_name.to_string(),
-						version,
-						last_ping_ts,
-						envoy_key.to_string(),
-					),
-					(),
-				)?;
-				if let Some(virtual_nodes) = virtual_nodes {
-					tx.write(
-						&VirtualNodesKey::new(namespace_id, envoy_key.to_string()),
-						virtual_nodes,
-					)?;
-					for i in 0..virtual_nodes {
-						tx.write(
-							&EnvoyHashIdxKey::new(
-								namespace_id,
-								pool_name.to_string(),
-								version,
-								xxh3_128_with_seed(envoy_key.as_bytes(), i as u64).to_be_bytes(),
-								envoy_key.to_string(),
-							),
-							(),
-						)?;
-					}
-				}
-
-				// Update the pool's protocol version. This is required for serverful pools because normally
-				// the pool's protocol version is updated via the metadata_poller wf but that only runs for
-				// serverless pools.
+				// Detect whether the serverful-pool protocol cache must be purged before the final
+				// registration claim updates the persisted version.
 				let ns_tx = tx.with_subspace(namespace::keys::subspace());
 				let runner_config_protocol_version_key =
 					pegboard::keys::runner_config::ProtocolVersionKey::new(
@@ -345,14 +229,11 @@ pub async fn init_conn(
 
 				let runner_config_protocol_changed =
 					existing_runner_config_protocol_version != Some(protocol_version);
-				if runner_config_protocol_changed {
-					ns_tx.write(&runner_config_protocol_version_key, protocol_version)?;
-				}
 
 				Ok((missed_commands, runner_config_protocol_changed))
 			}
 		})
-		.custom_instrument(tracing::info_span!("envoy_init_tx")),
+		.custom_instrument(tracing::info_span!("envoy_prepare_tx")),
 	)?;
 
 	if runner_config_protocol_changed {
@@ -369,6 +250,7 @@ pub async fn init_conn(
 		namespace_name,
 		pool_name,
 		envoy_key,
+		envoy_conn_id,
 		protocol_version,
 		ws_handle,
 		authorized_tunnel_routes: HashMap::new(),
@@ -384,37 +266,93 @@ pub async fn init_conn(
 		reported_stopping: AtomicBool::new(false),
 	});
 
-	// Send missed commands after the init packet.
-	if !missed_commands.is_empty() {
-		let replay_result: Result<()> = async {
+	// Prepare missed commands after the init packet, but do not transmit actor lifecycle work until
+	// this connection owns the registration. The previous connection remains authoritative here.
+	let missed_commands_prepared = if missed_commands.is_empty() {
+		None
+	} else {
+		let replay_result: Result<Vec<protocol::ActorCheckpoint>> = async {
+			let mut stop_checkpoints = Vec::new();
 			for cmd_wrapper in &mut missed_commands {
 				hibernating_requests::hydrate_command_wrapper(ctx, cmd_wrapper).await?;
-				if let protocol::Command::CommandStopActor(_) = cmd_wrapper.inner {
-					actor_lifecycle::stop_actor(&conn, &cmd_wrapper.checkpoint).await?;
+				if matches!(&cmd_wrapper.inner, protocol::Command::CommandStopActor(_)) {
+					stop_checkpoints.push(cmd_wrapper.checkpoint.clone());
 				}
 			}
-			Ok(())
+			Ok(stop_checkpoints)
 		}
 		.await;
-		if let Err(err) = replay_result {
-			actor_lifecycle::shutdown_conn_actors(&conn).await;
-			return Err(err);
-		}
+		let stop_checkpoints = match replay_result {
+			Ok(stop_checkpoints) => stop_checkpoints,
+			Err(err) => {
+				actor_lifecycle::shutdown_conn_actors(&conn).await;
+				return Err(err);
+			}
+		};
 
 		let msg =
 			versioned::ToEnvoy::wrap_latest(protocol::ToEnvoy::ToEnvoyCommands(missed_commands));
-		let msg_serialized = msg.serialize(protocol_version)?;
-		let _in_flight = ws_to_tunnel_task::WsResponseInFlightGuard::new();
+		Some((msg.serialize(protocol_version)?, stop_checkpoints))
+	};
+
+	// Transfer ownership only after every fallible initialization step that can run while the
+	// previous connection remains authoritative has succeeded. This transaction installs the owner
+	// and every scheduler-visible index together, so a failed prepare cannot expose a provisional
+	// connection to allocation.
+	let runner_config_protocol_changed_at_claim = claim_registration(
+		&udb,
+		conn.namespace_id,
+		&conn.envoy_key,
+		conn.envoy_conn_id,
+		&conn.pool_name,
+		version,
+		conn.protocol_version,
+		virtual_nodes,
+	)
+	.await?;
+
+	// The replay can start actors, so send it only after the connection owns the registration. A
+	// failed websocket write may have delivered a prefix; fail closed by expiring only this claimed
+	// connection instead of restoring its predecessor.
+	if let Some((msg_serialized, stop_checkpoints)) = missed_commands_prepared {
+		for checkpoint in &stop_checkpoints {
+			if let Err(err) = actor_lifecycle::stop_actor(&conn, checkpoint).await {
+				fail_closed_post_claim(ctx, &conn, "stop actor cache invalidation").await;
+				return Err(err);
+			}
+		}
+
+		let _in_flight = metrics::WS_RESPONSES_IN_FLIGHT.inc_guard();
 		if let Err(err) = conn
 			.ws_handle
 			.send(Message::Binary(msg_serialized.into()))
 			.await
 		{
 			drop(_in_flight);
-			actor_lifecycle::shutdown_conn_actors(&conn).await;
+			fail_closed_post_claim(ctx, &conn, "command replay websocket send").await;
 			return Err(err.into());
 		}
 		drop(_in_flight);
+	}
+	if runner_config_protocol_changed_at_claim {
+		// The required pre-claim purge keeps initialization failure-safe. Purge again after the
+		// persisted version changes so a concurrent reader cannot repopulate the old value in the
+		// purge-to-claim gap. The connection is ready and authoritative now, so a transient cache
+		// failure must not tear it down.
+		if let Err(err) = pegboard::utils::purge_runner_config_caches(
+			ctx.cache(),
+			conn.namespace_id,
+			&conn.pool_name,
+		)
+		.await
+		{
+			tracing::warn!(
+				namespace_id = ?conn.namespace_id,
+				pool_name = %conn.pool_name,
+				?err,
+				"failed to purge runner config caches after envoy registration"
+			);
+		}
 	}
 
 	if conn.is_serverless() {
@@ -422,6 +360,182 @@ pub async fn init_conn(
 	}
 
 	Ok(conn)
+}
+
+async fn fail_closed_post_claim(ctx: &StandaloneCtx, conn: &Conn, failure_stage: &'static str) {
+	if let Err(expire_err) = ctx
+		.op(pegboard::ops::envoy::expire::Input {
+			namespace_id: conn.namespace_id,
+			envoy_key: conn.envoy_key.clone(),
+			expected_envoy_conn_id: Some(conn.envoy_conn_id),
+			skip_if_fresh: false,
+		})
+		.await
+	{
+		tracing::error!(
+			namespace_id = ?conn.namespace_id,
+			envoy_key = %conn.envoy_key,
+			envoy_conn_id = ?conn.envoy_conn_id,
+			failure_stage,
+			?expire_err,
+			"failed to expire envoy after post-claim initialization failure",
+		);
+	}
+	actor_lifecycle::shutdown_conn_actors(conn).await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn claim_registration(
+	udb: &universaldb::Database,
+	namespace_id: Id,
+	envoy_key: &str,
+	envoy_conn_id: Id,
+	pool_name: &str,
+	version: u32,
+	protocol_version: u16,
+	virtual_nodes: Option<u8>,
+) -> Result<bool> {
+	udb.txn("envoy_conn_register", |tx| async move {
+		let tx = tx.with_subspace(pegboard::keys::subspace());
+		let create_ts_key =
+			pegboard::keys::envoy::CreateTsKey::new(namespace_id, envoy_key.to_string());
+		let last_ping_ts_key =
+			pegboard::keys::envoy::LastPingTsKey::new(namespace_id, envoy_key.to_string());
+		let version_key =
+			pegboard::keys::envoy::VersionKey::new(namespace_id, envoy_key.to_string());
+
+		let (create_ts_entry, old_last_ping_ts_entry, version_entry) = tokio::try_join!(
+			tx.read_opt(&create_ts_key, Serializable),
+			tx.read_opt(&last_ping_ts_key, Serializable),
+			tx.read_opt(&version_key, Serializable),
+		)?;
+
+		if let Some(old_version) = version_entry {
+			if old_version != version {
+				tracing::warn!(
+					?namespace_id,
+					%envoy_key,
+					old_version,
+					new_version = version,
+					"envoy_key reconnected with changed version; operationally prohibited - investigate"
+				);
+			}
+		}
+
+		tx.write(
+			&pegboard::keys::envoy::EnvoyConnIdKey::new(namespace_id, envoy_key.to_string()),
+			envoy_conn_id,
+		)?;
+		tx.write(
+			&pegboard::keys::envoy::PoolNameKey::new(namespace_id, envoy_key.to_string()),
+			pool_name.to_string(),
+		)?;
+		tx.write(&version_key, version)?;
+		tx.atomic_op(
+			&pegboard::keys::envoy::SlotsKey::new(namespace_id, envoy_key.to_string()),
+			&0i64.to_le_bytes(),
+			MutationType::Add,
+		);
+
+		let create_ts = if let Some(create_ts) = create_ts_entry {
+			create_ts
+		} else {
+			let create_ts = util::timestamp::now();
+			tx.write(&create_ts_key, create_ts)?;
+			create_ts
+		};
+		let last_ping_ts = util::timestamp::now();
+		tx.write(&last_ping_ts_key, last_ping_ts)?;
+		tx.write(
+			&pegboard::keys::envoy::ProtocolVersionKey::new(namespace_id, envoy_key.to_string()),
+			protocol_version,
+		)?;
+
+		tx.write(
+			&pegboard::keys::ns::ActiveEnvoyKey::new(
+				namespace_id,
+				create_ts,
+				envoy_key.to_string(),
+			),
+			(),
+		)?;
+		tx.write(
+			&pegboard::keys::ns::ActiveEnvoyByNameKey::new(
+				namespace_id,
+				pool_name.to_string(),
+				create_ts,
+				envoy_key.to_string(),
+			),
+			(),
+		)?;
+
+		if create_ts_entry.is_some() {
+			tx.delete(&pegboard::keys::envoy::ExpiredTsKey::new(
+				namespace_id,
+				envoy_key.to_string(),
+			));
+		}
+
+		if let (Some(old_last_ping_ts), Some(old_version)) = (old_last_ping_ts_entry, version_entry)
+		{
+			let old_lb_key = pegboard::keys::ns::EnvoyLoadBalancerIdxKey::new(
+				namespace_id,
+				pool_name.to_string(),
+				old_version,
+				old_last_ping_ts,
+				envoy_key.to_string(),
+			);
+			tx.add_conflict_key(&old_lb_key, ConflictRangeType::Read)?;
+			tx.delete(&old_lb_key);
+		}
+
+		tx.write(
+			&pegboard::keys::ns::EnvoyLoadBalancerIdxKey::new(
+				namespace_id,
+				pool_name.to_string(),
+				version,
+				last_ping_ts,
+				envoy_key.to_string(),
+			),
+			(),
+		)?;
+
+		if let Some(virtual_nodes) = virtual_nodes {
+			tx.write(
+				&VirtualNodesKey::new(namespace_id, envoy_key.to_string()),
+				virtual_nodes,
+			)?;
+			for i in 0..virtual_nodes {
+				tx.write(
+					&EnvoyHashIdxKey::new(
+						namespace_id,
+						pool_name.to_string(),
+						version,
+						xxh3_128_with_seed(envoy_key.as_bytes(), i as u64).to_be_bytes(),
+						envoy_key.to_string(),
+					),
+					(),
+				)?;
+			}
+		}
+
+		// Serverful pools do not run the metadata poller, so registration owns this update. Read
+		// the value in the claim transaction so concurrent registrations cannot hide a cache change.
+		let ns_tx = tx.with_subspace(namespace::keys::subspace());
+		let runner_config_protocol_version_key =
+			pegboard::keys::runner_config::ProtocolVersionKey::new(
+				namespace_id,
+				pool_name.to_string(),
+			);
+		let old_runner_config_protocol_version = ns_tx
+			.read_opt(&runner_config_protocol_version_key, Serializable)
+			.await?;
+		ns_tx.write(&runner_config_protocol_version_key, protocol_version)?;
+
+		Ok(old_runner_config_protocol_version != Some(protocol_version))
+	})
+	.custom_instrument(tracing::info_span!("envoy_register_tx"))
+	.await
 }
 
 /// Report success to the error tracker workflow.

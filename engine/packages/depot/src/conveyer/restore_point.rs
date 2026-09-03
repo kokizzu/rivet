@@ -15,11 +15,11 @@ use anyhow::Result;
 use super::{
 	Db,
 	error::SqliteStorageError,
-	metrics,
 	types::{
 		PinStatus, ResolvedRestoreTarget, ResolvedVersionstamp, RestorePointId, SnapshotSelector,
 	},
 };
+use crate::metrics;
 
 pub use pinned::{create_restore_point, delete_restore_point, restore_point_status};
 pub use resolve::{resolve_restore_point, resolve_restore_target};

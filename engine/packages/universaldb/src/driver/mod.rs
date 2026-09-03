@@ -90,6 +90,10 @@ pub trait TransactionDriver: Send + Sync {
 		end: &'a [u8],
 	) -> Pin<Box<dyn Future<Output = Result<i64>> + Send + 'a>>;
 
+	/// Bytes this transaction would carry if it committed now, measured the way the database's own
+	/// transaction size limit is.
+	fn approximate_size<'a>(&'a self) -> Pin<Box<dyn Future<Output = Result<i64>> + Send + 'a>>;
+
 	fn tag(&self, _tag: &str) -> Result<()> {
 		// No-op unless implemented
 		Ok(())
@@ -98,6 +102,17 @@ pub trait TransactionDriver: Send + Sync {
 	fn priority(&self, _priority: Priority) -> Result<()> {
 		// No-op unless implemented
 		Ok(())
+	}
+
+	/// Caps how many times [`DatabaseDriver::run`] re-runs this transaction's closure, overriding the
+	/// database-wide limit for this transaction only. A limit of `0` means the first error is
+	/// returned rather than retried, matching FoundationDB's `TransactionRetryLimit`.
+	///
+	/// Drivers that cannot honor a per-transaction limit must return an error rather than silently
+	/// accepting one: a caller setting this is bounding how long something stays unobserved, and a
+	/// no-op leaves that bound off with no way to tell.
+	fn retry_limit(&self, _limit: i32) -> Result<()> {
+		Err(crate::error::DatabaseError::RetryLimitUnsupported.into())
 	}
 
 	// Helper for committing without consuming self (for database drivers that need it)

@@ -78,7 +78,7 @@ pub enum SubCommand {
 	},
 
 	/// Move single key or entire subspace from A to B.
-	#[command(name = "move")]
+	#[command(name = "move", alias = "mv")]
 	Move {
 		/// Old key path. Supports relative key paths.
 		old_key: String,
@@ -248,6 +248,7 @@ impl SubCommand {
 							subspace_count: 0,
 							current_hidden_subspace: None,
 							hidden_count: 0,
+							hidden_total: 0,
 							last_key: SimpleTuple::new(),
 						};
 
@@ -327,7 +328,7 @@ impl SubCommand {
 								} else {
 									"subspaces"
 								},
-								ctx.entry_count
+								ctx.entry_count + ctx.hidden_total
 							);
 						}
 
@@ -430,7 +431,7 @@ impl SubCommand {
 									mode: StreamingMode::WantAll,
 									..(&old_subspace).into()
 								},
-								Snapshot,
+								Serializable,
 							);
 
 							let mut keys_moved = 0;
@@ -457,7 +458,7 @@ impl SubCommand {
 							let old_key = universaldb::tuple::pack(&old_tuple);
 							let new_key = universaldb::tuple::pack(&new_tuple);
 
-							let Some(value) = tx.get(&old_key, Snapshot).await? else {
+							let Some(value) = tx.get(&old_key, Serializable).await? else {
 								return Ok(0);
 							};
 
@@ -1125,6 +1126,8 @@ struct ListRenderContext {
 	subspace_count: usize,
 	current_hidden_subspace: Option<SimpleTuple>,
 	hidden_count: usize,
+	/// Sum of the entries of every hidden subspace, including the current one.
+	hidden_total: usize,
 	last_key: SimpleTuple,
 }
 
@@ -1207,6 +1210,7 @@ fn render_list_entry(
 				if let Some(curr) = &ctx.current_hidden_subspace {
 					if &sliced == curr {
 						ctx.hidden_count += 1;
+						ctx.hidden_total += 1;
 					} else {
 						curr.print(&list_style, &ctx.last_key);
 						println!(
@@ -1226,11 +1230,13 @@ fn render_list_entry(
 						ctx.last_key = curr.clone();
 						ctx.current_hidden_subspace = Some(sliced);
 						ctx.hidden_count = 1;
+						ctx.hidden_total += 1;
 						ctx.subspace_count += 1;
 					}
 				} else {
 					ctx.current_hidden_subspace = Some(sliced);
 					ctx.hidden_count = 1;
+					ctx.hidden_total += 1;
 					ctx.subspace_count += 1;
 				}
 			}

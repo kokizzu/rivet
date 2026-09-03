@@ -19,7 +19,7 @@ pub enum CommitKvOutcome {
 	},
 }
 
-#[tracing::instrument(skip_all, fields(%replica_id, key=hex::encode(&key)))]
+#[tracing::instrument(level = "debug", skip_all, fields(%replica_id, key=hex::encode(&key)))]
 pub async fn commit_kv(
 	tx: &Transaction,
 	replica_id: protocol::ReplicaId,

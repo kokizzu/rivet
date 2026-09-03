@@ -5,7 +5,6 @@ pub use rivet_util_id as id;
 
 pub mod async_counter;
 pub mod billing;
-pub mod build_meta;
 pub mod check;
 pub mod duration;
 pub mod format;

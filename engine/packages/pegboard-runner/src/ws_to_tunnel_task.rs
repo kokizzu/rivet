@@ -45,7 +45,7 @@ pub async fn task(
 	res
 }
 
-#[tracing::instrument(skip_all, fields(runner_id=?conn.runner_id, workflow_id=?conn.workflow_id, protocol_version=%conn.protocol_version))]
+#[tracing::instrument(level = "debug", skip_all, fields(runner_id=?conn.runner_id, workflow_id=?conn.workflow_id, protocol_version=%conn.protocol_version))]
 pub async fn task_inner(
 	ctx: StandaloneCtx,
 	conn: Arc<Conn>,
@@ -138,7 +138,7 @@ async fn recv_msg(
 	}
 }
 
-#[tracing::instrument(skip_all)]
+#[tracing::instrument(level = "debug", skip_all)]
 async fn handle_message_mk2(
 	ctx: &StandaloneCtx,
 	conn: &Conn,
@@ -497,7 +497,7 @@ async fn handle_message_mk2(
 	Ok(())
 }
 
-#[tracing::instrument(skip_all)]
+#[tracing::instrument(level = "debug", skip_all)]
 async fn handle_message_mk1(ctx: &StandaloneCtx, conn: &Conn, msg: Bytes) -> Result<()> {
 	// HACK: Decode v2 to handle tunnel ack
 	if rivet_runner_protocol::compat::version_needs_tunnel_ack(conn.protocol_version) {
@@ -853,7 +853,7 @@ async fn ack_commands(
 		.await
 }
 
-#[tracing::instrument(skip_all)]
+#[tracing::instrument(level = "debug", skip_all)]
 async fn handle_tunnel_message_mk2(
 	ups: &PubSub,
 	max_payload_size: usize,
@@ -906,7 +906,7 @@ async fn handle_tunnel_message_mk2(
 	Ok(())
 }
 
-#[tracing::instrument(skip_all)]
+#[tracing::instrument(level = "debug", skip_all)]
 async fn handle_tunnel_message_mk1(
 	ups: &PubSub,
 	max_payload_size: usize,

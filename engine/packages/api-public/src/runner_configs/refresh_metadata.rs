@@ -61,7 +61,7 @@ pub async fn refresh_metadata(
 	}
 }
 
-#[tracing::instrument(skip_all)]
+#[tracing::instrument(level = "debug", skip_all)]
 async fn refresh_metadata_inner(
 	ctx: ApiCtx,
 	path: RefreshMetadataPath,

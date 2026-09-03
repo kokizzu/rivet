@@ -1,6 +1,8 @@
 pub mod config;
 pub mod db;
 pub mod depot;
+pub mod depot_transfer;
+pub mod depot_vacuum;
 pub mod epoxy;
 pub mod profile;
 pub mod start;

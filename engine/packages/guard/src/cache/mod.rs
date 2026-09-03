@@ -12,7 +12,7 @@ pub mod pegboard_gateway;
 use crate::routing::{SEC_WEBSOCKET_PROTOCOL, WS_PROTOCOL_TARGET, X_RIVET_TARGET, actor_path};
 
 /// Creates the main cache key function that handles all incoming requests
-#[tracing::instrument(skip_all)]
+#[tracing::instrument(level = "debug", skip_all)]
 pub fn create_cache_key_function() -> CacheKeyFn {
 	Arc::new(move |req_ctx| {
 		tracing::debug!("building cache key");

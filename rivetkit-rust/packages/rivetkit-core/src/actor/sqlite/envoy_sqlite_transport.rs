@@ -28,4 +28,25 @@ impl SqliteTransport for EnvoySqliteTransport {
 	) -> Result<protocol::SqliteCommitResponse> {
 		self.handle.sqlite_commit(request).await
 	}
+
+	async fn commit_stage_begin(
+		&self,
+		request: protocol::SqliteCommitStageBeginRequest,
+	) -> Result<protocol::SqliteCommitStageBeginResponse> {
+		self.handle.sqlite_commit_stage_begin(request).await
+	}
+
+	async fn commit_stage_segment(
+		&self,
+		request: protocol::SqliteCommitStageSegmentRequest,
+	) -> Result<protocol::SqliteCommitStageSegmentResponse> {
+		self.handle.sqlite_commit_stage_segment(request).await
+	}
+
+	async fn commit_finalize(
+		&self,
+		request: protocol::SqliteCommitFinalizeRequest,
+	) -> Result<protocol::SqliteCommitFinalizeResponse> {
+		self.handle.sqlite_commit_finalize(request).await
+	}
 }

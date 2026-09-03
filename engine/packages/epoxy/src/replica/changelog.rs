@@ -14,7 +14,7 @@ use crate::keys::{
 };
 use crate::metrics;
 
-#[tracing::instrument(skip_all, fields(%replica_id, key=hex::encode(&key)))]
+#[tracing::instrument(level = "debug", skip_all, fields(%replica_id, key=hex::encode(&key)))]
 pub fn append(
 	replica_id: protocol::ReplicaId,
 	tx: &Transaction,
@@ -43,7 +43,7 @@ pub fn append(
 	Ok(())
 }
 
-#[tracing::instrument(skip_all, fields(%replica_id, count))]
+#[tracing::instrument(level = "debug", skip_all, fields(%replica_id, count))]
 pub async fn read(
 	tx: &Transaction,
 	replica_id: protocol::ReplicaId,
@@ -84,7 +84,7 @@ pub async fn read(
 	})
 }
 
-#[tracing::instrument(skip_all, fields(%replica_id, key = ?entry.key))]
+#[tracing::instrument(level = "debug", skip_all, fields(%replica_id, key = ?entry.key))]
 pub async fn apply_entry(
 	tx: &Transaction,
 	replica_id: protocol::ReplicaId,

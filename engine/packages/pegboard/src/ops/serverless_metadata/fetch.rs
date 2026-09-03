@@ -4,7 +4,6 @@ use std::time::Duration;
 use anyhow::Result;
 use gas::prelude::*;
 use reqwest::header::{HeaderMap as ReqwestHeaderMap, HeaderName, HeaderValue};
-use rivet_envoy_protocol::PROTOCOL_VERSION;
 use rivetkit_shared_types::serverless_metadata::ServerlessMetadataPayload;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -286,11 +285,15 @@ pub async fn pegboard_serverless_metadata_fetch(
 		}));
 	}
 
+	// The ceiling is the version negotiated across the engine fleet, not this binary's compiled
+	// version. Admitting a runner at a version an older pod cannot speak would fail once that pod
+	// served the runner.
+	let max_supported = ctx.config().protocols().envoy.version();
 	if let Some(envoy_protocol_version) = envoy_protocol_version {
-		if envoy_protocol_version < 1 || envoy_protocol_version > PROTOCOL_VERSION {
+		if envoy_protocol_version < 1 || envoy_protocol_version > max_supported {
 			return Ok(Err(ServerlessMetadataError::InvalidEnvoyProtocolVersion {
 				version: envoy_protocol_version,
-				max_supported: PROTOCOL_VERSION,
+				max_supported,
 			}));
 		}
 	}

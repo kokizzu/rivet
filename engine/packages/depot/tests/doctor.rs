@@ -222,20 +222,36 @@ async fn commit_sqlite(ctx: &common::TestDb, entries: &[(&str, &str)], now_ms: i
 	ctx.db.commit(pages, db_size_pages, now_ms).await
 }
 
+/// Replaces a commit's delta with one holding exactly `pages`.
+///
+/// Every row of the existing delta is cleared first. A commit stores its pages as one blob per
+/// shard-aligned page range, so writing a single key without clearing would leave the original blobs
+/// in place and add this one beside them, which is a different corruption than the one under test.
 async fn overwrite_delta(
 	ctx: &common::TestDb,
 	branch_id: DatabaseBranchId,
 	txid: u64,
 	db_size_pages: u32,
-	pages: Vec<DirtyPage>,
+	mut pages: Vec<DirtyPage>,
 ) -> Result<()> {
+	pages.sort_by_key(|page| page.pgno);
+	let first_pgno = pages
+		.first()
+		.map(|page| page.pgno - page.pgno % keys::SHARD_SIZE)
+		.context("overwrite_delta needs at least one page")?;
 	let blob = encode_ltx_v3(
 		LtxHeader::delta(txid, db_size_pages, 10_000 + txid as i64),
 		&pages,
 	)?;
+
+	for key in
+		common::read_prefix_keys(&ctx.udb, keys::branch_delta_chunk_prefix(branch_id, txid)).await?
+	{
+		clear_value(&ctx.udb, key).await?;
+	}
 	set_value(
 		&ctx.udb,
-		keys::branch_delta_chunk_key(branch_id, txid, 0),
+		keys::branch_delta_segment_chunk_key(branch_id, txid, first_pgno, 0),
 		blob,
 	)
 	.await
@@ -390,17 +406,23 @@ async fn doctor_reports_non_contiguous_delta_chunks_as_json() -> Result<()> {
 	.await?;
 	commit_sqlite(&ctx, &[("a", "1")], 1_000).await?;
 	let branch_id = branch_id(&ctx).await?;
-	let chunk = read_value(&ctx.udb, keys::branch_delta_chunk_key(branch_id, 1, 0))
+	// Shift the commit's own first chunk up one index so its blob no longer starts at chunk 0. Which
+	// key that is depends on how the commit stored its pages, so it is discovered rather than named.
+	let chunk_keys =
+		common::read_prefix_keys(&ctx.udb, keys::branch_delta_chunk_prefix(branch_id, 1)).await?;
+	let chunk_zero_key = chunk_keys
+		.first()
+		.cloned()
+		.context("delta chunk 0 should exist")?;
+	let chunk = read_value(&ctx.udb, chunk_zero_key.clone())
 		.await?
 		.context("delta chunk 0 should exist")?;
 
-	set_value(
-		&ctx.udb,
-		keys::branch_delta_chunk_key(branch_id, 1, 1),
-		chunk,
-	)
-	.await?;
-	clear_value(&ctx.udb, keys::branch_delta_chunk_key(branch_id, 1, 0)).await?;
+	let mut shifted_key = chunk_zero_key.clone();
+	let idx_start = shifted_key.len() - std::mem::size_of::<u32>();
+	shifted_key[idx_start..].copy_from_slice(&1_u32.to_be_bytes());
+	set_value(&ctx.udb, shifted_key, chunk).await?;
+	clear_value(&ctx.udb, chunk_zero_key).await?;
 
 	let report = run_doctor(&ctx, None).await?;
 
@@ -593,6 +615,29 @@ async fn doctor_max_txid_selects_latest_existing_commit_below_gap() -> Result<()
 	assert_eq!(report.selected_head_txid, Some(1));
 	assert_eq!(report.analysis_scope["max_txid"].as_u64(), Some(2));
 	assert_eq!(report.analysis_scope["selected_txid"].as_u64(), Some(1));
+	Ok(())
+}
+
+#[tokio::test]
+async fn doctor_stops_on_unsupported_cold_state() -> Result<()> {
+	let ctx = common::build_test_db("depot-doctor-cold", common::TierMode::Disabled).await?;
+	commit_sqlite(&ctx, &[("a", "1")], 1_000).await?;
+	let branch_id = branch_id(&ctx).await?;
+
+	set_value(
+		&ctx.udb,
+		keys::branch_compaction_cold_shard_key(branch_id, 0, 1),
+		b"unsupported".to_vec(),
+	)
+	.await?;
+
+	let report = run_doctor(&ctx, None).await?;
+
+	assert_eq!(report.verdict.verdict, DoctorVerdictKind::Unsupported);
+	assert_eq!(
+		report.verdict.unsupported_reason,
+		Some("unsupported_unexpected_storage_shape")
+	);
 	Ok(())
 }
 

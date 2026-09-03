@@ -50,7 +50,6 @@ pub(crate) enum Transition {
 	},
 	Running {
 		envoy: EnvoyState,
-		last_liveness_check_ts: i64,
 	},
 	SleepIntent {
 		envoy: EnvoyState,
@@ -113,14 +112,17 @@ pub struct EnvoyState {
 	pub envoy_key: String,
 	pub last_event_idx: i64,
 	pub last_event_ack_idx: i64,
+	#[serde(default)]
+	pub last_liveness_check_ts: i64,
 }
 
 impl EnvoyState {
-	pub fn new(envoy_key: String) -> Self {
+	pub fn new(envoy_key: String, now: i64) -> Self {
 		EnvoyState {
 			envoy_key,
 			last_event_idx: -1,
 			last_event_ack_idx: -1,
+			last_liveness_check_ts: now,
 		}
 	}
 }
@@ -132,6 +134,7 @@ impl Default for EnvoyState {
 			envoy_key: String::new(),
 			last_event_idx: -1,
 			last_event_ack_idx: -1,
+			last_liveness_check_ts: 0,
 		}
 	}
 }

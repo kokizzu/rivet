@@ -26,7 +26,7 @@ This section explains how WebSocket retries are coordinated between Guard and Pe
 ## Overview
 
 - Retries are only possible before the client WebSocket is accepted ("opening" stage).
-- A retryable transient failure is signaled via the error `guard.websocket_service_unavailable` (WebSocketServiceUnavailable).
+- A retryable transient failure is signaled via specific `guard.websocket_*` errors, such as `guard.websocket_open_timeout` or `guard.websocket_tunnel_subscription_closed`.
 - When Guard receives this error during opening, it re-resolves routes (ignoring cache), applies backoff, and retries with the same client socket and a new handler if available.
 - After the client socket is accepted ("open"), retries are not possible; the handler must close gracefully on failure.
 
@@ -37,9 +37,9 @@ This section explains how WebSocket retries are coordinated between Guard and Pe
   - Handler contract:
     - Do not await the client websocket yet.
     - Return the untouched `HyperWebsocket` in the error tuple so Guard still owns it: `Err((client_ws, err))`.
-    - The outer wrapper maps tunnel-closed UPS errors (e.g., `ups.request_timeout`) to `WebSocketServiceUnavailable`.
+    - The outer wrapper maps tunnel-closed UPS errors (e.g., `ups.request_timeout`) to a specific retryable `guard.websocket_*` error.
   - Guard reaction:
-    - Treats `WebSocketServiceUnavailable` as retryable.
+    - Treats the specific pre-open `guard.websocket_*` errors as retryable.
     - Re-resolves the route with ignore-cache=true, using middleware-config retry/backoff.
     - Outcomes:
       - Re-resolve → `CustomServe`: reuse the same `client_ws` and retry with the new handler.
@@ -61,12 +61,12 @@ This section explains how WebSocket retries are coordinated between Guard and Pe
 ### Implementer Guidance
 
 - Keep the client socket intact for retries:
-  - Only return a retryable error (that maps to `WebSocketServiceUnavailable`) before awaiting the client websocket.
+  - Only return a retryable pre-open `guard.websocket_*` error before awaiting the client websocket.
   - Return the socket in the error tuple: `Err((client_ws, err))`.
 
 - Map tunnel-closed errors at the wrapper:
-  - In the outer `handle_websocket` wrapper, detect tunnel-closed (e.g., `ups.request_timeout`) and map to `WebSocketServiceUnavailable`.
-  - `handle_websocket_inner` should return raw errors; do not construct `WebSocketServiceUnavailable` inside the inner function.
+  - In the outer `handle_websocket` wrapper, detect tunnel-closed conditions and map them to specific retryable `guard.websocket_*` errors.
+  - `handle_websocket_inner` should return the most specific error for the observed failure.
 
 - Use `ups.request` for all tunnel operations (open, messages, close):
   - Pre-accept failures should surface as errors with the unconsumed `client_ws` so Guard can retry.
@@ -79,5 +79,5 @@ This section explains how WebSocket retries are coordinated between Guard and Pe
 ### Rationale
 
 - Returning the untouched `HyperWebsocket` in errors preserves the ability for Guard to re-route and retry without disconnecting the client.
-- Mapping tunnel-closed conditions to a single sentinel error (`WebSocketServiceUnavailable`) provides a consistent, guard-specific signal for retryability.
+- Mapping tunnel-closed conditions to specific guard errors keeps retryability explicit while preserving the underlying failure reason.
 - Restricting retries to pre-accept avoids protocol violations and simplifies resource ownership.

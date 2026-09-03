@@ -14,16 +14,17 @@ use moka::future::Cache;
 use opentelemetry_http::{HeaderExtractor, HeaderInjector};
 use rand::seq::SliceRandom;
 use rivet_api_builder::{RequestIds, X_RIVET_RAY_ID};
+use rivet_error::RivetError;
+use rivet_metrics::GaugeGuardExt;
 use rivet_util::Id;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use rivet_runner_protocol as protocol;
 use std::{
-	net::{IpAddr, SocketAddr},
+	net::SocketAddr,
 	sync::Arc,
 	time::{Duration, Instant},
 };
-use tokio::sync::Mutex;
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_util::sync::CancellationToken;
@@ -34,7 +35,7 @@ use crate::RouteTarget;
 use crate::request_context::RequestContext;
 use crate::response_body::ResponseBody;
 use crate::route::{CacheKeyFn, ResolveRouteOutput, RouteCache, RoutingFn, RoutingOutput};
-use crate::utils::InFlightCounter;
+use crate::utils::{ClientState, InFlightPermit};
 use crate::{
 	WebSocketHandle, custom_serve::HibernationResult, errors, metrics, task_group::TaskGroup, utils,
 };
@@ -42,7 +43,13 @@ use crate::{
 pub const X_FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");
 pub const X_RIVET_ERROR: HeaderName = HeaderName::from_static("x-rivet-error");
 
-const PROXY_STATE_CACHE_TTL: Duration = Duration::from_secs(60 * 60); // 1 hour
+/// How long a client's throttling state is kept after its last request.
+///
+/// This is an idle timeout rather than a live timeout so that a client which keeps sending traffic
+/// keeps its rate limit window and in-flight count. Expiring an active client would refill its rate
+/// limit window early, and would reset its in-flight count to zero while its existing requests are
+/// still running.
+const CLIENT_STATE_CACHE_IDLE_TIMEOUT: Duration = Duration::from_secs(60 * 60); // 1 hour
 const WEBSOCKET_CLOSE_LINGER: Duration = Duration::from_millis(5); // Keep TCP connection open briefly after WebSocket close
 
 fn websocket_config(guard_config: &rivet_config::config::guard::Guard) -> WebSocketConfig {
@@ -64,9 +71,11 @@ pub struct ProxyState {
 	>,
 	route_cache: RouteCache,
 	// We use moka::Cache instead of scc::HashMap because it automatically handles TTL and capacity
-	rate_limiters: Cache<std::net::IpAddr, Arc<Mutex<rivet_util::throttle::RateLimiter>>>,
-	in_flight_counters: Cache<std::net::IpAddr, Arc<Mutex<InFlightCounter>>>,
-	in_flight_requests: Cache<protocol::RequestId, ()>,
+	client_states: Cache<std::net::IpAddr, Arc<parking_lot::Mutex<ClientState>>>,
+	// Entries are owned by an InFlightPermit, so this is bounded by the per-client in-flight limits
+	// and does not need its own capacity or TTL eviction. Evicting a live entry here would let its
+	// request id be handed out to a second concurrent request.
+	in_flight_requests: Arc<scc::HashSet<protocol::RequestId>>,
 
 	tasks: Arc<TaskGroup>,
 }
@@ -104,15 +113,11 @@ impl ProxyState {
 			cache_key_fn,
 			client,
 			route_cache: RouteCache::new(route_cache_ttl),
-			rate_limiters: Cache::builder()
+			client_states: Cache::builder()
 				.max_capacity(10_000)
-				.time_to_idle(PROXY_STATE_CACHE_TTL)
+				.time_to_idle(CLIENT_STATE_CACHE_IDLE_TIMEOUT)
 				.build(),
-			in_flight_counters: Cache::builder()
-				.max_capacity(10_000)
-				.time_to_idle(PROXY_STATE_CACHE_TTL)
-				.build(),
-			in_flight_requests: Cache::builder().max_capacity(10_000_000).build(),
+			in_flight_requests: Arc::new(scc::HashSet::new()),
 			tasks: TaskGroup::new(),
 		}
 	}
@@ -217,111 +222,72 @@ impl ProxyState {
 		}
 	}
 
-	/// Returns true if the rate limit was hit.
-	#[tracing::instrument(skip_all)]
-	async fn check_rate_limit(&self, req_ctx: &RequestContext) -> Result<bool> {
-		// Get existing limiter or create a new one
-		let limiter_arc =
-			if let Some(existing_limiter) = self.rate_limiters.get(&req_ctx.client_ip).await {
-				existing_limiter
-			} else {
-				let new_limiter = Arc::new(Mutex::new(rivet_util::throttle::RateLimiter::new(
-					rivet_util::throttle::RateLimitMethod::FixedWindow {
-						requests: req_ctx.rate_limit.requests,
-						period: Duration::from_secs(req_ctx.rate_limit.period),
-					},
-				)));
-				self.rate_limiters
-					.insert(req_ctx.client_ip, new_limiter.clone())
-					.await;
-				metrics::RATE_LIMITER_COUNT.set(self.rate_limiters.entry_count() as i64);
-				new_limiter
-			};
-
-		// Try to acquire from the limiter
-		let acquired = {
-			let mut limiter = limiter_arc.lock().await;
-			limiter.try_acquire()
-		};
-
-		Ok(!acquired)
-	}
-
-	/// Returns true if the counter could not be acquired.
-	#[tracing::instrument(skip_all)]
-	async fn acquire_in_flight(&self, req_ctx: &mut RequestContext) -> Result<bool> {
-		let cache_key = req_ctx.client_ip;
-
-		// Get existing counter or create a new one
-		let counter_arc =
-			if let Some(existing_counter) = self.in_flight_counters.get(&cache_key).await {
-				existing_counter
-			} else {
-				let new_counter = Arc::new(Mutex::new(InFlightCounter::new(
+	/// Get the throttling state for a client, creating it if it does not exist yet.
+	#[tracing::instrument(level = "debug", skip_all)]
+	async fn client_state(&self, req_ctx: &RequestContext) -> Arc<parking_lot::Mutex<ClientState>> {
+		let entry = self
+			.client_states
+			.entry(req_ctx.client_ip)
+			.or_insert_with(async {
+				Arc::new(parking_lot::Mutex::new(ClientState::new(
+					req_ctx.rate_limit.requests,
+					req_ctx.rate_limit.period,
 					req_ctx.max_in_flight.amount,
-				)));
-				self.in_flight_counters
-					.insert(cache_key, new_counter.clone())
-					.await;
-				metrics::IN_FLIGHT_COUNTER_COUNT.set(self.in_flight_counters.entry_count() as i64);
-				new_counter
-			};
+				)))
+			})
+			.await;
 
-		// Try to acquire from the counter
-		let acquired = {
-			let mut counter = counter_arc.lock().await;
-			counter.try_acquire()
+		if entry.is_fresh() {
+			// Each entry holds both a rate limiter and an in-flight counter
+			let count = self.client_states.entry_count() as i64;
+			metrics::RATE_LIMITER_COUNT.set(count);
+			metrics::IN_FLIGHT_COUNTER_COUNT.set(count);
+		}
+
+		entry.into_value()
+	}
+
+	/// Admits a request under the client's rate limit and in-flight limit, assigning it a unique
+	/// request id. Returns false if either limit was hit.
+	///
+	/// On success the in-flight slot and the request id are owned by the permit stored on the
+	/// request context, and are released once every clone of that context is dropped.
+	#[tracing::instrument(level = "debug", skip_all)]
+	async fn try_admit_request(&self, req_ctx: &mut RequestContext) -> Result<bool> {
+		let client_state = self.client_state(req_ctx).await;
+
+		if !client_state.lock().try_admit() {
+			return Ok(false);
+		}
+
+		// The in-flight slot is held but not owned by anything yet. There are no await points before
+		// the permit takes ownership below, so the slot cannot be lost to cancellation here and only
+		// needs releasing on the error path.
+		let request_id = match self.generate_unique_in_flight_request_id() {
+			Ok(request_id) => request_id,
+			Err(err) => {
+				client_state.lock().release_in_flight();
+				return Err(err);
+			}
 		};
 
-		if !acquired {
-			return Ok(true); // Rate limited
-		}
+		req_ctx.in_flight_permit = Some(Arc::new(InFlightPermit::new(
+			client_state,
+			self.in_flight_requests.clone(),
+			request_id,
+		)));
 
-		// Generate unique request ID
-		req_ctx.in_flight_request_id = Some(self.generate_unique_in_flight_request_id().await?);
-
-		Ok(false)
+		Ok(true)
 	}
 
-	#[tracing::instrument(skip_all)]
-	async fn release_in_flight(
-		&self,
-		client_ip: IpAddr,
-		in_flight_request_id: Option<protocol::RequestId>,
-	) {
-		if let Some(counter_arc) = self.in_flight_counters.get(&client_ip).await {
-			let mut counter = counter_arc.lock().await;
-			counter.release();
-		}
-
-		if let Some(in_flight_request_id) = in_flight_request_id {
-			// Release request ID
-			self.in_flight_requests
-				.invalidate(&in_flight_request_id)
-				.await;
-			metrics::IN_FLIGHT_REQUEST_COUNT.set(self.in_flight_requests.entry_count() as i64);
-		}
-	}
-
-	/// Generate a unique request ID that is not currently in flight
-	async fn generate_unique_in_flight_request_id(&self) -> Result<protocol::RequestId> {
+	/// Generate a request ID that is not currently in flight.
+	fn generate_unique_in_flight_request_id(&self) -> Result<protocol::RequestId> {
 		const MAX_TRIES: u32 = 100;
 
 		for attempt in 0..MAX_TRIES {
 			let request_id = protocol::util::generate_request_id();
-			let mut inserted = false;
 
-			// Check if this ID is already in use
-			self.in_flight_requests
-				.entry(request_id)
-				.or_insert_with(async {
-					inserted = true;
-				})
-				.await;
-
-			if inserted {
-				metrics::IN_FLIGHT_REQUEST_COUNT.set(self.in_flight_requests.entry_count() as i64);
-
+			if self.in_flight_requests.insert_sync(request_id).is_ok() {
 				return Ok(request_id);
 			}
 
@@ -492,10 +458,18 @@ impl ProxyService {
 			Ok(res) => res,
 			Err(err) => {
 				// Log the error
-				tracing::error!(?err, "Request failed");
+				if err
+					.chain()
+					.find_map(|x| x.downcast_ref::<RivetError>())
+					.is_some()
+				{
+					tracing::warn!(?err, "Request failed");
+				} else {
+					tracing::error!(?err, "Request failed");
+				}
 
 				metrics::PROXY_REQUEST_ERROR_TOTAL
-					.with_label_values(&[&err.to_string()])
+					.with_label_values(&[&utils::error_metric_label(&err)])
 					.inc();
 
 				// If we receive an error during a websocket request, we attempt to open the websocket anyway
@@ -510,8 +484,12 @@ impl ProxyService {
 						Ok((client_response, client_ws)) => {
 							tracing::debug!("Client WebSocket upgrade for error proxy successful");
 
+							let active_guard = metrics::WEBSOCKET_ACTIVE.inc_guard();
+
 							self.state.tasks.spawn(
 								async move {
+									let _active_guard = active_guard;
+
 									let ws_handle = match WebSocketHandle::new(client_ws).await {
 										Ok(ws_handle) => ws_handle,
 										Err(err) => {
@@ -554,7 +532,7 @@ impl ProxyService {
 									// Keep TCP connection open briefly to allow client to process close
 									tokio::time::sleep(WEBSOCKET_CLOSE_LINGER).await;
 								}
-								.instrument(tracing::info_span!("ws_error_proxy_task")),
+								.instrument(tracing::debug_span!("ws_error_proxy_task")),
 							);
 
 							// Return the response that will upgrade the client connection
@@ -716,18 +694,10 @@ impl ProxyService {
 
 		let target = target_res?;
 
-		// Apply rate limiting
-		if self.state.check_rate_limit(req_ctx).await? {
-			return Err(errors::RateLimit {
-				method: req_ctx.method.to_string(),
-				path: req_ctx.path.clone(),
-				ip: req_ctx.client_ip.to_string(),
-			}
-			.build());
-		}
-
-		// Acquire in-flight limit and generate protocol request ID
-		if self.state.acquire_in_flight(req_ctx).await? {
+		// Apply rate limiting and in-flight limits, and assign the protocol request ID. The permit
+		// lives on the request context and releases the in-flight slot and request ID when the
+		// context is dropped.
+		if !self.state.try_admit_request(req_ctx).await? {
 			return Err(errors::RateLimit {
 				method: req_ctx.method.to_string(),
 				path: req_ctx.path.clone(),
@@ -737,7 +707,7 @@ impl ProxyService {
 		}
 
 		// Increment metrics
-		metrics::PROXY_REQUEST_PENDING.inc();
+		let _pending_guard = metrics::PROXY_REQUEST_PENDING.inc_guard();
 		metrics::PROXY_REQUEST_TOTAL.inc();
 
 		let is_websocket = hyper_tungstenite::is_upgrade_request(&req);
@@ -758,44 +728,7 @@ impl ProxyService {
 			.with_label_values(&[status])
 			.observe(duration_secs);
 
-		metrics::PROXY_REQUEST_PENDING.dec();
-
-		let client_ip = req_ctx.client_ip;
-		let in_flight_request_id = req_ctx.in_flight_request_id;
-		let state = self.state.clone();
-		let runtime = tokio::runtime::Handle::current();
-		// HTTP capacity remains held until the response reaches EOF, errors, or is dropped.
-		// WebSocket upgrades retain the existing immediate release behavior. Capturing the
-		// runtime handle lets the response body's synchronous Drop path schedule async cleanup.
-		let release_in_flight = move || {
-			runtime.spawn(
-				async move {
-					state
-						.release_in_flight(client_ip, in_flight_request_id)
-						.await;
-				}
-				.instrument(tracing::info_span!("release_in_flight_task")),
-			);
-		};
-
-		if is_websocket {
-			release_in_flight();
-			res
-		} else {
-			match res {
-				Ok(response) => {
-					let (parts, body) = response.into_parts();
-					Ok(Response::from_parts(
-						parts,
-						body.with_completion(release_in_flight),
-					))
-				}
-				Err(err) => {
-					release_in_flight();
-					Err(err)
-				}
-			}
-		}
+		res
 	}
 
 	#[tracing::instrument(skip_all)]
@@ -1127,6 +1060,10 @@ impl ProxyService {
 		// Clone needed values for the spawned task
 		let state = self.state.clone();
 
+		// Held by whichever task takes over the connection below, so the gauge follows the lifetime
+		// of the client WebSocket instead of any single early return inside those tasks.
+		let active_guard = metrics::WEBSOCKET_ACTIVE.inc_guard();
+
 		// Spawn a new task to handle the WebSocket bidirectional communication
 		match target {
 			ResolveRouteOutput::Target(mut target) => {
@@ -1135,6 +1072,7 @@ impl ProxyService {
 
 				self.state.tasks.spawn(
 					async move {
+						let _active_guard = active_guard;
 						let req_ctx = &mut req_ctx;
 
 						// Set up a timeout for the entire operation
@@ -1151,7 +1089,7 @@ impl ProxyService {
 						// First, wait for the client WebSocket to be ready (do this first to avoid race conditions)
 						tracing::debug!("Waiting for client WebSocket to be ready...");
 						let mut client_ws = match tokio::time::timeout(timeout_duration, client_ws)
-							.instrument(tracing::info_span!("connect_client_ws"))
+							.instrument(tracing::debug_span!("connect_client_ws"))
 							.await
 						{
 							Ok(Ok(ws)) => {
@@ -1252,7 +1190,7 @@ impl ProxyService {
 									false,
 								),
 							)
-							.instrument(tracing::info_span!("connect_upstream_ws"))
+							.instrument(tracing::debug_span!("connect_upstream_ws"))
 							.await
 							{
 								Ok(Ok((ws_stream, resp))) => {
@@ -1361,7 +1299,7 @@ impl ProxyService {
 							);
 
 							tokio::time::sleep(backoff)
-								.instrument(tracing::info_span!("backoff_sleep"))
+								.instrument(tracing::debug_span!("backoff_sleep"))
 								.await;
 
 							// Resolve target again, this time ignoring cache. This makes sure
@@ -1713,7 +1651,7 @@ impl ProxyService {
 						tokio::join!(client_to_upstream, upstream_to_client);
 						tracing::debug!("Bidirectional message forwarding completed");
 					}
-					.instrument(tracing::info_span!("handle_ws_task_target")),
+					.instrument(tracing::debug_span!("handle_ws_task_target")),
 				);
 			}
 			ResolveRouteOutput::CustomServe(mut handler) => {
@@ -1723,6 +1661,7 @@ impl ProxyService {
 
 				self.state.tasks.spawn(
 					async move {
+						let _active_guard = active_guard;
 						let req_ctx = &mut req_ctx;
 						let mut ws_hibernation_close = false;
 						let mut after_hibernation = false;
@@ -1911,14 +1850,9 @@ impl ProxyService {
 							}
 						}
 
-						// Release in-flight counter and request ID when task completes
-						state
-							.release_in_flight(req_ctx.client_ip, req_ctx.in_flight_request_id)
-							.await;
-
 						Ok(())
 					}
-					.instrument(tracing::info_span!("handle_ws_task_custom_serve")),
+					.instrument(tracing::debug_span!("handle_ws_task_custom_serve")),
 				);
 			}
 		}

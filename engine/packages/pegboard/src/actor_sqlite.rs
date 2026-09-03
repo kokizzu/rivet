@@ -4,7 +4,7 @@ use anyhow::{Context, Result, ensure};
 use depot::{
 	conveyer::{Db, branch as depot_branch},
 	keys as depot_keys,
-	types::{BucketId, DBHead, DirtyPage, SQLITE_PAGE_SIZE, decode_db_head},
+	types::{BucketId, CommitOptions, DBHead, DirtyPage, SQLITE_PAGE_SIZE, decode_db_head},
 };
 use gas::prelude::{Id, util::timestamp};
 use rivet_envoy_protocol as protocol;
@@ -20,6 +20,15 @@ const SQLITE_V1_META_VERSION: u16 = 1;
 const SQLITE_V1_META_LEN: usize = 10;
 const SQLITE_V1_CHUNK_SIZE: usize = 4096;
 const SQLITE_V1_MAX_MIGRATION_BYTES: u64 = 128 * 1024 * 1024;
+/// Pages written per commit while importing a v1 database, so a v1 database larger
+/// than one commit is imported across several commits.
+///
+/// Deliberately its own value rather than depot's commit cap. The two answer
+/// different questions: the cap is the largest commit depot will accept, this is
+/// how coarsely the importer should batch. The import writes through the
+/// single-shot commit path, so the batch has to stay small enough to fit one FDB
+/// transaction, and it also bounds how much work an interrupted import repeats.
+pub const MIGRATION_COMMIT_PAGES: usize = 320;
 const FILE_TAG_MAIN: u8 = 0x00;
 const FILE_TAG_JOURNAL: u8 = 0x01;
 const FILE_TAG_WAL: u8 = 0x02;
@@ -27,6 +36,8 @@ const FILE_TAG_SHM: u8 = 0x03;
 const SQLITE_MAGIC: &[u8; 16] = b"SQLite format 3\0";
 
 pub fn clear_v2_storage_for_destroy(tx: &universaldb::Transaction, actor_id: Id) {
+	tx.informal().clear(&migration_marker_key(actor_id));
+
 	let actor_id = actor_id.to_string();
 
 	tx.informal().clear(&depot_keys::meta_head_key(&actor_id));
@@ -46,6 +57,10 @@ pub fn clear_v2_storage_for_destroy(tx: &universaldb::Transaction, actor_id: Id)
 		let (begin, end) = prefix_range(&prefix);
 		tx.informal().clear_range(&begin, &end);
 	}
+}
+
+fn migration_marker_key(actor_id: Id) -> Vec<u8> {
+	crate::keys::subspace().pack(&crate::keys::actor::SqliteMigrationKey::new(actor_id))
 }
 
 fn prefix_range(prefix: &[u8]) -> (Vec<u8>, Vec<u8>) {
@@ -86,10 +101,13 @@ async fn maybe_migrate_v1_to_v2(db: &universaldb::Database, recipient: &Recipien
 
 	let actor_id = recipient.actor_id.to_string();
 
-	if load_v2_head(db, recipient.namespace_id, &actor_id)
-		.await?
-		.is_some()
-	{
+	let state = load_migration_state(db, recipient).await?;
+
+	// A v2 head with no in-progress marker is a complete database, either
+	// because an earlier migration finished or because the actor already ran on
+	// v2. The v1 data is never deleted, so this is the steady state for every
+	// already-migrated actor.
+	if state.head.is_some() && state.in_progress_pages.is_none() {
 		return Ok(false);
 	}
 
@@ -116,25 +134,43 @@ async fn maybe_migrate_v1_to_v2(db: &universaldb::Database, recipient: &Recipien
 		"starting v1→v2 migration"
 	);
 
-	let dirty_pages = recovered
-		.bytes
-		.chunks(SQLITE_PAGE_SIZE as usize)
-		.enumerate()
-		.map(|(idx, bytes)| DirtyPage {
-			pgno: idx as u32 + 1,
-			bytes: bytes.to_vec(),
-		})
-		.collect::<Vec<_>>();
 	let actor_db = Db::new(
 		Arc::new(db.clone()),
 		recipient.namespace_id,
 		actor_id.clone(),
 		NodeId::new(),
 	);
-	actor_db
-		.commit(dirty_pages, recovered.total_pages, timestamp::now())
+
+	// The marker is written before the first commit so that a crash part way
+	// through the import is always recognizable as an unfinished import rather
+	// than as a complete database.
+	write_migration_marker(db, recipient.actor_id, Some(recovered.total_pages))
+		.await
+		.map_err(|err| migration_error(&actor_id, "mark", err))?;
+
+	// Only resume on top of a head left by an unfinished import of this same
+	// database. A recorded page count that disagrees with what the v1 data reads
+	// as now means the published pages cannot be assumed to match, so the import
+	// starts over.
+	let resume_head = state.head.as_ref().filter(|_| {
+		state
+			.in_progress_pages
+			.is_some_and(|pages| pages == recovered.total_pages)
+	});
+	// The fence follows whatever head is actually published, even when the import
+	// starts over, so the first commit is not rejected for expecting no head.
+	let import = ImportPlan {
+		fence_head_txid: state.head.as_ref().map_or(0, |head| head.head_txid),
+		start_pgno: resume_head.map_or(2, |head| head.db_size_pages.saturating_add(1).max(2)),
+	};
+
+	import_v1_pages(&actor_db, &actor_id, &recovered, import)
 		.await
 		.map_err(|err| migration_error(&actor_id, "finalize", err))?;
+
+	write_migration_marker(db, recipient.actor_id, None)
+		.await
+		.map_err(|err| migration_error(&actor_id, "unmark", err))?;
 
 	metrics::SQLITE_MIGRATION_SUCCESSES_TOTAL.inc();
 	metrics::SQLITE_MIGRATION_DURATION.observe(start.elapsed().as_secs_f64());
@@ -148,35 +184,191 @@ async fn maybe_migrate_v1_to_v2(db: &universaldb::Database, recipient: &Recipien
 	Ok(true)
 }
 
-async fn load_v2_head(
-	db: &universaldb::Database,
-	namespace_id: Id,
+/// Imports the recovered v1 database into v2 storage.
+///
+/// Depot caps how much a single commit may carry, so anything but a tiny
+/// database is imported across several commits. Two properties keep a failure
+/// part way through from producing a database that looks complete:
+///
+/// - Page 1 holds the SQLite header and is committed last, so a partial import
+///   has no header and cannot be opened as a valid database.
+/// - Every commit fences on the head txid it expects, so a second concurrent
+///   attempt fails instead of interleaving its pages with this one.
+///
+/// A retry resumes from the published head because the v1 source is immutable
+/// for the lifetime of the migration, which makes the pages already written
+/// byte identical to what a fresh import would write.
+async fn import_v1_pages(
+	actor_db: &Db,
 	actor_id: &str,
-) -> Result<Option<DBHead>> {
-	let actor_id = actor_id.to_string();
-	let bucket_id = BucketId::from_gas_id(namespace_id);
-	db.txn("pegboard_actor_sqlite_get_head", move |tx| {
-		let actor_id = actor_id.clone();
+	recovered: &RecoveredDb,
+	import: ImportPlan,
+) -> Result<()> {
+	let total_pages = recovered.total_pages;
+	let mut expected_head_txid = import.fence_head_txid;
+
+	if total_pages == 0 {
+		commit_pages(actor_db, Vec::new(), 0, &mut expected_head_txid).await?;
+		return Ok(());
+	}
+
+	// Pages already published by an earlier attempt do not need to be rewritten.
+	// Page 1 is never among them because it is only committed once every other
+	// page has landed.
+	let mut next_pgno = import.start_pgno;
+	if next_pgno > 2 {
+		tracing::info!(
+			actor_id = %actor_id,
+			fence_head_txid = import.fence_head_txid,
+			next_pgno,
+			total_pages,
+			"resuming unfinished v1→v2 import"
+		);
+	}
+
+	while next_pgno <= total_pages {
+		let end_pgno = next_pgno
+			.saturating_add(u32::try_from(MIGRATION_COMMIT_PAGES)? - 1)
+			.min(total_pages);
+		let pages = (next_pgno..=end_pgno)
+			.map(|pgno| page_at(recovered, pgno))
+			.collect::<Result<Vec<_>>>()?;
+
+		// The intermediate size is the highest page written so far, which keeps
+		// every page in the commit within the database and avoids publishing a
+		// size that references pages that do not exist yet.
+		commit_pages(actor_db, pages, end_pgno, &mut expected_head_txid).await?;
+
+		next_pgno = end_pgno.saturating_add(1);
+	}
+
+	// Publishing page 1 with the real page count completes the database.
+	commit_pages(
+		actor_db,
+		vec![page_at(recovered, 1)?],
+		total_pages,
+		&mut expected_head_txid,
+	)
+	.await?;
+
+	Ok(())
+}
+
+struct ImportPlan {
+	/// Head txid the first commit of the import must observe.
+	fence_head_txid: u64,
+	/// First page to write. Always at least 2, since page 1 is written last.
+	start_pgno: u32,
+}
+
+async fn commit_pages(
+	actor_db: &Db,
+	pages: Vec<DirtyPage>,
+	db_size_pages: u32,
+	expected_head_txid: &mut u64,
+) -> Result<()> {
+	let result = actor_db
+		.commit_with_options(
+			pages,
+			db_size_pages,
+			timestamp::now(),
+			CommitOptions {
+				expected_head_txid: Some(*expected_head_txid),
+				disable_size_cap: false,
+			},
+		)
+		.await?;
+	*expected_head_txid = result.head_txid;
+
+	Ok(())
+}
+
+fn page_at(recovered: &RecoveredDb, pgno: u32) -> Result<DirtyPage> {
+	let page_size = SQLITE_PAGE_SIZE as usize;
+	let start = (pgno as usize - 1)
+		.checked_mul(page_size)
+		.context("sqlite v1 page offset overflow")?;
+	let bytes = recovered
+		.bytes
+		.get(start..start + page_size)
+		.with_context(|| format!("sqlite v1 page {pgno} is outside the recovered database"))?;
+
+	Ok(DirtyPage {
+		pgno,
+		bytes: bytes.to_vec(),
+	})
+}
+
+struct MigrationState {
+	head: Option<DBHead>,
+	in_progress_pages: Option<u32>,
+}
+
+async fn load_migration_state(
+	db: &universaldb::Database,
+	recipient: &Recipient,
+) -> Result<MigrationState> {
+	let actor_id = recipient.actor_id;
+	let database_id = actor_id.to_string();
+	let bucket_id = BucketId::from_gas_id(recipient.namespace_id);
+	db.txn("pegboard_actor_sqlite_get_migration_state", move |tx| {
+		let database_id = database_id.clone();
 		let bucket_id = bucket_id;
 		async move {
 			let key = if let Some(branch_id) = depot_branch::resolve_database_branch(
 				&tx,
 				bucket_id,
-				&actor_id,
+				&database_id,
 				universaldb::utils::IsolationLevel::Snapshot,
 			)
 			.await?
 			{
 				depot_keys::branch_meta_head_key(branch_id)
 			} else {
-				depot_keys::meta_head_key(&actor_id)
+				depot_keys::meta_head_key(&database_id)
 			};
-			tx.informal()
+			let head = tx
+				.informal()
 				.get(&key, universaldb::utils::IsolationLevel::Snapshot)
 				.await?
 				.map(|bytes| decode_db_head(bytes.as_ref()))
 				.transpose()
-				.context("decode sqlite db head")
+				.context("decode sqlite db head")?;
+
+			let marker_key = crate::keys::actor::SqliteMigrationKey::new(actor_id);
+			let in_progress_pages = tx
+				.with_subspace(crate::keys::subspace())
+				.read_opt(
+					&marker_key,
+					universaldb::utils::IsolationLevel::Serializable,
+				)
+				.await?;
+
+			Ok(MigrationState {
+				head,
+				in_progress_pages,
+			})
+		}
+	})
+	.await
+}
+
+async fn write_migration_marker(
+	db: &universaldb::Database,
+	actor_id: Id,
+	total_pages: Option<u32>,
+) -> Result<()> {
+	db.txn("pegboard_actor_sqlite_write_migration_marker", move |tx| {
+		let total_pages = total_pages;
+		async move {
+			let tx = tx.with_subspace(crate::keys::subspace());
+			let key = crate::keys::actor::SqliteMigrationKey::new(actor_id);
+			match total_pages {
+				Some(total_pages) => tx.write(&key, total_pages)?,
+				None => tx.delete(&key),
+			}
+
+			Ok(())
 		}
 	})
 	.await

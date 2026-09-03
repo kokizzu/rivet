@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use super::State;
 use crate::types;
 
-#[tracing::instrument(skip_all)]
+#[tracing::instrument(level = "debug", skip_all)]
 pub async fn replica_status_change(
 	ctx: &mut WorkflowCtx,
 	signal: super::ReplicaStatusChange,
@@ -37,7 +37,7 @@ pub async fn replica_status_change(
 	Ok(())
 }
 
-#[tracing::instrument(skip_all)]
+#[tracing::instrument(level = "debug", skip_all)]
 pub async fn replica_reconfigure(ctx: &mut WorkflowCtx) -> Result<()> {
 	ctx.activity(UpdateReplicaUrlsInput {}).await?;
 

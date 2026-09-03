@@ -103,6 +103,6 @@ pub(crate) async fn read_local_value(
 				})
 			}
 		})
-		.custom_instrument(tracing::info_span!("read_local_value_tx"))
+		.custom_instrument(tracing::debug_span!("read_local_value_tx"))
 		.await
 }

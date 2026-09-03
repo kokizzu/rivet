@@ -13,7 +13,7 @@ IMAGE_REPO=$1
 shift
 TAGS=("$@")
 
-DOCKERFILE=${DOCKERFILE:-docker/engine/Dockerfile}
+DOCKERFILE=${DOCKERFILE:-docker/engine/ee.Dockerfile}
 TARGET=${TARGET:-engine-full}
 CONTEXT=${CONTEXT:-.}
 
@@ -28,7 +28,6 @@ docker build -f "${DOCKERFILE}" --target "${TARGET}" \
   --build-arg BUILD_FRONTEND=true \
   --build-arg VITE_FEATURE_FLAGS="${VITE_FEATURE_FLAGS:-}" \
   --build-arg VITE_APP_TURNSTILE_SITE_KEY="${VITE_APP_TURNSTILE_SITE_KEY:-}" \
-  # --build-arg CARGO_BUILD_MODE=release \
   "${BUILD_TAG_ARGS[@]}" \
   "${CONTEXT}"
 
@@ -39,4 +38,3 @@ for tag in "${TAGS[@]}"; do
 done
 
 echo "Done! Images built and pushed: ${TAGS[*]}"
-

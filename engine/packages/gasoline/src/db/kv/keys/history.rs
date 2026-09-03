@@ -469,6 +469,70 @@ impl<'de> TupleUnpack<'de> for SignalIdKey {
 	}
 }
 
+/// Id of the worker that last wrote this event. Rewritten every time the event is inserted or
+/// updated so history always shows which worker produced its current contents.
+#[derive(Debug)]
+pub struct WorkerIdKey {
+	workflow_id: Id,
+	location: Location,
+	forgotten: bool,
+}
+
+impl WorkerIdKey {
+	pub fn new(workflow_id: Id, location: Location) -> Self {
+		WorkerIdKey {
+			workflow_id,
+			location,
+			forgotten: false,
+		}
+	}
+}
+
+impl FormalKey for WorkerIdKey {
+	type Value = Id;
+
+	fn deserialize(&self, raw: &[u8]) -> Result<Self::Value> {
+		Ok(Id::from_slice(raw)?)
+	}
+
+	fn serialize(&self, value: Self::Value) -> Result<Vec<u8>> {
+		Ok(value.as_bytes().to_vec())
+	}
+}
+
+impl TuplePack for WorkerIdKey {
+	fn pack<W: std::io::Write>(
+		&self,
+		w: &mut W,
+		tuple_depth: TupleDepth,
+	) -> std::io::Result<VersionstampOffset> {
+		pack_history_key(
+			self.workflow_id,
+			&self.location,
+			w,
+			tuple_depth,
+			self.forgotten,
+			WORKER_ID,
+		)
+	}
+}
+
+impl<'de> TupleUnpack<'de> for WorkerIdKey {
+	fn unpack(input: &[u8], tuple_depth: TupleDepth) -> PackResult<(&[u8], Self)> {
+		let (input, (workflow_id, location, forgotten)) =
+			unpack_history_key(input, tuple_depth, WORKER_ID, "WORKER_ID")?;
+
+		Ok((
+			input,
+			WorkerIdKey {
+				workflow_id,
+				location,
+				forgotten,
+			},
+		))
+	}
+}
+
 #[derive(Debug)]
 pub struct SubWorkflowIdKey {
 	workflow_id: Id,
@@ -1419,7 +1483,7 @@ impl FormalChunkedKey for IndexedInputKey {
 				.flatten()
 				.collect(),
 		)?)
-		.context("failed to combine `InputKey`")
+		.context("failed to combine `IndexedInputKey`")
 	}
 
 	fn split(&self, value: Self::Value) -> Result<Vec<Vec<u8>>> {
@@ -1664,12 +1728,15 @@ pub mod insert {
 	pub fn common(
 		subspace: &universaldb::tuple::Subspace,
 		tx: &universaldb::RetryableTransaction,
+		worker_id: Id,
 		workflow_id: Id,
 		location: &Location,
 		event_type: EventType,
 		version: usize,
 		create_ts: i64,
 	) -> Result<()> {
+		write_worker_id(subspace, tx, worker_id, workflow_id, location)?;
+
 		let event_type_key = super::EventTypeKey::new(workflow_id, location.clone());
 		tx.set(
 			&subspace.pack(&event_type_key),
@@ -1691,9 +1758,28 @@ pub mod insert {
 		Ok(())
 	}
 
+	/// Records the worker that wrote the event at this location. Called by every insert and update so
+	/// the key always reflects the last writer.
+	pub fn write_worker_id(
+		subspace: &universaldb::tuple::Subspace,
+		tx: &universaldb::RetryableTransaction,
+		worker_id: Id,
+		workflow_id: Id,
+		location: &Location,
+	) -> Result<()> {
+		let worker_id_key = super::WorkerIdKey::new(workflow_id, location.clone());
+		tx.set(
+			&subspace.pack(&worker_id_key),
+			&worker_id_key.serialize(worker_id)?,
+		);
+
+		Ok(())
+	}
+
 	pub fn signals_event(
 		subspace: &universaldb::tuple::Subspace,
 		tx: &universaldb::RetryableTransaction,
+		worker_id: Id,
 		workflow_id: Id,
 		location: &Location,
 		version: usize,
@@ -1702,6 +1788,7 @@ pub mod insert {
 		common(
 			subspace,
 			tx,
+			worker_id,
 			workflow_id,
 			location,
 			EventType::Signals,
@@ -1747,6 +1834,7 @@ pub mod insert {
 	pub fn signal_send_event(
 		subspace: &universaldb::tuple::Subspace,
 		tx: &universaldb::RetryableTransaction,
+		worker_id: Id,
 		workflow_id: Id,
 		location: &Location,
 		version: usize,
@@ -1759,6 +1847,7 @@ pub mod insert {
 		common(
 			subspace,
 			tx,
+			worker_id,
 			workflow_id,
 			location,
 			EventType::SignalSend,
@@ -1799,6 +1888,7 @@ pub mod insert {
 	pub fn sub_workflow_event(
 		subspace: &universaldb::tuple::Subspace,
 		tx: &universaldb::RetryableTransaction,
+		worker_id: Id,
 		workflow_id: Id,
 		location: &Location,
 		version: usize,
@@ -1811,6 +1901,7 @@ pub mod insert {
 		common(
 			subspace,
 			tx,
+			worker_id,
 			workflow_id,
 			location,
 			EventType::SubWorkflow,
@@ -1863,6 +1954,7 @@ pub mod insert {
 	pub fn activity_event(
 		subspace: &universaldb::tuple::Subspace,
 		tx: &universaldb::RetryableTransaction,
+		worker_id: Id,
 		workflow_id: Id,
 		location: &Location,
 		version: usize,
@@ -1874,6 +1966,7 @@ pub mod insert {
 		common(
 			subspace,
 			tx,
+			worker_id,
 			workflow_id,
 			location,
 			EventType::Activity,
@@ -1924,6 +2017,7 @@ pub mod insert {
 	pub fn message_send_event(
 		subspace: &universaldb::tuple::Subspace,
 		tx: &universaldb::RetryableTransaction,
+		worker_id: Id,
 		workflow_id: Id,
 		location: &Location,
 		version: usize,
@@ -1935,6 +2029,7 @@ pub mod insert {
 		common(
 			subspace,
 			tx,
+			worker_id,
 			workflow_id,
 			location,
 			EventType::MessageSend,
@@ -1977,6 +2072,7 @@ pub mod insert {
 	pub fn loop_event(
 		subspace: &universaldb::tuple::Subspace,
 		tx: &universaldb::RetryableTransaction,
+		worker_id: Id,
 		workflow_id: Id,
 		location: &Location,
 		version: usize,
@@ -1988,6 +2084,7 @@ pub mod insert {
 		common(
 			subspace,
 			tx,
+			worker_id,
 			workflow_id,
 			location,
 			EventType::Loop,
@@ -2027,12 +2124,15 @@ pub mod insert {
 	pub fn update_loop_event(
 		subspace: &universaldb::tuple::Subspace,
 		tx: &universaldb::RetryableTransaction,
+		worker_id: Id,
 		workflow_id: Id,
 		location: &Location,
 		iteration: usize,
 		state: &serde_json::value::RawValue,
 		output: Option<&serde_json::value::RawValue>,
 	) -> Result<()> {
+		write_worker_id(subspace, tx, worker_id, workflow_id, location)?;
+
 		let iteration_key = super::IterationKey::new(workflow_id, location.clone());
 		tx.set(
 			&subspace.pack(&iteration_key),
@@ -2069,6 +2169,7 @@ pub mod insert {
 	pub fn sleep_event(
 		subspace: &universaldb::tuple::Subspace,
 		tx: &universaldb::RetryableTransaction,
+		worker_id: Id,
 		workflow_id: Id,
 		location: &Location,
 		version: usize,
@@ -2079,6 +2180,7 @@ pub mod insert {
 		common(
 			subspace,
 			tx,
+			worker_id,
 			workflow_id,
 			location,
 			EventType::Sleep,
@@ -2104,10 +2206,13 @@ pub mod insert {
 	pub fn update_sleep_event(
 		subspace: &universaldb::tuple::Subspace,
 		tx: &universaldb::RetryableTransaction,
+		worker_id: Id,
 		workflow_id: Id,
 		location: &Location,
 		sleep_state: SleepState,
 	) -> Result<()> {
+		write_worker_id(subspace, tx, worker_id, workflow_id, location)?;
+
 		let sleep_state_key = super::SleepStateKey::new(workflow_id, location.clone());
 		tx.set(
 			&subspace.pack(&sleep_state_key),
@@ -2120,6 +2225,7 @@ pub mod insert {
 	pub fn branch_event(
 		subspace: &universaldb::tuple::Subspace,
 		tx: &universaldb::RetryableTransaction,
+		worker_id: Id,
 		workflow_id: Id,
 		location: &Location,
 		version: usize,
@@ -2128,6 +2234,7 @@ pub mod insert {
 		common(
 			subspace,
 			tx,
+			worker_id,
 			workflow_id,
 			location,
 			EventType::Branch,
@@ -2141,6 +2248,7 @@ pub mod insert {
 	pub fn removed_event(
 		subspace: &universaldb::tuple::Subspace,
 		tx: &universaldb::RetryableTransaction,
+		worker_id: Id,
 		workflow_id: Id,
 		location: &Location,
 		version: usize,
@@ -2151,6 +2259,7 @@ pub mod insert {
 		common(
 			subspace,
 			tx,
+			worker_id,
 			workflow_id,
 			location,
 			EventType::Removed,
@@ -2178,6 +2287,7 @@ pub mod insert {
 	pub fn version_check_event(
 		subspace: &universaldb::tuple::Subspace,
 		tx: &universaldb::RetryableTransaction,
+		worker_id: Id,
 		workflow_id: Id,
 		location: &Location,
 		version: usize,
@@ -2187,6 +2297,7 @@ pub mod insert {
 		common(
 			subspace,
 			tx,
+			worker_id,
 			workflow_id,
 			location,
 			EventType::VersionCheck,

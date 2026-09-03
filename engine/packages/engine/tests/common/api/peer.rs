@@ -343,22 +343,3 @@ pub async fn set_epoxy_state(
 	let response = req.send().await?;
 	parse_response(response).await
 }
-
-pub async fn build_set_tracing_config_request(
-	port: u16,
-	request: rivet_api_peer::internal::SetTracingConfigRequest,
-) -> Result<reqwest::RequestBuilder> {
-	let client = rivet_pools::reqwest::client().await?;
-	Ok(client
-		.put(format!("{}/debug/tracing/config", get_endpoint(port)))
-		.json(&request))
-}
-
-pub async fn set_tracing_config(
-	port: u16,
-	request: rivet_api_peer::internal::SetTracingConfigRequest,
-) -> Result<rivet_api_peer::internal::SetTracingConfigResponse> {
-	let req = build_set_tracing_config_request(port, request).await?;
-	let response = req.send().await?;
-	parse_response(response).await
-}

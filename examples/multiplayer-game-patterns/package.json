@@ -29,7 +29,7 @@
     "lucide-react": "^0.439.0",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
-    "rivetkit": "*",
+    "rivetkit": "workspace:*",
     "three": "^0.171.0"
   },
   "stableVersion": "0.8.0",

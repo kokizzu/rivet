@@ -8,6 +8,7 @@ mod metrics;
 pub mod options;
 pub mod prelude;
 pub mod range_option;
+pub mod throttle;
 mod transaction;
 pub(crate) mod tx_ops;
 pub mod utils;
@@ -18,6 +19,7 @@ pub use database::Database;
 pub use driver::DatabaseDriverHandle;
 pub use key_selector::KeySelector;
 pub use range_option::RangeOption;
+pub use throttle::{ThrottleCharge, ThrottleClass, ThrottleConfig, ThrottleDecision, ThrottleKind};
 pub use transaction::{RetryableTransaction, Transaction};
 pub use utils::{Subspace, calculate_tx_retry_backoff};
 

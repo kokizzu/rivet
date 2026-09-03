@@ -4,8 +4,8 @@ use vbare::OwnedVersionedData;
 
 use super::serialization::SQLITE_STORAGE_META_VERSION;
 
-pub const DEFAULT_PITR_INTERVAL_MS: i64 = 5 * 60 * 1000;
-pub const DEFAULT_PITR_RETENTION_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+/// How long a shard stays resident in the hot cache after its last access. Eviction candidates are
+/// shards whose access bucket is older than `retention_ms / ACCESS_TOUCH_THROTTLE_MS` buckets.
 pub const DEFAULT_SHARD_CACHE_RETENTION_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -14,12 +14,15 @@ pub struct PitrPolicy {
 	pub retention_ms: i64,
 }
 
-impl Default for PitrPolicy {
-	fn default() -> Self {
-		Self {
-			interval_ms: DEFAULT_PITR_INTERVAL_MS,
-			retention_ms: DEFAULT_PITR_RETENTION_MS,
-		}
+impl PitrPolicy {
+	/// Policy applied to databases with no bucket or database override, or `None` when PITR is
+	/// disabled. A disabled cluster selects no interval coverage and ignores stored overrides, so
+	/// this is the single point that decides whether PITR runs at all.
+	pub fn from_config(config: &rivet_config::config::Sqlite) -> Option<Self> {
+		config.pitr().map(|pitr| Self {
+			interval_ms: pitr.interval_ms(),
+			retention_ms: pitr.retention_ms(),
+		})
 	}
 }
 

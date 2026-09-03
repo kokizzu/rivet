@@ -27,7 +27,7 @@ pub struct MessageCtx {
 }
 
 impl MessageCtx {
-	#[tracing::instrument(skip_all, fields(%ray_id))]
+	#[tracing::instrument(level = "debug", skip_all, fields(%ray_id))]
 	pub fn new(
 		config: &rivet_config::Config,
 		pools: &rivet_pools::Pools,
@@ -73,7 +73,7 @@ impl MessageCtx {
 						}
 					}
 				}
-				.instrument(tracing::info_span!("message_bg")),
+				.instrument(tracing::debug_span!("message_bg")),
 			)
 			.map_err(|err| WorkflowError::PublishMessage(err.into()))
 			.map(|_| ())
@@ -291,7 +291,7 @@ where
 	/// Waits for the next message in the subscription.
 	///
 	/// This future can be safely dropped.
-	#[tracing::instrument(name="message_next", skip_all, fields(message = M::NAME))]
+	#[tracing::instrument(level = "debug", name="message_next", skip_all, fields(message = M::NAME))]
 	pub async fn next(&mut self) -> WorkflowResult<PubsubMessage<M>> {
 		tracing::debug!("waiting for message");
 

@@ -209,7 +209,7 @@ macro_rules! __perf_span {
 		labels: { $($label_name:ident = $label_marker:tt $label_value:expr),* $(,)? },
 		fields: { $($field_name:ident = $field_marker:tt $field_value:expr),* $(,)? }
 	) => {
-		::tracing::info_span!(
+		::tracing::debug_span!(
 			$name,
 			$($label_name = $label_marker $label_value,)*
 			$($field_name = $field_marker $field_value,)*
@@ -221,7 +221,7 @@ macro_rules! __perf_span {
 #[macro_export]
 macro_rules! __perf_span_items {
 	($name:literal, [$($items:tt)*], ; ) => {
-		::tracing::info_span!($name, $($items)*)
+		::tracing::debug_span!($name, $($items)*)
 	};
 	($name:literal, [$($items:tt)*], $field:ident = %$value:expr, $($rest:tt)* ; $($fields:tt)*) => {
 		$crate::__perf_span_items!($name, [$($items)* $field = %$value,], $($rest)* ; $($fields)*)

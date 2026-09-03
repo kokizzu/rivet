@@ -161,6 +161,7 @@ where
 			let actual_sub_workflow_id = ctx
 				.db()
 				.dispatch_sub_workflow(
+					ctx.worker_id(),
 					ctx.ray_id(),
 					ctx.workflow_id(),
 					&location,

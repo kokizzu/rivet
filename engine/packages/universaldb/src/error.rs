@@ -12,6 +12,9 @@ pub enum DatabaseError {
 
 	#[error("operation issued while a commit was outstanding")]
 	UsedDuringCommit,
+
+	#[error("driver does not support a per-transaction retry limit")]
+	RetryLimitUnsupported,
 }
 
 impl DatabaseError {

@@ -60,6 +60,7 @@ async fn stale_envoy_seen_by_hash_read_path_is_expired_by_scheduler() -> Result<
 	let fixture = common::EnvoyFixture {
 		namespace_id,
 		envoy_key: stale_envoy_key.to_string(),
+		envoy_conn_id: None,
 		pool_name,
 		version: common::VERSION,
 		create_ts: common::HASH_NOW,

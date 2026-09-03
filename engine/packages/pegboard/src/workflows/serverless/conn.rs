@@ -6,6 +6,7 @@ use futures_util::{FutureExt, StreamExt};
 use gas::prelude::*;
 use reqwest::header::{HeaderName, HeaderValue};
 use reqwest_eventsource as sse;
+use rivet_metrics::GaugeGuardExt;
 use rivet_runner_protocol as protocol;
 use rivet_runtime::TermSignal;
 use rivet_types::actor::RunnerPoolError;
@@ -158,15 +159,13 @@ async fn outbound_req(ctx: &ActivityCtx, input: &OutboundReqInput) -> Result<Out
 	let mut term_signal = TermSignal::get();
 
 	loop {
-		metrics::SERVERLESS_OUTBOUND_REQ_ACTIVE
-			.with_label_values(&[&input.namespace_id.to_string(), &input.runner_name])
-			.inc();
+		let res = {
+			let _active_guard = metrics::SERVERLESS_OUTBOUND_REQ_ACTIVE
+				.with_label_values(&[&input.namespace_id.to_string(), &input.runner_name])
+				.inc_guard();
 
-		let res = outbound_req_inner(ctx, input, &mut term_signal).await;
-
-		metrics::SERVERLESS_OUTBOUND_REQ_ACTIVE
-			.with_label_values(&[&input.namespace_id.to_string(), &input.runner_name])
-			.dec();
+			outbound_req_inner(ctx, input, &mut term_signal).await
+		};
 
 		match res {
 			// If the outbound req exited successfully, continue with no backoff
@@ -652,7 +651,7 @@ async fn publish_to_client_stop(
 	runner_id: Id,
 	runner_protocol_version: u16,
 ) -> Result<()> {
-	let receiver_subject = RunnerReceiverSubject::new(runner_id).to_string();
+	let receiver_subject = RunnerReceiverSubject::new(runner_id);
 
 	let message_serialized = if protocol::is_mk2(runner_protocol_version) {
 		protocol::versioned::ToRunnerMk2::wrap_latest(protocol::mk2::ToRunner::ToRunnerClose)

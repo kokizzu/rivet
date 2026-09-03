@@ -46,6 +46,7 @@ pub struct Guard {
 	pub actor_force_wake_pending_timeout_ms: Option<i64>,
 	/// Enable & configure HTTPS
 	pub https: Option<Https>,
+
 	/// Max HTTP request body size in bytes (first line of defense).
 	pub http_max_request_body_size: Option<usize>,
 	/// Max WebSocket message size in bytes.

@@ -33,6 +33,7 @@ rivet-pools.workspace = true
 rivet-runtime.workspace = true
 rivet-test-deps.workspace = true
 rivet-util.workspace = true
+scc.workspace = true
 sentry.workspace = true
 serde_json.workspace = true
 serde.workspace = true

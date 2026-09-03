@@ -67,6 +67,7 @@ pub async fn serverless_health_check(
 	}
 }
 
+#[tracing::instrument(level = "debug", skip_all)]
 async fn serverless_health_check_inner(
 	ctx: ApiCtx,
 	_query: ServerlessHealthCheckQuery,

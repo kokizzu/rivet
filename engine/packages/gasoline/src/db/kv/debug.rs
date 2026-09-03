@@ -5,7 +5,7 @@ use std::{
 	time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use futures_util::{StreamExt, TryStreamExt, stream::FuturesUnordered};
 use rivet_util::Id;
 use serde::Serialize;
@@ -25,8 +25,9 @@ use crate::{
 		BumpSubSubject,
 		debug::{
 			ActivityError, ActivityEvent, DatabaseDebug, Event, EventData, HistoryData, LoopEvent,
-			MessageSendEvent, SignalData, SignalEvent, SignalSendEvent, SignalState, SignalsEvent,
-			SubWorkflowEvent, WorkflowData, WorkflowState,
+			MessageSendEvent, RepairInspection, RepairOutcome, RepairVariant, RepairVerification,
+			SignalData, SignalEvent, SignalSendEvent, SignalState, SignalsEvent, SubWorkflowEvent,
+			WorkflowData, WorkflowState,
 		},
 	},
 	error::{WorkflowError, WorkflowResult},
@@ -40,7 +41,7 @@ use crate::{
 const EARLY_TXN_TIMEOUT: Duration = Duration::from_secs(3);
 
 impl DatabaseKv {
-	#[tracing::instrument(skip_all)]
+	#[tracing::instrument(level = "debug", skip_all)]
 	async fn get_workflows_inner(
 		&self,
 		workflow_ids: Vec<Id>,
@@ -181,7 +182,7 @@ impl DatabaseKv {
 		Ok(res)
 	}
 
-	#[tracing::instrument(skip_all)]
+	#[tracing::instrument(level = "debug", skip_all)]
 	async fn get_signals_inner(
 		&self,
 		signal_ids: Vec<Id>,
@@ -276,7 +277,7 @@ impl DatabaseKv {
 // Its just for debugging
 #[async_trait::async_trait]
 impl DatabaseDebug for DatabaseKv {
-	#[tracing::instrument(skip_all)]
+	#[tracing::instrument(level = "debug", skip_all)]
 	async fn get_workflows(&self, workflow_ids: Vec<Id>) -> Result<Vec<WorkflowData>> {
 		self.pools
 			.udb()?
@@ -288,7 +289,7 @@ impl DatabaseDebug for DatabaseKv {
 			.map_err(Into::into)
 	}
 
-	#[tracing::instrument(skip_all)]
+	#[tracing::instrument(level = "debug", skip_all)]
 	async fn find_workflows(
 		&self,
 		tags: &[(String, String)],
@@ -412,12 +413,12 @@ impl DatabaseDebug for DatabaseKv {
 					Ok(workflows)
 				}
 			})
-			.instrument(tracing::info_span!("find_workflows_tx"))
+			.instrument(tracing::debug_span!("find_workflows_tx"))
 			.await
 			.map_err(Into::into)
 	}
 
-	#[tracing::instrument(skip_all)]
+	#[tracing::instrument(level = "debug", skip_all)]
 	async fn silence_workflows(&self, workflow_ids: Vec<Id>) -> Result<()> {
 		self.pools
 			.udb()?
@@ -624,12 +625,20 @@ impl DatabaseDebug for DatabaseKv {
 						let metric = if has_output {
 							keys::metric::Metric::WorkflowComplete(workflow_name.clone())
 						} else if has_wake_condition {
+							keys::metric::Metric::WorkflowSleeping(workflow_name.clone())
+						} else {
+							// Workflow is dead
 							let error =
 								error_key.deserialize(&error_entry.context("key should exist")?)?;
 
+							// Clear dead idx
+							tx.clear(&self.subspace.pack(&keys::workflow::DeadIdxKey::new(
+								workflow_name.clone(),
+								error.clone(),
+								workflow_id,
+							)));
+
 							keys::metric::Metric::WorkflowDead(workflow_name.clone(), error)
-						} else {
-							keys::metric::Metric::WorkflowSleeping(workflow_name.clone())
 						};
 
 						update_metric(&tx.with_subspace(self.subspace.clone()), Some(metric), None);
@@ -642,7 +651,7 @@ impl DatabaseDebug for DatabaseKv {
 			.map_err(Into::into)
 	}
 
-	#[tracing::instrument(skip_all)]
+	#[tracing::instrument(level = "debug", skip_all)]
 	async fn wake_workflows(&self, workflow_ids: Vec<Id>) -> Result<()> {
 		self.pools
 			.udb()?
@@ -718,11 +727,19 @@ impl DatabaseDebug for DatabaseKv {
 						tx.write(&has_wake_condition_key, ())?;
 
 						if !has_wake_condition {
+							let error = error.context("key should exist")?;
+
+							tx.delete(&keys::workflow::DeadIdxKey::new(
+								workflow_name.clone(),
+								error.clone(),
+								workflow_id,
+							));
+
 							update_metric(
 								&tx,
 								Some(keys::metric::Metric::WorkflowDead(
 									workflow_name.clone(),
-									error.context("key should exist")?,
+									error,
 								)),
 								Some(keys::metric::Metric::WorkflowSleeping(workflow_name)),
 							);
@@ -732,7 +749,7 @@ impl DatabaseDebug for DatabaseKv {
 					Ok(())
 				}
 			})
-			.instrument(tracing::info_span!("wake_workflows_tx"))
+			.instrument(tracing::debug_span!("wake_workflows_tx"))
 			.await?;
 
 		self.bump(BumpSubSubject::Worker);
@@ -740,7 +757,7 @@ impl DatabaseDebug for DatabaseKv {
 		Ok(())
 	}
 
-	#[tracing::instrument(skip_all)]
+	#[tracing::instrument(level = "debug", skip_all)]
 	async fn get_workflow_history(
 		&self,
 		workflow_id: Id,
@@ -794,7 +811,7 @@ impl DatabaseDebug for DatabaseKv {
 								if current_event.location != partial_key.location {
 									if current_event.location.is_empty() {
 										current_event = WorkflowHistoryEventBuilder::new(
-											partial_key.location,
+											partial_key.location.clone(),
 											partial_key.forgotten,
 										);
 									} else {
@@ -803,7 +820,7 @@ impl DatabaseDebug for DatabaseKv {
 										let previous_event = std::mem::replace(
 											&mut current_event,
 											WorkflowHistoryEventBuilder::new(
-												partial_key.location,
+												partial_key.location.clone(),
 												partial_key.forgotten,
 											),
 										);
@@ -924,7 +941,10 @@ impl DatabaseDebug for DatabaseKv {
 								{
 									ensure!(
 										current_event.indexed_signal_ids.len() == key.index,
-										"corrupt history, indexed signal doesn't exist yet or is out of order"
+										"corrupt history location={} expected={} got={}, indexed signal doesn't exist yet or is out of order",
+										partial_key.location,
+										current_event.indexed_signal_ids.len(),
+										key.index,
 									);
 
 									let signal_id = key.deserialize(entry.value())?;
@@ -937,7 +957,10 @@ impl DatabaseDebug for DatabaseKv {
 								{
 									ensure!(
 										current_event.indexed_names.len() == key.index,
-										"corrupt history, indexed name doesn't exist yet or is out of order"
+										"corrupt history location={} expected={} got={}, indexed name doesn't exist yet or is out of order",
+										partial_key.location,
+										current_event.indexed_names.len(),
+										key.index,
 									);
 
 									let name = key.deserialize(entry.value())?;
@@ -946,19 +969,23 @@ impl DatabaseDebug for DatabaseKv {
 									self.subspace
 										.unpack::<keys::history::IndexedInputChunkKey>(entry.key())
 								{
-									ensure!(
-										current_event.indexed_input_chunks.len() == key.index,
-										"corrupt history, indexed chunk doesn't exist yet or is out of order"
-									);
-
 									if let Some(input_chunks) =
 										current_event.indexed_input_chunks.get_mut(key.index)
 									{
 										input_chunks.push(entry);
-									} else {
+									} else if current_event.indexed_input_chunks.len()
+										== key.index
+									{
 										current_event
-											.indexed_input_chunks
-											.insert(key.index, vec![entry]);
+										.indexed_input_chunks
+										.push(vec![entry]);
+									} else {
+										bail!(
+											"corrupt history location={} expected={} got={}, indexed chunk doesn't exist yet or is out of order",
+											partial_key.location,
+											current_event.indexed_input_chunks.len(),
+											key.index,
+										);
 									}
 								}
 
@@ -990,12 +1017,12 @@ impl DatabaseDebug for DatabaseKv {
 					}))
 				}
 			})
-			.instrument(tracing::info_span!("pull_workflow_history_tx"))
+			.instrument(tracing::debug_span!("pull_workflow_history_tx"))
 			.await
 			.map_err(Into::into)
 	}
 
-	#[tracing::instrument(skip_all)]
+	#[tracing::instrument(level = "debug", skip_all)]
 	async fn get_signals(&self, signal_ids: Vec<Id>) -> Result<Vec<SignalData>> {
 		self.pools
 			.udb()?
@@ -1003,12 +1030,12 @@ impl DatabaseDebug for DatabaseKv {
 				let signal_ids = signal_ids.clone();
 				async move { self.get_signals_inner(signal_ids, &tx).await }
 			})
-			.instrument(tracing::info_span!("get_signals_tx"))
+			.instrument(tracing::debug_span!("get_signals_tx"))
 			.await
 			.map_err(Into::into)
 	}
 
-	#[tracing::instrument(skip_all)]
+	#[tracing::instrument(level = "debug", skip_all)]
 	async fn find_signals(
 		&self,
 		_tags: &[(String, String)],
@@ -1117,12 +1144,12 @@ impl DatabaseDebug for DatabaseKv {
 					Ok(signals)
 				}
 			})
-			.instrument(tracing::info_span!("find_signals_tx"))
+			.instrument(tracing::debug_span!("find_signals_tx"))
 			.await
 			.map_err(Into::into)
 	}
 
-	#[tracing::instrument(skip_all)]
+	#[tracing::instrument(level = "debug", skip_all)]
 	async fn silence_signals(&self, signal_ids: Vec<Id>) -> Result<()> {
 		self.pools
 			.udb()?
@@ -1201,7 +1228,16 @@ impl DatabaseDebug for DatabaseKv {
 							&silence_ts_key.serialize(rivet_util::timestamp::now())?,
 						);
 
+						// An acked signal was already inserted into the prune idx when it was acked
 						if ack_ts_entry.is_none() {
+							// Insert into prune idx so the pruner can reclaim this signal once it
+							// is old enough
+							let prune_idx_key = keys::signal::PruneIdxKey::new(signal_id);
+							tx.set(
+								&self.subspace.pack(&prune_idx_key),
+								&prune_idx_key.serialize(())?,
+							);
+
 							update_metric(
 								&tx.with_subspace(self.subspace.clone()),
 								Some(keys::metric::Metric::SignalPending(signal_name)),
@@ -1217,29 +1253,17 @@ impl DatabaseDebug for DatabaseKv {
 			.map_err(Into::into)
 	}
 
-	#[tracing::instrument(skip_all)]
+	#[tracing::instrument(level = "debug", skip_all)]
 	async fn revive_workflows(
 		&self,
 		names: &[&str],
 		error_like: &[&str],
 		dry_run: bool,
-		parallelization: u16,
 	) -> Result<usize> {
-		ensure!(parallelization > 0);
-		ensure!(parallelization < 1024);
-
-		let chunk_size = u128::MAX / parallelization as u128;
 		let mut futs = FuturesUnordered::new();
 
-		for i in 0..parallelization as u128 {
-			let start = i * chunk_size;
-			futs.push(self.revive_workflows_inner(
-				names,
-				error_like,
-				dry_run,
-				start,
-				start + chunk_size,
-			));
+		for name in names {
+			futs.push(self.revive_workflows_inner(name, error_like, dry_run));
 		}
 
 		let mut total = 0;
@@ -1252,7 +1276,142 @@ impl DatabaseDebug for DatabaseKv {
 		Ok(total)
 	}
 
-	#[tracing::instrument(skip_all)]
+	async fn backfill_dead_workflows(
+		&self,
+		limit: usize,
+		last_key: Option<&[u8]>,
+	) -> Result<(usize, Option<Vec<u8>>)> {
+		let last_key = last_key.map(|x| x.to_vec());
+
+		self.pools
+			.udb()?
+			.txn("gas_debug_backfill_dead_workflows", |tx| {
+				let last_key = &last_key;
+				async move {
+					let tx = tx.with_subspace(self.subspace.clone());
+
+					let mut total = 0;
+
+					let entire_subspace_key = keys::workflow::DataSubspaceKey::new();
+					let subspace_range = self.subspace.subspace(&entire_subspace_key).range();
+					let start = if let Some(last_key) = last_key {
+						last_key.clone()
+					} else {
+						subspace_range.0
+					};
+					let end = subspace_range.1;
+
+					let mut stream = tx.get_ranges_keyvalues(
+						RangeOption {
+							mode: StreamingMode::WantAll,
+							..(start.clone(), end).into()
+						},
+						Snapshot,
+					);
+
+					// Points at the first key of the workflow currently being scanned. Resuming
+					// from here rescans that workflow from the start, which is required because a
+					// workflow is only indexed once all of its keys have been read.
+					let mut new_last_key = Some(start);
+					let mut current_workflow_id = None;
+					let mut name = None;
+					let mut error = None;
+					let mut state_matches = true;
+
+					let fut = async {
+						while let Some(entry) = stream.try_next().await? {
+							let workflow_id = *self.subspace.unpack::<JustId>(entry.key())?;
+
+							if let Some(curr) = current_workflow_id {
+								if workflow_id != curr {
+									// Save if matches query
+									if let (Some(name), Some(error)) = (name.take(), error.take())
+										&& state_matches
+									{
+										tx.write(
+											&keys::workflow::DeadIdxKey::new(name, error, curr),
+											(),
+										)?;
+									}
+
+									total += 1;
+
+									// Reset state
+									new_last_key = Some(entry.key().to_vec());
+									state_matches = true;
+
+									// Stop on a workflow boundary so the cursor never points in
+									// the middle of a workflow's keys
+									if total >= limit {
+										return anyhow::Ok(());
+									}
+								}
+							}
+
+							current_workflow_id = Some(workflow_id);
+
+							if let Ok(name_key) =
+								self.subspace.unpack::<keys::workflow::NameKey>(entry.key())
+							{
+								name = Some(name_key.deserialize(entry.value())?);
+							} else if let Ok(_) = self
+								.subspace
+								.unpack::<keys::workflow::OutputChunkKey>(entry.key())
+							{
+								state_matches = false;
+							} else if let Ok(_) = self
+								.subspace
+								.unpack::<keys::workflow::WorkerIdKey>(entry.key())
+							{
+								state_matches = false;
+							} else if let Ok(_) = self
+								.subspace
+								.unpack::<keys::workflow::HasWakeConditionKey>(entry.key())
+							{
+								state_matches = false;
+							} else if let Ok(_) = self
+								.subspace
+								.unpack::<keys::workflow::SilenceTsKey>(entry.key())
+							{
+								state_matches = false;
+							} else if let Ok(error_key) = self
+								.subspace
+								.unpack::<keys::workflow::ErrorKey>(entry.key())
+							{
+								error = Some(error_key.deserialize(entry.value())?);
+							}
+						}
+
+						// Save the last workflow in the range
+						if let Some(curr) = current_workflow_id {
+							if let (Some(name), Some(error)) = (name.take(), error.take())
+								&& state_matches
+							{
+								tx.write(&keys::workflow::DeadIdxKey::new(name, error, curr), ())?;
+							}
+
+							total += 1;
+						}
+
+						// Reached the end of all workflows
+						new_last_key = None;
+
+						anyhow::Ok(())
+					};
+
+					match tokio::time::timeout(EARLY_TXN_TIMEOUT, fut).await {
+						Ok(res) => res?,
+						Err(_) => tracing::debug!("timed out reading workflows"),
+					}
+
+					Ok((total, new_last_key))
+				}
+			})
+			.instrument(tracing::debug_span!("backfill_dead_workflows_tx"))
+			.await
+	}
+
+	#[tracing::instrument(level = "debug", skip_all)]
 	async fn prune_workflows(
 		&self,
 		before_ts: i64,
@@ -1337,12 +1496,17 @@ impl DatabaseDebug for DatabaseKv {
 
 						match prune_key.variant {
 							PruneVariant::All => {
-								let data_subspace =
-									keys::workflow::DataSubspaceKey::new_with_workflow_id(
+								tx.delete_key_subspace(
+									&keys::workflow::DataSubspaceKey::new_with_workflow_id(
 										prune_key.workflow_id,
-									);
+									),
+								);
 
-								tx.delete_key_subspace(&data_subspace);
+								tx.delete_key_subspace(
+									&keys::workflow::PendingSignalKey::entire_subspace(
+										prune_key.workflow_id,
+									),
+								);
 
 								if let (Some(inserter), Some(create_ts)) = (
 									&mut inserter,
@@ -1390,7 +1554,7 @@ impl DatabaseDebug for DatabaseKv {
 					Ok((prune_count, inserter, new_last_key))
 				}
 			})
-			.instrument(tracing::info_span!("prune_workflows_tx"))
+			.instrument(tracing::debug_span!("prune_workflows_tx"))
 			.await?;
 
 		if let Some(mut inserter) = inserter {
@@ -1401,7 +1565,89 @@ impl DatabaseDebug for DatabaseKv {
 		Ok((prune_count, new_last_key))
 	}
 
-	#[tracing::instrument(skip_all)]
+	#[tracing::instrument(level = "debug", skip_all)]
+	async fn prune_signals(
+		&self,
+		before_ts: i64,
+		limit: usize,
+		last_key: Option<&[u8]>,
+	) -> Result<(usize, Option<Vec<u8>>)> {
+		let last_key = last_key.map(|x| x.to_vec());
+
+		self.pools
+			.udb()?
+			.txn("gas_debug_prune_signals", |tx| {
+				let last_key = &last_key;
+				async move {
+					tx.tag("prune_signals")?;
+
+					let start = Instant::now();
+					let tx = tx.with_subspace(self.subspace.clone());
+					let mut prune_count = 0;
+					let mut new_last_key = None;
+
+					let subspace_start = self
+						.subspace
+						.subspace(&keys::signal::PruneIdxKey::entire_subspace())
+						.range()
+						.0;
+					let subspace_end = self
+						.subspace
+						.subspace(&keys::signal::PruneIdxKey::subspace(before_ts))
+						.range()
+						.1;
+
+					let range_start = if let Some(last_key) = last_key {
+						last_key
+					} else {
+						&subspace_start
+					};
+					let range_end = &subspace_end;
+
+					let mut stream = tx.get_ranges_keyvalues(
+						universaldb::RangeOption {
+							mode: StreamingMode::WantAll,
+							..(range_start.as_slice(), range_end.as_slice()).into()
+						},
+						Serializable,
+					);
+
+					loop {
+						if start.elapsed() > EARLY_TXN_TIMEOUT {
+							tracing::warn!("timed out pruning signals");
+							break;
+						}
+
+						let Some(entry) = stream.try_next().await? else {
+							new_last_key = None;
+							break;
+						};
+
+						let prune_key = tx.unpack::<keys::signal::PruneIdxKey>(entry.key())?;
+
+						// Remove prune idx entry
+						tx.delete(&prune_key);
+
+						tx.delete_key_subspace(&keys::signal::DataSubspaceKey::new_with_signal_id(
+							prune_key.signal_id,
+						));
+
+						prune_count += 1;
+						new_last_key = Some([entry.key(), &[0xff]].concat());
+
+						if prune_count >= limit {
+							break;
+						}
+					}
+
+					Ok((prune_count, new_last_key))
+				}
+			})
+			.instrument(tracing::debug_span!("prune_signals_tx"))
+			.await
+	}
+
+	#[tracing::instrument(level = "debug", skip_all)]
 	async fn prune_complete_workflow_history(
 		&self,
 		names: &[&str],
@@ -1436,7 +1682,7 @@ impl DatabaseDebug for DatabaseKv {
 		Ok(total)
 	}
 
-	#[tracing::instrument(skip_all)]
+	#[tracing::instrument(level = "debug", skip_all)]
 	async fn prune_acked_signals(
 		&self,
 		names: &[&str],
@@ -1472,49 +1718,69 @@ impl DatabaseDebug for DatabaseKv {
 
 		Ok(total)
 	}
+
+	#[tracing::instrument(skip_all)]
+	async fn inspect_workflow_repair(
+		&self,
+		workflow_id: Id,
+		variant: RepairVariant,
+		location: Option<Location>,
+	) -> Result<RepairInspection> {
+		self.inspect_workflow_repair_inner(workflow_id, variant, location)
+			.await
+	}
+
+	#[tracing::instrument(skip_all)]
+	async fn repair_workflow(
+		&self,
+		workflow_id: Id,
+		variant: RepairVariant,
+		location: Option<Location>,
+	) -> Result<RepairOutcome> {
+		self.repair_workflow_inner(workflow_id, variant, location)
+			.await
+	}
+
+	#[tracing::instrument(skip_all)]
+	async fn verify_workflow_repair(
+		&self,
+		workflow_id: Id,
+		variant: RepairVariant,
+		location: Location,
+	) -> Result<RepairVerification> {
+		self.verify_workflow_repair_inner(workflow_id, variant, location)
+			.await
+	}
 }
 
 impl DatabaseKv {
 	pub async fn revive_workflows_inner(
 		&self,
-		names: &[&str],
+		name: &str,
 		error_like: &[&str],
 		dry_run: bool,
-		start: u128,
-		end: u128,
 	) -> Result<usize> {
 		let mut total = 0;
-		let mut current_workflow_id = Some(Id::v1(Uuid::from_u128(start), self.config.dc_label()));
-		let end_workflow_id = Id::v1(Uuid::from_u128(end), self.config.dc_label());
+		let mut last_key = None;
 
 		loop {
-			let (new_current_workflow_id, workflow_ids) = self.pools
+			let (new_last_key, workflow_ids) = self.pools
 				.udb()?
 				.txn("gas_debug_revive_workflows", |tx| {
+					let mut last_key = last_key.clone();
+
 					async move {
-						for name in names {
-							tx.tag(&format!("revive_workflows:{name}"))?;
-						}
+						tx.tag(&format!("revive_workflows:{name}"))?;
 
 						let mut workflow_ids = Vec::new();
 
-						let key_end = keys::workflow::DataSubspaceKey::new_with_workflow_id(end_workflow_id);
-						let end = self.subspace.subspace(&key_end).range().1;
-
-						let start = if let Some(current_workflow_id) = current_workflow_id {
-							let key_start = keys::workflow::DataSubspaceKey::new_with_workflow_id(current_workflow_id);
-							let mut bytes = self.subspace.subspace(&key_start).range().0;
-
-							if let Some(b) = bytes.last_mut() {
-								*b = 255;
-							}
-
-							bytes
+						let entire_subspace_key = keys::workflow::DeadIdxKey::subspace(name.to_string());
+						let start = if let Some(last_key) = last_key.take() {
+							last_key
 						} else {
-							let entire_subspace_key = keys::workflow::DataSubspaceKey::new();
-
 							self.subspace.subspace(&entire_subspace_key).range().0
 						};
+						let end = self.subspace.subspace(&entire_subspace_key).range().1;
 
 						let mut stream = tx.get_ranges_keyvalues(
 							RangeOption {
@@ -1525,80 +1791,20 @@ impl DatabaseKv {
 						);
 
 						let mut workflows_processed = 0;
-						let mut current_workflow_id = None;
-						let mut name_matches = false;
-						let mut state_matches = true;
-						let mut error_matches = error_like.is_empty();
 
 						let fut = async {
 							while let Some(entry) = stream.try_next().await? {
-								let workflow_id = *self.subspace.unpack::<JustId>(entry.key())?;
+								let dead_idx_key = self.subspace.unpack::<keys::workflow::DeadIdxKey>(entry.key())?;
 
-								if let Some(curr) = current_workflow_id {
-									if workflow_id != curr {
-										// Save if matches query
-										if name_matches && state_matches && error_matches {
-											workflow_ids.push(curr);
-										}
-
-										workflows_processed += 1;
-
-										// Reset state
-										name_matches = false;
-										state_matches = true;
-										error_matches = error_like.is_empty();
-									}
+								if error_like.is_empty() || error_like.iter().any(|err| dead_idx_key.error.to_lowercase().contains(err)) {
+									workflow_ids.push(dead_idx_key.workflow_id);
 								}
 
-								current_workflow_id = Some(workflow_id);
-
-								if let Ok(name_key) =
-									self.subspace.unpack::<keys::workflow::NameKey>(entry.key())
-								{
-									let workflow_name = name_key.deserialize(entry.value())?;
-
-									name_matches = names.iter().any(|name| &workflow_name == name);
-								} else if let Ok(_) = self
-									.subspace
-									.unpack::<keys::workflow::OutputChunkKey>(entry.key())
-								{
-									state_matches = false;
-								} else if let Ok(_) = self
-									.subspace
-									.unpack::<keys::workflow::WorkerIdKey>(entry.key())
-								{
-									state_matches = false;
-								} else if let Ok(_) = self
-									.subspace
-									.unpack::<keys::workflow::HasWakeConditionKey>(entry.key())
-								{
-									state_matches = false;
-								} else if let Ok(_) = self
-									.subspace
-									.unpack::<keys::workflow::SilenceTsKey>(entry.key())
-								{
-									state_matches = false;
-								} else if let Ok(error_key) = self
-									.subspace
-									.unpack::<keys::workflow::ErrorKey>(entry.key())
-								{
-									let error = error_key.deserialize(entry.value())?.to_lowercase();
-
-									error_matches = error_like.is_empty() || error_like.iter().any(|err| error.contains(err));
-								}
-							}
-
-							if let (Some(workflow_id), true) = (
-								current_workflow_id,
-								name_matches && state_matches && error_matches,
-							) {
-								workflow_ids.push(workflow_id);
-								current_workflow_id = None;
-							}
-
-							if current_workflow_id.is_some() {
 								workflows_processed += 1;
+								last_key = Some(entry.key().to_vec());
 							}
+
+							last_key = None;
 
 							anyhow::Ok(())
 						};
@@ -1610,20 +1816,20 @@ impl DatabaseKv {
 
 						tracing::info!(?workflows_processed, matching_workflows=?workflow_ids.len(), "batch processed workflows");
 
-						Ok((current_workflow_id, workflow_ids))
+						Ok((last_key, workflow_ids))
 					}
 				})
-				.instrument(tracing::info_span!("find_dead_workflows_tx"))
+				.instrument(tracing::debug_span!("find_dead_workflows_tx"))
 				.await?;
 
-			current_workflow_id = new_current_workflow_id;
+			last_key = new_last_key;
 			total += workflow_ids.len();
 
 			if !dry_run {
 				self.wake_workflows(workflow_ids).await?;
 			}
 
-			if current_workflow_id.is_none() {
+			if last_key.is_none() {
 				tracing::info!("reached end of workflows");
 				break;
 			}
@@ -1775,7 +1981,7 @@ impl DatabaseKv {
 						Ok((current_workflow_id, workflow_ids))
 					}
 				})
-				.instrument(tracing::info_span!("find_complete_workflows_tx"))
+				.instrument(tracing::debug_span!("find_complete_workflows_tx"))
 				.await?;
 
 			current_workflow_id = new_current_workflow_id;
@@ -1948,7 +2154,7 @@ impl DatabaseKv {
 						Ok((current_signal_id, signal_ids))
 					}
 				})
-				.instrument(tracing::info_span!("find_acked_signals_tx"))
+				.instrument(tracing::debug_span!("find_acked_signals_tx"))
 				.await?;
 
 			current_signal_id = new_current_signal_id;

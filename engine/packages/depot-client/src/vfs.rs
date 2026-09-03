@@ -100,7 +100,7 @@ macro_rules! vfs_catch_unwind {
 		match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| $body)) {
 			Ok(result) => result,
 			Err(panic) => {
-				tracing::error!(message = panic_message(&panic), "sqlite callback panicked");
+				tracing::error!(msg = panic_message(&panic), "sqlite callback panicked");
 				$err_val
 			}
 		}
@@ -118,6 +118,29 @@ pub trait SqliteTransport: Send + Sync {
 		&self,
 		request: protocol::SqliteCommitRequest,
 	) -> Result<protocol::SqliteCommitResponse>;
+
+	/// Opens a staged commit, for a commit too large to send in one message.
+	///
+	/// Required rather than defaulted. A default made staging look optional, and the transport that
+	/// runs `depot vacuum` in-process silently took it: every commit above the single-shot threshold
+	/// failed there, which is exactly the commit shape a vacuum produces. A transport that genuinely
+	/// cannot stage has to say so in its own body.
+	async fn commit_stage_begin(
+		&self,
+		request: protocol::SqliteCommitStageBeginRequest,
+	) -> Result<protocol::SqliteCommitStageBeginResponse>;
+
+	/// Stages one shard-aligned segment of an open staged commit.
+	async fn commit_stage_segment(
+		&self,
+		request: protocol::SqliteCommitStageSegmentRequest,
+	) -> Result<protocol::SqliteCommitStageSegmentResponse>;
+
+	/// Publishes an open staged commit, making every staged segment visible at once.
+	async fn commit_finalize(
+		&self,
+		request: protocol::SqliteCommitFinalizeRequest,
+	) -> Result<protocol::SqliteCommitFinalizeResponse>;
 }
 
 pub type SqliteTransportHandle = Arc<dyn SqliteTransport>;
@@ -250,6 +273,9 @@ impl From<Vec<(u32, Vec<u8>)>> for InitialPages {
 pub enum CommitPath {
 	Fast,
 	Slow,
+	/// Written as several staged segments plus a finalize, because the commit was too large to send
+	/// in one message.
+	Staged,
 }
 
 #[derive(Debug, Clone)]
@@ -615,6 +641,10 @@ pub struct VfsContext {
 #[derive(Debug, Clone)]
 struct VfsState {
 	db_size_pages: u32,
+	/// Size depot last acknowledged. `db_size_pages` moving away from this is a pending size change
+	/// that has to reach depot even when no page bytes are dirty, because SQLite reports a shrink
+	/// through `xTruncate` alone.
+	committed_db_size_pages: u32,
 	head_txid: Option<u64>,
 	page_size: usize,
 	page_cache: Cache<u32, Vec<u8>>,
@@ -1134,6 +1164,7 @@ impl VfsState {
 		let committed_page_cache = build_page_cache(config);
 		let mut state = Self {
 			db_size_pages: 1,
+			committed_db_size_pages: 1,
 			head_txid: None,
 			page_size: DEFAULT_PAGE_SIZE,
 			page_cache,
@@ -1306,6 +1337,7 @@ impl VfsState {
 		}
 		if let Some(db_size_pages) = sqlite_header_db_size_pages(&page) {
 			self.db_size_pages = db_size_pages;
+			self.committed_db_size_pages = db_size_pages;
 		}
 		self.cache_page(config, kind, 1, page);
 	}
@@ -1617,6 +1649,12 @@ impl VfsContext {
 
 	fn aux_file_exists(&self, path: &str) -> bool {
 		self.aux_files.read().contains_key(path)
+	}
+
+	fn read_aux_file(&self, path: &str) -> Option<Vec<u8>> {
+		let state = self.aux_files.read().get(path).cloned()?;
+		let bytes = state.bytes.lock().clone();
+		Some(bytes)
 	}
 
 	fn delete_aux_file(&self, path: &str) {
@@ -2115,7 +2153,10 @@ impl VfsContext {
 					"sqlite actor lost its fence".to_string(),
 				));
 			}
-			if state.write_buffer.in_atomic_write || state.write_buffer.dirty.is_empty() {
+			if state.write_buffer.in_atomic_write
+				|| (state.write_buffer.dirty.is_empty()
+					&& state.db_size_pages == state.committed_db_size_pages)
+			{
 				return Ok(CommitWait::Completed(None));
 			}
 
@@ -2198,6 +2239,7 @@ impl VfsContext {
 		let state_update_start = Instant::now();
 		let mut state = self.state.write();
 		state.db_size_pages = outcome.db_size_pages;
+		state.committed_db_size_pages = outcome.db_size_pages;
 		state.head_txid = outcome
 			.head_txid
 			.or_else(|| state.head_txid.map(|head_txid| head_txid.saturating_add(1)));
@@ -2240,7 +2282,9 @@ impl VfsContext {
 			if !state.write_buffer.in_atomic_write {
 				return Ok(CommitWait::Completed(()));
 			}
-			if state.write_buffer.dirty.is_empty() {
+			if state.write_buffer.dirty.is_empty()
+				&& state.db_size_pages == state.committed_db_size_pages
+			{
 				state.write_buffer.in_atomic_write = false;
 				return Ok(CommitWait::Completed(()));
 			}
@@ -2322,6 +2366,7 @@ impl VfsContext {
 		let state_update_start = Instant::now();
 		let mut state = self.state.write();
 		state.db_size_pages = outcome.db_size_pages;
+		state.committed_db_size_pages = outcome.db_size_pages;
 		state.head_txid = outcome
 			.head_txid
 			.or_else(|| state.head_txid.map(|head_txid| head_txid.saturating_add(1)));
@@ -2340,7 +2385,15 @@ impl VfsContext {
 		Ok(CommitWait::Completed(()))
 	}
 
-	fn truncate_main_file(&self, size: sqlite3_int64) {
+	/// Returns true when the truncate left behind a size change that only a commit can carry to
+	/// depot.
+	///
+	/// SQLite's batch-atomic commit path truncates *after* `SQLITE_FCNTL_COMMIT_ATOMIC_WRITE` and
+	/// does not sync afterwards, so a shrink recorded only in memory here never reaches depot. When
+	/// the write buffer is empty the caller has to issue a size-only commit. When it is not, the
+	/// buffered pages carry the new size on the commit that follows, and committing here would
+	/// publish a transaction SQLite has not finished.
+	fn truncate_main_file(&self, size: sqlite3_int64) -> bool {
 		let page_size = self.page_size() as i64;
 		let truncated_pages = ((size + page_size - 1) / page_size) as u32;
 		let mut state = self.state.write();
@@ -2350,6 +2403,9 @@ impl VfsContext {
 			.dirty
 			.retain(|pgno, _| *pgno <= truncated_pages);
 		state.invalidate_page_cache();
+		!state.write_buffer.in_atomic_write
+			&& state.write_buffer.dirty.is_empty()
+			&& state.db_size_pages != state.committed_db_size_pages
 	}
 }
 
@@ -2569,13 +2625,29 @@ fn next_temp_aux_path() -> String {
 }
 
 unsafe fn get_aux_state(file: &VfsFile) -> Option<&AuxFileHandle> {
-	(!file.aux.is_null()).then(|| &*file.aux)
+	unsafe { (!file.aux.is_null()).then(|| &*file.aux) }
 }
+
+/// Dirty pages above which a commit is staged in segments rather than sent as one message.
+///
+/// Matches the engine's single-shot cap. A commit at or under it fits one FDB transaction with its
+/// page bytes included, so it takes the single round trip; anything larger has to be staged because
+/// the engine would reject it, not merely because staging is faster.
+///
+/// Kept as its own value rather than imported, since the engine is free to lower its cap and this
+/// side must keep working against an engine on either side of that change. Sending a single-shot
+/// commit the engine refuses fails the commit, while staging one it would have accepted only costs
+/// extra round trips.
+const COMMIT_STAGE_THRESHOLD_PAGES: usize = 320;
 
 async fn commit_buffered_pages(
 	transport: &dyn SqliteTransport,
 	request: BufferedCommitRequest,
 ) -> std::result::Result<(BufferedCommitOutcome, CommitTransportMetrics), CommitBufferError> {
+	if request.dirty_pages.len() > COMMIT_STAGE_THRESHOLD_PAGES {
+		return commit_staged_pages(transport, request).await;
+	}
+
 	let mut metrics = CommitTransportMetrics::default();
 	let serialize_start = Instant::now();
 	let commit_request = protocol::SqliteCommitRequest {
@@ -2614,16 +2686,122 @@ async fn commit_buffered_pages(
 	}
 }
 
+/// Commits pages too numerous for one message by staging them in shard-aligned segments.
+///
+/// The whole commit fails on any error, exactly as the single-shot path does: SQLite sees one failed
+/// commit, never a partial one. Nothing staged is visible until finalize, so an abandoned attempt
+/// leaves the database exactly as it was, and the engine reclaims the staged bytes when the next
+/// attempt reopens the same txid.
+async fn commit_staged_pages(
+	transport: &dyn SqliteTransport,
+	request: BufferedCommitRequest,
+) -> std::result::Result<(BufferedCommitOutcome, CommitTransportMetrics), CommitBufferError> {
+	// Refused before begin rather than discovered partway through. The engine enforces the same cap
+	// and is the authority, but finding out from it means staging up to 128 MiB of segments first,
+	// and the bytes already staged are only reclaimed when some later commit reopens the txid.
+	if request.dirty_pages.len() > depot_client_types::MAX_COMMIT_DIRTY_PAGES {
+		return Err(CommitBufferError::Other(format!(
+			"commit of {} dirty pages exceeds the {} page maximum",
+			request.dirty_pages.len(),
+			depot_client_types::MAX_COMMIT_DIRTY_PAGES,
+		)));
+	}
+
+	let mut metrics = CommitTransportMetrics::default();
+	let serialize_start = Instant::now();
+	let mut dirty_pages = request.dirty_pages;
+	// Cutting segments needs ascending pages, and sorting once here keeps the per-segment work to a
+	// slice.
+	dirty_pages.sort_by_key(|page| page.pgno);
+	metrics.serialize_ns += serialize_start.elapsed().as_nanos() as u64;
+
+	let transport_start = Instant::now();
+	let txid = match transport
+		.commit_stage_begin(protocol::SqliteCommitStageBeginRequest {
+			actor_id: request.actor_id.clone(),
+			expected_generation: None,
+			expected_head_txid: request.expected_head_txid,
+		})
+		.await
+		.map_err(|err| CommitBufferError::Other(err.to_string()))?
+	{
+		protocol::SqliteCommitStageBeginResponse::SqliteCommitStageBeginOk(ok) => ok.txid,
+		protocol::SqliteCommitStageBeginResponse::SqliteErrorResponse(error) => {
+			return Err(staged_commit_error(error));
+		}
+	};
+
+	let mut segment_first_pgnos = Vec::new();
+	for (first_pgno, segment) in
+		depot_client_types::cut_page_segments(&dirty_pages, |page| page.pgno)
+	{
+		match transport
+			.commit_stage_segment(protocol::SqliteCommitStageSegmentRequest {
+				actor_id: request.actor_id.clone(),
+				expected_generation: None,
+				txid,
+				first_pgno,
+				dirty_pages: segment.to_vec(),
+			})
+			.await
+			.map_err(|err| CommitBufferError::Other(err.to_string()))?
+		{
+			protocol::SqliteCommitStageSegmentResponse::SqliteCommitStageSegmentOk(_) => {
+				segment_first_pgnos.push(first_pgno);
+			}
+			protocol::SqliteCommitStageSegmentResponse::SqliteErrorResponse(error) => {
+				return Err(staged_commit_error(error));
+			}
+		}
+	}
+
+	let head_txid = match transport
+		.commit_finalize(protocol::SqliteCommitFinalizeRequest {
+			actor_id: request.actor_id.clone(),
+			expected_generation: None,
+			txid,
+			new_db_size_pages: request.new_db_size_pages,
+			now_ms: sqlite_now_ms().map_err(|err| CommitBufferError::Other(err.to_string()))?,
+			segment_first_pgnos,
+		})
+		.await
+		.map_err(|err| CommitBufferError::Other(err.to_string()))?
+	{
+		protocol::SqliteCommitFinalizeResponse::SqliteCommitFinalizeOk(ok) => ok.head_txid,
+		protocol::SqliteCommitFinalizeResponse::SqliteErrorResponse(error) => {
+			return Err(staged_commit_error(error));
+		}
+	};
+	metrics.transport_ns += transport_start.elapsed().as_nanos() as u64;
+
+	Ok((
+		BufferedCommitOutcome {
+			path: CommitPath::Staged,
+			db_size_pages: request.new_db_size_pages,
+			head_txid,
+		},
+		metrics,
+	))
+}
+
+fn staged_commit_error(error: protocol::SqliteErrorResponse) -> CommitBufferError {
+	if is_head_fence_mismatch_response(&error) {
+		CommitBufferError::FenceMismatch(error.message)
+	} else {
+		CommitBufferError::Other(error.message)
+	}
+}
+
 fn is_head_fence_mismatch_response(error: &protocol::SqliteErrorResponse) -> bool {
 	is_head_fence_mismatch(&error.group, &error.code)
 }
 
 unsafe fn get_file(p: *mut sqlite3_file) -> &'static mut VfsFile {
-	&mut *(p as *mut VfsFile)
+	unsafe { &mut *(p as *mut VfsFile) }
 }
 
 unsafe fn get_vfs_ctx(p: *mut sqlite3_vfs) -> &'static VfsContext {
-	&*((*p).pAppData as *const VfsContext)
+	unsafe { &*((*p).pAppData as *const VfsContext) }
 }
 
 fn sqlite_error_message(db: *mut sqlite3) -> String {
@@ -2845,45 +3023,49 @@ fn page_span(offset: i64, length: usize, page_size: usize) -> std::result::Resul
 }
 
 unsafe extern "C" fn io_close(p_file: *mut sqlite3_file) -> c_int {
-	vfs_catch_unwind!(SQLITE_IOERR, {
-		if p_file.is_null() {
-			return SQLITE_OK;
-		}
-		let file = get_file(p_file);
-		let result = if !file.aux.is_null() {
-			let aux = Box::from_raw(file.aux);
-			if aux.delete_on_close {
-				let ctx = &*file.ctx;
-				ctx.delete_aux_file(&aux.path);
+	unsafe {
+		vfs_catch_unwind!(SQLITE_IOERR, {
+			if p_file.is_null() {
+				return SQLITE_OK;
 			}
-			file.aux = ptr::null_mut();
-			Ok(())
-		} else {
-			let ctx = &*file.ctx;
-			let should_flush = {
-				let state = ctx.state.read();
-				state.write_buffer.in_atomic_write || !state.write_buffer.dirty.is_empty()
-			};
-			if should_flush {
-				if ctx.state.read().write_buffer.in_atomic_write {
-					ctx.commit_atomic_write().map(|_| ())
-				} else {
-					ctx.flush_dirty_pages().map(|_| ())
+			let file = get_file(p_file);
+			let result = if !file.aux.is_null() {
+				let aux = Box::from_raw(file.aux);
+				if aux.delete_on_close {
+					let ctx = &*file.ctx;
+					ctx.delete_aux_file(&aux.path);
 				}
-			} else {
+				file.aux = ptr::null_mut();
 				Ok(())
-			}
-		};
-		file.base.pMethods = ptr::null();
-		match result {
-			Ok(()) => SQLITE_OK,
-			Err(err) => {
+			} else {
 				let ctx = &*file.ctx;
-				handle_finalize_fence_error(ctx, &err);
-				SQLITE_IOERR
+				let should_flush = {
+					let state = ctx.state.read();
+					state.write_buffer.in_atomic_write
+						|| !state.write_buffer.dirty.is_empty()
+						|| state.db_size_pages != state.committed_db_size_pages
+				};
+				if should_flush {
+					if ctx.state.read().write_buffer.in_atomic_write {
+						ctx.commit_atomic_write().map(|_| ())
+					} else {
+						ctx.flush_dirty_pages().map(|_| ())
+					}
+				} else {
+					Ok(())
+				}
+			};
+			file.base.pMethods = ptr::null();
+			match result {
+				Ok(()) => SQLITE_OK,
+				Err(err) => {
+					let ctx = &*file.ctx;
+					handle_finalize_fence_error(ctx, &err);
+					SQLITE_IOERR
+				}
 			}
-		}
-	})
+		})
+	}
 }
 
 unsafe extern "C" fn io_read(
@@ -2892,130 +3074,132 @@ unsafe extern "C" fn io_read(
 	i_amt: c_int,
 	i_offset: sqlite3_int64,
 ) -> c_int {
-	vfs_catch_unwind!(SQLITE_IOERR_READ, {
-		if i_amt <= 0 {
-			return SQLITE_OK;
-		}
+	unsafe {
+		vfs_catch_unwind!(SQLITE_IOERR_READ, {
+			if i_amt <= 0 {
+				return SQLITE_OK;
+			}
 
-		let file = get_file(p_file);
-		if let Some(aux) = get_aux_state(file) {
-			if i_offset < 0 {
+			let file = get_file(p_file);
+			if let Some(aux) = get_aux_state(file) {
+				if i_offset < 0 {
+					return SQLITE_IOERR_READ;
+				}
+
+				let offset = i_offset as usize;
+				let requested = i_amt as usize;
+				let buf = slice::from_raw_parts_mut(p_buf.cast::<u8>(), requested);
+				buf.fill(0);
+
+				let bytes = aux.state.bytes.lock();
+				if offset >= bytes.len() {
+					return SQLITE_IOERR_SHORT_READ;
+				}
+
+				let copy_len = requested.min(bytes.len() - offset);
+				buf[..copy_len].copy_from_slice(&bytes[offset..offset + copy_len]);
+				return if copy_len < requested {
+					SQLITE_IOERR_SHORT_READ
+				} else {
+					SQLITE_OK
+				};
+			}
+
+			let ctx = &*file.ctx;
+			if ctx.is_dead() {
 				return SQLITE_IOERR_READ;
 			}
 
-			let offset = i_offset as usize;
-			let requested = i_amt as usize;
-			let buf = slice::from_raw_parts_mut(p_buf.cast::<u8>(), requested);
-			buf.fill(0);
+			let buf = slice::from_raw_parts_mut(p_buf.cast::<u8>(), i_amt as usize);
+			let requested_pages = match page_span(i_offset, i_amt as usize, ctx.page_size()) {
+				Ok(pages) => pages,
+				Err(_) => return SQLITE_IOERR_READ,
+			};
+			let page_size = ctx.page_size();
+			let (file_size, db_size_pages) = {
+				let state = ctx.state.read();
+				(
+					state.db_size_pages as usize * state.page_size,
+					state.db_size_pages,
+				)
+			};
 
-			let bytes = aux.state.bytes.lock();
-			if offset >= bytes.len() {
+			let resolved = match ctx.resolve_pages(&requested_pages, true) {
+				Ok(pages) => pages,
+				Err(GetPagesError::FenceMismatch(message)) => {
+					tracing::error!(
+						actor_id = %ctx.actor_id,
+						requested_pages = ?requested_pages,
+						error = %message,
+						"sqlite xRead hit fatal sqlite error"
+					);
+					ctx.mark_fatal(message);
+					return SQLITE_IOERR_READ;
+				}
+				Err(GetPagesError::Other(message)) => {
+					tracing::error!(
+						actor_id = %ctx.actor_id,
+						requested_pages = ?requested_pages,
+						error = %message,
+						"sqlite xRead failed to resolve pages"
+					);
+					ctx.set_last_error(message);
+					return SQLITE_IOERR_READ;
+				}
+			};
+			ctx.clear_last_error();
+
+			#[cfg(debug_assertions)]
+			{
+				let missing_in_range_pages = requested_pages
+					.iter()
+					.copied()
+					.filter(|pgno| *pgno <= db_size_pages)
+					.filter(|pgno| !matches!(resolved.get(pgno), Some(Some(_))))
+					.collect::<Vec<_>>();
+				if !missing_in_range_pages.is_empty() {
+					tracing::warn!(
+						actor_id = %ctx.actor_id,
+						offset = i_offset,
+						amount = i_amt,
+						page_size,
+						db_size_pages,
+						file_size,
+						requested_pages = ?requested_pages,
+						missing_in_range_pages = ?missing_in_range_pages,
+						"sqlite xRead would zero-fill pages within declared db size"
+					);
+				}
+			}
+
+			buf.fill(0);
+			for pgno in requested_pages.iter().copied() {
+				let Some(Some(bytes)) = resolved.get(&pgno) else {
+					continue;
+				};
+				let page_start = (pgno as usize - 1) * page_size;
+				let copy_start = page_start.max(i_offset as usize);
+				let copy_end = (page_start + page_size).min(i_offset as usize + i_amt as usize);
+				if copy_start >= copy_end {
+					continue;
+				}
+				let page_offset = copy_start - page_start;
+				let dest_offset = copy_start - i_offset as usize;
+				let copy_len = copy_end - copy_start;
+				buf[dest_offset..dest_offset + copy_len]
+					.copy_from_slice(&bytes[page_offset..page_offset + copy_len]);
+			}
+			if !ctx.config.retain_read_cache {
+				ctx.state.read().evict_target_read_pages(&requested_pages);
+			}
+
+			if i_offset as usize + i_amt as usize > file_size {
 				return SQLITE_IOERR_SHORT_READ;
 			}
 
-			let copy_len = requested.min(bytes.len() - offset);
-			buf[..copy_len].copy_from_slice(&bytes[offset..offset + copy_len]);
-			return if copy_len < requested {
-				SQLITE_IOERR_SHORT_READ
-			} else {
-				SQLITE_OK
-			};
-		}
-
-		let ctx = &*file.ctx;
-		if ctx.is_dead() {
-			return SQLITE_IOERR_READ;
-		}
-
-		let buf = slice::from_raw_parts_mut(p_buf.cast::<u8>(), i_amt as usize);
-		let requested_pages = match page_span(i_offset, i_amt as usize, ctx.page_size()) {
-			Ok(pages) => pages,
-			Err(_) => return SQLITE_IOERR_READ,
-		};
-		let page_size = ctx.page_size();
-		let (file_size, db_size_pages) = {
-			let state = ctx.state.read();
-			(
-				state.db_size_pages as usize * state.page_size,
-				state.db_size_pages,
-			)
-		};
-
-		let resolved = match ctx.resolve_pages(&requested_pages, true) {
-			Ok(pages) => pages,
-			Err(GetPagesError::FenceMismatch(message)) => {
-				tracing::error!(
-					actor_id = %ctx.actor_id,
-					requested_pages = ?requested_pages,
-					error = %message,
-					"sqlite xRead hit fatal sqlite error"
-				);
-				ctx.mark_fatal(message);
-				return SQLITE_IOERR_READ;
-			}
-			Err(GetPagesError::Other(message)) => {
-				tracing::error!(
-					actor_id = %ctx.actor_id,
-					requested_pages = ?requested_pages,
-					error = %message,
-					"sqlite xRead failed to resolve pages"
-				);
-				ctx.set_last_error(message);
-				return SQLITE_IOERR_READ;
-			}
-		};
-		ctx.clear_last_error();
-
-		#[cfg(debug_assertions)]
-		{
-			let missing_in_range_pages = requested_pages
-				.iter()
-				.copied()
-				.filter(|pgno| *pgno <= db_size_pages)
-				.filter(|pgno| !matches!(resolved.get(pgno), Some(Some(_))))
-				.collect::<Vec<_>>();
-			if !missing_in_range_pages.is_empty() {
-				tracing::warn!(
-					actor_id = %ctx.actor_id,
-					offset = i_offset,
-					amount = i_amt,
-					page_size,
-					db_size_pages,
-					file_size,
-					requested_pages = ?requested_pages,
-					missing_in_range_pages = ?missing_in_range_pages,
-					"sqlite xRead would zero-fill pages within declared db size"
-				);
-			}
-		}
-
-		buf.fill(0);
-		for pgno in requested_pages.iter().copied() {
-			let Some(Some(bytes)) = resolved.get(&pgno) else {
-				continue;
-			};
-			let page_start = (pgno as usize - 1) * page_size;
-			let copy_start = page_start.max(i_offset as usize);
-			let copy_end = (page_start + page_size).min(i_offset as usize + i_amt as usize);
-			if copy_start >= copy_end {
-				continue;
-			}
-			let page_offset = copy_start - page_start;
-			let dest_offset = copy_start - i_offset as usize;
-			let copy_len = copy_end - copy_start;
-			buf[dest_offset..dest_offset + copy_len]
-				.copy_from_slice(&bytes[page_offset..page_offset + copy_len]);
-		}
-		if !ctx.config.retain_read_cache {
-			ctx.state.read().evict_target_read_pages(&requested_pages);
-		}
-
-		if i_offset as usize + i_amt as usize > file_size {
-			return SQLITE_IOERR_SHORT_READ;
-		}
-
-		SQLITE_OK
-	})
+			SQLITE_OK
+		})
+	}
 }
 
 unsafe extern "C" fn io_write(
@@ -3024,210 +3208,232 @@ unsafe extern "C" fn io_write(
 	i_amt: c_int,
 	i_offset: sqlite3_int64,
 ) -> c_int {
-	vfs_catch_unwind!(SQLITE_IOERR_WRITE, {
-		if i_amt <= 0 {
-			return SQLITE_OK;
-		}
+	unsafe {
+		vfs_catch_unwind!(SQLITE_IOERR_WRITE, {
+			if i_amt <= 0 {
+				return SQLITE_OK;
+			}
 
-		let file = get_file(p_file);
-		if let Some(aux) = get_aux_state(file) {
-			if i_offset < 0 {
+			let file = get_file(p_file);
+			if let Some(aux) = get_aux_state(file) {
+				if i_offset < 0 {
+					return SQLITE_IOERR_WRITE;
+				}
+
+				let offset = i_offset as usize;
+				let source = slice::from_raw_parts(p_buf.cast::<u8>(), i_amt as usize);
+				let mut bytes = aux.state.bytes.lock();
+				let end = offset + source.len();
+				if bytes.len() < end {
+					bytes.resize(end, 0);
+				}
+				bytes[offset..end].copy_from_slice(source);
+				return SQLITE_OK;
+			}
+
+			let ctx = &*file.ctx;
+			if ctx.is_dead() {
 				return SQLITE_IOERR_WRITE;
 			}
 
-			let offset = i_offset as usize;
+			let page_size = ctx.page_size();
 			let source = slice::from_raw_parts(p_buf.cast::<u8>(), i_amt as usize);
-			let mut bytes = aux.state.bytes.lock();
-			let end = offset + source.len();
-			if bytes.len() < end {
-				bytes.resize(end, 0);
-			}
-			bytes[offset..end].copy_from_slice(source);
-			return SQLITE_OK;
-		}
+			let target_pages = match page_span(i_offset, i_amt as usize, page_size) {
+				Ok(pages) => pages,
+				Err(_) => return SQLITE_IOERR_WRITE,
+			};
 
-		let ctx = &*file.ctx;
-		if ctx.is_dead() {
-			return SQLITE_IOERR_WRITE;
-		}
+			// Fast path: for full-page aligned writes we don't need the existing
+			// page data because we're overwriting every byte. Skip resolve_pages
+			// to eliminate a round trip to the engine per page. Also, for pages
+			// beyond db_size_pages (new allocations), there's nothing to fetch.
+			let offset = i_offset as usize;
+			let amt = i_amt as usize;
+			let is_aligned_full_page = offset % page_size == 0 && amt % page_size == 0;
 
-		let page_size = ctx.page_size();
-		let source = slice::from_raw_parts(p_buf.cast::<u8>(), i_amt as usize);
-		let target_pages = match page_span(i_offset, i_amt as usize, page_size) {
-			Ok(pages) => pages,
-			Err(_) => return SQLITE_IOERR_WRITE,
-		};
+			let (resolved, existing_db_size_pages) = if is_aligned_full_page {
+				(HashMap::new(), None)
+			} else {
+				let (db_size_pages, pages_to_resolve): (u32, Vec<u32>) = {
+					let state = ctx.state.read();
+					let known_max = state.db_size_pages;
+					(
+						known_max,
+						target_pages
+							.iter()
+							.copied()
+							.filter(|pgno| *pgno <= known_max)
+							.collect(),
+					)
+				};
 
-		// Fast path: for full-page aligned writes we don't need the existing
-		// page data because we're overwriting every byte. Skip resolve_pages
-		// to eliminate a round trip to the engine per page. Also, for pages
-		// beyond db_size_pages (new allocations), there's nothing to fetch.
-		let offset = i_offset as usize;
-		let amt = i_amt as usize;
-		let is_aligned_full_page = offset % page_size == 0 && amt % page_size == 0;
-
-		let (resolved, existing_db_size_pages) = if is_aligned_full_page {
-			(HashMap::new(), None)
-		} else {
-			let (db_size_pages, pages_to_resolve): (u32, Vec<u32>) = {
-				let state = ctx.state.read();
-				let known_max = state.db_size_pages;
-				(
-					known_max,
-					target_pages
+				let mut resolved = if pages_to_resolve.is_empty() {
+					HashMap::new()
+				} else {
+					match ctx.resolve_pages(&pages_to_resolve, false) {
+						Ok(pages) => pages,
+						Err(GetPagesError::FenceMismatch(message)) => {
+							ctx.mark_fatal(message);
+							return SQLITE_IOERR_WRITE;
+						}
+						Err(GetPagesError::Other(message)) => {
+							ctx.set_last_error(message);
+							return SQLITE_IOERR_WRITE;
+						}
+					}
+				};
+				for pgno in &target_pages {
+					if *pgno > db_size_pages {
+						resolved.entry(*pgno).or_insert(None);
+					}
+				}
+				(resolved, Some(db_size_pages))
+			};
+			#[cfg(debug_assertions)]
+			{
+				if let Some(db_size_pages) = existing_db_size_pages {
+					let missing_existing_pages = target_pages
 						.iter()
 						.copied()
-						.filter(|pgno| *pgno <= known_max)
-						.collect(),
-				)
-			};
-
-			let mut resolved = if pages_to_resolve.is_empty() {
-				HashMap::new()
-			} else {
-				match ctx.resolve_pages(&pages_to_resolve, false) {
-					Ok(pages) => pages,
-					Err(GetPagesError::FenceMismatch(message)) => {
-						ctx.mark_fatal(message);
-						return SQLITE_IOERR_WRITE;
-					}
-					Err(GetPagesError::Other(message)) => {
-						ctx.set_last_error(message);
-						return SQLITE_IOERR_WRITE;
+						.filter(|pgno| *pgno <= db_size_pages)
+						.filter(|pgno| !matches!(resolved.get(pgno), Some(Some(_))))
+						.collect::<Vec<_>>();
+					if !missing_existing_pages.is_empty() {
+						tracing::warn!(
+							actor_id = %ctx.actor_id,
+							offset = i_offset,
+							amount = i_amt,
+							page_size,
+							db_size_pages,
+							target_pages = ?target_pages,
+							missing_existing_pages = ?missing_existing_pages,
+							"sqlite xWrite partial update would synthesize existing pages from zeros"
+						);
 					}
 				}
-			};
-			for pgno in &target_pages {
-				if *pgno > db_size_pages {
-					resolved.entry(*pgno).or_insert(None);
+			}
+
+			let mut dirty_pages = BTreeMap::new();
+			for pgno in target_pages {
+				let page_start = (pgno as usize - 1) * page_size;
+				let patch_start = page_start.max(offset);
+				let patch_end = (page_start + page_size).min(offset + amt);
+				let Some(copy_len) = patch_end.checked_sub(patch_start) else {
+					continue;
+				};
+				if copy_len == 0 {
+					continue;
 				}
-			}
-			(resolved, Some(db_size_pages))
-		};
-		#[cfg(debug_assertions)]
-		{
-			if let Some(db_size_pages) = existing_db_size_pages {
-				let missing_existing_pages = target_pages
-					.iter()
-					.copied()
-					.filter(|pgno| *pgno <= db_size_pages)
-					.filter(|pgno| !matches!(resolved.get(pgno), Some(Some(_))))
-					.collect::<Vec<_>>();
-				if !missing_existing_pages.is_empty() {
-					tracing::warn!(
-						actor_id = %ctx.actor_id,
-						offset = i_offset,
-						amount = i_amt,
-						page_size,
-						db_size_pages,
-						target_pages = ?target_pages,
-						missing_existing_pages = ?missing_existing_pages,
-						"sqlite xWrite partial update would synthesize existing pages from zeros"
-					);
+
+				let mut page = if is_aligned_full_page {
+					vec![0; page_size]
+				} else {
+					resolved
+						.get(&pgno)
+						.and_then(|bytes| bytes.clone())
+						.unwrap_or_else(|| vec![0; page_size])
+				};
+				if page.len() < page_size {
+					page.resize(page_size, 0);
 				}
-			}
-		}
 
-		let mut dirty_pages = BTreeMap::new();
-		for pgno in target_pages {
-			let page_start = (pgno as usize - 1) * page_size;
-			let patch_start = page_start.max(offset);
-			let patch_end = (page_start + page_size).min(offset + amt);
-			let Some(copy_len) = patch_end.checked_sub(patch_start) else {
-				continue;
-			};
-			if copy_len == 0 {
-				continue;
+				let page_offset = patch_start - page_start;
+				let source_offset = patch_start - offset;
+				page[page_offset..page_offset + copy_len]
+					.copy_from_slice(&source[source_offset..source_offset + copy_len]);
+				dirty_pages.insert(pgno, page);
 			}
 
-			let mut page = if is_aligned_full_page {
-				vec![0; page_size]
-			} else {
-				resolved
-					.get(&pgno)
-					.and_then(|bytes| bytes.clone())
-					.unwrap_or_else(|| vec![0; page_size])
-			};
-			if page.len() < page_size {
-				page.resize(page_size, 0);
+			let mut state = ctx.state.write();
+			for (pgno, bytes) in dirty_pages {
+				state.write_buffer.dirty.insert(pgno, bytes);
 			}
-
-			let page_offset = patch_start - page_start;
-			let source_offset = patch_start - offset;
-			page[page_offset..page_offset + copy_len]
-				.copy_from_slice(&source[source_offset..source_offset + copy_len]);
-			dirty_pages.insert(pgno, page);
-		}
-
-		let mut state = ctx.state.write();
-		for (pgno, bytes) in dirty_pages {
-			state.write_buffer.dirty.insert(pgno, bytes);
-		}
-		let end_page = ((offset + amt) + page_size - 1) / page_size;
-		state.db_size_pages = state.db_size_pages.max(end_page as u32);
-		ctx.clear_last_error();
-		SQLITE_OK
-	})
+			let end_page = ((offset + amt) + page_size - 1) / page_size;
+			state.db_size_pages = state.db_size_pages.max(end_page as u32);
+			ctx.clear_last_error();
+			SQLITE_OK
+		})
+	}
 }
 
 unsafe extern "C" fn io_truncate(p_file: *mut sqlite3_file, size: sqlite3_int64) -> c_int {
-	vfs_catch_unwind!(SQLITE_IOERR_TRUNCATE, {
-		if size < 0 {
-			return SQLITE_IOERR_TRUNCATE;
-		}
-		let file = get_file(p_file);
-		if let Some(aux) = get_aux_state(file) {
-			aux.state.bytes.lock().truncate(size as usize);
-			return SQLITE_OK;
-		}
-		let ctx = &*file.ctx;
-		ctx.truncate_main_file(size);
-		SQLITE_OK
-	})
+	unsafe {
+		vfs_catch_unwind!(SQLITE_IOERR_TRUNCATE, {
+			if size < 0 {
+				return SQLITE_IOERR_TRUNCATE;
+			}
+			let file = get_file(p_file);
+			if let Some(aux) = get_aux_state(file) {
+				aux.state.bytes.lock().truncate(size as usize);
+				return SQLITE_OK;
+			}
+			let ctx = &*file.ctx;
+			if !ctx.truncate_main_file(size) {
+				return SQLITE_OK;
+			}
+			match ctx.flush_dirty_pages() {
+				Ok(_) => SQLITE_OK,
+				Err(err) => {
+					tracing::error!(
+						actor_id = %ctx.actor_id,
+						last_error = ?ctx.clone_last_error(),
+						?err,
+						"sqlite truncate commit failed"
+					);
+					handle_finalize_fence_error(ctx, &err);
+					SQLITE_IOERR_TRUNCATE
+				}
+			}
+		})
+	}
 }
 
 /// xSync returns once `ctx.flush_dirty_pages()` resolves. Durability of those
 /// bytes is delegated to depot's `sqlite_commit` reply. If pegboard-envoy ever
 /// pre-acks before the FDB tx commit, xSync's durability contract is broken.
 unsafe extern "C" fn io_sync(p_file: *mut sqlite3_file, _flags: c_int) -> c_int {
-	vfs_catch_unwind!(SQLITE_IOERR_FSYNC, {
-		let file = get_file(p_file);
-		if get_aux_state(file).is_some() {
-			return SQLITE_OK;
-		}
-		let ctx = &*file.ctx;
-		if let Some(message) = ctx.take_transient_commit_error() {
-			ctx.set_last_error(message);
-			return SQLITE_IOERR_FSYNC;
-		}
-		match ctx.flush_dirty_pages() {
-			Ok(_) => SQLITE_OK,
-			Err(err) => {
-				tracing::error!(
-					actor_id = %ctx.actor_id,
-					last_error = ?ctx.clone_last_error(),
-					?err,
-					"sqlite sync failed"
-				);
-				handle_finalize_fence_error(ctx, &err);
-				SQLITE_IOERR_FSYNC
+	unsafe {
+		vfs_catch_unwind!(SQLITE_IOERR_FSYNC, {
+			let file = get_file(p_file);
+			if get_aux_state(file).is_some() {
+				return SQLITE_OK;
 			}
-		}
-	})
+			let ctx = &*file.ctx;
+			if let Some(message) = ctx.take_transient_commit_error() {
+				ctx.set_last_error(message);
+				return SQLITE_IOERR_FSYNC;
+			}
+			match ctx.flush_dirty_pages() {
+				Ok(_) => SQLITE_OK,
+				Err(err) => {
+					tracing::error!(
+						actor_id = %ctx.actor_id,
+						last_error = ?ctx.clone_last_error(),
+						?err,
+						"sqlite sync failed"
+					);
+					handle_finalize_fence_error(ctx, &err);
+					SQLITE_IOERR_FSYNC
+				}
+			}
+		})
+	}
 }
 
 unsafe extern "C" fn io_file_size(p_file: *mut sqlite3_file, p_size: *mut sqlite3_int64) -> c_int {
-	vfs_catch_unwind!(SQLITE_IOERR_FSTAT, {
-		let file = get_file(p_file);
-		if let Some(aux) = get_aux_state(file) {
-			*p_size = aux.state.bytes.lock().len() as sqlite3_int64;
-			return SQLITE_OK;
-		}
-		let ctx = &*file.ctx;
-		let state = ctx.state.read();
-		*p_size = (state.db_size_pages as usize * state.page_size) as sqlite3_int64;
-		SQLITE_OK
-	})
+	unsafe {
+		vfs_catch_unwind!(SQLITE_IOERR_FSTAT, {
+			let file = get_file(p_file);
+			if let Some(aux) = get_aux_state(file) {
+				*p_size = aux.state.bytes.lock().len() as sqlite3_int64;
+				return SQLITE_OK;
+			}
+			let ctx = &*file.ctx;
+			let state = ctx.state.read();
+			*p_size = (state.db_size_pages as usize * state.page_size) as sqlite3_int64;
+			SQLITE_OK
+		})
+	}
 }
 
 // Lock callbacks are intentional no-ops. Pegboard guarantees a single actor
@@ -3248,10 +3454,12 @@ unsafe extern "C" fn io_check_reserved_lock(
 	_p_file: *mut sqlite3_file,
 	p_res_out: *mut c_int,
 ) -> c_int {
-	vfs_catch_unwind!(SQLITE_IOERR, {
-		*p_res_out = 0;
-		SQLITE_OK
-	})
+	unsafe {
+		vfs_catch_unwind!(SQLITE_IOERR, {
+			*p_res_out = 0;
+			SQLITE_OK
+		})
+	}
 }
 
 unsafe extern "C" fn io_file_control(
@@ -3259,50 +3467,52 @@ unsafe extern "C" fn io_file_control(
 	op: c_int,
 	_p_arg: *mut c_void,
 ) -> c_int {
-	vfs_catch_unwind!(SQLITE_IOERR, {
-		let file = get_file(p_file);
-		if get_aux_state(file).is_some() {
-			return SQLITE_NOTFOUND;
-		}
-		let ctx = &*file.ctx;
-
-		match op {
-			SQLITE_FCNTL_BEGIN_ATOMIC_WRITE => {
-				let mut state = ctx.state.write();
-				state.write_buffer.in_atomic_write = true;
-				state.write_buffer.saved_db_size = state.db_size_pages;
-				state.write_buffer.dirty.clear();
-				SQLITE_OK
+	unsafe {
+		vfs_catch_unwind!(SQLITE_IOERR, {
+			let file = get_file(p_file);
+			if get_aux_state(file).is_some() {
+				return SQLITE_NOTFOUND;
 			}
-			SQLITE_FCNTL_COMMIT_ATOMIC_WRITE => match ctx.commit_atomic_write() {
-				Ok(()) => {
-					ctx.commit_atomic_count.fetch_add(1, Ordering::Relaxed);
+			let ctx = &*file.ctx;
+
+			match op {
+				SQLITE_FCNTL_BEGIN_ATOMIC_WRITE => {
+					let mut state = ctx.state.write();
+					state.write_buffer.in_atomic_write = true;
+					state.write_buffer.saved_db_size = state.db_size_pages;
+					state.write_buffer.dirty.clear();
 					SQLITE_OK
 				}
-				Err(err) => {
-					tracing::error!(
-						actor_id = %ctx.actor_id,
-						last_error = ?ctx.clone_last_error(),
-						?err,
-						"sqlite atomic write file control failed"
-					);
-					if let CommitBufferError::Other(message) = &err {
-						ctx.defer_transient_commit_error(message.clone());
+				SQLITE_FCNTL_COMMIT_ATOMIC_WRITE => match ctx.commit_atomic_write() {
+					Ok(()) => {
+						ctx.commit_atomic_count.fetch_add(1, Ordering::Relaxed);
+						SQLITE_OK
 					}
-					handle_finalize_fence_error(ctx, &err);
-					SQLITE_IOERR
+					Err(err) => {
+						tracing::error!(
+							actor_id = %ctx.actor_id,
+							last_error = ?ctx.clone_last_error(),
+							?err,
+							"sqlite atomic write file control failed"
+						);
+						if let CommitBufferError::Other(message) = &err {
+							ctx.defer_transient_commit_error(message.clone());
+						}
+						handle_finalize_fence_error(ctx, &err);
+						SQLITE_IOERR
+					}
+				},
+				SQLITE_FCNTL_ROLLBACK_ATOMIC_WRITE => {
+					let mut state = ctx.state.write();
+					state.write_buffer.dirty.clear();
+					state.write_buffer.in_atomic_write = false;
+					state.db_size_pages = state.write_buffer.saved_db_size;
+					SQLITE_OK
 				}
-			},
-			SQLITE_FCNTL_ROLLBACK_ATOMIC_WRITE => {
-				let mut state = ctx.state.write();
-				state.write_buffer.dirty.clear();
-				state.write_buffer.in_atomic_write = false;
-				state.db_size_pages = state.write_buffer.saved_db_size;
-				SQLITE_OK
+				_ => SQLITE_NOTFOUND,
 			}
-			_ => SQLITE_NOTFOUND,
-		}
-	})
+		})
+	}
 }
 
 unsafe extern "C" fn io_sector_size(_p_file: *mut sqlite3_file) -> c_int {
@@ -3310,18 +3520,20 @@ unsafe extern "C" fn io_sector_size(_p_file: *mut sqlite3_file) -> c_int {
 }
 
 unsafe extern "C" fn io_device_characteristics(p_file: *mut sqlite3_file) -> c_int {
-	vfs_catch_unwind!(0, {
-		let file = get_file(p_file);
-		if get_aux_state(file).is_some() {
-			0
-		} else {
-			#[cfg(test)]
-			if !(*file.ctx).config.advertise_batch_atomic {
-				return 0;
+	unsafe {
+		vfs_catch_unwind!(0, {
+			let file = get_file(p_file);
+			if get_aux_state(file).is_some() {
+				0
+			} else {
+				#[cfg(test)]
+				if !(*file.ctx).config.advertise_batch_atomic {
+					return 0;
+				}
+				SQLITE_IOCAP_BATCH_ATOMIC
 			}
-			SQLITE_IOCAP_BATCH_ATOMIC
-		}
-	})
+		})
+	}
 }
 
 unsafe extern "C" fn vfs_open(
@@ -3331,59 +3543,61 @@ unsafe extern "C" fn vfs_open(
 	flags: c_int,
 	p_out_flags: *mut c_int,
 ) -> c_int {
-	vfs_catch_unwind!(SQLITE_CANTOPEN, {
-		let ctx = get_vfs_ctx(p_vfs);
-		let delete_on_close = (flags & SQLITE_OPEN_DELETEONCLOSE) != 0;
-		let path = if z_name.is_null() {
-			if delete_on_close {
-				next_temp_aux_path()
+	unsafe {
+		vfs_catch_unwind!(SQLITE_CANTOPEN, {
+			let ctx = get_vfs_ctx(p_vfs);
+			let delete_on_close = (flags & SQLITE_OPEN_DELETEONCLOSE) != 0;
+			let path = if z_name.is_null() {
+				if delete_on_close {
+					next_temp_aux_path()
+				} else {
+					return SQLITE_CANTOPEN;
+				}
 			} else {
-				return SQLITE_CANTOPEN;
+				match CStr::from_ptr(z_name).to_str() {
+					Ok(path) => path.to_string(),
+					Err(_) => return SQLITE_CANTOPEN,
+				}
+			};
+			let is_main =
+				path == ctx.actor_id && !delete_on_close && (flags & SQLITE_OPEN_MAIN_DB) != 0;
+
+			#[cfg(test)]
+			if !is_main {
+				if let Some(message) = ctx.take_aux_open_error() {
+					ctx.set_last_error(message);
+					return SQLITE_CANTOPEN;
+				}
 			}
-		} else {
-			match CStr::from_ptr(z_name).to_str() {
-				Ok(path) => path.to_string(),
-				Err(_) => return SQLITE_CANTOPEN,
+
+			let base = sqlite3_file {
+				pMethods: ctx.io_methods.as_ref(),
+			};
+			let aux = if is_main {
+				ptr::null_mut()
+			} else {
+				Box::into_raw(Box::new(AuxFileHandle {
+					path: path.clone(),
+					state: ctx.open_aux_file(&path),
+					delete_on_close,
+				}))
+			};
+			ptr::write(
+				p_file.cast::<VfsFile>(),
+				VfsFile {
+					base,
+					ctx: ctx as *const VfsContext,
+					aux,
+				},
+			);
+
+			if !p_out_flags.is_null() {
+				*p_out_flags = flags;
 			}
-		};
-		let is_main =
-			path == ctx.actor_id && !delete_on_close && (flags & SQLITE_OPEN_MAIN_DB) != 0;
 
-		#[cfg(test)]
-		if !is_main {
-			if let Some(message) = ctx.take_aux_open_error() {
-				ctx.set_last_error(message);
-				return SQLITE_CANTOPEN;
-			}
-		}
-
-		let base = sqlite3_file {
-			pMethods: ctx.io_methods.as_ref(),
-		};
-		let aux = if is_main {
-			ptr::null_mut()
-		} else {
-			Box::into_raw(Box::new(AuxFileHandle {
-				path: path.clone(),
-				state: ctx.open_aux_file(&path),
-				delete_on_close,
-			}))
-		};
-		ptr::write(
-			p_file.cast::<VfsFile>(),
-			VfsFile {
-				base,
-				ctx: ctx as *const VfsContext,
-				aux,
-			},
-		);
-
-		if !p_out_flags.is_null() {
-			*p_out_flags = flags;
-		}
-
-		SQLITE_OK
-	})
+			SQLITE_OK
+		})
+	}
 }
 
 unsafe extern "C" fn vfs_delete(
@@ -3391,30 +3605,32 @@ unsafe extern "C" fn vfs_delete(
 	z_name: *const c_char,
 	_sync_dir: c_int,
 ) -> c_int {
-	vfs_catch_unwind!(SQLITE_IOERR_DELETE, {
-		if z_name.is_null() {
-			return SQLITE_OK;
-		}
-
-		let ctx = get_vfs_ctx(p_vfs);
-		let path = match CStr::from_ptr(z_name).to_str() {
-			Ok(path) => path,
-			Err(_) => return SQLITE_OK,
-		};
-		if path == ctx.actor_id {
-			// Main database deletion is unsupported because xDelete cannot remove persisted depot state.
-			ctx.set_last_error("main database deletion is unsupported".to_string());
-			return SQLITE_IOERR_DELETE;
-		} else {
-			#[cfg(test)]
-			if let Some(message) = ctx.take_aux_delete_error() {
-				ctx.set_last_error(message);
-				return SQLITE_IOERR_DELETE;
+	unsafe {
+		vfs_catch_unwind!(SQLITE_IOERR_DELETE, {
+			if z_name.is_null() {
+				return SQLITE_OK;
 			}
-			ctx.delete_aux_file(path);
-		}
-		SQLITE_OK
-	})
+
+			let ctx = get_vfs_ctx(p_vfs);
+			let path = match CStr::from_ptr(z_name).to_str() {
+				Ok(path) => path,
+				Err(_) => return SQLITE_OK,
+			};
+			if path == ctx.actor_id {
+				// Main database deletion is unsupported because xDelete cannot remove persisted depot state.
+				ctx.set_last_error("main database deletion is unsupported".to_string());
+				return SQLITE_IOERR_DELETE;
+			} else {
+				#[cfg(test)]
+				if let Some(message) = ctx.take_aux_delete_error() {
+					ctx.set_last_error(message);
+					return SQLITE_IOERR_DELETE;
+				}
+				ctx.delete_aux_file(path);
+			}
+			SQLITE_OK
+		})
+	}
 }
 
 unsafe extern "C" fn vfs_access(
@@ -3423,28 +3639,30 @@ unsafe extern "C" fn vfs_access(
 	_flags: c_int,
 	p_res_out: *mut c_int,
 ) -> c_int {
-	vfs_catch_unwind!(SQLITE_IOERR_ACCESS, {
-		if z_name.is_null() {
-			*p_res_out = 0;
-			return SQLITE_OK;
-		}
-
-		let ctx = get_vfs_ctx(p_vfs);
-		let path = match CStr::from_ptr(z_name).to_str() {
-			Ok(path) => path,
-			Err(_) => {
+	unsafe {
+		vfs_catch_unwind!(SQLITE_IOERR_ACCESS, {
+			if z_name.is_null() {
 				*p_res_out = 0;
 				return SQLITE_OK;
 			}
-		};
 
-		*p_res_out = if path == ctx.actor_id || ctx.aux_file_exists(path) {
-			1
-		} else {
-			0
-		};
-		SQLITE_OK
-	})
+			let ctx = get_vfs_ctx(p_vfs);
+			let path = match CStr::from_ptr(z_name).to_str() {
+				Ok(path) => path,
+				Err(_) => {
+					*p_res_out = 0;
+					return SQLITE_OK;
+				}
+			};
+
+			*p_res_out = if path == ctx.actor_id || ctx.aux_file_exists(path) {
+				1
+			} else {
+				0
+			};
+			SQLITE_OK
+		})
+	}
 }
 
 unsafe extern "C" fn vfs_full_pathname(
@@ -3453,20 +3671,22 @@ unsafe extern "C" fn vfs_full_pathname(
 	n_out: c_int,
 	z_out: *mut c_char,
 ) -> c_int {
-	vfs_catch_unwind!(SQLITE_IOERR, {
-		if z_name.is_null() || z_out.is_null() || n_out <= 0 {
-			return SQLITE_IOERR;
-		}
+	unsafe {
+		vfs_catch_unwind!(SQLITE_IOERR, {
+			if z_name.is_null() || z_out.is_null() || n_out <= 0 {
+				return SQLITE_IOERR;
+			}
 
-		let name = CStr::from_ptr(z_name);
-		let bytes = name.to_bytes_with_nul();
-		if bytes.len() >= n_out as usize {
-			return SQLITE_IOERR;
-		}
+			let name = CStr::from_ptr(z_name);
+			let bytes = name.to_bytes_with_nul();
+			if bytes.len() >= n_out as usize {
+				return SQLITE_IOERR;
+			}
 
-		ptr::copy_nonoverlapping(bytes.as_ptr().cast::<c_char>(), z_out, bytes.len());
-		SQLITE_OK
-	})
+			ptr::copy_nonoverlapping(bytes.as_ptr().cast::<c_char>(), z_out, bytes.len());
+			SQLITE_OK
+		})
+	}
 }
 
 unsafe extern "C" fn vfs_randomness(
@@ -3474,13 +3694,15 @@ unsafe extern "C" fn vfs_randomness(
 	n_byte: c_int,
 	z_out: *mut c_char,
 ) -> c_int {
-	vfs_catch_unwind!(0, {
-		let buf = slice::from_raw_parts_mut(z_out.cast::<u8>(), n_byte as usize);
-		match getrandom::getrandom(buf) {
-			Ok(()) => n_byte,
-			Err(_) => 0,
-		}
-	})
+	unsafe {
+		vfs_catch_unwind!(0, {
+			let buf = slice::from_raw_parts_mut(z_out.cast::<u8>(), n_byte as usize);
+			match getrandom::getrandom(buf) {
+				Ok(()) => n_byte,
+				Err(_) => 0,
+			}
+		})
+	}
 }
 
 unsafe extern "C" fn vfs_sleep(_p_vfs: *mut sqlite3_vfs, microseconds: c_int) -> c_int {
@@ -3491,13 +3713,15 @@ unsafe extern "C" fn vfs_sleep(_p_vfs: *mut sqlite3_vfs, microseconds: c_int) ->
 }
 
 unsafe extern "C" fn vfs_current_time(_p_vfs: *mut sqlite3_vfs, p_time_out: *mut f64) -> c_int {
-	vfs_catch_unwind!(SQLITE_IOERR, {
-		let now = std::time::SystemTime::now()
-			.duration_since(std::time::UNIX_EPOCH)
-			.unwrap_or_default();
-		*p_time_out = 2440587.5 + (now.as_secs_f64() / 86400.0);
-		SQLITE_OK
-	})
+	unsafe {
+		vfs_catch_unwind!(SQLITE_IOERR, {
+			let now = std::time::SystemTime::now()
+				.duration_since(std::time::UNIX_EPOCH)
+				.unwrap_or_default();
+			*p_time_out = 2440587.5 + (now.as_secs_f64() / 86400.0);
+			SQLITE_OK
+		})
+	}
 }
 
 unsafe extern "C" fn vfs_get_last_error(
@@ -3505,25 +3729,27 @@ unsafe extern "C" fn vfs_get_last_error(
 	n_byte: c_int,
 	z_err_msg: *mut c_char,
 ) -> c_int {
-	vfs_catch_unwind!(SQLITE_IOERR, {
-		if n_byte <= 0 || z_err_msg.is_null() {
-			return 0;
-		}
+	unsafe {
+		vfs_catch_unwind!(SQLITE_IOERR, {
+			if n_byte <= 0 || z_err_msg.is_null() {
+				return 0;
+			}
 
-		let ctx = get_vfs_ctx(p_vfs);
-		let Some(message) = ctx.clone_last_error() else {
-			*z_err_msg = 0;
-			return 0;
-		};
+			let ctx = get_vfs_ctx(p_vfs);
+			let Some(message) = ctx.clone_last_error() else {
+				*z_err_msg = 0;
+				return 0;
+			};
 
-		let bytes = message.as_bytes();
-		let max_len = (n_byte as usize).saturating_sub(1);
-		let copy_len = bytes.len().min(max_len);
-		let dst = z_err_msg.cast::<u8>();
-		ptr::copy_nonoverlapping(bytes.as_ptr(), dst, copy_len);
-		*dst.add(copy_len) = 0;
-		0
-	})
+			let bytes = message.as_bytes();
+			let max_len = (n_byte as usize).saturating_sub(1);
+			let copy_len = bytes.len().min(max_len);
+			let dst = z_err_msg.cast::<u8>();
+			ptr::copy_nonoverlapping(bytes.as_ptr(), dst, copy_len);
+			*dst.add(copy_len) = 0;
+			0
+		})
+	}
 }
 
 impl SqliteVfs {
@@ -3541,6 +3767,17 @@ impl SqliteVfs {
 
 	pub(crate) fn snapshot_preload_hints(&self) -> VfsPreloadHintSnapshot {
 		self.ctx.snapshot_preload_hints()
+	}
+
+	/// Reads back an auxiliary file this VFS holds in memory. `VACUUM INTO` and other statements
+	/// that name an output file resolve it through the connection's VFS, so the only way to get
+	/// those bytes onto the host filesystem is to copy them out here.
+	pub(crate) fn read_aux_file(&self, path: &str) -> Option<Vec<u8>> {
+		self.ctx.read_aux_file(path)
+	}
+
+	pub(crate) fn delete_aux_file(&self, path: &str) {
+		self.ctx.delete_aux_file(path);
 	}
 
 	pub(crate) fn sqlite_vfs_metrics(&self) -> SqliteVfsMetricsSnapshot {
@@ -3738,7 +3975,9 @@ impl Drop for NativeDatabase {
 			let ctx = self._vfs.ctx();
 			let should_flush = {
 				let state = ctx.state.read();
-				state.write_buffer.in_atomic_write || !state.write_buffer.dirty.is_empty()
+				state.write_buffer.in_atomic_write
+					|| !state.write_buffer.dirty.is_empty()
+					|| state.db_size_pages != state.committed_db_size_pages
 			};
 			if should_flush {
 				let result = if ctx.state.read().write_buffer.in_atomic_write {

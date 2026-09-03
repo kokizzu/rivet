@@ -201,3 +201,26 @@ pub(super) fn header_reserved_bytes(page: &[u8]) -> Option<usize> {
 	}
 	Some(usize::from(page[20]))
 }
+
+/// The database size in pages recorded in page one's header, when that field is trustworthy.
+///
+/// SQLite only treats the in-header size as valid when the "version valid for" counter matches the
+/// file change counter, and a zero there means the size must come from the file length instead.
+/// Returning `None` in those cases keeps callers from comparing against a field SQLite itself would
+/// ignore.
+pub(super) fn header_db_size_pages(page: &[u8]) -> Option<u32> {
+	const HEADER_MAGIC: &[u8; 16] = b"SQLite format 3\0";
+	if page.len() < 100 || &page[..HEADER_MAGIC.len()] != HEADER_MAGIC {
+		return None;
+	}
+	let change_counter = u32::from_be_bytes(page[24..28].try_into().ok()?);
+	let version_valid_for = u32::from_be_bytes(page[92..96].try_into().ok()?);
+	if change_counter != version_valid_for {
+		return None;
+	}
+	let db_size_pages = u32::from_be_bytes(page[28..32].try_into().ok()?);
+	if db_size_pages == 0 {
+		return None;
+	}
+	Some(db_size_pages)
+}

@@ -1,12 +1,16 @@
 mod common;
 
+use common::read_prefix_keys;
+
 use std::sync::Arc;
 
 use anyhow::Result;
 #[cfg(feature = "test-faults")]
 use depot::fault::{CommitFaultPoint, DepotFaultController, DepotFaultPoint, FaultBoundary};
 use depot::{
-	ACCESS_TOUCH_THROTTLE_MS, MAX_COMMIT_DIRTY_PAGES, MAX_COMMIT_RAW_DIRTY_BYTES,
+	ACCESS_TOUCH_THROTTLE_MS, HOT_BURST_COLD_LAG_THRESHOLD_TXIDS,
+	MAX_SINGLE_SHOT_COMMIT_DIRTY_PAGES, MAX_SINGLE_SHOT_COMMIT_RAW_DIRTY_BYTES,
+	constants::COMMIT_SEGMENT_MAX_SHARDS,
 	conveyer::Db,
 	conveyer::{
 		commit::{clear_sqlite_cmp_dirty_if_observed_idle, test_hooks},
@@ -14,7 +18,8 @@ use depot::{
 	},
 	error::SqliteStorageError,
 	keys::{
-		PAGE_SIZE, branch_commit_key, branch_compaction_root_key, branch_delta_chunk_key,
+		PAGE_SIZE, SHARD_SIZE, branch_commit_key, branch_commit_stage_key,
+		branch_compaction_root_key, branch_delta_chunk_key, branch_delta_chunk_prefix,
 		branch_manifest_last_access_bucket_key, branch_manifest_last_access_ts_ms_key,
 		branch_meta_compact_key, branch_meta_head_key, branch_pidx_key, branch_shard_key,
 		branch_vtx_key, branches_list_key, bucket_branches_list_key, bucket_branches_refcount_key,
@@ -260,10 +265,13 @@ async fn commit_lazily_initializes_meta_on_first_write() -> Result<()> {
 			read_value(&db, branch_pidx_key(branch_id, 1)).await?,
 			Some(1_u64.to_be_bytes().to_vec())
 		);
+		// Asserted through the commit's key range rather than a single key: a commit writes one blob
+		// per shard-aligned page range, so which keys it used depends on the pages it touched. What
+		// matters here is that the first commit persisted a delta at all.
 		assert!(
-			read_value(&db, branch_delta_chunk_key(branch_id, 1, 0))
+			!read_prefix_keys(&db, branch_delta_chunk_prefix(branch_id, 1))
 				.await?
-				.is_some()
+				.is_empty()
 		);
 		assert!(read_quota(&db).await? > 0);
 		assert_eq!(
@@ -404,13 +412,13 @@ async fn commit_rejects_invalid_dirty_pages_before_storage_writes() -> Result<()
 			"sqlite commit duplicated page 1",
 		)
 		.await?;
-		let oversized_pages = (1..=u32::try_from(MAX_COMMIT_DIRTY_PAGES + 1).unwrap())
+		let oversized_pages = (1..=u32::try_from(MAX_SINGLE_SHOT_COMMIT_DIRTY_PAGES + 1).unwrap())
 			.map(|pgno| page(pgno, 0x33))
 			.collect::<Vec<_>>();
 		let err = database_db
 			.commit(
 				oversized_pages,
-				u32::try_from(MAX_COMMIT_DIRTY_PAGES + 1).unwrap(),
+				u32::try_from(MAX_SINGLE_SHOT_COMMIT_DIRTY_PAGES + 1).unwrap(),
 				1_000,
 			)
 			.await
@@ -418,9 +426,9 @@ async fn commit_rejects_invalid_dirty_pages_before_storage_writes() -> Result<()
 		assert_eq!(
 			err.downcast_ref::<SqliteStorageError>(),
 			Some(&SqliteStorageError::CommitTooLarge {
-				actual_size_bytes: u64::try_from(MAX_COMMIT_DIRTY_PAGES + 1).unwrap()
+				actual_size_bytes: u64::try_from(MAX_SINGLE_SHOT_COMMIT_DIRTY_PAGES + 1).unwrap()
 					* u64::from(PAGE_SIZE),
-				max_size_bytes: MAX_COMMIT_RAW_DIRTY_BYTES as u64,
+				max_size_bytes: MAX_SINGLE_SHOT_COMMIT_RAW_DIRTY_BYTES as u64,
 			})
 		);
 		assert_eq!(
@@ -432,13 +440,13 @@ async fn commit_rejects_invalid_dirty_pages_before_storage_writes() -> Result<()
 			None
 		);
 
-		let oversized_pages = (1..=u32::try_from(MAX_COMMIT_DIRTY_PAGES + 1).unwrap())
+		let oversized_pages = (1..=u32::try_from(MAX_SINGLE_SHOT_COMMIT_DIRTY_PAGES + 1).unwrap())
 			.map(|pgno| page(pgno, 0x44))
 			.collect::<Vec<_>>();
 		database_db
 			.commit_with_options(
 				oversized_pages,
-				u32::try_from(MAX_COMMIT_DIRTY_PAGES + 1).unwrap(),
+				u32::try_from(MAX_SINGLE_SHOT_COMMIT_DIRTY_PAGES + 1).unwrap(),
 				1_001,
 				CommitOptions {
 					disable_size_cap: true,
@@ -481,10 +489,12 @@ async fn commit_pre_durable_fault_leaves_old_state() -> Result<()> {
 			FaultBoundary::PreDurableCommit
 		);
 		assert_eq!(read_head(&db).await?, head_with_branch(branch_id, 1, 2));
+		// The whole key range, not one key: an absence assertion against a single hardcoded key
+		// passes vacuously the moment the commit path writes a different one.
 		assert!(
-			read_value(&db, branch_delta_chunk_key(branch_id, 2, 0))
+			read_prefix_keys(&db, branch_delta_chunk_prefix(branch_id, 2))
 				.await?
-				.is_none()
+				.is_empty()
 		);
 		assert!(
 			read_value(&db, branch_pidx_key(branch_id, 2))
@@ -725,10 +735,88 @@ async fn commit_rejects_quota_cap_before_writes() -> Result<()> {
 				))
 		);
 		assert_eq!(read_head(&db).await?, head_with_branch(branch_id, 1, 1));
+		// The whole key range, not one key: an absence assertion against a single hardcoded key
+		// passes vacuously the moment the commit path writes a different one.
 		assert!(
-			read_value(&db, branch_delta_chunk_key(branch_id, 2, 0))
+			read_prefix_keys(&db, branch_delta_chunk_prefix(branch_id, 2))
 				.await?
-				.is_none()
+				.is_empty()
+		);
+
+		Ok(())
+	})
+}
+
+#[tokio::test]
+async fn commit_uses_burst_adjusted_quota_cap() -> Result<()> {
+	commit_matrix!("depot-commit-burst-quota", |ctx, db, database_db| {
+		database_db.commit(vec![page(1, 0x11)], 1, 1_000).await?;
+		let branch_id = read_branch_id(&db).await?;
+		let storage_used = read_quota(&db).await?;
+
+		seed(
+			&db,
+			vec![
+				(
+					branch_meta_head_key(branch_id),
+					encode_db_head(head_with_branch(
+						branch_id,
+						HOT_BURST_COLD_LAG_THRESHOLD_TXIDS,
+						1,
+					))?,
+				),
+				(
+					branch_compaction_root_key(branch_id),
+					encode_compaction_root(CompactionRoot {
+						schema_version: 1,
+						manifest_generation: 1,
+						hot_watermark_txid: 0,
+						cold_watermark_txid: 0,
+						cold_watermark_versionstamp: [0; 16],
+					})?,
+				),
+			],
+		)
+		.await?;
+		db.txn("test_depotconveyer_commit", move |tx| async move {
+			quota::atomic_add_branch(&tx, branch_id, SQLITE_MAX_STORAGE_BYTES - storage_used);
+			Ok(())
+		})
+		.await?;
+
+		let database_db = ctx.make_db(test_bucket(), TEST_DATABASE);
+		database_db.commit(vec![page(1, 0x44)], 1, 3_000).await?;
+		assert!(read_quota(&db).await? > SQLITE_MAX_STORAGE_BYTES);
+		let expected_head_txid = HOT_BURST_COLD_LAG_THRESHOLD_TXIDS + 1;
+
+		seed(
+			&db,
+			vec![(
+				branch_compaction_root_key(branch_id),
+				encode_compaction_root(CompactionRoot {
+					schema_version: 1,
+					manifest_generation: 2,
+					hot_watermark_txid: expected_head_txid,
+					cold_watermark_txid: expected_head_txid,
+					cold_watermark_versionstamp: [1; 16],
+				})?,
+			)],
+		)
+		.await?;
+		let err = database_db
+			.commit(vec![page(1, 0x55)], 1, 4_000)
+			.await
+			.expect_err("commit should exceed quota after cold lag recovers");
+		assert!(
+			err.downcast_ref::<depot::error::SqliteStorageError>()
+				.is_some_and(|err| matches!(
+					err,
+					depot::error::SqliteStorageError::SqliteStorageQuotaExceeded { .. }
+				))
+		);
+		assert_eq!(
+			read_head(&db).await?,
+			head_with_branch(branch_id, expected_head_txid, 1)
 		);
 
 		Ok(())
@@ -1209,4 +1297,234 @@ async fn dirty_marker_clear_removes_exact_idle_marker() -> Result<()> {
 		})
 	})
 	.await
+}
+
+/// A staged commit must land exactly what the same writes would have landed as one commit. This is
+/// the whole point of the path: it exists to lift a size ceiling, not to change semantics.
+#[tokio::test]
+async fn staged_commit_publishes_the_same_state_as_a_single_shot_commit() -> Result<()> {
+	commit_matrix!("depot-staged-commit-equivalence", |ctx, db, database_db| {
+		let _ = &ctx;
+		let shard = SHARD_SIZE;
+		let segments = [
+			(0_u32, vec![page(1, 0xa1), page(2, 0xa2)]),
+			(
+				shard * COMMIT_SEGMENT_MAX_SHARDS,
+				vec![page(shard * COMMIT_SEGMENT_MAX_SHARDS + 1, 0xb1)],
+			),
+		];
+
+		// Stage on top of a real commit. A database with no head has nothing to read through at
+		// all, so staging onto an empty one would prove less than it appears to.
+		database_db.commit(vec![page(1, 0x01)], 2, 1_000).await?;
+		let txid = database_db.commit_stage_begin(0, Some(1)).await?;
+		assert_eq!(txid, 2, "the engine allocates head + 1");
+		for (first_pgno, pages) in &segments {
+			database_db
+				.commit_stage_segment(0, txid, *first_pgno, pages.clone())
+				.await?;
+		}
+
+		// Nothing is visible until finalize: no head advance, and the pages still read as absent.
+		let branch_id = read_branch_id(&db).await?;
+		assert_eq!(
+			read_head(&db).await?.head_txid,
+			1,
+			"staging must not move head"
+		);
+		assert_eq!(
+			read_value(&db, branch_pidx_key(branch_id, 1)).await?,
+			Some(1_u64.to_be_bytes().to_vec()),
+			"staging must not rewrite the PIDX owner"
+		);
+		assert_eq!(
+			database_db.get_pages(vec![1]).await?,
+			vec![fetched_page(1, 0x01)],
+			"a staged page must still read as its pre-stage content"
+		);
+
+		let result = database_db
+			.commit_finalize(
+				0,
+				txid,
+				shard * COMMIT_SEGMENT_MAX_SHARDS + 2,
+				1_000,
+				segments.iter().map(|(first_pgno, _)| *first_pgno).collect(),
+			)
+			.await?;
+		assert_eq!(result.head_txid, 2);
+
+		assert_eq!(
+			database_db
+				.get_pages(vec![1, 2, shard * COMMIT_SEGMENT_MAX_SHARDS + 1])
+				.await?,
+			vec![
+				fetched_page(1, 0xa1),
+				fetched_page(2, 0xa2),
+				fetched_page(shard * COMMIT_SEGMENT_MAX_SHARDS + 1, 0xb1),
+			]
+		);
+		// The stage bookkeeping is spent, so a later begin at this txid cannot mistake it for an
+		// orphan and refund bytes that are now live commit data.
+		assert_eq!(
+			read_value(&db, branch_commit_stage_key(branch_id, txid)).await?,
+			None
+		);
+
+		Ok(())
+	})
+}
+
+/// An abandoned stage leaves no visible trace and must not strand its bytes. The next begin is
+/// handed the same txid (head never moved), so it clears the orphan and refunds what was charged.
+#[tokio::test]
+async fn abandoned_stage_is_reclaimed_by_the_next_begin() -> Result<()> {
+	commit_matrix!("depot-staged-commit-orphan", |ctx, db, database_db| {
+		let _ = &ctx;
+		let quota_before = read_quota(&db).await?;
+
+		let txid = database_db.commit_stage_begin(0, Some(0)).await?;
+		database_db
+			.commit_stage_segment(0, txid, 0, vec![page(1, 0xc1)])
+			.await?;
+		let branch_id = read_branch_id(&db).await?;
+		assert!(
+			read_quota(&db).await? > quota_before,
+			"staging charges as it goes"
+		);
+		assert!(
+			!read_prefix_keys(&db, branch_delta_chunk_prefix(branch_id, txid))
+				.await?
+				.is_empty()
+		);
+
+		// Abandon it: no finalize, just another begin, which is what a restarted actor does.
+		let retried_txid = database_db.commit_stage_begin(0, Some(0)).await?;
+		assert_eq!(
+			retried_txid, txid,
+			"head never moved, so the txid is reused"
+		);
+		assert!(
+			read_prefix_keys(&db, branch_delta_chunk_prefix(branch_id, txid))
+				.await?
+				.is_empty(),
+			"the orphan's chunks must be cleared"
+		);
+		assert_eq!(
+			read_quota(&db).await?,
+			quota_before,
+			"the orphan's bytes must be refunded exactly"
+		);
+
+		Ok(())
+	})
+}
+
+/// Finalize verifies the segments it was told about. A client that lost a stage reply and finalized
+/// anyway must be rejected rather than publishing a commit with a hole in it.
+#[tokio::test]
+async fn finalize_rejects_a_segment_that_was_never_staged() -> Result<()> {
+	commit_matrix!(
+		"depot-staged-commit-missing-segment",
+		|ctx, db, database_db| {
+			let _ = (&ctx, &db);
+			database_db.commit(vec![page(1, 0x01)], 2, 1_000).await?;
+			let txid = database_db.commit_stage_begin(0, Some(1)).await?;
+			database_db
+				.commit_stage_segment(0, txid, 0, vec![page(1, 0xd1)])
+				.await?;
+
+			let err = database_db
+				.commit_finalize(
+					0,
+					txid,
+					2,
+					1_000,
+					vec![0, SHARD_SIZE * COMMIT_SEGMENT_MAX_SHARDS],
+				)
+				.await
+				.expect_err("finalize must reject an unstaged segment");
+			assert!(
+				format!("{err:#}").contains("StageNotFound"),
+				"unexpected error: {err}"
+			);
+			// The rejected finalize must not have published anything.
+			assert_eq!(
+				database_db.get_pages(vec![1]).await?,
+				vec![fetched_page(1, 0x01)]
+			);
+
+			Ok(())
+		}
+	)
+}
+
+/// Segment alignment is enforced engine-side, not merely produced correctly by the client. A shard
+/// split across two segments could be folded from one of them and written as a shard image missing
+/// the other's newer pages, which is silent corruption rather than a failed request.
+#[tokio::test]
+async fn stage_rejects_misaligned_and_out_of_order_segments() -> Result<()> {
+	commit_matrix!("depot-staged-commit-alignment", |ctx, db, database_db| {
+		let _ = (&ctx, &db);
+		let txid = database_db.commit_stage_begin(0, Some(0)).await?;
+
+		let err = database_db
+			.commit_stage_segment(0, txid, 1, vec![page(1, 0xe1)])
+			.await
+			.expect_err("a misaligned segment start must be rejected");
+		assert!(
+			format!("{err:#}").contains("not shard-aligned"),
+			"unexpected error: {err}"
+		);
+
+		let err = database_db
+			.commit_stage_segment(
+				0,
+				txid,
+				0,
+				vec![page(SHARD_SIZE * COMMIT_SEGMENT_MAX_SHARDS, 0xe2)],
+			)
+			.await
+			.expect_err("a page past the segment's shard span must be rejected");
+		assert!(
+			format!("{err:#}").contains("shard span"),
+			"unexpected error: {err}"
+		);
+
+		database_db
+			.commit_stage_segment(
+				0,
+				txid,
+				SHARD_SIZE * COMMIT_SEGMENT_MAX_SHARDS,
+				vec![page(SHARD_SIZE * COMMIT_SEGMENT_MAX_SHARDS + 1, 0xe3)],
+			)
+			.await?;
+		let err = database_db
+			.commit_stage_segment(0, txid, 0, vec![page(1, 0xe4)])
+			.await
+			.expect_err("segments must ascend");
+		assert!(
+			format!("{err:#}").contains("overlaps the span"),
+			"unexpected error: {err}"
+		);
+
+		// Ascending is not enough. A segment one shard past the last one still claims shards the
+		// last one covered, which is a shard split across two segments and the thing alignment
+		// exists to prevent.
+		let err = database_db
+			.commit_stage_segment(
+				0,
+				txid,
+				SHARD_SIZE * (COMMIT_SEGMENT_MAX_SHARDS + 1),
+				vec![page(SHARD_SIZE * (COMMIT_SEGMENT_MAX_SHARDS + 1) + 1, 0xe5)],
+			)
+			.await
+			.expect_err("a segment overlapping the previous segment's shards must be rejected");
+		assert!(
+			format!("{err:#}").contains("overlaps the span"),
+			"unexpected error: {err}"
+		);
+
+		Ok(())
+	})
 }

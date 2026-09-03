@@ -4,13 +4,20 @@ use http_body_util::Full;
 use hyper::Response;
 use hyper::StatusCode;
 use hyper::header::HeaderName;
+use parking_lot::Mutex;
 use rivet_api_builder::{ErrorResponse, RawErrorResponse};
 use rivet_error::{INTERNAL_ERROR, RivetError};
+use rivet_metrics::{GaugeGuardExt, IntGaugeGuard};
+use rivet_runner_protocol as protocol;
 use rivet_util::Id;
+use rivet_util::throttle::{RateLimitMethod, RateLimiter};
+use std::sync::Arc;
 use std::time::Duration;
+use tokio_tungstenite::tungstenite::error::ProtocolError;
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, frame::coding::CloseCode};
 use url::Url;
 
+use crate::metrics;
 use crate::proxy_service::{X_FORWARDED_FOR, X_RIVET_ERROR};
 use crate::response_body::ResponseBody;
 use crate::{request_context::RequestContext, route::RouteTarget};
@@ -19,18 +26,93 @@ const X_RIVET_TARGET: HeaderName = HeaderName::from_static("x-rivet-target");
 const X_RIVET_ACTOR: HeaderName = HeaderName::from_static("x-rivet-actor");
 const X_RIVET_TOKEN: HeaderName = HeaderName::from_static("x-rivet-token");
 
+/// Throttling state for a single client IP. Both the rate limiter and the in-flight counter are
+/// keyed by client IP, so they share one cache entry and one lock.
+pub(crate) struct ClientState {
+	rate_limiter: RateLimiter,
+	in_flight: InFlightCounter,
+}
+
+impl ClientState {
+	pub(crate) fn new(
+		rate_limit_requests: u64,
+		rate_limit_period: u64,
+		max_in_flight: usize,
+	) -> Self {
+		Self {
+			rate_limiter: RateLimiter::new(RateLimitMethod::FixedWindow {
+				requests: rate_limit_requests,
+				period: Duration::from_secs(rate_limit_period),
+			}),
+			in_flight: InFlightCounter::new(max_in_flight),
+		}
+	}
+
+	/// Consumes one rate limit token and one in-flight slot, returning false if either limit was
+	/// hit. A rate limit token is still consumed when the in-flight limit rejects the request.
+	pub(crate) fn try_admit(&mut self) -> bool {
+		self.rate_limiter.try_acquire() && self.in_flight.try_acquire()
+	}
+
+	pub(crate) fn release_in_flight(&mut self) {
+		self.in_flight.release();
+	}
+}
+
+/// Owns one slot in a client's in-flight counter together with the request id registered in the
+/// global in-flight request set and the matching increment on `IN_FLIGHT_REQUEST_COUNT`. All three
+/// are released in `Drop`, so a cancelled or panicking request cannot leak any of them.
+///
+/// The permit is held behind an `Arc` on `RequestContext`. Tasks that outlive the initial response,
+/// such as a proxied websocket, clone the context and therefore keep the slot and request id
+/// reserved for as long as they are still using them.
+pub(crate) struct InFlightPermit {
+	client_state: Arc<Mutex<ClientState>>,
+	in_flight_requests: Arc<scc::HashSet<protocol::RequestId>>,
+	request_id: protocol::RequestId,
+	_in_flight_metric: IntGaugeGuard,
+}
+
+impl InFlightPermit {
+	/// Takes ownership of a slot already acquired from `client_state` and a request id already
+	/// inserted into `in_flight_requests`.
+	pub(crate) fn new(
+		client_state: Arc<Mutex<ClientState>>,
+		in_flight_requests: Arc<scc::HashSet<protocol::RequestId>>,
+		request_id: protocol::RequestId,
+	) -> Self {
+		Self {
+			client_state,
+			in_flight_requests,
+			request_id,
+			_in_flight_metric: metrics::IN_FLIGHT_REQUEST_COUNT.inc_guard(),
+		}
+	}
+
+	pub(crate) fn request_id(&self) -> protocol::RequestId {
+		self.request_id
+	}
+}
+
+impl Drop for InFlightPermit {
+	fn drop(&mut self) {
+		self.client_state.lock().release_in_flight();
+		self.in_flight_requests.remove_sync(&self.request_id);
+	}
+}
+
 // In-flight requests counter (semaphore)
-pub(crate) struct InFlightCounter {
+struct InFlightCounter {
 	count: usize,
 	max: usize,
 }
 
 impl InFlightCounter {
-	pub(crate) fn new(max: usize) -> Self {
+	fn new(max: usize) -> Self {
 		Self { count: 0, max }
 	}
 
-	pub(crate) fn try_acquire(&mut self) -> bool {
+	fn try_acquire(&mut self) -> bool {
 		if self.count < self.max {
 			self.count += 1;
 			true
@@ -39,7 +121,7 @@ impl InFlightCounter {
 		}
 	}
 
-	pub(crate) fn release(&mut self) {
+	fn release(&mut self) {
 		self.count = self.count.saturating_sub(1);
 	}
 }
@@ -128,6 +210,60 @@ pub(crate) fn add_proxy_headers_with_addr(
 	Ok(())
 }
 
+/// Label used when an error does not match any of the types known to `error_type_name`.
+const UNKNOWN_ERROR_LABEL: &str = "unknown";
+
+/// Expands to the name of the first type in the list that `$err` downcasts to. The written path is
+/// used rather than `type_name` because `type_name` exposes private module paths such as
+/// `std::io::error::Error`.
+macro_rules! match_error_type {
+	($err:expr, $($ty:ty),* $(,)?) => {{
+		let err = $err;
+		None$(.or_else(|| err.downcast_ref::<$ty>().map(|_| stringify!($ty))))*
+	}};
+}
+
+/// Returns the type name of an error if it is one of the foreign error types guard commonly
+/// encounters.
+fn error_type_name(err: &(dyn std::error::Error + 'static)) -> Option<&'static str> {
+	match_error_type!(
+		err,
+		std::io::Error,
+		tokio_tungstenite::tungstenite::Error,
+		hyper_tungstenite::tungstenite::Error,
+		hyper::Error,
+		hyper_util::client::legacy::Error,
+		hyper::http::Error,
+		hyper::header::InvalidHeaderValue,
+		hyper::header::ToStrError,
+		hyper::header::InvalidHeaderName,
+		serde_json::Error,
+		url::ParseError,
+		tokio::time::error::Elapsed,
+	)
+}
+
+/// Builds a bounded metric label for an error. Formal errors become `{group}.{code}`. Anything else
+/// falls back to the error's type name, since error messages frequently embed request specific
+/// values such as ids, hosts, and paths that would make the label unbounded.
+pub(crate) fn error_metric_label(err: &anyhow::Error) -> String {
+	if let Some(rivet_err) = err.chain().find_map(|x| x.downcast_ref::<RivetError>()) {
+		return format!("{}.{}", rivet_err.group(), rivet_err.code());
+	}
+
+	if let Some(raw_err) = err
+		.chain()
+		.find_map(|x| x.downcast_ref::<RawErrorResponse>())
+	{
+		return format!("{}.{}", raw_err.1.group, raw_err.1.code);
+	}
+
+	err.chain()
+		.find_map(error_type_name)
+		.unwrap_or(UNKNOWN_ERROR_LABEL)
+		.to_string()
+}
+
 pub(crate) fn err_into_response(err: anyhow::Error) -> Result<Response<ResponseBody>> {
 	let (status, error_response) =
 		if let Some(rivet_err) = err.chain().find_map(|x| x.downcast_ref::<RivetError>()) {
@@ -135,12 +271,25 @@ pub(crate) fn err_into_response(err: anyhow::Error) -> Result<Response<ResponseB
 				("api", "not_found") => StatusCode::NOT_FOUND,
 				("api", "unauthorized") => StatusCode::UNAUTHORIZED,
 				("api", "forbidden") => StatusCode::FORBIDDEN,
+				("acl", "token_not_found") => StatusCode::UNAUTHORIZED,
+				("acl", "token_expired") => StatusCode::UNAUTHORIZED,
+				("acl", "insufficient_permissions") => StatusCode::FORBIDDEN,
 				("guard", "rate_limit") => StatusCode::TOO_MANY_REQUESTS,
 				("guard", "upstream_error") => StatusCode::BAD_GATEWAY,
 				("guard", "routing_error") => StatusCode::BAD_GATEWAY,
 				("guard", "request_timeout") => StatusCode::GATEWAY_TIMEOUT,
+				("guard", "route_dispatch_timeout") => StatusCode::GATEWAY_TIMEOUT,
+				("guard", "route_api_public_timeout") => StatusCode::GATEWAY_TIMEOUT,
+				("guard", "route_compute_timeout") => StatusCode::GATEWAY_TIMEOUT,
+				("guard", "route_auth_check_timeout") => StatusCode::GATEWAY_TIMEOUT,
 				("guard", "retry_attempts_exceeded") => StatusCode::BAD_GATEWAY,
+				("pegboard", "route_subscribe_timeout") => StatusCode::GATEWAY_TIMEOUT,
+				("pegboard", "route_fetch_actor_timeout") => StatusCode::GATEWAY_TIMEOUT,
+				("pegboard", "route_auth_check_timeout") => StatusCode::GATEWAY_TIMEOUT,
+				("pegboard", "route_wake_signal_timeout") => StatusCode::GATEWAY_TIMEOUT,
+				("pegboard", "route_resolve_query_timeout") => StatusCode::GATEWAY_TIMEOUT,
 				("guard", "service_unavailable") => StatusCode::SERVICE_UNAVAILABLE,
+				("guard", "actor_wake_retries_exceeded") => StatusCode::SERVICE_UNAVAILABLE,
 				("guard", "actor_stopped_while_waiting") => StatusCode::SERVICE_UNAVAILABLE,
 				("guard", "tunnel_request_aborted") => StatusCode::SERVICE_UNAVAILABLE,
 				("guard", "tunnel_message_timeout") => StatusCode::GATEWAY_TIMEOUT,
@@ -206,6 +355,7 @@ fn is_retryable_guard_http_error(code: &str) -> bool {
 		code,
 		"service_unavailable"
 			| "actor_ready_timeout"
+			| "actor_wake_retries_exceeded"
 			| "actor_stopped_while_waiting"
 			| "tunnel_request_aborted"
 			| "tunnel_message_timeout"
@@ -227,7 +377,16 @@ pub(crate) fn should_retry_request_inner(status: StatusCode, headers: &hyper::He
 // Determine if a websocket error is retryable (e.g., transient UPS/tunnel issues)
 pub(crate) fn is_retryable_ws_error(err: &anyhow::Error) -> bool {
 	if let Some(rivet_err) = err.chain().find_map(|x| x.downcast_ref::<RivetError>()) {
-		rivet_err.group() == "guard" && rivet_err.code() == "websocket_service_unavailable"
+		rivet_err.group() == "guard"
+			&& matches!(
+				rivet_err.code(),
+				"websocket_closed_before_open"
+					| "actor_stopped_while_waiting_for_websocket_open"
+					| "websocket_open_dropped"
+					| "websocket_open_response_closed"
+					| "websocket_open_timeout"
+					| "websocket_tunnel_subscription_closed"
+			)
 	} else {
 		false
 	}
@@ -242,6 +401,10 @@ pub fn is_ws_hibernate(err: &anyhow::Error) -> bool {
 }
 
 pub(crate) fn err_to_close_frame(err: anyhow::Error, ray_id: Id) -> CloseFrame {
+	metrics::WEBSOCKET_CLOSE_ERROR_TOTAL
+		.with_label_values(&[&error_metric_label(&err)])
+		.inc();
+
 	let rivet_err = err
 		.chain()
 		.find_map(|x| x.downcast_ref::<RivetError>())
@@ -253,9 +416,40 @@ pub(crate) fn err_to_close_frame(err: anyhow::Error, ray_id: Id) -> CloseFrame {
 		_ => CloseCode::Error,
 	};
 
+	// Log the error
 	match code {
 		CloseCode::Normal => tracing::debug!("websocket closed"),
-		_ => tracing::error!(?err, "websocket failed"),
+		_ => {
+			// Downgrade log if error is `ResetWithoutClosingHandshake` or `SendAfterClosing`
+			if err.chain().any(|x| {
+				match x.downcast_ref::<tokio_tungstenite::tungstenite::Error>() {
+					Some(tokio_tungstenite::tungstenite::Error::AlreadyClosed)
+					| Some(tokio_tungstenite::tungstenite::Error::Protocol(
+						ProtocolError::ResetWithoutClosingHandshake,
+					))
+					| Some(tokio_tungstenite::tungstenite::Error::Protocol(
+						ProtocolError::SendAfterClosing,
+					)) => true,
+					Some(tokio_tungstenite::tungstenite::Error::Io(io_err))
+						if io_err.to_string().contains("connection reset by peer") =>
+					{
+						true
+					}
+					Some(tokio_tungstenite::tungstenite::Error::Io(io_err))
+						if io_err.kind() == std::io::ErrorKind::BrokenPipe =>
+					{
+						true
+					}
+					_ => false,
+				}
+			}) {
+				tracing::warn!(?err, "websocket failed");
+			} else if rivet_err.group() == "core" && rivet_err.code() == "internal_error" {
+				tracing::error!(?err, "websocket failed");
+			} else {
+				tracing::warn!(?err, "websocket failed");
+			}
+		}
 	}
 
 	let reason = format!("{}.{}#{}", rivet_err.group(), rivet_err.code(), ray_id);

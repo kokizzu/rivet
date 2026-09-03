@@ -8,6 +8,7 @@ license.workspace = true
 
 [dependencies]
 datacenter.workspace = true
+depot.workspace = true
 epoxy.workspace = true
 gas.workspace = true
 gasoline-runtime.workspace = true

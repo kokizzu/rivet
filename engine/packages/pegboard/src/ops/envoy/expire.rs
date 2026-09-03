@@ -9,6 +9,10 @@ use crate::keys;
 pub struct Input {
 	pub namespace_id: Id,
 	pub envoy_key: String,
+	/// Only expire the registration owned by this connection. `None` is retained for read-path
+	/// expiry and legacy registrations created before connection fencing was introduced.
+	#[serde(default)]
+	pub expected_envoy_conn_id: Option<Id>,
 	/// Re-read freshness markers inside the expire transaction before deleting any keys.
 	///
 	/// This must use serializable reads so a heartbeat committed after a stale allocator
@@ -41,12 +45,51 @@ pub async fn expire_with_pools(
 				let tx = tx.with_subspace(keys::subspace());
 				let now = util::timestamp::now();
 
+				let envoy_conn_id_key = keys::envoy::EnvoyConnIdKey::new(
+					input.namespace_id,
+					input.envoy_key.clone(),
+				);
 				let pool_name_key = keys::envoy::PoolNameKey::new(input.namespace_id, input.envoy_key.clone());
 				let version_key = keys::envoy::VersionKey::new(input.namespace_id, input.envoy_key.clone());
 				let create_ts_key = keys::envoy::CreateTsKey::new(input.namespace_id, input.envoy_key.clone());
 				let last_ping_ts_key = keys::envoy::LastPingTsKey::new(input.namespace_id, input.envoy_key.clone());
 				let expired_ts_key = keys::envoy::ExpiredTsKey::new(input.namespace_id, input.envoy_key.clone());
 				let virtual_nodes_key = keys::envoy::VirtualNodesKey::new(input.namespace_id, input.envoy_key.clone());
+				let current_envoy_conn_id = tx
+					.read_opt(&envoy_conn_id_key, Serializable)
+					.await?;
+
+				match (input.expected_envoy_conn_id, current_envoy_conn_id) {
+					(Some(expected), Some(current)) if expected != current => {
+						tracing::debug!(
+							namespace_id = ?input.namespace_id,
+							envoy_key = %input.envoy_key,
+							%expected,
+							%current,
+							"skipping expiry from stale envoy connection",
+						);
+						return Ok(Output { did_expire: false });
+					}
+					(Some(expected), None) => {
+						tracing::warn!(
+							namespace_id = ?input.namespace_id,
+							envoy_key = %input.envoy_key,
+							%expected,
+							"skipping fenced expiry for legacy envoy registration",
+						);
+						return Ok(Output { did_expire: false });
+					}
+					(None, Some(current)) if !input.skip_if_fresh => {
+						tracing::warn!(
+							namespace_id = ?input.namespace_id,
+							envoy_key = %input.envoy_key,
+							%current,
+							"skipping unfenced forced expiry for fenced envoy registration",
+						);
+						return Ok(Output { did_expire: false });
+					}
+					_ => {}
+				}
 
 				if input.skip_if_fresh {
 					let (last_ping_ts, expired_ts) = tokio::try_join!(

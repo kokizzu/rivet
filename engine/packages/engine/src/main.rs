@@ -4,20 +4,8 @@ use anyhow::Result;
 use clap::Parser;
 use once_cell::sync::Lazy;
 use rivet_engine::{SubCommand, run_config};
-use rivet_util::build_meta;
 
-static LONG_VERSION: Lazy<String> = Lazy::new(|| {
-	format!(
-		"{}\nGit SHA: {}\nBuild Timestamp: {}\nRustc Version: {}\nRustc Host: {}\nCargo Target: {}\nCargo Profile: {}",
-		build_meta::VERSION,
-		build_meta::GIT_SHA,
-		build_meta::BUILD_TIMESTAMP,
-		build_meta::RUSTC_VERSION,
-		build_meta::RUSTC_HOST,
-		build_meta::CARGO_TARGET,
-		build_meta::cargo_profile()
-	)
-});
+static LONG_VERSION: Lazy<String> = Lazy::new(|| rivet_build_meta::pretty_print());
 
 #[derive(Parser)]
 #[command(name = "Rivet", version, long_version = LONG_VERSION.as_str(), about)]
@@ -36,12 +24,22 @@ fn main() -> Result<()> {
 }
 
 async fn main_inner() -> Result<()> {
-	tracing::info!(version=%build_meta::VERSION, git_sha=%build_meta::GIT_SHA, built_at=%build_meta::BUILD_TIMESTAMP, "starting rivet");
-
 	let cli = Cli::parse();
 
+	tracing::info!(
+		version=%rivet_build_meta::VERSION,
+		git_sha=%rivet_build_meta::GIT_SHA,
+		built_at=%rivet_build_meta::BUILD_TIMESTAMP,
+		"starting rivet",
+	);
+
 	// Load config
-	let config = rivet_config::Config::load(&cli.config).await?;
+	let config = rivet_config::Config::load(
+		&cli.config,
+		rivet_build_meta::build_meta(),
+		rivet_build_meta::compiled_runtime_protocols(),
+	)
+	.await?;
 	tracing::info!(config=?*config, "loaded config");
 
 	// Initialize telemetry (does nothing if telemetry is disabled)

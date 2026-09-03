@@ -40,6 +40,9 @@ pub enum Responder {
 	Nats {
 		client: async_nats::Client,
 		reply: async_nats::Subject,
+		/// Negotiated commit protocol version, read when the job was accepted so the reply is
+		/// encoded at the same version for the whole life of the job.
+		protocol_version: u16,
 	},
 }
 
@@ -51,8 +54,12 @@ impl Responder {
 			Responder::Local(tx) => {
 				let _ = tx.send(outcome);
 			}
-			Responder::Nats { client, reply } => {
-				let payload = match codec::encode_commit_reply(outcome) {
+			Responder::Nats {
+				client,
+				reply,
+				protocol_version,
+			} => {
+				let payload = match codec::encode_commit_reply(outcome, protocol_version) {
 					Ok(payload) => payload,
 					Err(err) => {
 						tracing::error!(?err, "failed to encode udb commit reply");

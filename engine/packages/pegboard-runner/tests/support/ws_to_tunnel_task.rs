@@ -8,7 +8,21 @@ use universalpubsub::{NextOutput, PubSub, driver::memory::MemoryDriver};
 use super::{handle_tunnel_message_mk1, handle_tunnel_message_mk2};
 
 fn memory_pubsub(channel: &str) -> PubSub {
-	PubSub::new(Arc::new(MemoryDriver::new(channel.to_string())))
+	// `RuntimeProtocols::default()` reports version 0 so that a process which never negotiated
+	// cannot silently reach the wire, so supply the compiled version here.
+	let config = rivet_config::Config::from_root_with_build_meta(
+		rivet_config::config::Root::default(),
+		rivet_config::BuildMeta::default(),
+		rivet_config::RuntimeProtocols {
+			ups: rivet_config::RuntimeProtocol::new(
+				rivet_config::RuntimeProtocolKind::Ups,
+				rivet_ups_protocol::PROTOCOL_VERSION,
+			),
+			..Default::default()
+		},
+	);
+
+	PubSub::new(config, Arc::new(MemoryDriver::new(channel.to_string())))
 }
 
 fn response_abort_message_mk2(

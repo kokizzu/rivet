@@ -93,7 +93,7 @@ impl ActorEventDemuxer {
 	}
 
 	/// Shutdown all tasks and wait for them to complete
-	#[tracing::instrument(skip_all)]
+	#[tracing::instrument(level = "debug", skip_all)]
 	pub async fn shutdown(self) {
 		tracing::debug!(channels=?self.channels.len(), "shutting down actor demuxer");
 
@@ -135,7 +135,7 @@ async fn channel_handler(
 	}
 }
 
-#[tracing::instrument(skip_all, fields(?runner_id, ?actor_id))]
+#[tracing::instrument(level = "debug", skip_all, fields(?runner_id, ?actor_id))]
 async fn dispatch_events(
 	ctx: &StandaloneCtx,
 	runner_id: Id,

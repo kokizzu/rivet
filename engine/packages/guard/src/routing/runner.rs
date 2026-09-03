@@ -4,8 +4,7 @@ use rivet_guard_core::{RoutingOutput, request_context::RequestContext};
 use std::sync::Arc;
 use subtle::ConstantTimeEq;
 
-use super::{SEC_WEBSOCKET_PROTOCOL, X_RIVET_TOKEN, validate_regional_host};
-pub(crate) const WS_PROTOCOL_TOKEN: &str = "rivet_token.";
+use super::{SEC_WEBSOCKET_PROTOCOL, WS_PROTOCOL_TOKEN, X_RIVET_TOKEN, validate_regional_host};
 
 /// Route requests to the runner service using header-based routing
 #[tracing::instrument(skip_all)]
@@ -88,7 +87,10 @@ async fn route_request_inner(
 			.ct_ne(auth.admin_token.read().as_bytes())
 			.into()
 		{
-			return Err(rivet_api_builder::ApiForbidden.build());
+			return Err(rivet_api_builder::ApiForbidden {
+				reason: "Invalid token".into(),
+			}
+			.build());
 		}
 
 		tracing::debug!("authenticated runner connection");

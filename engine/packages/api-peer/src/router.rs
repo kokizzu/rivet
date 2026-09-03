@@ -2,7 +2,7 @@ use rivet_api_builder::{create_router, prelude::*};
 
 use crate::{actors, depot_inspect, envoys, internal, namespaces, runner_configs, runners};
 
-#[tracing::instrument(skip_all)]
+#[tracing::instrument(level = "debug", skip_all)]
 pub async fn router(
 	config: rivet_config::Config,
 	pools: rivet_pools::Pools,
@@ -63,6 +63,10 @@ pub async fn router(
 				"/depot/inspect/branches/{branch_id}/rows/{family}",
 				get(depot_inspect::branch_rows),
 			)
+			.route(
+				"/depot/inspect/branches/{branch_id}/cold-reconcile",
+				get(depot_inspect::cold_reconcile),
+			)
 			.route("/depot/inspect/raw/key/{key}", get(depot_inspect::raw_key))
 			.route("/depot/inspect/raw/scan", get(depot_inspect::raw_scan))
 			.route(
@@ -98,7 +102,6 @@ pub async fn router(
 				get(internal::get_epoxy_kv_optimistic),
 			)
 			.route("/epoxy/replica/kv/{key}", put(internal::set_epoxy_kv))
-			.route("/debug/tracing/config", put(internal::set_tracing_config))
 			.route("/debug/profile/config", put(internal::set_profiling_config))
 	})
 	.await

@@ -3,7 +3,7 @@ use std::{
 	time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use opentelemetry::trace::TraceContextExt;
 use rivet_runtime::TermSignal;
@@ -20,13 +20,17 @@ use crate::{
 	registry::RegistryHandle,
 };
 
-/// How often to run gc and update ping.
+/// How often to update ping.
 pub(crate) const PING_INTERVAL: Duration = Duration::from_secs(10);
+/// How often to run gc.
+pub(crate) const GC_INTERVAL: Duration = Duration::from_secs(10);
 /// How often to publish metrics.
 const METRICS_INTERVAL: Duration = Duration::from_secs(20);
 // How long the pull workflows function can take before shutting down the runtime.
 const PULL_WORKFLOWS_TIMEOUT: Duration = Duration::from_secs(10);
 const SHUTDOWN_PROGRESS_INTERVAL: Duration = Duration::from_secs(7);
+/// How long before considering the leases of a given worker expired.
+pub(crate) const WORKER_LOST_THRESHOLD_MS: i64 = rivet_util::duration::seconds(30);
 
 /// Used to spawn a new thread that indefinitely polls the database for new workflows. Only pulls workflows
 /// that are registered in its registry. After pulling, the workflows are ran and their state is written to
@@ -42,6 +46,7 @@ pub struct Worker {
 	pools: rivet_pools::Pools,
 
 	running_workflows: HashMap<Id, WorkflowHandle>,
+	running_workflows_by_name: HashMap<String, usize>,
 }
 
 impl Worker {
@@ -53,9 +58,7 @@ impl Worker {
 	) -> Self {
 		Worker {
 			worker_id: Id::new_v1(config.dc_label()),
-			version: chrono::DateTime::parse_from_rfc3339(rivet_util::build_meta::BUILD_TIMESTAMP)
-				.map(|x| x.timestamp_millis())
-				.unwrap_or_default(),
+			version: config.build_meta().worker_version(),
 
 			registry,
 			db,
@@ -64,6 +67,7 @@ impl Worker {
 			pools,
 
 			running_workflows: HashMap::new(),
+			running_workflows_by_name: HashMap::new(),
 		}
 	}
 
@@ -97,6 +101,7 @@ impl Worker {
 			.context("failed updating worker ping")?;
 
 		// Create handles for bg tasks
+		let mut ping_handle = self.update_ping();
 		let mut gc_handle = self.gc();
 		let mut metrics_handle = self.publish_metrics();
 
@@ -114,11 +119,7 @@ impl Worker {
 				res = bump_sub.next() => {
 					match res {
 						Some(bumps) => {
-							// TODO: Temporarily don't record worker id to reduce metrics cardinality
-							// let worker_id_str = self.worker_id.to_string();
-							let worker_id_str = "worker".to_string();
 							metrics::WORKER_BUMPS_PER_TICK
-								.with_label_values(&[worker_id_str.as_str()])
 								.observe(bumps.len() as f64);
 						}
 						None => break Err(WorkflowError::SubscriptionUnsubscribed.into()),
@@ -126,14 +127,14 @@ impl Worker {
 
 					tick_interval.reset();
 				},
-
-				res = &mut gc_handle => {
-					tracing::error!(?res, "metrics task unexpectedly stopped");
-					break Ok(());
+				res = &mut ping_handle => {
+					break res.map_err(anyhow::Error::from).flatten().context("ping task unexpectedly stopped");
 				}
+				res = &mut gc_handle => {
+					break res.context("gc task unexpectedly stopped");
+				},
 				res = &mut metrics_handle => {
-					tracing::error!(?res, "metrics task unexpectedly stopped");
-					break Ok(());
+					break res.context("metrics task unexpectedly stopped");
 				},
 				res = shutdown_fut => {
 					if res.is_err() {
@@ -152,8 +153,9 @@ impl Worker {
 		};
 
 		// Cancel background tasks
-		metrics_handle.abort();
+		ping_handle.abort();
 		gc_handle.abort();
+		metrics_handle.abort();
 
 		if let Err(err) = &res {
 			tracing::error!(?err, "worker errored, attempting graceful shutdown");
@@ -165,7 +167,7 @@ impl Worker {
 	}
 
 	/// Query the database for new workflows and run them.
-	#[tracing::instrument(skip_all)]
+	#[tracing::instrument(level = "debug", skip_all)]
 	async fn tick(&mut self, cache: &rivet_cache::Cache) -> Result<()> {
 		// Create filter from registered workflow names
 		let filter = self
@@ -178,16 +180,29 @@ impl Worker {
 		// Query awake workflows
 		let workflows = tokio::time::timeout(
 			PULL_WORKFLOWS_TIMEOUT,
-			self.db
-				.pull_workflows(self.worker_id, self.version, &filter),
+			self.db.pull_workflows(
+				self.worker_id,
+				self.version,
+				&filter,
+				&self.running_workflows_by_name,
+			),
 		)
 		.await
 		.context("took too long pulling workflows, worker cannot continue")??;
 
 		// Remove join handles for completed workflows. This must happen after we pull workflows to ensure an
 		// accurate state of the current workflows
-		self.running_workflows
-			.retain(|_, wf| !wf.handle.is_finished());
+		self.running_workflows.retain(|_, wf| {
+			let retain = !wf.handle.is_finished();
+
+			if !retain {
+				if let Some(count) = self.running_workflows_by_name.get_mut(&wf.name) {
+					*count -= 1;
+				}
+			}
+
+			retain
+		});
 
 		for workflow in workflows {
 			let workflow_id = workflow.workflow_id;
@@ -201,6 +216,7 @@ impl Worker {
 			let name = workflow.workflow_name.clone();
 
 			let ctx = WorkflowCtx::new(
+				self.worker_id,
 				self.registry.clone(),
 				self.db.clone(),
 				self.config.clone(),
@@ -225,6 +241,10 @@ impl Worker {
 				},
 			);
 
+			*self
+				.running_workflows_by_name
+				.entry(name.clone())
+				.or_default() += 1;
 			self.running_workflows.insert(
 				workflow_id,
 				WorkflowHandle {
@@ -235,43 +255,80 @@ impl Worker {
 			);
 		}
 
-		// TODO: Temporarily don't record worker id to reduce metrics cardinality
-		// let worker_id_str = self.worker_id.to_string();
-		let worker_id_str = "worker".to_string();
-
 		metrics::WORKER_WORKFLOW_ACTIVE.reset();
 		for (_, wf) in &self.running_workflows {
 			metrics::WORKER_WORKFLOW_ACTIVE
-				.with_label_values(&[worker_id_str.as_str(), wf.name.as_str()])
+				.with_label_values(&[wf.name.as_str()])
 				.inc();
 		}
 
 		Ok(())
 	}
 
-	fn gc(&self) -> JoinHandle<()> {
+	fn update_ping(&self) -> JoinHandle<Result<()>> {
 		let db = self.db.clone();
 		let worker_id = self.worker_id;
 		let version = self.version;
 
 		tokio::spawn(
 			async move {
+				let mut last_update_ts = rivet_util::timestamp::now();
 				let mut ping_interval = tokio::time::interval(PING_INTERVAL);
 				ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
 				loop {
 					ping_interval.tick().await;
 
-					if let Err(err) = db.update_worker_ping(worker_id, version, true).await {
-						tracing::error!(?err, "unhandled update ping error");
+					// Stop before the lost threshold is reached. Once the threshold passes, another
+					// worker clears this worker's leases and every write from its running workflows
+					// fails the lease fence.
+					let deadline = Duration::from_millis(
+						WORKER_LOST_THRESHOLD_MS
+							.saturating_sub(
+								rivet_util::timestamp::now().saturating_sub(last_update_ts),
+							)
+							.max(0) as u64,
+					)
+					.saturating_sub(PING_INTERVAL.mul_f32(0.5));
+
+					// NOTE: Biased so the deadline is always polled first. An expired deadline is ready
+					// on the first poll, so a ping that resolves without ever awaiting cannot skip it.
+					tokio::select! {
+						biased;
+						_ = tokio::time::sleep(deadline) => {
+							bail!("timed out updating worker ping");
+						}
+						res = db.update_worker_ping(worker_id, version, true) => {
+							match res {
+								Err(err) => tracing::error!(?err, "ping update error"),
+								Ok(ping_ts) => last_update_ts = ping_ts,
+							}
+						}
 					}
+				}
+			}
+			.instrument(tracing::debug_span!("worker_ping_task")),
+		)
+	}
+
+	fn gc(&self) -> JoinHandle<()> {
+		let db = self.db.clone();
+		let worker_id = self.worker_id;
+
+		tokio::spawn(
+			async move {
+				let mut gc_interval = tokio::time::interval(GC_INTERVAL);
+				gc_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+				loop {
+					gc_interval.tick().await;
 
 					if let Err(err) = db.clear_expired_leases(worker_id).await {
 						tracing::error!(?err, "unhandled gc error");
 					}
 				}
 			}
-			.instrument(tracing::info_span!("worker_gc_task")),
+			.instrument(tracing::debug_span!("worker_gc_task")),
 		)
 	}
 
@@ -292,7 +349,7 @@ impl Worker {
 					}
 				}
 			}
-			.instrument(tracing::info_span!("worker_metrics_task")),
+			.instrument(tracing::debug_span!("worker_metrics_task")),
 		)
 	}
 
@@ -314,7 +371,7 @@ impl Worker {
 					}
 				}
 			}
-			.instrument(tracing::info_span!("worker_shutdown_ping_task")),
+			.instrument(tracing::debug_span!("worker_shutdown_ping_task")),
 		)
 	}
 

@@ -87,7 +87,10 @@ async fn route_envoy_internal(
 			.ct_ne(auth.admin_token.read().as_bytes())
 			.into()
 		{
-			return Err(rivet_api_builder::ApiForbidden.build());
+			return Err(rivet_api_builder::ApiForbidden {
+				reason: "Invalid token".into(),
+			}
+			.build());
 		}
 
 		tracing::debug!("authenticated envoy connection");

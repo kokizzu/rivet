@@ -225,6 +225,12 @@ impl LtxBlob {
 		&self.header
 	}
 
+	/// The page numbers the blob carries, ascending, read from the parsed index
+	/// without decompressing anything.
+	pub fn page_numbers(&self) -> impl Iterator<Item = u32> + '_ {
+		self.page_index.iter().map(|entry| entry.pgno)
+	}
+
 	/// Decompresses and returns the single requested page, or `None` if the blob
 	/// does not contain it. Only the requested frame is decompressed.
 	pub fn get_page(&self, pgno: u32) -> Result<Option<Vec<u8>>> {

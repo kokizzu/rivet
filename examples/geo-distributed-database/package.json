@@ -24,10 +24,10 @@
 		"vitest": "^3.1.1"
 	},
 	"dependencies": {
-		"@rivetkit/react": "*",
+		"@rivetkit/react": "workspace:*",
 		"react": "^18.2.0",
 		"react-dom": "^18.2.0",
-		"rivetkit": "*"
+		"rivetkit": "workspace:*"
 	},
 	"license": "MIT"
 }

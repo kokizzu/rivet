@@ -3,6 +3,38 @@ use hyper::header::HeaderValue;
 use super::*;
 
 #[test]
+fn labels_rivet_errors_by_group_and_code() {
+	let err = crate::errors::UriParseError("http://actor-9f3b.example/path".to_owned()).build();
+
+	assert_eq!("guard.uri_parse_error", error_metric_label(&err));
+}
+
+#[test]
+fn labels_rivet_errors_wrapped_in_context() {
+	let err = anyhow::Error::from(crate::errors::WebSocketNotSupported.build())
+		.context("failed handling websocket for actor 9f3b");
+
+	assert_eq!("guard.websocket_not_supported", error_metric_label(&err));
+}
+
+#[test]
+fn labels_foreign_errors_by_type_name() {
+	let err = anyhow::Error::from(std::io::Error::new(
+		std::io::ErrorKind::ConnectionReset,
+		"connection reset by peer from 10.0.0.4:52190",
+	));
+
+	assert_eq!("std::io::Error", error_metric_label(&err));
+}
+
+#[test]
+fn labels_unknown_errors_without_leaking_the_message() {
+	let err = anyhow::anyhow!("actor 9f3b on host example.com failed");
+
+	assert_eq!(UNKNOWN_ERROR_LABEL, error_metric_label(&err));
+}
+
+#[test]
 fn retries_guard_actor_ready_timeout_response() {
 	let mut headers = hyper::HeaderMap::new();
 	headers.insert(

@@ -221,7 +221,7 @@
 		"@rivetkit/virtual-websocket": "workspace:*",
 		"@rivetkit/workflow-engine": "workspace:*",
 		"cbor-x": "^1.6.0",
-		"drizzle-orm": "^0.44.2",
+		"drizzle-orm": "catalog:",
 		"hono": "^4.7.0",
 		"invariant": "^2.2.4",
 		"p-retry": "^6.2.1",

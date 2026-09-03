@@ -33,6 +33,8 @@ All Depot keys live under the crate-owned `[0x02]` prefix. The next byte is the 
 | `BUCKET_CATALOG_BY_DB` | `[0x02][0x73]` | bucket catalog, workflow compaction | Reverse bucket membership index by database branch. |
 | `BUCKET_PROOF_EPOCH` | `[0x02][0x74]` | bucket fork/catalog mutation | Bucket-tree proof invalidation epoch. |
 | `SQLITE_CMP_DIRTY` | `[0x02][0x75]` | conveyer, workflow compaction | Coalesced compaction wake marker by database branch. |
+| `CMP_THROTTLE` | `[0x02][0x76]` | workflow compaction | Ephemeral windowed read/write byte counters. |
+| `DB_BRANCH_OWNER` | `[0x02][0x77]` | pointer writes, workflow compaction | Reverse index from database branch to its owning DBPTR row. |
 
 ## Pointers And Bucket Catalog
 
@@ -98,28 +100,40 @@ BR/{database_id_be:16}/PIDX/{pgno_be:4}
   -> u64 BE owner_txid
 BR/{database_id_be:16}/DELTA/{txid_be:8}/{chunk_be:4}
   -> LTX chunk blob
-BR/{database_id_be:16}/SHARD/{shard_id_be:4}/{as_of_txid_be:8}
-  -> LTX shard blob
+BR/{database_id_be:16}/SHARD/{shard_id_be:4}/{as_of_txid_be:8}/{chunk_be:4}
+  -> LTX shard blob chunk
 BR/{database_id_be:16}/PITR_INTERVAL/{bucket_start_ms_be:8}
   -> PitrIntervalCoverage (vbare-versioned)
 ```
 
 `COMMITS` stores commit metadata, including wall-clock time, captured versionstamp, size in pages, and post-apply checksum. `VTX` maps a versionstamp back to txid for restore point resolution and GC. `PIDX` maps a page number to the DELTA txid that currently owns it.
 
-`SHARD` is versioned by `as_of_txid`. Reads choose the largest `as_of_txid <= read_txid`. Hot compaction writes new SHARD versions and does not overwrite older ones.
+`SHARD` is versioned by `as_of_txid`. Reads choose the largest `as_of_txid <= read_txid`. Hot compaction writes new SHARD versions and does not overwrite older ones. Like `DELTA`, a shard image is split into `universaldb::utils::CHUNK_SIZE` chunk rows and reassembled on read, because a dense `SHARD_SIZE`-page image exceeds FDB's 100 KB value cap. A value sitting directly at the bare `.../{as_of_txid}` key (no chunk segment) is a pre-chunking legacy row read as a one-chunk blob; a version is written exactly once as one format or the other, and whole-version rewrites clear the version's full key range first. All chunk split, reassembly, and version-range logic lives in `conveyer/shard_blob.rs`.
 
 ## Workflow Compaction Metadata
 
 ```text
 BR/{database_id_be:16}/CMP/root
   -> CompactionRoot (vbare-versioned)
+BR/{database_id_be:16}/CMP/cold_shard/{shard_id_be:4}/{as_of_txid_be:8}
+  -> ColdShardRef (vbare-versioned)
+BR/{database_id_be:16}/CMP/retired_cold_object/{object_key_hash:32}
+  -> RetiredColdObject (vbare-versioned)
 BR/{database_id_be:16}/CMP/stage/{job_id}/hot_shard/{shard_id_be:4}/{as_of_txid_be:8}/{chunk_be:4}
   -> staged LTX shard blob
+BR/{database_id_be:16}/CMP/pidx_repair
+  -> hot_watermark_txid at completion (u64 BE)
+BR/{database_id_be:16}/CMP/reclaim_progress
+  -> ReclaimProgress (vbare-versioned)
 ```
 
 The DB manager owns published `CMP` metadata. Staged hot shard keys are not reader-visible until the manager validates the active job and copies them to `SHARD`; the same install transaction advances `CMP/root` and compare-and-clears matching PIDX rows.
 
-`CompactionRoot` may contain legacy cold watermark fields for persisted compatibility. OSS Depot does not use those fields as planning or deletion authority.
+`CMP/cold_shard` and `CMP/retired_cold_object` are **read-only in this edition**. Nothing here writes them, but a branch that was previously compacted by an enterprise build still carries them, so their key builders and codecs are retained and the read path must keep treating a `CMP/cold_shard` row as coverage it cannot resolve (`ShardCoverageMissing`) rather than zero-filling the page. Do not delete them as dead code; see [OSS to EE upgrade](../oss-to-ee-upgrade.md).
+
+`CMP/pidx_repair` marks that the stale-PIDX repair sweep has walked the branch's whole `PIDX` prefix once. Hot slices that folded a page without clearing its PIDX row left that row owned by a txid below the watermark, where the owner-window filter in hot planning never revisits it, so the row pinned its `DELTA` and `COMMITS` rows against reclaim permanently. The sweep clears such a row once it confirms a `SHARD` version covers the page at or above the owner txid, and fails closed otherwise. Absence of the key means "not yet swept", which is the correct default for branches that predate the sweep; presence retires it, because re-walking would re-read every live PIDX row on every reclaim job. The value is the hot watermark the walk ran at, and it is always nonzero. A branch that has never installed a fold cannot hold a stale row, so a sweep below the first fold returns without walking and leaves the marker unwritten rather than retiring the branch on a pass that could not have found anything.
+
+`CMP/reclaim_progress` is diagnostic output, not an input to planning. The reclaim drain's two windowed scans carry their cursors in the reclaimer's durable `loope` state, which is readable only by decoding Gasoline history, so a drain whose `commit_scan_cursor` is pinned at 0 is indistinguishable from one making progress without that archaeology. The reclaim plan transaction writes this row after its liveness and generation guards pass, so it never resurrects a key in a swept branch's subspace. Nothing reads it back.
 
 ## Branch Manifest Subkeys
 
@@ -154,4 +168,16 @@ BUCKET_PROOF_EPOCH/{root_bucket_id_be:16}
   -> proof invalidation epoch (atomic i64 LE)
 SQLITE_CMP_DIRTY/{database_id_be:16}
   -> SqliteCmpDirty (vbare-versioned)
+```
+
+## Inherited cold object keys
+
+This edition writes no objects. A `ColdShardRef` inherited from an enterprise build carries an
+`object_key` shaped like the following, which is recorded here only so the value is readable:
+
+```text
+{root}/
+  db/{database_id_uuid_hex:32}/
+    shard/{shard_id_be_hex:8}/
+      {as_of_txid_be_hex:16}-{object_generation_id}-{content_hash_hex}.ltx
 ```

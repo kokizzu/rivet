@@ -23,26 +23,37 @@ use futures_util::{StreamExt, TryStreamExt, stream};
 use crate::conveyer::{
 	Db,
 	db::{BranchAncestry, CacheSnapshot, touch_access_if_bucket_advanced},
+	delta_blob,
 	error::SqliteStorageError,
 	keys::{self, PAGE_SIZE, SHARD_SIZE},
 	ltx::{LtxBlob, decode_ltx_v3},
-	metrics,
-	page_index::DeltaPageIndex,
+	page_index::{DeltaPageIndex, PageOwner},
 	types::{
-		DatabaseBranchId, FetchedPage, GetPagesOptions, GetPagesResult, PageSourceCandidate,
-		PageSourceCandidateResult, PageSourceKind, PageSourceProvenance, decode_commit_row,
+		DatabaseBranchId, FetchedPage, GetPagesOptions, GetPagesReadStats, GetPagesResult,
+		PageSourceCandidate, PageSourceCandidateResult, PageSourceKind, PageSourceProvenance,
+		decode_commit_row,
 	},
 };
+use crate::metrics;
 
 use self::{
 	pidx::{PageRef, PageRefKind, decode_pidx_txid},
 	plan::{ReadSource, StorageScope, resolve_storage_scope},
-	shard::{DeltaBlobLoad, ShardBlobLoad, tx_load_delta_blob, tx_load_latest_shard_blob},
-	tx::{tx_get_value, tx_scan_prefix_values},
+	shard::{
+		DeltaBlobLoad, ShardBlobLoad, tx_load_delta_blob, tx_load_latest_shard_blob,
+		tx_load_source_shard_fold_floors,
+	},
+	tx::{tx_get_value, tx_scan_range_reverse_limited},
 };
 
 /// Maximum number of concurrent FDB reads issued while prefetching page sources.
 const PAGE_SOURCE_FETCH_CONCURRENCY: usize = 32;
+
+/// Maximum number of DELTA chunk rows read per FDB range call while walking a
+/// source's delta history backward. This caps one range call, not the walk; the
+/// walk's own bounds are resolving every missing page and the shard-version floor
+/// below which a page's state already lives in a shard image.
+const DELTA_HISTORY_SCAN_BATCH_KEYS: usize = 500;
 
 impl Db {
 	pub async fn get_pages(&self, pgnos: Vec<u32>) -> Result<Vec<FetchedPage>> {
@@ -86,9 +97,9 @@ impl Db {
 		#[cfg(feature = "pidx-cache")]
 		let cached_pidx = cached_snapshot
 			.as_ref()
-			.and_then(|snapshot| cache::snapshot_pidx_cache(&snapshot.pidx, &pgnos));
+			.map(|snapshot| cache::snapshot_pidx_cache(&snapshot.pidx, &pgnos));
 		#[cfg(not(feature = "pidx-cache"))]
-		let cached_pidx = None::<BTreeMap<u32, Option<u64>>>;
+		let cached_pidx = None::<BTreeMap<u32, PageOwner>>;
 		let cached_branch_id = cached_snapshot.as_ref().map(|snapshot| snapshot.branch_id);
 		#[cfg(feature = "pidx-cache")]
 		let cached_head_txid = cached_snapshot
@@ -110,13 +121,19 @@ impl Db {
 		let collect_provenance = options.collect_provenance;
 		let phase_node_id = node_id.clone();
 		let ltx_blob_cache = self.ltx_blob_cache.clone();
+		let delta_layout_cache = self.delta_segment_layout_cache.clone();
 		#[cfg(feature = "test-faults")]
 		let fault_controller = self.fault_controller.clone();
+		// Read backpressure. A large staged commit makes its own pages take the slow read path, so
+		// read volume peaks alongside write volume.
+		self.await_actor_throttle(universaldb::ThrottleKind::Read)
+			.await;
 		let tx_result = self
 			.udb
 			.txn("depot_get_pages", move |tx| {
 				let phase_node_id = phase_node_id.clone();
 				let ltx_blob_cache = ltx_blob_cache.clone();
+				let delta_layout_cache = delta_layout_cache.clone();
 				let database_id = database_id.clone();
 				let bucket_id = bucket_id;
 				let pgnos = pgnos_for_tx.clone();
@@ -131,6 +148,13 @@ impl Db {
 				let fault_controller = fault_controller.clone();
 
 				async move {
+					// Opt this transaction's reads into the actor throttle's accounting. Charging is
+					// what makes the next caller's check meaningful; the check itself already
+					// happened before the transaction opened.
+					tx.charge_throttle(
+						rivet_config::config::DEPOT_ACTOR_THROTTLE,
+						universaldb::ThrottleCharge::Read,
+					)?;
 					let mut debug = GetPagesDebug::default();
 					debug.pages_requested = pgnos.len();
 					debug.requested_pgno_min = pgnos.iter().copied().min().unwrap_or(0);
@@ -269,97 +293,96 @@ impl Db {
 							.unwrap_or(0);
 					}
 					let cache_source = cache::cache_source_for_scope(&scope);
-					if let (Some(cache_source), Some(cached_pidx)) =
-						(cache_source, cached_pidx.as_ref())
-					{
-						debug.pidx_cache_hit = true;
-						debug.pidx_cache_rows_used = cached_pidx.len();
-						for (pgno, txid) in cached_pidx {
-							if let Some(txid) = txid.filter(|txid| *txid <= cache_source.max_txid())
-							{
-								pidx_by_pgno.insert(
-									*pgno,
-									PageRef {
-										source: cache_source,
-										txid,
-										kind: PageRefKind::Pidx,
-									},
-								);
+					let StorageScope::Branch(plan) = &scope;
+
+					// Resolve owners already known to the lazy per-page cache, and collect
+					// the pages that still need a point read. The cache is only available
+					// for a single-source (unforked) read; a forked read has no cache and
+					// point-reads every requested page.
+					let mut pages_to_read: Vec<u32> = Vec::new();
+					match (cache_source, cached_pidx.as_ref()) {
+						(Some(cache_source), Some(cached_known)) => {
+							debug.pidx_cache_hit = !cached_known.is_empty();
+							debug.pidx_cache_rows_used = cached_known.len();
+							for pgno in &pgnos_in_range {
+								match cached_known.get(pgno) {
+									Some(PageOwner::Owner(txid))
+										if *txid <= cache_source.max_txid() =>
+									{
+										pidx_by_pgno.insert(
+											*pgno,
+											PageRef {
+												source: cache_source,
+												txid: *txid,
+												kind: PageRefKind::Pidx,
+											},
+										);
+									}
+									// A cached owner above the cap (diagnostic reads) and a cached
+									// proven-absent owner both mean no usable PIDX owner; fall
+									// through without a point read.
+									Some(PageOwner::Owner(_)) | Some(PageOwner::NoOwner) => {}
+									None => pages_to_read.push(*pgno),
+								}
 							}
 						}
-					} else {
-						debug.pidx_cache_hit = false;
-						let StorageScope::Branch(plan) = &scope;
-						// Scan every source's PIDX prefix concurrently. A forked database has
-						// up to MAX_FORK_DEPTH sources, and these are independent reads on the
-						// same transaction, so we pipeline them instead of awaiting serially.
-						let pidx_tx_ref = &tx;
-						let pidx_db_ref = &database_id;
-						let mut scanned_pidx_rows: BTreeMap<usize, Vec<(Vec<u8>, Vec<u8>)>> =
-							stream::iter(plan.sources.iter().copied().enumerate())
-								.map(move |(idx, source)| async move {
-									let rows = tx_scan_prefix_values(
-										pidx_tx_ref,
-										&source.pidx_prefix(pidx_db_ref),
+						_ => {
+							debug.pidx_cache_hit = false;
+							pages_to_read = pgnos_in_range.clone();
+						}
+					}
+
+					// Point-read PIDX owners for exactly the unresolved pages across
+					// sources in priority order, instead of scanning every source's whole
+					// PIDX prefix.
+					let point_read_owners = point_read_pidx_owners(
+						&tx,
+						&database_id,
+						&plan.sources,
+						&pages_to_read,
+						&mut debug,
+					)
+					.await?;
+					for (pgno, page_ref) in &point_read_owners {
+						pidx_by_pgno.entry(*pgno).or_insert(*page_ref);
+					}
+
+					// Teach the single-source cache the owners found and the pages proven
+					// to have no PIDX owner, so a later read of the same pages is a cache
+					// hit. A single-source point read only hits that source, so a missing
+					// owner means the page has no PIDX owner.
+					if cache_source.is_some() {
+						loaded_pidx_rows = Some(
+							pages_to_read
+								.iter()
+								.map(|pgno| {
+									(
+										*pgno,
+										point_read_owners.get(pgno).map(|page_ref| page_ref.txid),
 									)
-									.await?;
-									Result::<(usize, Vec<(Vec<u8>, Vec<u8>)>)>::Ok((idx, rows))
 								})
-								.buffer_unordered(PAGE_SOURCE_FETCH_CONCURRENCY)
-								.try_collect()
-								.await?;
-						// Process sources in priority order so the first source that owns a
-						// page wins, matching the sequential scan's `or_insert` semantics.
-						for (idx, source) in plan.sources.iter().enumerate() {
-							let rows = scanned_pidx_rows
-								.remove(&idx)
-								.expect("every pidx source scanned");
-							debug.pidx_sources_scanned += 1;
-							debug.pidx_rows_scanned += rows.len();
-							let mut decoded_rows = Vec::new();
-							for (key, value) in rows {
-								let pgno = source.decode_pidx_pgno(&database_id, &key)?;
-								let txid = decode_pidx_txid(&value)?;
-								if debug.scanned_txid_min == 0 || txid < debug.scanned_txid_min {
-									debug.scanned_txid_min = txid;
-								}
-								if txid > debug.scanned_txid_max {
-									debug.scanned_txid_max = txid;
-								}
-								if txid > source.max_txid() {
-									debug.pidx_rows_filtered_above_max_txid += 1;
-									continue;
-								}
-								pidx_by_pgno.entry(pgno).or_insert(PageRef {
-									source: *source,
-									txid,
-									kind: PageRefKind::Pidx,
-								});
-								decoded_rows.push((pgno, txid));
-							}
-							if plan.sources.len() == 1 {
-								loaded_pidx_rows = Some(decoded_rows);
-							}
-						}
-						let historical_delta_sources = if diagnostic_current_source_delta_fallback
-							&& !read_mode.allows_side_effects()
-						{
-							&plan.sources[..]
-						} else {
-							&plan.sources[1..]
-						};
-						for (pgno, page_ref) in fill_historical_delta_refs(
-							&tx,
-							&database_id,
-							historical_delta_sources,
-							&pgnos_in_range,
-							&pidx_by_pgno,
-							&mut debug,
-						)
-						.await?
-						{
-							pidx_by_pgno.entry(pgno).or_insert(page_ref);
-						}
+								.collect::<Vec<_>>(),
+						);
+					}
+
+					let historical_delta_sources = if diagnostic_current_source_delta_fallback
+						&& !read_mode.allows_side_effects()
+					{
+						&plan.sources[..]
+					} else {
+						&plan.sources[1..]
+					};
+					for (pgno, page_ref) in fill_historical_delta_refs(
+						&tx,
+						&database_id,
+						historical_delta_sources,
+						&pgnos_in_range,
+						&pidx_by_pgno,
+						&mut debug,
+					)
+					.await?
+					{
+						pidx_by_pgno.entry(pgno).or_insert(page_ref);
 					}
 					metrics::observe_get_pages_phase(
 						&phase_node_id,
@@ -385,21 +408,26 @@ impl Db {
 					let mut page_candidates = BTreeMap::<u32, Vec<PageSourceCandidate>>::new();
 					let mut selected_candidates = BTreeMap::<u32, PageSourceCandidate>::new();
 					let mut missing_delta_prefixes = BTreeSet::new();
-					let mut shard_sources = BTreeMap::<u32, Option<(Vec<u8>, Vec<u8>)>>::new();
+					// Commits whose scan cost has already been charged to the debug counters.
+					let mut counted_delta_txids = BTreeSet::new();
+					let mut shard_sources =
+						BTreeMap::<u32, Option<(DatabaseBranchId, Vec<u8>, Vec<u8>)>>::new();
 					let mut stale_pidx_pgnos = BTreeSet::new();
 					let mut shard_cache_read_outcomes =
 						BTreeMap::<u32, ShardCacheReadOutcome>::new();
 					let mut touched_cache_backed_page = false;
+					let mut touched_shards = BTreeSet::<u32>::new();
 
 					let phase_start = Instant::now();
 
-					// Phase 1: prefetch every unique delta blob and shard blob concurrently.
-					// The assembly loop below dedups loads per delta prefix and per shard, so
-					// we resolve the unique keys here, fetch each exactly once, and let the
-					// loop read from these maps instead of awaiting inline.
+					// Phase 1: prefetch every unique delta blob, shard blob, and cold ref
+					// concurrently. The assembly loop below dedups loads per delta prefix and
+					// per shard, so we resolve the unique keys here, fetch each exactly once,
+					// and let the loop read from these maps instead of awaiting inline.
 					let tx_ref = &tx;
 					let scope_ref = &scope;
 					let ltx_blob_cache_ref = &ltx_blob_cache;
+					let delta_layout_cache_ref = &delta_layout_cache;
 					#[cfg(feature = "test-faults")]
 					let database_id_ref = &database_id;
 					#[cfg(feature = "test-faults")]
@@ -408,16 +436,30 @@ impl Db {
 					// Unique delta prefixes referenced by PIDX, paired with the first page that
 					// references them so fault injection stays attributed to the same page as
 					// the sequential path.
-					let mut delta_prefix_triggers: Vec<(Vec<u8>, u32)> = Vec::new();
+					// One load per commit, carrying every page that resolves through it. A commit can
+					// store its pages across several blobs, so the load needs the whole page set to
+					// know which of them to materialize; loading them all would copy blobs no page
+					// in this read asks for.
+					let mut delta_prefix_triggers: Vec<(Vec<u8>, ReadSource, u64, Vec<u32>)> =
+						Vec::new();
 					{
-						let mut seen = BTreeSet::new();
+						let mut by_prefix = BTreeMap::<Vec<u8>, usize>::new();
 						for pgno in &pgnos_in_range {
 							if let Some(page_ref) = pidx_by_pgno.get(pgno) {
 								let prefix = page_ref
 									.source
 									.delta_chunk_prefix(&database_id, page_ref.txid);
-								if seen.insert(prefix.clone()) {
-									delta_prefix_triggers.push((prefix, *pgno));
+								match by_prefix.get(&prefix) {
+									Some(idx) => delta_prefix_triggers[*idx].3.push(*pgno),
+									None => {
+										by_prefix.insert(prefix.clone(), delta_prefix_triggers.len());
+										delta_prefix_triggers.push((
+											prefix,
+											page_ref.source,
+											page_ref.txid,
+											vec![*pgno],
+										));
+									}
 								}
 							}
 						}
@@ -425,19 +467,27 @@ impl Db {
 
 					let delta_blobs: BTreeMap<Vec<u8>, DeltaBlobLoad> =
 						stream::iter(delta_prefix_triggers)
-							.map(move |(prefix, trigger_pgno)| async move {
-								let load =
-									tx_load_delta_blob(tx_ref, &prefix, ltx_blob_cache_ref).await?;
+							.map(move |(prefix, source, txid, trigger_pgnos)| async move {
+								let trigger_pgno = trigger_pgnos[0];
+								let load = tx_load_delta_blob(
+									tx_ref,
+									source,
+									txid,
+									&trigger_pgnos,
+									ltx_blob_cache_ref,
+									delta_layout_cache_ref,
+								)
+								.await?;
 								#[cfg(feature = "test-faults")]
 								let load = {
 									let mut load = load;
 									if matches!(
 										maybe_fire_read_fault(
 											fault_controller_ref,
-											if load.blob.is_some() {
-												ReadFaultPoint::AfterDeltaBlobLoad
-											} else {
+											if load.segments.is_empty() {
 												ReadFaultPoint::DeltaBlobMissing
+											} else {
+												ReadFaultPoint::AfterDeltaBlobLoad
 											},
 											database_id_ref,
 											Some(scope_ref.branch_id()),
@@ -450,7 +500,10 @@ impl Db {
 											..
 										})
 									) {
-										load.blob = None;
+										// Dropping every blob of the commit is what "the delta
+										// artifact is gone" means now that a commit can hold
+										// several: any survivor would still resolve pages.
+										load.segments.clear();
 									}
 									load
 								};
@@ -476,7 +529,9 @@ impl Db {
 										.delta_chunk_prefix(&database_id, page_ref.txid);
 									delta_blobs
 										.get(&prefix)
-										.and_then(|load| load.blob.as_ref())
+										.and_then(|load| {
+											delta_blob::segment_for_page(&load.segments, *pgno)
+										})
 										.is_some()
 								});
 							if has_present_delta {
@@ -524,15 +579,23 @@ impl Db {
 						.await?;
 
 					for pgno in &pgnos_in_range {
+						// A page resolves through the key of the blob that can hold it, not through its
+						// commit's prefix: a segmented commit stores its pages across several blobs, so
+						// two pages of one commit can resolve to different ones. When the commit has no
+						// blob at all the prefix stands in, so the missing-delta bookkeeping below still
+						// has a stable identity to record.
 						let preferred_delta = pidx_by_pgno.get(pgno).copied().map(|page_ref| {
-							(
-								page_ref
-									.source
-									.delta_chunk_prefix(&database_id, page_ref.txid),
-								page_ref.source,
-								page_ref.txid,
-								page_ref.kind,
-							)
+							let txid_prefix = page_ref
+								.source
+								.delta_chunk_prefix(&database_id, page_ref.txid);
+							let blob_key = delta_blobs
+								.get(&txid_prefix)
+								.and_then(|load| {
+									delta_blob::segment_for_page(&load.segments, *pgno)
+								})
+								.map(|segment| segment.key.clone())
+								.unwrap_or(txid_prefix);
+							(blob_key, page_ref.source, page_ref.txid, page_ref.kind)
 						});
 
 						if preferred_delta
@@ -552,19 +615,27 @@ impl Db {
 							}
 						}
 
-						if let Some((delta_prefix, _delta_source, delta_txid, delta_kind)) = preferred_delta
+						if let Some((delta_prefix, delta_source, delta_txid, delta_kind)) = preferred_delta
 							.as_ref()
 							.filter(|(prefix, _, _, _)| !missing_delta_prefixes.contains(prefix))
 						{
 							if !source_blobs.contains_key(delta_prefix) {
+								let txid_prefix = delta_source
+									.delta_chunk_prefix(&database_id, *delta_txid);
 								let delta_load = delta_blobs
-									.get(delta_prefix)
+									.get(&txid_prefix)
 									.expect("delta blob prefetched for every PIDX prefix");
 								debug.delta_blob_loads += 1;
-								debug.delta_chunk_rows_scanned += delta_load.chunk_rows_scanned;
-								if let Some(blob) = delta_load.blob.as_ref() {
-									debug.delta_blob_bytes += blob.len();
-									source_blobs.insert(delta_prefix.clone(), blob.clone());
+								// One scan covers the whole commit, so its rows are counted once even
+								// when several of its blobs are consulted.
+								if counted_delta_txids.insert(txid_prefix) {
+									debug.delta_chunk_rows_scanned += delta_load.chunk_rows_scanned;
+								}
+								if let Some(segment) =
+									delta_blob::segment_for_page(&delta_load.segments, *pgno)
+								{
+									debug.delta_blob_bytes += segment.blob.len();
+									source_blobs.insert(delta_prefix.clone(), segment.blob.clone());
 								} else {
 									debug.delta_blob_missing += 1;
 									missing_delta_prefixes.insert(delta_prefix.clone());
@@ -608,7 +679,7 @@ impl Db {
 							debug.hot_shard_range_scans += 1;
 							debug.hot_shard_rows_scanned += shard_load.rows_scanned;
 							let source = shard_load.source.clone();
-							if let Some((_, blob)) = source.as_ref() {
+							if let Some((_, _, blob)) = source.as_ref() {
 								debug.hot_shard_hits += 1;
 								debug.hot_shard_bytes += blob.len();
 							} else {
@@ -617,7 +688,7 @@ impl Db {
 							shard_sources.insert(shard_id, source);
 						}
 
-						if let Some((source_key, blob)) =
+						if let Some((source_branch_id, source_key, blob)) =
 							shard_sources.get(&shard_id).cloned().flatten()
 						{
 							if !source_blobs.contains_key(&source_key) {
@@ -625,7 +696,7 @@ impl Db {
 							}
 							if collect_provenance {
 								let (source_shard_id, source_as_of_txid) =
-									decode_branch_shard_source_key(scope.branch_id(), &source_key)
+									decode_branch_shard_source_key(source_branch_id, &source_key)
 										.unwrap_or((shard_id, 0));
 								let candidate = PageSourceCandidate {
 									kind: PageSourceKind::HotShard,
@@ -640,6 +711,7 @@ impl Db {
 							page_sources.insert(*pgno, source_key);
 							shard_cache_read_outcomes.insert(*pgno, ShardCacheReadOutcome::FdbHit);
 							touched_cache_backed_page = true;
+							touched_shards.insert(shard_id);
 						}
 					}
 					metrics::observe_get_pages_phase(
@@ -657,6 +729,7 @@ impl Db {
 							&tx,
 							branch_id,
 							cached_access_bucket,
+							&touched_shards,
 							now_ms,
 						)
 						.await?
@@ -684,8 +757,7 @@ impl Db {
 			.await?;
 
 		let mut tx_result = tx_result;
-
-		let mut stale_pidx_pgnos = tx_result.stale_pidx_pgnos;
+		let stale_pidx_pgnos = tx_result.stale_pidx_pgnos;
 
 		let mut decoded_blobs = BTreeMap::<Vec<u8>, std::sync::Arc<LtxBlob>>::new();
 		let mut pages = Vec::with_capacity(pgnos.len());
@@ -775,19 +847,40 @@ impl Db {
 					});
 					(selected.kind, selected.txid, selected.shard_id)
 				} else if source_key.starts_with(&keys::branch_delta_prefix(tx_result.branch_id)) {
-					stale_pidx_pgnos.insert(pgno);
-					tx_result.debug.stale_delta_pages += 1;
-					(
-						PageSourceKind::StaleDelta,
-						selected.and_then(|x| x.txid),
-						None,
-					)
+					// A PIDX row names this delta as the page's owner, so the delta must carry the
+					// page. Zero-filling here would hand SQLite a blank page in place of committed
+					// data, which is exactly how a compaction defect becomes a malformed database.
+					// Fail the read instead so the defect is visible where it happened.
+					let txid =
+						keys::decode_branch_delta_chunk_txid(tx_result.branch_id, source_key)
+							.ok()
+							.or_else(|| selected.and_then(|x| x.txid))
+							.unwrap_or_default();
+					tracing::error!(
+						database_id = %database_id_for_log,
+						pgno,
+						txid,
+						"pidx-owned delta does not carry its page"
+					);
+					return Err(SqliteStorageError::DeltaPageMissing { pgno, txid }.into());
 				} else {
-					(
-						PageSourceKind::ZeroFill,
-						None,
-						selected.and_then(|x| x.shard_id),
-					)
+					// The read resolved to a shard image, and every shard image is required to be a
+					// complete image of its shard, so this is a compaction defect. The page is still
+					// served as zeros rather than failing the whole batch, because the open-time
+					// preload fetches many pages at once and a hard error here would make an already
+					// damaged database unopenable rather than merely wrong. The metric and log are
+					// what make the state visible.
+					let shard_id = selected.and_then(|x| x.shard_id);
+					tracing::warn!(
+						database_id = %database_id_for_log,
+						pgno,
+						shard_id,
+						"shard image does not carry a page it should cover; serving zeros"
+					);
+					metrics::SQLITE_READ_SHARD_PAGE_MISSING_TOTAL
+						.with_label_values(&[node_id.as_str()])
+						.inc();
+					(PageSourceKind::ZeroFill, None, shard_id)
 				};
 				(
 					bytes
@@ -859,12 +952,39 @@ impl Db {
 		if allow_side_effects {
 			self.read_bytes_since_rollup
 				.fetch_add(returned_bytes, std::sync::atomic::Ordering::Relaxed);
+
+			// Return overflow pages referenced by the requested leaf pages up front.
+			// This runs before taking the cache-snapshot write lock because it issues
+			// nested get_pages calls that take the lock themselves. Expansion is a
+			// best-effort prefetch: an error here must not fail the base read, whose
+			// requested pages are already materialized.
+			if options.expand_overflow {
+				if let Err(err) = self
+					.expand_overflow_pages(&mut pages, tx_result.db_size_pages)
+					.await
+				{
+					tracing::warn!(
+						database_id = %self.database_id,
+						?err,
+						"sqlite overflow prefetch expansion failed; returning base pages",
+					);
+				}
+			}
+
 			let mut cache_snapshot = self.cache_snapshot.write().await;
 			let current_branch_id = cache_snapshot.as_ref().map(|snapshot| snapshot.branch_id);
 			let publish_branch_changed =
 				cache::branch_cache_changed(current_branch_id, tx_result.branch_id);
+			// The lazy per-page cache is only valid at a single head. If the head
+			// advanced since the cached snapshot, its entries may now be stale, so
+			// reset to a fresh index and repopulate from this read instead of reusing
+			// the old Arc (which would serve stale ownership at the new head).
 			#[cfg(feature = "pidx-cache")]
-			let pidx = if publish_branch_changed {
+			let cache_head_changed = cache_snapshot
+				.as_ref()
+				.is_some_and(|snapshot| snapshot.cache_head_txid != tx_result.head_txid);
+			#[cfg(feature = "pidx-cache")]
+			let pidx = if publish_branch_changed || cache_head_changed {
 				std::sync::Arc::new(DeltaPageIndex::new())
 			} else {
 				cache_snapshot
@@ -877,7 +997,7 @@ impl Db {
 			#[cfg(not(feature = "pidx-cache"))]
 			let _ = publish_branch_changed;
 			if let Some(loaded_pidx_rows) = tx_result.loaded_pidx_rows.take() {
-				metrics::SQLITE_PUMP_PIDX_FDB_LOAD_TOTAL
+				metrics::SQLITE_PUMP_PIDX_COLD_SCAN_TOTAL
 					.with_label_values(labels)
 					.inc();
 
@@ -921,6 +1041,7 @@ impl Db {
 				pages_from_delta = tx_result.debug.pages_from_delta,
 				pages_from_historical_delta = tx_result.debug.pages_from_historical_delta,
 				pages_from_hot_shard = tx_result.debug.pages_from_hot_shard,
+				pages_from_cold = tx_result.debug.pages_from_cold,
 				zero_fill_pages = tx_result.debug.zero_fill_pages,
 				out_of_range_pages = tx_result.debug.out_of_range_pages,
 				stale_delta_pages = tx_result.debug.stale_delta_pages,
@@ -949,6 +1070,8 @@ impl Db {
 				hot_shard_hits = tx_result.debug.hot_shard_hits,
 				hot_shard_misses = tx_result.debug.hot_shard_misses,
 				hot_shard_bytes = tx_result.debug.hot_shard_bytes,
+				cold_page_loads = tx_result.debug.cold_page_loads,
+				cold_page_bytes = tx_result.debug.cold_page_bytes,
 				source_blob_count = tx_result.debug.source_blob_count,
 				source_blob_bytes = tx_result.debug.source_blob_bytes,
 				decoded_source_blobs = tx_result.debug.decoded_source_blobs,
@@ -957,11 +1080,52 @@ impl Db {
 			);
 		}
 
+		let returned_bytes = pages
+			.iter()
+			.filter_map(|page| page.bytes.as_ref().map(Vec::len))
+			.fold(0_usize, usize::saturating_add);
+		metrics::SQLITE_PUMP_GET_PAGES_RETURNED_BYTES
+			.with_label_values(labels)
+			.observe(returned_bytes as f64);
+
+		// Page one's header carries its own copy of the database size, and the commit row for the
+		// txid this read resolved to carries the authoritative one. They are written together, so a
+		// disagreement means the read served a page one from a different point in history than the
+		// size it was paired with. That is what makes the failure destructive rather than merely
+		// wrong: the VFS latches the header's size at open and never revisits it, so a short page
+		// one silently truncates every page above it on the next commit.
+		if let Some(page_db_size_pages) = pages
+			.iter()
+			.find(|page| page.pgno == 1)
+			.and_then(|page| page.bytes.as_deref())
+			.and_then(sqlite_page::header_db_size_pages)
+		{
+			if page_db_size_pages != tx_result.db_size_pages {
+				tracing::error!(
+					database_id = %database_id_for_log,
+					txid = tx_result.head_txid,
+					page_db_size_pages,
+					head_db_size_pages = tx_result.db_size_pages,
+					"sqlite page one disagrees with the database size at its txid"
+				);
+				metrics::SQLITE_READ_STALE_MAIN_PAGE_TOTAL
+					.with_label_values(&[node_id.as_str()])
+					.inc();
+				return Err(SqliteStorageError::StaleMainPage {
+					txid: tx_result.head_txid,
+					page_db_size_pages,
+					head_db_size_pages: tx_result.db_size_pages,
+				}
+				.into());
+			}
+		}
+
 		Ok(GetPagesResult {
 			pages,
 			head_txid: tx_result.head_txid,
 			db_size_pages: tx_result.db_size_pages,
 			provenance,
+			read_stats: tx_result.debug.read_stats(),
 		})
 	}
 
@@ -1064,7 +1228,7 @@ struct GetPagesTxResult {
 	access_bucket: Option<i64>,
 	head_txid: u64,
 	db_size_pages: u32,
-	loaded_pidx_rows: Option<Vec<(u32, u64)>>,
+	loaded_pidx_rows: Option<Vec<(u32, Option<u64>)>>,
 	page_sources: BTreeMap<u32, Vec<u8>>,
 	source_blobs: BTreeMap<Vec<u8>, Vec<u8>>,
 	page_candidates: BTreeMap<u32, Vec<PageSourceCandidate>>,
@@ -1084,6 +1248,7 @@ struct GetPagesDebug {
 	pages_from_delta: usize,
 	pages_from_historical_delta: usize,
 	pages_from_hot_shard: usize,
+	pages_from_cold: usize,
 	zero_fill_pages: usize,
 	out_of_range_pages: usize,
 	stale_delta_pages: usize,
@@ -1103,6 +1268,8 @@ struct GetPagesDebug {
 	page_sources_len: usize,
 	historical_delta_chunk_rows_scanned: usize,
 	historical_delta_txids_decoded: usize,
+	historical_delta_scan_floor_txid: u64,
+	historical_delta_pages_shard_superseded: usize,
 	delta_blob_loads: usize,
 	delta_blob_missing: usize,
 	delta_chunk_rows_scanned: usize,
@@ -1112,6 +1279,8 @@ struct GetPagesDebug {
 	hot_shard_hits: usize,
 	hot_shard_misses: usize,
 	hot_shard_bytes: usize,
+	cold_page_loads: usize,
+	cold_page_bytes: usize,
 	source_blob_count: usize,
 	source_blob_bytes: usize,
 	decoded_source_blobs: usize,
@@ -1126,13 +1295,22 @@ impl GetPagesDebug {
 			|| self.hot_shard_rows_scanned >= SQLITE_GET_PAGES_DEBUG_EXPENSIVE_ROWS
 	}
 
+	fn read_stats(&self) -> GetPagesReadStats {
+		GetPagesReadStats {
+			historical_delta_chunk_rows_scanned: self.historical_delta_chunk_rows_scanned,
+			historical_delta_txids_decoded: self.historical_delta_txids_decoded,
+			historical_delta_scan_floor_txid: self.historical_delta_scan_floor_txid,
+			historical_delta_pages_shard_superseded: self.historical_delta_pages_shard_superseded,
+		}
+	}
+
 	fn record_winner(&mut self, kind: PageSourceKind) {
 		match kind {
 			PageSourceKind::PidxDelta => self.pages_from_delta += 1,
 			PageSourceKind::HistoricalDelta => self.pages_from_historical_delta += 1,
 			PageSourceKind::MissingDelta => self.stale_delta_pages += 1,
-			PageSourceKind::StaleDelta => self.stale_delta_pages += 1,
 			PageSourceKind::HotShard => self.pages_from_hot_shard += 1,
+			PageSourceKind::Cold => self.pages_from_cold += 1,
 			PageSourceKind::ZeroFill => self.zero_fill_pages += 1,
 			PageSourceKind::OutOfRange => self.out_of_range_pages += 1,
 		}
@@ -1201,12 +1379,12 @@ fn mark_provenance_winner(
 			if candidate.reason.is_none() {
 				candidate.reason = Some(
 					match winner_kind {
-						PageSourceKind::StaleDelta => "delta_does_not_contain_page",
 						PageSourceKind::ZeroFill => "selected_source_did_not_contain_page",
 						PageSourceKind::PidxDelta
 						| PageSourceKind::HistoricalDelta
 						| PageSourceKind::MissingDelta
 						| PageSourceKind::HotShard
+						| PageSourceKind::Cold
 						| PageSourceKind::OutOfRange => "superseded",
 					}
 					.to_string(),
@@ -1225,6 +1403,78 @@ fn mark_provenance_winner(
 	}
 }
 
+/// Point-read the PIDX owner of each requested page across sources in priority
+/// order, reading only the requested pages instead of every source's whole PIDX
+/// prefix. The first source that owns a page (with an owner txid at or below its
+/// cap) wins, matching the prior full-scan `or_insert` priority. Pages still
+/// unowned after every source are left for the DELTA-history / SHARD fallbacks.
+async fn point_read_pidx_owners(
+	tx: &universaldb::Transaction,
+	database_id: &str,
+	sources: &[ReadSource],
+	pages: &[u32],
+	debug: &mut GetPagesDebug,
+) -> Result<BTreeMap<u32, PageRef>> {
+	let mut owners = BTreeMap::new();
+	let mut remaining = pages.to_vec();
+
+	for source in sources.iter().copied() {
+		if remaining.is_empty() {
+			break;
+		}
+		debug.pidx_sources_scanned += 1;
+
+		// Point-read this source's PIDX for each still-unowned page concurrently;
+		// these are independent reads on the same transaction.
+		let reads: Vec<(u32, Option<u64>)> = stream::iter(remaining.iter().copied())
+			.map(|pgno| {
+				let key = source.pidx_key(database_id, pgno);
+				async move {
+					let txid = match tx_get_value(tx, &key).await? {
+						Some(value) => Some(decode_pidx_txid(&value)?),
+						None => None,
+					};
+					Result::<(u32, Option<u64>)>::Ok((pgno, txid))
+				}
+			})
+			.buffer_unordered(PAGE_SOURCE_FETCH_CONCURRENCY)
+			.try_collect()
+			.await?;
+
+		let mut next_remaining = Vec::new();
+		for (pgno, txid) in reads {
+			match txid {
+				Some(txid) => {
+					debug.pidx_rows_scanned += 1;
+					if debug.scanned_txid_min == 0 || txid < debug.scanned_txid_min {
+						debug.scanned_txid_min = txid;
+					}
+					if txid > debug.scanned_txid_max {
+						debug.scanned_txid_max = txid;
+					}
+					if txid <= source.max_txid() {
+						owners.entry(pgno).or_insert(PageRef {
+							source,
+							txid,
+							kind: PageRefKind::Pidx,
+						});
+					} else {
+						// An ancestor PIDX owner newer than the fork cap is ignored;
+						// the page resolves through that source's capped DELTA history
+						// or an older source.
+						debug.pidx_rows_filtered_above_max_txid += 1;
+						next_remaining.push(pgno);
+					}
+				}
+				None => next_remaining.push(pgno),
+			}
+		}
+		remaining = next_remaining;
+	}
+
+	Ok(owners)
+}
+
 async fn fill_historical_delta_refs(
 	tx: &universaldb::Transaction,
 	database_id: &str,
@@ -1240,74 +1490,272 @@ async fn fill_historical_delta_refs(
 		.collect::<BTreeSet<_>>();
 	let mut refs = BTreeMap::new();
 
-	// Prefetch each capped source's DELTA history concurrently. The per-source
-	// processing below stays sequential to preserve source priority and the
-	// early-exit once every missing page is resolved.
-	let mut scanned_delta_rows: BTreeMap<usize, Vec<(Vec<u8>, Vec<u8>)>> =
-		stream::iter(capped_sources.iter().copied().enumerate())
-			.map(move |(idx, source)| async move {
-				let rows = tx_scan_prefix_values(tx, &source.delta_prefix(database_id)).await?;
-				Result::<(usize, Vec<(Vec<u8>, Vec<u8>)>)>::Ok((idx, rows))
-			})
-			.buffer_unordered(PAGE_SOURCE_FETCH_CONCURRENCY)
-			.try_collect()
-			.await?;
-
-	for (idx, source) in capped_sources.iter().enumerate() {
-		let source_rows = scanned_delta_rows
-			.remove(&idx)
-			.expect("every capped source scanned");
+	// Walk each capped source's DELTA history newest-first, stopping as soon as
+	// every missing page is resolved. Sources are processed sequentially to
+	// preserve source priority; a source is not read at all once nothing is
+	// missing.
+	for source in capped_sources.iter().copied() {
 		if missing_pgnos.is_empty() {
 			break;
 		}
 
-		let mut chunks_by_txid = BTreeMap::<u64, Vec<(u32, Vec<u8>)>>::new();
-		for (key, chunk) in source_rows {
-			debug.historical_delta_chunk_rows_scanned += 1;
-			let txid = source.decode_delta_chunk_txid(database_id, &key)?;
-			if txid > source.max_txid() {
-				continue;
-			}
-			let chunk_idx = source.decode_delta_chunk_idx(database_id, txid, &key)?;
-			chunks_by_txid
-				.entry(txid)
-				.or_default()
-				.push((chunk_idx, chunk));
-		}
+		// Bound this source's walk by its own folded shard versions. A page whose last
+		// write at or below the cap was already folded appears in no retained delta, so
+		// without this bound the walk runs the source's whole retained history to
+		// exhaustion on every read before the SHARD fallback gets a turn.
+		let shard_ids = missing_pgnos
+			.iter()
+			.map(|pgno| pgno / SHARD_SIZE)
+			.collect::<BTreeSet<_>>();
+		let shard_fold_floors = tx_load_source_shard_fold_floors(tx, source, &shard_ids).await?;
 
-		for (txid, mut chunks) in chunks_by_txid.into_iter().rev() {
-			if missing_pgnos.is_empty() {
-				break;
-			}
+		scan_source_delta_history(
+			tx,
+			database_id,
+			source,
+			&missing_pgnos,
+			&shard_fold_floors,
+			&mut refs,
+			debug,
+		)
+		.await?;
 
-			chunks.sort_by_key(|(chunk_idx, _)| *chunk_idx);
-			let mut blob = Vec::new();
-			for (_, chunk) in chunks {
-				blob.extend_from_slice(&chunk);
-			}
-			let decoded = decode_ltx_v3(&blob)
-				.with_context(|| format!("decode historical sqlite delta {txid}"))?;
-			debug.historical_delta_txids_decoded += 1;
-			let found_pgnos = missing_pgnos
-				.iter()
-				.copied()
-				.filter(|pgno| decoded.get_page(*pgno).is_some())
-				.collect::<Vec<_>>();
-			for pgno in found_pgnos {
-				refs.insert(
-					pgno,
-					PageRef {
-						source: *source,
-						txid,
-						kind: PageRefKind::HistoricalDelta,
-					},
-				);
-				missing_pgnos.remove(&pgno);
-			}
-		}
+		// Pages this source resolved are done; the rest fall through to the next
+		// source, which walks its own history under its own floors.
+		missing_pgnos.retain(|pgno| !refs.contains_key(pgno));
 	}
 
 	Ok(refs)
+}
+
+/// Txid below which `pgno` is already covered by one of the source's folded shard versions, if it
+/// has one.
+fn page_shard_fold_floor(shard_fold_floors: &BTreeMap<u32, u64>, pgno: u32) -> Option<u64> {
+	shard_fold_floors.get(&(pgno / SHARD_SIZE)).copied()
+}
+
+/// Lowest txid the DELTA-history walk still has to read for `pages`. Each page is superseded below
+/// its shard's floor, so the walk can stop at the lowest floor among them; a page whose shard has no
+/// floor keeps the walk unbounded below.
+fn delta_history_scan_floor(pages: &BTreeSet<u32>, shard_fold_floors: &BTreeMap<u32, u64>) -> u64 {
+	pages
+		.iter()
+		.map(|pgno| page_shard_fold_floor(shard_fold_floors, *pgno).unwrap_or(0))
+		.min()
+		.unwrap_or(0)
+}
+
+/// Drops the pages whose shard floor sits at or above `txid`, so the walk stops searching for them as
+/// it descends past their fold. Returns the number dropped.
+fn drop_shard_superseded_pages(
+	pages: &mut BTreeSet<u32>,
+	shard_fold_floors: &BTreeMap<u32, u64>,
+	txid: u64,
+) -> usize {
+	let superseded = pages
+		.iter()
+		.copied()
+		.filter(|pgno| {
+			page_shard_fold_floor(shard_fold_floors, *pgno).is_some_and(|floor| floor >= txid)
+		})
+		.collect::<Vec<_>>();
+	for pgno in &superseded {
+		pages.remove(pgno);
+	}
+
+	superseded.len()
+}
+
+/// Walk a single source's DELTA history from `source.max_txid()` downward in
+/// bounded reverse range reads, decoding each fully-gathered txid and resolving
+/// any missing pages it covers. Returns once every missing page is resolved, every
+/// remaining page is covered by one of this source's shard versions, or the history
+/// above those versions is exhausted, so a recent page never reads more than the
+/// first batch and a folded page reads no history at all.
+async fn scan_source_delta_history(
+	tx: &universaldb::Transaction,
+	database_id: &str,
+	source: ReadSource,
+	missing_pgnos: &BTreeSet<u32>,
+	shard_fold_floors: &BTreeMap<u32, u64>,
+	refs: &mut BTreeMap<u32, PageRef>,
+	debug: &mut GetPagesDebug,
+) -> Result<()> {
+	// Pages this source's history can still resolve. Shrinks as deltas resolve pages and
+	// as the walk descends past a page's shard version, and is local to this source so a
+	// page a shard version covers here still reaches the next source.
+	let mut searching = missing_pgnos.clone();
+	debug.historical_delta_pages_shard_superseded +=
+		drop_shard_superseded_pages(&mut searching, shard_fold_floors, source.max_txid());
+
+	// Start the reverse walk just above the source cap so chunks newer than
+	// max_txid are never read, even on an ancestor source whose parent received
+	// many commits after this source's fork point. The cap txid holds multiple
+	// chunk rows, so the exclusive bound must sit past its largest possible chunk
+	// suffix to keep every chunk of the cap txid in range; `delta_txid_scan_end`
+	// owns that, so the bound does not have to assume how wide a suffix is.
+	let mut batch_end = source.delta_txid_scan_end(database_id, source.max_txid());
+	// Chunks for the txid currently being gathered. Reverse key order yields a
+	// txid's chunks contiguously (high chunk index to low), so the gathered set is
+	// complete the moment a lower txid appears or the history ends.
+	let mut pending: Option<(u64, Vec<(Vec<u8>, Vec<u8>)>)> = None;
+
+	loop {
+		if searching.is_empty() {
+			break;
+		}
+
+		// Read no deeper than the lowest shard version still covering a searched page.
+		// Recomputed per batch because resolving a page can raise the floor.
+		let scan_floor = delta_history_scan_floor(&searching, shard_fold_floors);
+		if scan_floor > debug.historical_delta_scan_floor_txid {
+			debug.historical_delta_scan_floor_txid = scan_floor;
+		}
+		let begin = if scan_floor == 0 {
+			source.delta_prefix(database_id)
+		} else {
+			source.delta_chunk_prefix(database_id, scan_floor.saturating_add(1))
+		};
+		if begin.as_slice() >= batch_end.as_slice() {
+			break;
+		}
+
+		let batch =
+			tx_scan_range_reverse_limited(tx, &begin, &batch_end, DELTA_HISTORY_SCAN_BATCH_KEYS)
+				.await?;
+		if batch.is_empty() {
+			break;
+		}
+		let batch_len = batch.len();
+		let mut last_key = None;
+
+		for (key, chunk) in batch {
+			debug.historical_delta_chunk_rows_scanned += 1;
+			let txid = source.decode_delta_chunk_txid(database_id, &key)?;
+
+			let same_txid = matches!(&pending, Some((pending_txid, _)) if *pending_txid == txid);
+			if !same_txid {
+				if let Some((pending_txid, pending_chunks)) = pending.take() {
+					process_delta_txid(
+						source,
+						pending_txid,
+						pending_chunks,
+						&mut searching,
+						refs,
+						debug,
+					)?;
+				}
+				// Descending past a page's shard version means no lower delta can
+				// improve on it, so it stops being searched and falls to that version.
+				debug.historical_delta_pages_shard_superseded +=
+					drop_shard_superseded_pages(&mut searching, shard_fold_floors, txid);
+				if searching.is_empty() {
+					pending = None;
+					last_key = None;
+					break;
+				}
+				pending = Some((txid, Vec::new()));
+			}
+
+			pending
+				.as_mut()
+				.expect("pending initialized above")
+				.1
+				.push((key.clone(), chunk));
+			last_key = Some(key);
+		}
+
+		if searching.is_empty() {
+			break;
+		}
+		// A short batch means the range is exhausted.
+		if batch_len < DELTA_HISTORY_SCAN_BATCH_KEYS {
+			break;
+		}
+		match last_key {
+			// Continue strictly below the smallest key read this batch.
+			Some(key) => batch_end = key,
+			None => break,
+		}
+	}
+
+	if !searching.is_empty() {
+		if let Some((pending_txid, pending_chunks)) = pending.take() {
+			process_delta_txid(
+				source,
+				pending_txid,
+				pending_chunks,
+				&mut searching,
+				refs,
+				debug,
+			)?;
+		}
+	}
+
+	Ok(())
+}
+
+/// Decode one fully-gathered delta txid and record a `HistoricalDelta` ref for
+/// every page still being searched that it covers.
+///
+/// A commit's rows are reassembled into its blobs rather than concatenated. A segmented commit
+/// stores one self-contained LTX blob per shard-aligned page range and every one of them restarts
+/// its chunk index at zero, so sorting the rows by chunk index and joining them yields interleaved
+/// bytes rather than a decodable file.
+///
+/// Only the blobs that can hold a page still being searched are decoded. Segments cover disjoint
+/// page ranges, so a walk looking for one page does not pay to decode the rest of a large commit.
+fn process_delta_txid(
+	source: ReadSource,
+	txid: u64,
+	rows: Vec<(Vec<u8>, Vec<u8>)>,
+	searching: &mut BTreeSet<u32>,
+	refs: &mut BTreeMap<u32, PageRef>,
+	debug: &mut GetPagesDebug,
+) -> Result<()> {
+	if searching.is_empty() {
+		return Ok(());
+	}
+
+	let segments = source.reassemble_delta_segments(txid, rows)?;
+	debug.historical_delta_txids_decoded += 1;
+
+	let mut by_segment = BTreeMap::<usize, Vec<u32>>::new();
+	for pgno in searching.iter().copied() {
+		if let Some(idx) = delta_blob::segment_index_for_page(&segments, pgno) {
+			by_segment.entry(idx).or_default().push(pgno);
+		}
+	}
+
+	let mut found_pgnos = Vec::new();
+	for (idx, pgnos) in by_segment {
+		let segment = &segments[idx];
+		let decoded = decode_ltx_v3(&segment.blob).with_context(|| {
+			format!(
+				"decode historical sqlite delta {txid} segment {:?}",
+				segment.first_pgno
+			)
+		})?;
+		found_pgnos.extend(
+			pgnos
+				.into_iter()
+				.filter(|pgno| decoded.get_page(*pgno).is_some()),
+		);
+	}
+
+	for pgno in found_pgnos {
+		refs.insert(
+			pgno,
+			PageRef {
+				source,
+				txid,
+				kind: PageRefKind::HistoricalDelta,
+			},
+		);
+		searching.remove(&pgno);
+	}
+
+	Ok(())
 }
 
 #[cfg(feature = "test-faults")]

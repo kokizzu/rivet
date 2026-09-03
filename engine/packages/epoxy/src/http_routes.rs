@@ -21,6 +21,22 @@ pub fn mount_routes(
 			"/v{version}/epoxy/changelog-read",
 			bin::post(changelog_read),
 		)
+		// Deliberately unversioned: a peer probes this to find out which versions we speak, so it
+		// has to stay reachable by a replica that shares no protocol version with us.
+		.route("/epoxy/protocol-version", get(protocol_version))
+}
+
+/// Publishes the epoxy protocol version this datacenter agreed on, for peer replicas in other
+/// datacenters to probe. Their heartbeats live in a different database, so this is the only way they
+/// can learn what we accept.
+pub async fn protocol_version(
+	ctx: ApiCtx,
+	_path: (),
+	_query: (),
+) -> Result<crate::protocol_version::ProtocolVersionResponse> {
+	Ok(crate::protocol_version::ProtocolVersionResponse {
+		protocol_version: ctx.config().protocols().epoxy.version(),
+	})
 }
 
 pub async fn message(ctx: ApiCtx, path: ProtocolPath, _query: (), body: Bytes) -> Result<Vec<u8>> {

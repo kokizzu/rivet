@@ -83,6 +83,6 @@ fn cap_check_rejects_values_over_limit() {
 
 #[test]
 fn trigger_throttle_constants_match_spec() {
-	assert_eq!(TRIGGER_THROTTLE_MS, 500);
+	assert_eq!(TRIGGER_THROTTLE_MS, 15_000);
 	assert_eq!(TRIGGER_MAX_SILENCE_MS, 30_000);
 }

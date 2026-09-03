@@ -100,10 +100,10 @@ fn to_rivet_tunnel_message_kind_name(kind: &protocol::ToRivetTunnelMessageKind) 
 
 /// Threshold above which a single tunnel-ping RTT triggers a structured warn log.
 /// Loaded once from `RIVET_GATEWAY2_SLOW_PING_THRESHOLD_MS` at process start; defaults
-/// to 50 ms. The histogram captures the full RTT distribution regardless; this only
+/// to 150 ms. The histogram captures the full RTT distribution regardless; this only
 /// controls the structured-log signal that surfaces individual slow events for
 /// post-hoc correlation with actor/envoy identity.
-static SLOW_PING_THRESHOLD_MS: AtomicU64 = AtomicU64::new(50);
+static SLOW_PING_THRESHOLD_MS: AtomicU64 = AtomicU64::new(150);
 const GATEWAY2_FALLBACK_PROTOCOL_VERSION: u16 = 6;
 
 fn gateway2_protocol_version(envoy_protocol_version: Option<u16>) -> u16 {
@@ -398,7 +398,7 @@ impl SharedState {
 		let new = match self
 			.in_flight_requests
 			.entry_async(request_id)
-			.instrument(tracing::info_span!("entry_async"))
+			.instrument(tracing::debug_span!("entry_async"))
 			.await
 		{
 			Entry::Vacant(entry) => {
@@ -441,14 +441,20 @@ impl SharedState {
 			}
 		};
 
-		ensure!(
-			!after_hibernation || !new,
-			"should not be creating a new in flight entry after hibernation"
-		);
+		// The entry is expected to still exist when waking from hibernation. It can be gone if the
+		// previous attempt stopped the request or if it was garbage collected, in which case the
+		// envoy has no record of this request and the caller has to open the websocket again.
+		if after_hibernation && new {
+			tracing::warn!(
+				request_id=%display_id(&request_id),
+				"created a new in flight entry after hibernation, reopening websocket"
+			);
+		}
 
 		Ok(InFlightRequestCtx {
 			msg_rx,
 			drop_rx,
+			created: new,
 			handle: InFlightRequestHandle {
 				shared_state: self.clone(),
 				request_id,
@@ -483,6 +489,7 @@ impl SharedState {
 		Ok(InFlightRequestCtx {
 			msg_rx,
 			drop_rx,
+			created: false,
 			handle: InFlightRequestHandle {
 				shared_state: self.clone(),
 				request_id,
@@ -490,7 +497,7 @@ impl SharedState {
 		})
 	}
 
-	#[tracing::instrument(skip_all)]
+	#[tracing::instrument(level = "debug", skip_all)]
 	async fn gc(&self) {
 		let mut interval = tokio::time::interval(self.gc_interval);
 		interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -502,7 +509,7 @@ impl SharedState {
 		}
 	}
 
-	#[tracing::instrument(skip_all)]
+	#[tracing::instrument(level = "debug", skip_all)]
 	async fn gc_in_flight_requests(&self) {
 		let now = Instant::now();
 		let hibernation_timeout =
@@ -553,7 +560,7 @@ impl SharedState {
 					true
 				}
 			})
-			.instrument(tracing::info_span!("retain_async"))
+			.instrument(tracing::debug_span!("retain_async"))
 			.await;
 	}
 }
@@ -573,6 +580,8 @@ pub struct InFlightRequestCtx {
 	/// This is separate from `msg_rx` there may still be messages that need to be sent to the
 	/// request after `msg_rx` has dropped.
 	pub drop_rx: watch::Receiver<Option<MsgGcReason>>,
+	/// Whether a new in flight entry was created instead of reusing an existing one.
+	pub created: bool,
 	pub handle: InFlightRequestHandle,
 }
 
@@ -583,7 +592,7 @@ pub struct InFlightRequestHandle {
 }
 
 impl InFlightRequestHandle {
-	#[tracing::instrument(skip_all, fields(request_id=%display_id(&self.request_id)))]
+	#[tracing::instrument(level = "debug", skip_all, fields(request_id=%display_id(&self.request_id)))]
 	pub async fn send_message(
 		&self,
 		message_kind: protocol::ToEnvoyTunnelMessageKind,
@@ -768,7 +777,7 @@ impl InFlightRequestHandle {
 						attempt_bucket(attempt),
 					])
 					.inc();
-				tracing::warn!(
+				tracing::debug!(
 					%namespace_id,
 					%pool_name,
 					?actor_key,
@@ -827,7 +836,7 @@ impl InFlightRequestHandle {
 		Ok(())
 	}
 
-	#[tracing::instrument(skip_all, fields(request_id=%display_id(&self.request_id)))]
+	#[tracing::instrument(level = "debug", skip_all, fields(request_id=%display_id(&self.request_id)))]
 	pub async fn send_and_check_ping(&self) -> Result<()> {
 		let req = self
 			.shared_state
@@ -902,7 +911,7 @@ impl InFlightRequestHandle {
 		Ok(())
 	}
 
-	#[tracing::instrument(skip_all, fields(request_id=%display_id(&self.request_id)))]
+	#[tracing::instrument(level = "debug", skip_all, fields(request_id=%display_id(&self.request_id)))]
 	pub async fn keepalive_hws(&self) -> Result<()> {
 		let mut req = self
 			.shared_state
@@ -919,7 +928,7 @@ impl InFlightRequestHandle {
 
 		Ok(())
 	}
-	#[tracing::instrument(skip_all, fields(request_id=%display_id(&self.request_id), %enable))]
+	#[tracing::instrument(level = "debug", skip_all, fields(request_id=%display_id(&self.request_id), %enable))]
 	pub async fn toggle_hibernatable(&self, enable: bool) -> Result<()> {
 		let mut req = self
 			.shared_state
@@ -1155,7 +1164,7 @@ impl InFlightRequest {
 		}
 	}
 
-	#[tracing::instrument(skip_all)]
+	#[tracing::instrument(level = "debug", skip_all)]
 	fn recv_message(&mut self, msg: protocol::ToGateway) {
 		match msg {
 			protocol::ToGateway::ToGatewayPong(pong) => {
@@ -1176,8 +1185,7 @@ impl InFlightRequest {
 
 						// Slow-ping structured log. Threshold is intentionally well below the
 						// tunnel_ping_timeout so we get an early-warning record per slow round
-						// trip. Tunable via RIVET_GATEWAY2_SLOW_PING_THRESHOLD_MS, defaults to
-						// 50 ms (~25× healthy baseline of 2 ms).
+						// trip.
 						let slow_threshold_ms = SLOW_PING_THRESHOLD_MS.load(Ordering::Relaxed);
 						if (rtt as u64) > slow_threshold_ms {
 							tracing::warn!(

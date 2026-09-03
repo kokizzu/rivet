@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
@@ -7,14 +7,15 @@ use depot::{
 	keys,
 	ltx::{DecodedLtx, decode_ltx_v3},
 	types::{
-		BranchState, BucketId, CommitRow, DatabaseBranchId, decode_commit_row,
-		decode_compaction_root, decode_database_branch_record, decode_database_pointer,
-		decode_db_head, decode_db_history_pin, decode_pitr_interval_coverage,
-		decode_sqlite_cmp_dirty,
+		BranchState, BucketId, ColdShardRef, CommitRow, DatabaseBranchId, decode_cold_shard_ref,
+		decode_commit_row, decode_compaction_root, decode_database_branch_record,
+		decode_database_pointer, decode_db_head, decode_db_history_pin,
+		decode_pitr_interval_coverage, decode_retired_cold_object, decode_sqlite_cmp_dirty,
 	},
 };
 use futures_util::TryStreamExt;
 use rivet_pools::__rivet_util::Id;
+use sha2::{Digest, Sha256};
 use universaldb::{
 	RangeOption,
 	options::StreamingMode,
@@ -33,6 +34,13 @@ struct BranchRows {
 	commits: BTreeMap<u64, CommitRow>,
 	deltas: BTreeMap<u64, DecodedLtx>,
 	shards: BTreeMap<(u32, u64), DecodedLtx>,
+	cold_refs: Vec<ColdRefCoverage>,
+}
+
+/// A cold shard ref left behind by an enterprise build. Nothing here publishes one, but a branch
+/// carried over from such a build still has to satisfy the ref invariants.
+struct ColdRefCoverage {
+	reference: ColdShardRef,
 }
 
 impl DepotInvariantScanner {
@@ -207,10 +215,12 @@ impl<'a> InvariantScan<'a> {
 		let commits = self.check_commits(branch_id, head_txid).await?;
 		let deltas = self.check_deltas(branch_id, &commits).await?;
 		let shards = self.check_shards(branch_id, head_txid, &commits).await?;
+		let cold_refs = self.check_cold_refs(branch_id, &commits).await?;
 		Ok(BranchRows {
 			commits,
 			deltas,
 			shards,
+			cold_refs,
 		})
 	}
 
@@ -270,7 +280,11 @@ impl<'a> InvariantScan<'a> {
 		branch_id: DatabaseBranchId,
 		commits: &BTreeMap<u64, CommitRow>,
 	) -> Result<BTreeMap<u64, DecodedLtx>> {
-		let mut chunks = BTreeMap::<u64, BTreeMap<u32, Vec<u8>>>::new();
+		// Grouped per segment, not per txid. A large commit is stored as one self-contained LTX
+		// blob per shard-aligned page range and every one of them numbers its chunks from zero, so
+		// grouping a txid's rows by chunk index alone would collide the segments' chunk 0 against
+		// each other and then concatenate whatever survived.
+		let mut chunks = BTreeMap::<(u64, Option<u32>), BTreeMap<u32, Vec<u8>>>::new();
 		for (key, value) in scan_prefix(self.tx, keys::branch_delta_prefix(branch_id)).await? {
 			let txid = match keys::decode_branch_delta_chunk_txid(branch_id, &key) {
 				Ok(txid) => txid,
@@ -279,9 +293,12 @@ impl<'a> InvariantScan<'a> {
 					continue;
 				}
 			};
-			match keys::decode_branch_delta_chunk_idx(branch_id, txid, &key) {
-				Ok(chunk_idx) => {
-					chunks.entry(txid).or_default().insert(chunk_idx, value);
+			match keys::decode_branch_delta_chunk_ref(branch_id, txid, &key) {
+				Ok(chunk_ref) => {
+					chunks
+						.entry((txid, chunk_ref.first_pgno()))
+						.or_default()
+						.insert(chunk_ref.chunk_idx(), value);
 				}
 				Err(err) => {
 					self.violate(format!("delta chunk key failed to decode index: {err:#}"))
@@ -289,12 +306,16 @@ impl<'a> InvariantScan<'a> {
 			}
 		}
 
-		let mut deltas = BTreeMap::new();
-		for (txid, chunk_map) in chunks {
+		// One entry per txid still, with a commit's segments merged. Their page ranges are disjoint
+		// and ascending, so concatenating the decoded pages keeps them sorted, which is what
+		// `DecodedLtx::get_page` binary searches. `page_index` offsets address one backing blob and
+		// a merged delta has none, so it is left empty; nothing here reads it.
+		let mut deltas = BTreeMap::<u64, DecodedLtx>::new();
+		for ((txid, first_pgno), chunk_map) in chunks {
 			for expected_idx in 0..u32::try_from(chunk_map.len()).unwrap_or(u32::MAX) {
 				if !chunk_map.contains_key(&expected_idx) {
 					self.violate(format!(
-						"delta txid {txid} was missing chunk {expected_idx}"
+						"delta txid {txid} segment {first_pgno:?} was missing chunk {expected_idx}"
 					));
 				}
 			}
@@ -304,11 +325,20 @@ impl<'a> InvariantScan<'a> {
 				bytes.extend_from_slice(chunk);
 			}
 			match decode_ltx_v3(&bytes) {
-				Ok(delta) => {
-					self.check_ltx_pages("delta", txid, &delta, commits);
-					deltas.insert(txid, delta);
-				}
-				Err(err) => self.violate(format!("delta txid {txid} failed to decode: {err:#}")),
+				Ok(segment) => match deltas.entry(txid) {
+					std::collections::btree_map::Entry::Vacant(entry) => {
+						self.check_ltx_pages("delta", txid, &segment, commits);
+						entry.insert(segment);
+					}
+					std::collections::btree_map::Entry::Occupied(mut entry) => {
+						self.check_ltx_pages("delta", txid, &segment, commits);
+						entry.get_mut().pages.extend(segment.pages);
+						entry.get_mut().page_index.clear();
+					}
+				},
+				Err(err) => self.violate(format!(
+					"delta txid {txid} segment {first_pgno:?} failed to decode: {err:#}"
+				)),
 			}
 		}
 		Ok(deltas)
@@ -320,17 +350,42 @@ impl<'a> InvariantScan<'a> {
 		head_txid: u64,
 		commits: &BTreeMap<u64, CommitRow>,
 	) -> Result<BTreeMap<(u32, u64), DecodedLtx>> {
-		let mut shards = BTreeMap::new();
 		let compacted_through = self.compacted_commit_floor(branch_id, head_txid).await?;
+
+		// A shard image is stored as ordered chunk rows so no single value exceeds the FDB value
+		// cap, so reassemble each version before decoding it. A row with no chunk index is a
+		// pre-chunking legacy row holding the whole blob.
+		let mut chunks = BTreeMap::<(u32, u64), BTreeMap<u32, Vec<u8>>>::new();
 		for (key, value) in scan_prefix(self.tx, keys::branch_shard_prefix(branch_id)).await? {
-			let Some((shard_id, as_of_txid)) = decode_branch_shard_version_key(branch_id, &key)?
-			else {
-				continue;
-			};
+			match keys::decode_branch_shard_row_key(branch_id, &key) {
+				Ok((shard_id, as_of_txid, chunk_idx)) => {
+					chunks
+						.entry((shard_id, as_of_txid))
+						.or_default()
+						.insert(chunk_idx.unwrap_or(0), value);
+				}
+				Err(err) => self.violate(format!("hot shard key failed to decode: {err:#}")),
+			}
+		}
+
+		let mut shards = BTreeMap::new();
+		for ((shard_id, as_of_txid), chunk_map) in chunks {
+			for expected_idx in 0..u32::try_from(chunk_map.len()).unwrap_or(u32::MAX) {
+				if !chunk_map.contains_key(&expected_idx) {
+					self.violate(format!(
+						"hot shard {shard_id}/{as_of_txid} was missing chunk {expected_idx}"
+					));
+				}
+			}
+
+			let mut value = Vec::new();
+			for chunk in chunk_map.values() {
+				value.extend_from_slice(chunk);
+			}
 			match decode_ltx_v3(&value) {
 				Ok(shard) => {
 					// Hot shard cache rows can outlive compacted commit rows. The compaction
-					// root is the fence that says those commits are now represented by shard
+					// root is the fence that says those commits are now represented by cold
 					// coverage, so stale hot rows below the fence only need shape validation.
 					if commits.contains_key(&as_of_txid) || as_of_txid > compacted_through {
 						self.check_ltx_pages("hot shard", as_of_txid, &shard, commits);
@@ -346,6 +401,59 @@ impl<'a> InvariantScan<'a> {
 			}
 		}
 		Ok(shards)
+	}
+
+	async fn check_cold_refs(
+		&mut self,
+		branch_id: DatabaseBranchId,
+		commits: &BTreeMap<u64, CommitRow>,
+	) -> Result<Vec<ColdRefCoverage>> {
+		let mut refs = Vec::new();
+		let mut seen = BTreeSet::new();
+		for (key, value) in scan_prefix(
+			self.tx,
+			keys::branch_compaction_cold_shard_prefix(branch_id),
+		)
+		.await?
+		{
+			let key_parts = match decode_cold_shard_key(branch_id, &key) {
+				Ok(parts) => parts,
+				Err(err) => {
+					self.violate(format!("cold shard key failed to decode: {err:#}"));
+					continue;
+				}
+			};
+			let reference = match decode_cold_shard_ref(&value) {
+				Ok(reference) => reference,
+				Err(err) => {
+					self.violate(format!("cold shard ref failed to decode: {err:#}"));
+					continue;
+				}
+			};
+			if key_parts != (reference.shard_id, reference.as_of_txid) {
+				self.violate("cold shard ref key did not match encoded metadata");
+			}
+			if !seen.insert((reference.shard_id, reference.as_of_txid)) {
+				self.violate("duplicate cold shard ref was present");
+			}
+			if let Some(commit) = commits.get(&reference.as_of_txid) {
+				if reference.as_of_txid > reference.max_txid
+					|| reference.min_txid > reference.max_txid
+				{
+					self.violate("cold shard ref txid range was invalid");
+				}
+				if reference.shard_id > commit.db_size_pages / keys::SHARD_SIZE {
+					self.violate("cold shard ref was beyond database size");
+				}
+			} else {
+				self.violate(format!(
+					"cold shard ref pointed at missing commit {}",
+					reference.as_of_txid
+				));
+			}
+			refs.push(ColdRefCoverage { reference });
+		}
+		Ok(refs)
 	}
 
 	async fn check_pidx(
@@ -413,6 +521,29 @@ impl<'a> InvariantScan<'a> {
 					}
 				}
 				Err(err) => self.violate(format!("dirty marker failed to decode: {err:#}")),
+			}
+		}
+
+		for (key, value) in scan_prefix(
+			self.tx,
+			keys::branch_compaction_retired_cold_object_prefix(branch_id),
+		)
+		.await?
+		{
+			match decode_retired_cold_object(&value) {
+				Ok(retired) => {
+					let expected_key = keys::branch_compaction_retired_cold_object_key(
+						branch_id,
+						content_hash(retired.object_key.as_bytes()),
+					);
+					if key != expected_key {
+						self.violate("retired cold object key did not match object key hash");
+					}
+					if retired.delete_after_ms < retired.retired_at_ms {
+						self.violate("retired cold object delete fence preceded retirement time");
+					}
+				}
+				Err(err) => self.violate(format!("retired cold object failed to decode: {err:#}")),
 			}
 		}
 
@@ -560,13 +691,23 @@ impl<'a> InvariantScan<'a> {
 			return true;
 		}
 		let shard_id = pgno / keys::SHARD_SIZE;
-		rows.shards
+		if rows
+			.shards
 			.iter()
 			.any(|(&(candidate_shard, as_of_txid), shard)| {
 				candidate_shard == shard_id
 					&& as_of_txid >= owner_txid
 					&& shard.get_page(pgno).is_some()
-			})
+			}) {
+			return true;
+		}
+		// The object itself is unreachable without a cold tier, so the ref's txid range is all the
+		// coverage that can be established here.
+		rows.cold_refs.iter().any(|reference| {
+			reference.reference.shard_id == shard_id
+				&& reference.reference.min_txid <= owner_txid
+				&& reference.reference.max_txid >= owner_txid
+		})
 	}
 
 	fn violate(&mut self, message: impl Into<String>) {
@@ -632,33 +773,32 @@ fn decode_pidx_txid(value: &[u8]) -> Result<u64> {
 	Ok(u64::from_be_bytes(bytes))
 }
 
-fn decode_branch_shard_version_key(
-	branch_id: DatabaseBranchId,
-	key: &[u8],
-) -> Result<Option<(u32, u64)>> {
-	let prefix = keys::branch_shard_prefix(branch_id);
+fn decode_cold_shard_key(branch_id: DatabaseBranchId, key: &[u8]) -> Result<(u32, u64)> {
+	let prefix = keys::branch_compaction_cold_shard_prefix(branch_id);
 	let suffix = key
 		.strip_prefix(prefix.as_slice())
-		.context("branch shard key did not start with expected prefix")?;
-	if suffix.len() == std::mem::size_of::<u32>() {
-		return Ok(None);
-	}
+		.context("cold shard key did not start with expected prefix")?;
 	ensure!(
 		suffix.len() == std::mem::size_of::<u32>() + 1 + std::mem::size_of::<u64>()
 			&& suffix[std::mem::size_of::<u32>()] == b'/',
-		"branch shard key suffix had invalid length"
+		"cold shard key suffix had invalid length"
 	);
 	let shard_id = u32::from_be_bytes(
 		suffix[..std::mem::size_of::<u32>()]
 			.try_into()
-			.context("decode branch shard id")?,
+			.context("decode cold shard id")?,
 	);
 	let as_of_txid = u64::from_be_bytes(
 		suffix[std::mem::size_of::<u32>() + 1..]
 			.try_into()
-			.context("decode branch shard txid")?,
+			.context("decode cold shard txid")?,
 	);
-	Ok(Some((shard_id, as_of_txid)))
+	Ok((shard_id, as_of_txid))
+}
+
+fn content_hash(bytes: &[u8]) -> [u8; 32] {
+	let digest = Sha256::digest(bytes);
+	digest.into()
 }
 
 #[test]

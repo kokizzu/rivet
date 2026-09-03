@@ -35,7 +35,7 @@ const RUNNER_POOL_ERROR_CHECK_INTERVAL: Duration = Duration::from_secs(2);
 pub const X_RIVET_ACTOR: HeaderName = HeaderName::from_static("x-rivet-actor");
 
 /// Route requests to actor services using path-based routing
-#[tracing::instrument(skip_all)]
+#[tracing::instrument(skip_all, fields(actor_id = tracing::field::Empty))]
 pub async fn route_request_path_based(
 	ctx: &StandaloneCtx,
 	shared_state: &SharedState,
@@ -146,7 +146,7 @@ pub async fn route_request_path_based_inner(
 }
 
 /// Route requests to actor services based on headers
-#[tracing::instrument(skip_all)]
+#[tracing::instrument(skip_all, fields(actor_id = tracing::field::Empty))]
 pub async fn route_request(
 	ctx: &StandaloneCtx,
 	shared_state: &SharedState,
@@ -184,7 +184,10 @@ pub async fn route_request(
 				.build()
 			})?;
 
-		let protocols: Vec<&str> = protocols_header.split(',').map(|p| p.trim()).collect();
+		let protocols = protocols_header
+			.split(',')
+			.map(|p| p.trim())
+			.collect::<Vec<&str>>();
 
 		let actor_id_raw = protocols
 			.iter()
@@ -280,7 +283,12 @@ async fn route_request_inner(
 	_token: Option<&str>,
 	skip_ready_wait: bool,
 ) -> Result<RoutingOutput> {
-	// NOTE: Token validation implemented in EE
+	tracing::Span::current().record("actor_id", actor_id.to_string());
+
+	// Attach CORS headers to the actual (non-OPTIONS) response so both the
+	// actor response and any early error (e.g. EE auth failure) are readable
+	// by the browser.
+	set_non_preflight_cors(req_ctx);
 
 	// Route to peer dc where the actor lives
 	if actor_id.label() != ctx.config().dc_label() {
@@ -371,6 +379,8 @@ async fn route_request_inner(
 		return Err(pegboard::errors::Actor::NotFound.build());
 	};
 
+	// NOTE: Token validation implemented in EE
+
 	if actor.destroyed {
 		return Err(pegboard::errors::Actor::NotFound.build());
 	}
@@ -423,6 +433,7 @@ async fn route_request_inner(
 	}
 }
 
+#[tracing::instrument(skip_all)]
 async fn handle_actor_v2(
 	ctx: &StandaloneCtx,
 	shared_state: &SharedState,
@@ -713,6 +724,7 @@ async fn handle_actor_v2(
 	}
 }
 
+#[tracing::instrument(skip_all)]
 async fn handle_actor_v1(
 	ctx: &StandaloneCtx,
 	shared_state: &SharedState,
@@ -971,6 +983,7 @@ fn parse_skip_ready_wait_bool(value: &str) -> Option<bool> {
 /// This is used to short circuit waiting for the actor to schedule by checking if the underlying
 /// pool is unhealthy. The initial delay is intended to give the actor time to allocate cleanly in
 /// case the pool status is flapping.
+#[tracing::instrument(level = "debug", skip_all)]
 async fn check_runner_pool_error_loop(
 	ctx: &StandaloneCtx,
 	namespace_id: Id,

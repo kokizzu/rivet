@@ -1,4 +1,4 @@
-pub(crate) mod chaos;
+pub(crate) mod growth;
 pub(crate) mod oracle;
 pub(crate) mod scenario;
 pub(crate) mod simple;

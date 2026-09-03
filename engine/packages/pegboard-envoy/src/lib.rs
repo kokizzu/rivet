@@ -86,7 +86,7 @@ impl CustomServeTrait for PegboardEnvoyWs {
 		// Parse URL to extract parameters
 		let url = url::Url::parse(&format!("ws://placeholder/{}", req_ctx.path()))
 			.context("failed to parse WebSocket URL")?;
-		let url_data = utils::UrlData::parse_url(url)?;
+		let url_data = utils::UrlData::parse_url(url, ctx.config().protocols().envoy.version())?;
 
 		tracing::debug!(path=%req_ctx.path(), "tunnel ws connection established");
 
@@ -122,7 +122,7 @@ impl CustomServeTrait for PegboardEnvoyWs {
 			.subscribe(&topic)
 			.await
 			.with_context(|| format!("failed to subscribe to envoy receiver topic: {}", topic))?;
-		let mut eviction_sub = ups.subscribe(&eviction_topic).await.with_context(|| {
+		let eviction_sub = ups.subscribe(&eviction_topic).await.with_context(|| {
 			format!(
 				"failed to subscribe to envoy eviction topic: {}",
 				eviction_topic
@@ -145,23 +145,55 @@ impl CustomServeTrait for PegboardEnvoyWs {
 		let conn = match conn::init_conn(&ctx, ws_handle.clone(), url_data).await {
 			Ok(conn) => conn,
 			Err(err) => {
-				metrics::transition_envoy_connection_state(
+				record_init_failure(
 					namespace_id_str.as_str(),
 					&pool_name_str,
 					protocol_version_str.as_str(),
-					metrics::EnvoyState::Starting,
-					metrics::EnvoyState::Disconnected,
 					"init_failed",
-				);
-				metrics::dec_envoy_connection_state(
-					namespace_id_str.as_str(),
-					&pool_name_str,
-					protocol_version_str.as_str(),
-					metrics::EnvoyState::Disconnected,
 				);
 				return Err(err).context("failed to initialize envoy connection");
 			}
 		};
+		// Publish eviction message to evict any currently connected envoys with the same key. This happens
+		// after subscribing to prevent race conditions. This notification is only a convergence hint:
+		// the persisted owner is already authoritative, and expiring that ready owner because pubsub is
+		// transiently unavailable would turn a successful handoff into a full outage.
+		if let Err(err) = ups
+			.publish(&eviction_topic, &[], PublishOpts::broadcast())
+			.await
+		{
+			tracing::warn!(
+				namespace_id = ?conn.namespace_id,
+				envoy_key = %conn.envoy_key,
+				?err,
+				"failed to publish envoy reconnect eviction hint"
+			);
+		}
+
+		// A concurrently registered connection may already have superseded this one. The persisted
+		// owner is the authority for deciding which connection must exit.
+		let is_current_registration = match conn.is_current_registration().await {
+			Ok(is_current_registration) => is_current_registration,
+			Err(err) => {
+				record_init_failure(
+					namespace_id_str.as_str(),
+					&pool_name_str,
+					protocol_version_str.as_str(),
+					"registration_check_failed",
+				);
+				return Err(err).context("failed to verify envoy registration owner");
+			}
+		};
+		if !is_current_registration {
+			record_init_failure(
+				namespace_id_str.as_str(),
+				&pool_name_str,
+				protocol_version_str.as_str(),
+				"evicted_during_init",
+			);
+			return Err(errors::WsError::Eviction.build());
+		}
+
 		metrics::transition_envoy_connection_state(
 			conn.namespace_id.to_string().as_str(),
 			&conn.pool_name,
@@ -171,23 +203,16 @@ impl CustomServeTrait for PegboardEnvoyWs {
 			"init_complete",
 		);
 
-		// Publish eviction message to evict any currently connected envoys with the same key. This happens
-		// after subscribing to prevent race conditions.
-		ups.publish(&eviction_topic, &[], PublishOpts::broadcast())
-			.await?;
-		// Because we will receive our own message, skip the first message in the sub
-		eviction_sub.next().await?;
-
-		metrics::CONNECTION_ACTIVE
+		let _connection_active_guard = metrics::CONNECTION_ACTIVE
 			.with_label_values(&[
 				conn.namespace_id.to_string().as_str(),
 				&conn.pool_name,
 				conn.protocol_version.to_string().as_str(),
 			])
-			.inc();
-		metrics::ENVOY_CONNECTED
+			.inc_guard();
+		let _envoy_connected_guard = metrics::ENVOY_CONNECTED
 			.with_label_values(&[conn.namespace_id.to_string().as_str(), &conn.pool_name])
-			.inc();
+			.inc_guard();
 		tracing::info!(
 			namespace_id = %conn.namespace_id,
 			pool_name = %conn.pool_name,
@@ -310,6 +335,7 @@ impl CustomServeTrait for PegboardEnvoyWs {
 				.op(pegboard::ops::envoy::expire::Input {
 					namespace_id: conn.namespace_id,
 					envoy_key: conn.envoy_key.to_string(),
+					expected_envoy_conn_id: Some(conn.envoy_conn_id),
 					skip_if_fresh: false,
 				})
 				.await;
@@ -436,16 +462,6 @@ impl CustomServeTrait for PegboardEnvoyWs {
 			final_envoy_state,
 		);
 
-		metrics::CONNECTION_ACTIVE
-			.with_label_values(&[
-				conn.namespace_id.to_string().as_str(),
-				&conn.pool_name,
-				conn.protocol_version.to_string().as_str(),
-			])
-			.dec();
-		metrics::ENVOY_CONNECTED
-			.with_label_values(&[conn.namespace_id.to_string().as_str(), &conn.pool_name])
-			.dec();
 		metrics::ENVOY_LIFETIME_SECONDS
 			.with_label_values(&[conn.namespace_id.to_string().as_str(), &conn.pool_name])
 			.observe(conn.connected_at.elapsed().as_secs_f64());
@@ -453,6 +469,29 @@ impl CustomServeTrait for PegboardEnvoyWs {
 		// This will determine the close frame sent back to the envoy websocket
 		lifecycle_res.map(|_| None)
 	}
+}
+
+/// Records the metrics teardown for a connection that never reached the connected state.
+fn record_init_failure(
+	namespace_id: &str,
+	pool_name: &str,
+	protocol_version: &str,
+	reason: &'static str,
+) {
+	metrics::transition_envoy_connection_state(
+		namespace_id,
+		pool_name,
+		protocol_version,
+		metrics::EnvoyState::Starting,
+		metrics::EnvoyState::Disconnected,
+		reason,
+	);
+	metrics::dec_envoy_connection_state(
+		namespace_id,
+		pool_name,
+		protocol_version,
+		metrics::EnvoyState::Disconnected,
+	);
 }
 
 fn classify_final_envoy_state(
@@ -474,6 +513,9 @@ fn classify_final_envoy_state(
 				Some(("ws", "timed_out")) => (metrics::EnvoyState::Lost, "ping_timeout"),
 				Some(("ws", "eviction")) => (metrics::EnvoyState::Disconnected, "evicted"),
 				Some(("ws", "going_away")) => (metrics::EnvoyState::Disconnected, "going_away"),
+				Some(("ws", "registration_expired")) => {
+					(metrics::EnvoyState::Disconnected, "registration_expired")
+				}
 				_ => (metrics::EnvoyState::Disconnected, "connection_error"),
 			}
 		}

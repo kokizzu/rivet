@@ -76,6 +76,30 @@ pub async fn run(ctx: &StandaloneCtx) -> Result<()> {
 			.await?;
 	}
 
+	// Depot compaction backfill. Skipped when compaction is disabled, since the workflow is not
+	// registered in that case.
+	if !ctx.config().sqlite().unstable_disable_compaction()
+		&& !is_complete(ctx, depot::workflows::compaction_backfill::BACKFILL_NAME).await?
+	{
+		ctx.workflow(depot::workflows::compaction_backfill::Input {})
+			.unique()
+			.dispatch()
+			.await?;
+	}
+
+	// Gas dead wf backfill
+	if !is_complete(
+		ctx,
+		gasoline_runtime::workflows::dead_wf_backfill::BACKFILL_NAME,
+	)
+	.await?
+	{
+		ctx.workflow(gasoline_runtime::workflows::dead_wf_backfill::Input {})
+			.unique()
+			.dispatch()
+			.await?;
+	}
+
 	Ok(())
 }
 
@@ -93,7 +117,7 @@ async fn is_complete(ctx: &StandaloneCtx, name: &str) -> Result<bool> {
 				.await
 			}
 		})
-		.custom_instrument(tracing::info_span!("check_backfill_complete_tx"))
+		.custom_instrument(tracing::debug_span!("check_backfill_complete_tx"))
 		.await?;
 
 	if complete {

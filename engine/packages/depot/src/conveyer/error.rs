@@ -45,6 +45,20 @@ pub enum SqliteStorageError {
 	},
 
 	#[error(
+		"stage_not_found",
+		"SQLite staged commit segment is missing.",
+		"SQLite staged commit segment is missing. Finalize claimed a segment at page {first_pgno} for txid {txid}, but nothing is staged there."
+	)]
+	StageNotFound { txid: u64, first_pgno: u32 },
+
+	#[error(
+		"stage_segment_invalid",
+		"SQLite staged commit segment is invalid.",
+		"SQLite staged commit segment is invalid: {reason}."
+	)]
+	StageSegmentInvalid { reason: String },
+
+	#[error(
 		"quota_exceeded",
 		"Not enough space left in Depot.",
 		"Not enough space left in Depot ({remaining_bytes} bytes remaining, current payload is {payload_size} bytes)."
@@ -105,6 +119,31 @@ pub enum SqliteStorageError {
 	ShardCoverageMissing { pgno: u32 },
 
 	#[error(
+		"delta_page_missing",
+		"SQLite delta does not carry a page it owns.",
+		"SQLite delta at txid {txid} owns page {pgno} but does not carry it."
+	)]
+	DeltaPageMissing { pgno: u32, txid: u64 },
+
+	#[error(
+		"cold_object_corrupt",
+		"SQLite cold object does not match the reference that named it.",
+		"SQLite cold object {object_key} does not match its reference."
+	)]
+	ColdObjectCorrupt { object_key: String },
+
+	#[error(
+		"stale_main_page",
+		"SQLite page one disagrees with the database size at its txid.",
+		"SQLite page one at txid {txid} reports {page_db_size_pages} pages but the commit at that txid records {head_db_size_pages}."
+	)]
+	StaleMainPage {
+		txid: u64,
+		page_db_size_pages: u32,
+		head_db_size_pages: u32,
+	},
+
+	#[error(
 		"shard_cache_corrupt",
 		"SQLite shard cache is corrupt.",
 		"SQLite shard cache has conflicting bytes for shard {shard_id} at txid {as_of_txid}."
@@ -156,6 +195,13 @@ impl fmt::Display for SqliteStorageError {
 				f,
 				"sqlite head fence mismatch: expected head txid {expected_head_txid}, current head txid {actual_head_txid}"
 			),
+			SqliteStorageError::StageNotFound { txid, first_pgno } => write!(
+				f,
+				"StageNotFound: no staged segment at page {first_pgno} for txid {txid}"
+			),
+			SqliteStorageError::StageSegmentInvalid { reason } => {
+				write!(f, "StageSegmentInvalid: {reason}")
+			}
 			SqliteStorageError::SqliteStorageQuotaExceeded {
 				remaining_bytes,
 				payload_size,
@@ -198,6 +244,28 @@ impl fmt::Display for SqliteStorageError {
 			}
 			SqliteStorageError::ShardCoverageMissing { pgno } => {
 				write!(f, "sqlite shard coverage is missing for page {pgno}")
+			}
+			SqliteStorageError::DeltaPageMissing { pgno, txid } => {
+				write!(
+					f,
+					"sqlite delta at txid {txid} owns page {pgno} but does not carry it"
+				)
+			}
+			SqliteStorageError::ColdObjectCorrupt { object_key } => {
+				write!(
+					f,
+					"sqlite cold object {object_key} does not match the reference that named it"
+				)
+			}
+			SqliteStorageError::StaleMainPage {
+				txid,
+				page_db_size_pages,
+				head_db_size_pages,
+			} => {
+				write!(
+					f,
+					"sqlite page one at txid {txid} reports {page_db_size_pages} pages but the commit at that txid records {head_db_size_pages}"
+				)
 			}
 			SqliteStorageError::ShardCacheCorrupt {
 				shard_id,

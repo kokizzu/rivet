@@ -55,7 +55,9 @@ async function main(): Promise<void> {
 			const key = keys[index]!;
 			const startedAt = Date.now();
 			try {
-				const out = await client.growDb.getOrCreate(key).integrityCheck();
+				const out = await client.growDb
+					.getOrCreate(key)
+					.integrityCheck();
 				if (!out.ok) failed += 1;
 				const record = {
 					event: "db_checked",
@@ -64,7 +66,8 @@ async function main(): Promise<void> {
 					result: out.result.slice(0, 400),
 					rows: out.rows,
 					pageCount: out.pageCount,
-					sizeMib: Math.round((out.sizeBytes / (1024 * 1024)) * 10) / 10,
+					sizeMib:
+						Math.round((out.sizeBytes / (1024 * 1024)) * 10) / 10,
 					elapsedMs: Date.now() - startedAt,
 				};
 				results.push(record);
@@ -85,7 +88,9 @@ async function main(): Promise<void> {
 	}
 
 	await Promise.all(
-		Array.from({ length: Math.min(concurrency, keys.length) }, () => worker()),
+		Array.from({ length: Math.min(concurrency, keys.length) }, () =>
+			worker(),
+		),
 	);
 
 	console.log(

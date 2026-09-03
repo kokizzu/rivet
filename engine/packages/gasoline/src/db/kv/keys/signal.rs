@@ -415,3 +415,92 @@ impl<'de> TupleUnpack<'de> for SilenceTsKey {
 		Ok((input, v))
 	}
 }
+
+#[derive(Debug)]
+pub struct PruneIdxKey {
+	pub ts: i64,
+	pub signal_id: Id,
+}
+
+impl PruneIdxKey {
+	pub fn new(signal_id: Id) -> Self {
+		PruneIdxKey {
+			ts: rivet_util::timestamp::now(),
+			signal_id,
+		}
+	}
+
+	pub fn subspace(ts: i64) -> PruneIdxSubspaceKey {
+		PruneIdxSubspaceKey::new(ts)
+	}
+
+	pub fn entire_subspace() -> PruneIdxSubspaceKey {
+		PruneIdxSubspaceKey::entire()
+	}
+}
+
+impl FormalKey for PruneIdxKey {
+	type Value = ();
+
+	fn deserialize(&self, _raw: &[u8]) -> Result<Self::Value> {
+		Ok(())
+	}
+
+	fn serialize(&self, _value: Self::Value) -> Result<Vec<u8>> {
+		Ok(Vec::new())
+	}
+}
+
+impl TuplePack for PruneIdxKey {
+	fn pack<W: std::io::Write>(
+		&self,
+		w: &mut W,
+		tuple_depth: TupleDepth,
+	) -> std::io::Result<VersionstampOffset> {
+		let t = (SIGNAL, PRUNE_IDX, self.ts, self.signal_id);
+		t.pack(w, tuple_depth)
+	}
+}
+
+impl<'de> TupleUnpack<'de> for PruneIdxKey {
+	fn unpack(input: &[u8], tuple_depth: TupleDepth) -> PackResult<(&[u8], Self)> {
+		let (input, (_, _, ts, signal_id)) = <(usize, usize, i64, Id)>::unpack(input, tuple_depth)?;
+
+		let v = PruneIdxKey { ts, signal_id };
+
+		Ok((input, v))
+	}
+}
+
+pub struct PruneIdxSubspaceKey {
+	ts: Option<i64>,
+}
+
+impl PruneIdxSubspaceKey {
+	pub fn new(ts: i64) -> Self {
+		PruneIdxSubspaceKey { ts: Some(ts) }
+	}
+
+	pub fn entire() -> Self {
+		PruneIdxSubspaceKey { ts: None }
+	}
+}
+
+impl TuplePack for PruneIdxSubspaceKey {
+	fn pack<W: std::io::Write>(
+		&self,
+		w: &mut W,
+		tuple_depth: TupleDepth,
+	) -> std::io::Result<VersionstampOffset> {
+		let mut offset = VersionstampOffset::None { size: 0 };
+
+		let t = (SIGNAL, PRUNE_IDX);
+		offset += t.pack(w, tuple_depth)?;
+
+		if let Some(ts) = &self.ts {
+			offset += ts.pack(w, tuple_depth)?;
+		}
+
+		Ok(offset)
+	}
+}

@@ -6,6 +6,7 @@ use hyper::{Request, Response, body::Incoming as BodyIncoming};
 use tokio_tungstenite::tungstenite::protocol::frame::CloseFrame;
 
 use crate::WebSocketHandle;
+use crate::errors;
 use crate::request_context::RequestContext;
 use crate::response_body::ResponseBody;
 
@@ -54,7 +55,7 @@ pub trait CustomServeTrait: Send + Sync {
 		// True if this websocket is reconnecting after hibernation.
 		_after_hibernation: bool,
 	) -> Result<Option<CloseFrame>> {
-		bail!("service does not support websockets");
+		Err(errors::WebSocketNotSupported.build())
 	}
 
 	// TODO: Combine into handle_websocket, remove hibernation from guard
@@ -64,6 +65,6 @@ pub trait CustomServeTrait: Send + Sync {
 		_req_ctx: &mut RequestContext,
 		_websocket: WebSocketHandle,
 	) -> Result<HibernationResult> {
-		bail!("service does not support websocket hibernation");
+		Err(errors::WebSocketHibernationNotSupported.build())
 	}
 }

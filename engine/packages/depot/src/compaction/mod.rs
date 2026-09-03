@@ -2,6 +2,7 @@ pub(crate) mod companion;
 pub(crate) mod shared;
 #[cfg(feature = "test-faults")]
 pub mod test_driver;
+pub(crate) mod throttle;
 pub(crate) mod types;
 
 #[cfg(debug_assertions)]

@@ -3,7 +3,9 @@ use bytes::Bytes;
 use depot::{
 	conveyer::Db,
 	error::{SqliteStorageError, is_head_fence_mismatch},
-	workflows::compaction::DeltasAvailable,
+	workflows::compaction::{
+		DATABASE_BRANCH_ID_TAG, DbManagerInput, DeltasAvailable, database_branch_tag_value,
+	},
 };
 use depot_client::{
 	database::NativeDatabaseHandle,
@@ -19,6 +21,7 @@ use pegboard::pubsub_subjects::GatewayReceiverSubject;
 use rivet_data::converted::{ActorNameKeyData, MetadataKeyData};
 use rivet_envoy_protocol::{self as protocol, PROTOCOL_VERSION, versioned};
 use rivet_guard_core::websocket_handle::WebSocketReceiver;
+use rivet_metrics::GaugeGuardExt;
 use rivet_perf::{perf_finish, perf_start};
 use std::{
 	collections::HashMap as StdHashMap,
@@ -48,8 +51,10 @@ const MAX_REMOTE_SQL_BIND_BYTES: usize = 128 * 1024;
 /// Max number of pages a single `get_pages` request may ask for. Each requested page number is ~4
 /// bytes on the wire but forces the engine to fetch and materialize up to a full 4 KiB page inside
 /// one UDB transaction, so an uncapped list is a large cost-asymmetry amplifier from an untrusted
-/// runner. Sized well above observed production read batches (max ~1024 pages); the commit path has
-/// its own lower cap (`MAX_COMMIT_DIRTY_PAGES`) since writes batch smaller than reads.
+/// runner. Sized well above observed production read batches (max ~1024 pages). The commit path has
+/// its own caps, much lower for a single-shot commit (`MAX_SINGLE_SHOT_COMMIT_DIRTY_PAGES`) and much
+/// higher for a staged one (`MAX_COMMIT_DIRTY_PAGES`), which spreads its pages over many messages
+/// rather than asking for them all at once.
 const MAX_GET_PAGES_PER_REQUEST: usize = 8192;
 
 /// Wall-clock threshold above which a single handle_message invocation is logged as a head-of-line
@@ -456,7 +461,7 @@ pub async fn task(
 	res
 }
 
-#[tracing::instrument(skip_all, fields(namespace_id=%conn.namespace_id, pool_name=%conn.pool_name, envoy_key=%conn.envoy_key, protocol_version=%conn.protocol_version))]
+#[tracing::instrument(level = "debug", skip_all, fields(namespace_id=%conn.namespace_id, pool_name=%conn.pool_name, envoy_key=%conn.envoy_key, protocol_version=%conn.protocol_version))]
 pub async fn task_inner(
 	ctx: StandaloneCtx,
 	conn: Arc<Conn>,
@@ -568,7 +573,7 @@ pub async fn task_inner(
 	}
 }
 
-#[tracing::instrument(skip_all)]
+#[tracing::instrument(level = "debug", skip_all)]
 async fn recv_msg(
 	ws_rx: &mut MutexGuard<'_, WebSocketReceiver>,
 	ws_to_tunnel_abort_rx: &mut watch::Receiver<()>,
@@ -635,6 +640,11 @@ fn message_kind_label(msg: &protocol::ToRivet) -> &'static str {
 		protocol::ToRivet::ToRivetKvRequest(_) => "kv_request",
 		protocol::ToRivet::ToRivetSqliteGetPagesRequest(_) => "sqlite_get_pages",
 		protocol::ToRivet::ToRivetSqliteCommitRequest(_) => "sqlite_commit",
+		protocol::ToRivet::ToRivetSqliteCommitStageBeginRequest(_) => "sqlite_commit_stage_begin",
+		protocol::ToRivet::ToRivetSqliteCommitStageSegmentRequest(_) => {
+			"sqlite_commit_stage_segment"
+		}
+		protocol::ToRivet::ToRivetSqliteCommitFinalizeRequest(_) => "sqlite_commit_finalize",
 		protocol::ToRivet::ToRivetSqliteExecRequest(_) => "sqlite_exec",
 		protocol::ToRivet::ToRivetSqliteExecuteRequest(_) => "sqlite_execute",
 		protocol::ToRivet::ToRivetSqliteExecuteBatchRequest(_) => "sqlite_execute_batch",
@@ -659,7 +669,7 @@ fn decode_message(
 	}
 }
 
-#[tracing::instrument(skip_all)]
+#[tracing::instrument(level = "debug", skip_all)]
 async fn handle_message(
 	ctx: &StandaloneCtx,
 	conn: Arc<Conn>,
@@ -672,7 +682,7 @@ async fn handle_message(
 	dispatch_message(ctx, conn, event_demuxer, task_manager, msg).await
 }
 
-#[tracing::instrument(skip_all)]
+#[tracing::instrument(level = "debug", skip_all)]
 async fn dispatch_message(
 	ctx: &StandaloneCtx,
 	conn: Arc<Conn>,
@@ -737,6 +747,62 @@ async fn dispatch_message(
 			let key = actor_sqlite_page_task::Key::new(req.data.actor_id.clone(), generation);
 			task_manager.enqueue_sqlite_page(key, actor_sqlite_page_task::Message::Commit(req))?;
 		}
+		// Staged commits run on the same actor-scoped task as the single-shot path so that a stage
+		// and a commit for one actor cannot interleave.
+		protocol::ToRivet::ToRivetSqliteCommitStageBeginRequest(req) => {
+			let Some(generation) = req.data.expected_generation else {
+				send_sqlite_commit_stage_begin_response(
+					&conn,
+					req.request_id,
+					protocol::SqliteCommitStageBeginResponse::SqliteErrorResponse(
+						sqlite_protocol_error_response(
+							"sqlite staged commit missing expectedGeneration",
+						),
+					),
+				)
+				.await?;
+				return Ok(None);
+			};
+			let key = actor_sqlite_page_task::Key::new(req.data.actor_id.clone(), generation);
+			task_manager
+				.enqueue_sqlite_page(key, actor_sqlite_page_task::Message::StageBegin(req))?;
+		}
+		protocol::ToRivet::ToRivetSqliteCommitStageSegmentRequest(req) => {
+			let Some(generation) = req.data.expected_generation else {
+				send_sqlite_commit_stage_segment_response(
+					&conn,
+					req.request_id,
+					protocol::SqliteCommitStageSegmentResponse::SqliteErrorResponse(
+						sqlite_protocol_error_response(
+							"sqlite staged commit missing expectedGeneration",
+						),
+					),
+				)
+				.await?;
+				return Ok(None);
+			};
+			let key = actor_sqlite_page_task::Key::new(req.data.actor_id.clone(), generation);
+			task_manager
+				.enqueue_sqlite_page(key, actor_sqlite_page_task::Message::StageSegment(req))?;
+		}
+		protocol::ToRivet::ToRivetSqliteCommitFinalizeRequest(req) => {
+			let Some(generation) = req.data.expected_generation else {
+				send_sqlite_commit_finalize_response(
+					&conn,
+					req.request_id,
+					protocol::SqliteCommitFinalizeResponse::SqliteErrorResponse(
+						sqlite_protocol_error_response(
+							"sqlite staged commit missing expectedGeneration",
+						),
+					),
+				)
+				.await?;
+				return Ok(None);
+			};
+			let key = actor_sqlite_page_task::Key::new(req.data.actor_id.clone(), generation);
+			task_manager
+				.enqueue_sqlite_page(key, actor_sqlite_page_task::Message::Finalize(req))?;
+		}
 		protocol::ToRivet::ToRivetSqliteExecRequest(req) => {
 			let key =
 				actor_remote_sqlite_task::Key::new(req.data.actor_id.clone(), req.data.generation);
@@ -781,6 +847,12 @@ async fn dispatch_message(
 			task_manager.enqueue_control(control_task::Message::AckCommands(ack))?;
 		}
 		protocol::ToRivet::ToRivetStopping => {
+			// A stopping message may arrive from a superseded websocket. Do not let that stale
+			// connection transition metrics or begin evicting the replacement's actors.
+			if !conn.is_current_registration().await? {
+				return Ok(Some(LifecycleResult::Evicted));
+			}
+
 			if !conn.reported_stopping.swap(true, Ordering::SeqCst) {
 				metrics::transition_envoy_connection_state(
 					conn.namespace_id.to_string().as_str(),
@@ -797,14 +869,22 @@ async fn dispatch_message(
 				ctx.op(pegboard::ops::envoy::expire::Input {
 					namespace_id: conn.namespace_id,
 					envoy_key: conn.envoy_key.to_string(),
+					expected_envoy_conn_id: Some(conn.envoy_conn_id),
 					skip_if_fresh: false,
 				})
 				.await?;
 			}
 
+			// Registration may have changed while expiry was in flight. The detached actor-eviction
+			// task also checks this id after its delay, but exit this stale websocket immediately.
+			if !conn.is_current_registration().await? {
+				return Ok(Some(LifecycleResult::Evicted));
+			}
+
 			let ctx = ctx.clone();
 			let namespace_id = conn.namespace_id;
 			let envoy_key = conn.envoy_key.clone();
+			let envoy_conn_id = conn.envoy_conn_id;
 			let actor_eviction_delay = conn.pool.actor_eviction_delay();
 			let actor_eviction_period = conn.pool.actor_eviction_period();
 			let actor_eviction_rate = conn.pool.actor_eviction_rate();
@@ -820,6 +900,7 @@ async fn dispatch_message(
 					.op(pegboard::ops::envoy::evict_actors::Input {
 						namespace_id,
 						envoy_key: envoy_key.clone(),
+						expected_envoy_conn_id: Some(envoy_conn_id),
 						throttle: Some(pegboard::ops::envoy::evict_actors::Throttle {
 							rate: actor_eviction_rate,
 							period: Duration::from_secs(actor_eviction_period as u64),
@@ -1312,7 +1393,7 @@ pub(super) async fn handle_metadata(
 		.await
 }
 
-#[tracing::instrument(skip_all)]
+#[tracing::instrument(level = "debug", skip_all)]
 pub(super) async fn handle_tunnel_message(
 	ctx: &StandaloneCtx,
 	conn: &Conn,
@@ -1614,6 +1695,132 @@ async fn handle_sqlite_commit(
 	Ok(response)
 }
 
+pub(super) async fn handle_sqlite_commit_stage_begin_response(
+	ctx: &StandaloneCtx,
+	conn: &Conn,
+	request: protocol::SqliteCommitStageBeginRequest,
+) -> protocol::SqliteCommitStageBeginResponse {
+	let actor_id = request.actor_id.clone();
+	match handle_sqlite_commit_stage_begin(ctx, conn, request).await {
+		Ok(response) => response,
+		Err(err) => {
+			tracing::error!(actor_id = %actor_id, ?err, "sqlite staged commit begin failed");
+			protocol::SqliteCommitStageBeginResponse::SqliteErrorResponse(sqlite_error_response(
+				&err,
+			))
+		}
+	}
+}
+
+async fn handle_sqlite_commit_stage_begin(
+	ctx: &StandaloneCtx,
+	conn: &Conn,
+	request: protocol::SqliteCommitStageBeginRequest,
+) -> Result<protocol::SqliteCommitStageBeginResponse> {
+	validate_sqlite_actor_for_request(ctx, conn, &request.actor_id, request.expected_generation)
+		.await?;
+	let generation = staged_commit_generation(request.expected_generation)?;
+	let actor_db = actor_db(ctx, conn, request.actor_id.clone()).await?;
+	let txid = actor_db
+		.commit_stage_begin(generation, request.expected_head_txid)
+		.await?;
+
+	Ok(
+		protocol::SqliteCommitStageBeginResponse::SqliteCommitStageBeginOk(
+			protocol::SqliteCommitStageBeginOk { txid },
+		),
+	)
+}
+
+pub(super) async fn handle_sqlite_commit_stage_segment_response(
+	ctx: &StandaloneCtx,
+	conn: &Conn,
+	request: protocol::SqliteCommitStageSegmentRequest,
+) -> protocol::SqliteCommitStageSegmentResponse {
+	let actor_id = request.actor_id.clone();
+	match handle_sqlite_commit_stage_segment(ctx, conn, request).await {
+		Ok(response) => response,
+		Err(err) => {
+			tracing::error!(actor_id = %actor_id, ?err, "sqlite staged commit segment failed");
+			protocol::SqliteCommitStageSegmentResponse::SqliteErrorResponse(sqlite_error_response(
+				&err,
+			))
+		}
+	}
+}
+
+async fn handle_sqlite_commit_stage_segment(
+	ctx: &StandaloneCtx,
+	conn: &Conn,
+	request: protocol::SqliteCommitStageSegmentRequest,
+) -> Result<protocol::SqliteCommitStageSegmentResponse> {
+	validate_sqlite_actor_for_request(ctx, conn, &request.actor_id, request.expected_generation)
+		.await?;
+	let generation = staged_commit_generation(request.expected_generation)?;
+	let actor_db = actor_db(ctx, conn, request.actor_id.clone()).await?;
+	let staged_bytes = actor_db
+		.commit_stage_segment(
+			generation,
+			request.txid,
+			request.first_pgno,
+			request
+				.dirty_pages
+				.into_iter()
+				.map(pump_dirty_page)
+				.collect(),
+		)
+		.await?;
+
+	Ok(
+		protocol::SqliteCommitStageSegmentResponse::SqliteCommitStageSegmentOk(
+			protocol::SqliteCommitStageSegmentOk { staged_bytes },
+		),
+	)
+}
+
+pub(super) async fn handle_sqlite_commit_finalize_response(
+	ctx: &StandaloneCtx,
+	conn: &Conn,
+	request: protocol::SqliteCommitFinalizeRequest,
+) -> protocol::SqliteCommitFinalizeResponse {
+	let actor_id = request.actor_id.clone();
+	match handle_sqlite_commit_finalize(ctx, conn, request).await {
+		Ok(response) => response,
+		Err(err) => {
+			tracing::error!(actor_id = %actor_id, ?err, "sqlite staged commit finalize failed");
+			protocol::SqliteCommitFinalizeResponse::SqliteErrorResponse(sqlite_error_response(&err))
+		}
+	}
+}
+
+async fn handle_sqlite_commit_finalize(
+	ctx: &StandaloneCtx,
+	conn: &Conn,
+	request: protocol::SqliteCommitFinalizeRequest,
+) -> Result<protocol::SqliteCommitFinalizeResponse> {
+	validate_sqlite_actor_for_request(ctx, conn, &request.actor_id, request.expected_generation)
+		.await?;
+	let generation = staged_commit_generation(request.expected_generation)?;
+	let actor_db = actor_db(ctx, conn, request.actor_id.clone()).await?;
+	let result = actor_db
+		.commit_finalize(
+			generation,
+			request.txid,
+			request.new_db_size_pages,
+			request.now_ms,
+			request.segment_first_pgnos,
+		)
+		.await?;
+
+	Ok(
+		protocol::SqliteCommitFinalizeResponse::SqliteCommitFinalizeOk(
+			protocol::SqliteCommitFinalizeOk {
+				head_txid: Some(result.head_txid),
+			},
+		),
+	)
+}
+
 fn sqlite_commit_response_kind(response: &protocol::SqliteCommitResponse) -> &'static str {
 	match response {
 		protocol::SqliteCommitResponse::SqliteCommitOk(_) => "ok",
@@ -1837,6 +2044,16 @@ async fn validate_sqlite_actor(ctx: &StandaloneCtx, conn: &Conn, actor_id: &str)
 	Ok(())
 }
 
+/// The generation a staged commit is fenced on.
+///
+/// Required, unlike the single-shot path where it is an optional check. A staged commit spans many
+/// transactions and the engine stamps this generation into the stage row, refusing any later segment
+/// or finalize that does not match. Defaulting a missing value to zero would give two generations
+/// that both omitted it the same fence, letting one generation's segments land in the other's stage.
+fn staged_commit_generation(expected_generation: Option<u64>) -> Result<u64> {
+	expected_generation.context("staged commit requires an expected generation")
+}
+
 async fn validate_sqlite_actor_for_request(
 	ctx: &StandaloneCtx,
 	conn: &Conn,
@@ -1862,7 +2079,7 @@ async fn validate_remote_sqlite_generation(
 	let envoy_key = conn.envoy_key.clone();
 	let (current_generation, has_pending_start_command) = ctx
 		.udb()?
-		.txn("envoy_check_pending_start_command", |tx| {
+		.txn("envoy_validate_sqlite", |tx| {
 			let envoy_key = envoy_key.clone();
 			async move {
 				let tx = tx.with_subspace(pegboard::keys::subspace());
@@ -2133,24 +2350,26 @@ async fn actor_db(ctx: &StandaloneCtx, conn: &Conn, actor_id: String) -> Result<
 				));
 			}
 
-			let compaction_signaler = Arc::new(move |_signal: DeltasAvailable| {
+			let ctx = ctx.clone();
+			let actor_id2 = actor_id.clone();
+			let compaction_signaler = Arc::new(move |signal: DeltasAvailable| {
+				let ctx = ctx.clone();
+				let actor_id2 = actor_id2.clone();
 				async move {
-					// TODO: Add back after enabling hot compaction
-					// let tag_value = database_branch_tag_value(signal.database_branch_id);
-					// let workflow_id = signal_ctx
-					// 	.workflow(DbManagerInput {
-					// 		database_branch_id: signal.database_branch_id,
-					// 		actor_id: Some(actor_id),
-					// 	})
-					// 	.tag(DATABASE_BRANCH_ID_TAG, &tag_value)
-					// 	.unique()
-					// 	.dispatch()
-					// 	.await?;
-					// signal_ctx
-					// 	.signal(signal)
-					// 	.to_workflow_id(workflow_id)
-					// 	.send()
-					// 	.await?;
+					let tag_value = database_branch_tag_value(signal.database_branch_id);
+					let workflow_id = ctx
+						.workflow(DbManagerInput {
+							database_branch_id: signal.database_branch_id,
+							actor_id: Some(actor_id2),
+						})
+						.tag(DATABASE_BRANCH_ID_TAG, &tag_value)
+						.unique()
+						.dispatch()
+						.await?;
+					ctx.signal(signal)
+						.to_workflow_id(workflow_id)
+						.send()
+						.await?;
 					Ok(())
 				}
 				.boxed()
@@ -2265,7 +2484,7 @@ async fn send_actor_kv_response(
 	let res_msg_serialized = res_msg
 		.serialize(conn.protocol_version)
 		.with_context(|| format!("failed to serialize {description}"))?;
-	let _in_flight = WsResponseInFlightGuard::new();
+	let _in_flight = metrics::WS_RESPONSES_IN_FLIGHT.inc_guard();
 	conn.ws_handle
 		.send(Message::Binary(res_msg_serialized.into()))
 		.await
@@ -2302,6 +2521,51 @@ pub(super) async fn send_sqlite_commit_response(
 			data,
 		}),
 		"sqlite commit response",
+	)
+	.await
+}
+
+pub(super) async fn send_sqlite_commit_stage_begin_response(
+	conn: &Conn,
+	request_id: u32,
+	data: protocol::SqliteCommitStageBeginResponse,
+) -> Result<()> {
+	send_to_envoy(
+		conn,
+		protocol::ToEnvoy::ToEnvoySqliteCommitStageBeginResponse(
+			protocol::ToEnvoySqliteCommitStageBeginResponse { request_id, data },
+		),
+		"sqlite commit stage begin response",
+	)
+	.await
+}
+
+pub(super) async fn send_sqlite_commit_stage_segment_response(
+	conn: &Conn,
+	request_id: u32,
+	data: protocol::SqliteCommitStageSegmentResponse,
+) -> Result<()> {
+	send_to_envoy(
+		conn,
+		protocol::ToEnvoy::ToEnvoySqliteCommitStageSegmentResponse(
+			protocol::ToEnvoySqliteCommitStageSegmentResponse { request_id, data },
+		),
+		"sqlite commit stage segment response",
+	)
+	.await
+}
+
+pub(super) async fn send_sqlite_commit_finalize_response(
+	conn: &Conn,
+	request_id: u32,
+	data: protocol::SqliteCommitFinalizeResponse,
+) -> Result<()> {
+	send_to_envoy(
+		conn,
+		protocol::ToEnvoy::ToEnvoySqliteCommitFinalizeResponse(
+			protocol::ToEnvoySqliteCommitFinalizeResponse { request_id, data },
+		),
+		"sqlite commit finalize response",
 	)
 	.await
 }
@@ -2357,31 +2621,13 @@ async fn send_to_envoy(conn: &Conn, msg: protocol::ToEnvoy, description: &str) -
 	let serialized = versioned::ToEnvoy::wrap_latest(msg)
 		.serialize(conn.protocol_version)
 		.with_context(|| format!("failed to serialize {description}"))?;
-	let _in_flight = WsResponseInFlightGuard::new();
+	let _in_flight = metrics::WS_RESPONSES_IN_FLIGHT.inc_guard();
 	conn.ws_handle
 		.send(Message::Binary(serialized.into()))
 		.await
 		.with_context(|| format!("failed to send {description}"))?;
 
 	Ok(())
-}
-
-/// RAII guard tracking responses currently being written to the envoy WebSocket.
-/// Increments [`metrics::WS_RESPONSES_IN_FLIGHT`] on construction and decrements on drop,
-/// so the gauge captures the time spent in `WebSocketHandle::send` (lock-wait plus network write).
-pub(super) struct WsResponseInFlightGuard;
-
-impl WsResponseInFlightGuard {
-	pub(super) fn new() -> Self {
-		metrics::WS_RESPONSES_IN_FLIGHT.inc();
-		Self
-	}
-}
-
-impl Drop for WsResponseInFlightGuard {
-	fn drop(&mut self) {
-		metrics::WS_RESPONSES_IN_FLIGHT.dec();
-	}
 }
 
 #[cfg(test)]

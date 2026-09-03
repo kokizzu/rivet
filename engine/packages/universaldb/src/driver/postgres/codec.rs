@@ -20,14 +20,16 @@ pub struct DecodedCommit {
 	pub client_seq: u64,
 }
 
-/// Encode a follower's commit request to the versioned BARE wire format with an embedded version
-/// header so a leader running older or newer code can still decode it during a rolling deploy.
+/// Encode a follower's commit request at `protocol_version`, the version negotiated across the
+/// fleet, with an embedded version header. Encoding at the compiled version instead would produce
+/// bytes a leader running older code cannot decode during a rolling deploy.
 pub fn encode_commit_request(
 	read_version: u64,
 	conflict_ranges: &[(Vec<u8>, Vec<u8>, ConflictRangeType)],
 	operations: &[Operation],
 	client_node_id: &[u8],
 	client_seq: u64,
+	protocol_version: u16,
 ) -> Result<Vec<u8>> {
 	let request = proto::CommitRequest {
 		read_version,
@@ -44,8 +46,7 @@ pub fn encode_commit_request(
 		client_seq,
 	};
 
-	versioned::CommitRequest::wrap_latest(request)
-		.serialize_with_embedded_version(proto::PROTOCOL_VERSION)
+	versioned::CommitRequest::wrap_latest(request).serialize_with_embedded_version(protocol_version)
 }
 
 /// Decode a commit request payload produced by [`encode_commit_request`].
@@ -79,9 +80,9 @@ pub fn decode_commit_request(payload: &[u8]) -> Result<DecodedCommit> {
 	})
 }
 
-/// Encode a leader's commit reply to the versioned BARE wire format with an embedded version header
-/// so a follower running older or newer code can still decode it during a rolling deploy.
-pub fn encode_commit_reply(outcome: CommitOutcome) -> Result<Vec<u8>> {
+/// Encode a leader's commit reply at `protocol_version`, the version negotiated across the fleet,
+/// with an embedded version header.
+pub fn encode_commit_reply(outcome: CommitOutcome, protocol_version: u16) -> Result<Vec<u8>> {
 	let reply = match outcome {
 		CommitOutcome::Committed { commit_version } => {
 			proto::CommitReply::CommitCommitted(proto::CommitCommitted { commit_version })
@@ -89,8 +90,7 @@ pub fn encode_commit_reply(outcome: CommitOutcome) -> Result<Vec<u8>> {
 		CommitOutcome::Conflict => proto::CommitReply::CommitConflict,
 	};
 
-	versioned::CommitReply::wrap_latest(reply)
-		.serialize_with_embedded_version(proto::PROTOCOL_VERSION)
+	versioned::CommitReply::wrap_latest(reply).serialize_with_embedded_version(protocol_version)
 }
 
 /// Decode a commit reply payload produced by [`encode_commit_reply`].
@@ -104,11 +104,11 @@ pub fn decode_commit_reply(payload: &[u8]) -> Result<CommitOutcome> {
 	})
 }
 
-/// Encode a durable-version watermark broadcast to the versioned BARE wire format with an embedded
-/// version header.
-pub fn encode_watermark(durable_version: i64) -> Result<Vec<u8>> {
+/// Encode a durable-version watermark broadcast at `protocol_version`, the version negotiated
+/// across the fleet, with an embedded version header.
+pub fn encode_watermark(durable_version: i64, protocol_version: u16) -> Result<Vec<u8>> {
 	versioned::Watermark::wrap_latest(proto::Watermark { durable_version })
-		.serialize_with_embedded_version(proto::PROTOCOL_VERSION)
+		.serialize_with_embedded_version(protocol_version)
 }
 
 /// Decode a watermark payload produced by [`encode_watermark`], returning the durable version.

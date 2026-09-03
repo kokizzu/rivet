@@ -216,6 +216,17 @@ lazy_static! {
 	).unwrap();
 
 	// MARK: WebSockets
+	pub static ref WEBSOCKET_ACTIVE: IntGauge = register_int_gauge_with_registry!(
+		"guard_websocket_active",
+		"Number of WebSocket connections currently open with a client.",
+		*REGISTRY
+	).unwrap();
+	pub static ref WEBSOCKET_CLOSE_ERROR_TOTAL: IntCounterVec = register_int_counter_vec_with_registry!(
+		"guard_websocket_close_errors_total",
+		"Total number of WebSocket connections closed because of an error.",
+		&["error"],
+		*REGISTRY
+	).unwrap();
 	pub static ref WEBSOCKET_SEND_DURATION: HistogramVec = register_histogram_vec_with_registry!(
 		"guard_websocket_send_duration",
 		"Time to send a WebSocket message through a shared WebSocketHandle in seconds.",

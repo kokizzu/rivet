@@ -34,8 +34,13 @@
 		"typescript": "^5.5.2"
 	},
 	"template": {
-		"technologies": ["typescript"],
-		"tags": ["agent-os", "vm"],
+		"technologies": [
+			"typescript"
+		],
+		"tags": [
+			"agent-os",
+			"vm"
+		],
 		"noFrontend": true,
 		"skipVercel": true
 	},

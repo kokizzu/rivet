@@ -7,7 +7,6 @@ use gas::prelude::*;
 use indexmap::IndexMap;
 use rivet_api_builder::ApiCtx;
 use rivet_profiling::pubsub_subjects::{ProfileConfigSubject, SetProfileConfigMessage};
-use rivet_tracing_reconfigure::pubsub_subjects::TracingConfigSubject;
 use serde::{Deserialize, Serialize};
 use universaldb::{
 	RangeOption,
@@ -39,42 +38,6 @@ pub async fn cache_purge(
 		.await?;
 
 	Ok(CachePurgeResponse {})
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SetTracingConfigRequest {
-	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub filter: Option<Option<String>>,
-	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub sampler_ratio: Option<Option<f64>>,
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SetTracingConfigResponse {}
-
-#[tracing::instrument(skip_all)]
-pub async fn set_tracing_config(
-	ctx: ApiCtx,
-	_path: (),
-	_query: (),
-	body: SetTracingConfigRequest,
-) -> Result<SetTracingConfigResponse> {
-	// Broadcast message to all services via UPS
-	let message = rivet_util::serde::json_to_vec!(&body)?;
-
-	ctx.ups()?
-		.publish(TracingConfigSubject, &message, PublishOpts::broadcast())
-		.await?;
-
-	tracing::info!(
-		filter = ?body.filter,
-		sampler_ratio = ?body.sampler_ratio,
-		"broadcasted tracing config update"
-	);
-
-	Ok(SetTracingConfigResponse {})
 }
 
 #[derive(Serialize, Deserialize)]

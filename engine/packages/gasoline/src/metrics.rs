@@ -1,10 +1,9 @@
 use rivet_metrics::{BUCKETS, MICRO_BUCKETS, REGISTRY, prometheus::*};
 
 lazy_static::lazy_static! {
-	pub static ref WORKER_LAST_PING: IntGaugeVec = register_int_gauge_vec_with_registry!(
+	pub static ref WORKER_LAST_PING: IntGauge = register_int_gauge_with_registry!(
 		"gasoline_worker_last_ping",
 		"Last ping of a worker as a unix ts.",
-		&["worker_id"],
 		*REGISTRY
 	).unwrap();
 	pub static ref WORKER_LAST_METRICS_PUBLISH: IntGauge = register_int_gauge_with_registry!(
@@ -12,56 +11,49 @@ lazy_static::lazy_static! {
 		"Last timestamp of metrics publish.",
 		*REGISTRY
 	).unwrap();
-	pub static ref WORKER_BUMPS_PER_TICK: HistogramVec = register_histogram_vec_with_registry!(
+	pub static ref WORKER_BUMPS_PER_TICK: Histogram = register_histogram_with_registry!(
 		"gasoline_worker_bumps_per_tick",
 		"Amount of bump messages received in a single worker tick.",
-		&["worker_id"],
 		vec![1.0, 2.0, 3.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1024.0],
 		*REGISTRY
 	).unwrap();
-	pub static ref LAST_PULL_WORKFLOWS_DURATION: GaugeVec = register_gauge_vec_with_registry!(
+	pub static ref LAST_PULL_WORKFLOWS_DURATION: Gauge = register_gauge_with_registry!(
 		"gasoline_last_pull_workflows_duration",
 		"Last duration of pulling workflow data.",
-		&["worker_id"],
 		*REGISTRY
 	).unwrap();
-	pub static ref LAST_PULL_WORKFLOWS_HISTORY_DURATION: GaugeVec = register_gauge_vec_with_registry!(
+	pub static ref LAST_PULL_WORKFLOWS_HISTORY_DURATION: Gauge = register_gauge_with_registry!(
 		"gasoline_last_pull_workflows_history_duration",
 		"Last duration of pulling workflow histories.",
-		&["worker_id"],
 		*REGISTRY
 	).unwrap();
-	pub static ref LAST_PULL_WORKFLOWS_FULL_DURATION: GaugeVec = register_gauge_vec_with_registry!(
+	pub static ref LAST_PULL_WORKFLOWS_FULL_DURATION: Gauge = register_gauge_with_registry!(
 		"gasoline_last_pull_workflows_full_duration",
 		"Last duration of pulling workflow data and history.",
-		&["worker_id"],
 		*REGISTRY
 	).unwrap();
-	pub static ref PULL_WORKFLOWS_DURATION: HistogramVec = register_histogram_vec_with_registry!(
+	pub static ref PULL_WORKFLOWS_DURATION: Histogram = register_histogram_with_registry!(
 		"gasoline_pull_workflows_duration",
 		"Duration of pulling workflow data.",
-		&["worker_id"],
 		BUCKETS.to_vec(),
 		*REGISTRY
 	).unwrap();
-	pub static ref PULL_WORKFLOWS_HISTORY_DURATION: HistogramVec = register_histogram_vec_with_registry!(
+	pub static ref PULL_WORKFLOWS_HISTORY_DURATION: Histogram = register_histogram_with_registry!(
 		"gasoline_pull_workflows_history_duration",
 		"Duration of pulling workflow histories.",
-		&["worker_id"],
 		BUCKETS.to_vec(),
 		*REGISTRY
 	).unwrap();
-	pub static ref PULL_WORKFLOWS_FULL_DURATION: HistogramVec = register_histogram_vec_with_registry!(
+	pub static ref PULL_WORKFLOWS_FULL_DURATION: Histogram = register_histogram_with_registry!(
 		"gasoline_pull_workflows_full_duration",
 		"Duration of pulling workflow data and history.",
-		&["worker_id"],
 		BUCKETS.to_vec(),
 		*REGISTRY
 	).unwrap();
 	pub static ref WORKER_WORKFLOW_ACTIVE: IntGaugeVec = register_int_gauge_vec_with_registry!(
 		"gasoline_worker_workflow_active",
 		"Total active workflows in memory for the given worker.",
-		&["worker_id", "workflow_name"],
+		&["workflow_name"],
 		*REGISTRY
 	).unwrap();
 
@@ -116,6 +108,26 @@ lazy_static::lazy_static! {
 		MICRO_BUCKETS.to_vec(),
 		*REGISTRY
 	).unwrap();
+	pub static ref WAKE_KEYS_PULLED: HistogramVec = register_histogram_vec_with_registry!(
+		"gasoline_wake_keys_pulled",
+		"Amount of wake condition keys read per pull.",
+		&["workflow_name"],
+		vec![
+			1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1024.0, 2048.0, 4096.0,
+			8192.0, 20000.0,
+		],
+		*REGISTRY
+	).unwrap();
+	pub static ref WORKFLOWS_DEDUPED: HistogramVec = register_histogram_vec_with_registry!(
+		"gasoline_workflows_deduped",
+		"Amount of unique workflows remaining after deduplicating wake condition keys per pull.",
+		&["workflow_name"],
+		vec![
+			1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1024.0, 2048.0, 4096.0,
+			8192.0, 10000.0,
+		],
+		*REGISTRY
+	).unwrap();
 	pub static ref WORKFLOW_LEASED: HistogramVec = register_histogram_vec_with_registry!(
 		"gasoline_workflow_leased",
 		"Amount of workflows leased per pull.",
@@ -123,6 +135,13 @@ lazy_static::lazy_static! {
 		vec![1.0, 2.0, 3.0, 4.0, 8.0, 16.0, 30.0, 60.0, 125.0, 250.0, 500.0, 1000.0],
 		*REGISTRY
 	).unwrap();
+	pub static ref WORKFLOW_CONCURRENCY_QUOTA_USAGE: GaugeVec = register_gauge_vec_with_registry!(
+		"gasoline_workflow_concurrency_quota_usage",
+		"Percent of max concurrency quota usage.",
+		&["workflow_name"],
+		*REGISTRY
+	).unwrap();
+
 
 	pub static ref COMPLETE_WORKFLOW_DURATION: HistogramVec = register_histogram_vec_with_registry!(
 		"gasoline_complete_workflow_duration",
@@ -183,13 +202,6 @@ lazy_static::lazy_static! {
 		"gasoline_signal_send_duration_seconds",
 		"Duration of the database write performed by a signal send. Fire-and-forget bump publish time is not included.",
 		&["workflow_name", "signal_name"],
-		BUCKETS.to_vec(),
-		*REGISTRY
-	).unwrap();
-	pub static ref SIGNAL_WAKEUP_TO_PULL_SECONDS: HistogramVec = register_histogram_vec_with_registry!(
-		"gasoline_signal_wakeup_to_pull_seconds",
-		"Duration from a workflow signal wakeup to the next database pull attempt. Non-zero values under load indicate tokio scheduling pressure on the workflow task.",
-		&["workflow_name"],
 		BUCKETS.to_vec(),
 		*REGISTRY
 	).unwrap();

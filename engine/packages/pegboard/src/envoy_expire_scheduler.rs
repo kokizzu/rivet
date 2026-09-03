@@ -9,15 +9,13 @@ use std::{
 	future::Future,
 	panic::AssertUnwindSafe,
 	pin::Pin,
-	sync::{
-		Arc, OnceLock,
-		atomic::{AtomicBool, Ordering},
-	},
+	sync::{Arc, OnceLock},
 	time::Instant,
 };
 
 use futures_util::FutureExt;
 use gas::prelude::Id;
+use rivet_metrics::GaugeGuardExt;
 use tokio::sync::{Notify, Semaphore};
 
 use crate::{metrics, ops};
@@ -58,6 +56,7 @@ pub fn get(pools: &rivet_pools::PoolsHandle) -> &'static Arc<EnvoyExpireSchedule
 					let input = ops::envoy::expire::Input {
 						namespace_id: ns,
 						envoy_key,
+						expected_envoy_conn_id: None,
 						skip_if_fresh: true,
 					};
 
@@ -135,17 +134,12 @@ async fn expire_worker(scheduler: Arc<EnvoyExpireScheduler>, ns: Id, envoy_key: 
 	let start = Instant::now();
 	let namespace_id = ns.to_string();
 	let pending_key = envoy_key.clone();
-	let in_flight = Arc::new(AtomicBool::new(false));
-	let in_flight_guard = Arc::clone(&in_flight);
 
 	scopeguard::defer! {
 		scheduler.pending.remove_sync(&pending_key);
 		metrics::ENVOY_EXPIRE_SCHEDULER_PENDING.set(scheduler.pending.len() as i64);
 		if scheduler.pending.len() == 0 {
 			scheduler.pending_empty.notify_waiters();
-		}
-		if in_flight_guard.load(Ordering::Relaxed) {
-			metrics::ENVOY_EXPIRE_SCHEDULER_IN_FLIGHT.dec();
 		}
 		metrics::ENVOY_EXPIRE_SCHEDULER_DURATION
 			.with_label_values(&[namespace_id.as_str()])
@@ -163,8 +157,7 @@ async fn expire_worker(scheduler: Arc<EnvoyExpireScheduler>, ns: Id, envoy_key: 
 		}
 	};
 
-	metrics::ENVOY_EXPIRE_SCHEDULER_IN_FLIGHT.inc();
-	in_flight.store(true, Ordering::Relaxed);
+	let _in_flight_guard = metrics::ENVOY_EXPIRE_SCHEDULER_IN_FLIGHT.inc_guard();
 
 	let result = AssertUnwindSafe((scheduler.expire)(ns, envoy_key.clone()))
 		.catch_unwind()

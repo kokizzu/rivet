@@ -197,6 +197,51 @@ impl Root {
 		self.sqlite.as_ref().unwrap_or(&DEFAULT)
 	}
 
+	/// Cluster-wide byte-rate budget for one UniversalDB throttle axis, in bytes per second. `kind` is
+	/// `"read"` or `"write"`. `None` leaves the axis unthrottled.
+	///
+	/// The depot compaction throttle predates the generic map and keeps its own configuration keys, so
+	/// those are consulted first and the map only fills in what they leave unset. It always resolves
+	/// to a budget: compaction is bulk background work that must never run unbounded just because
+	/// nothing was configured.
+	pub fn udb_throttle_bytes_per_second(&self, name: &str, kind: &str) -> Option<u64> {
+		if name == DEPOT_COMPACTION_THROTTLE {
+			let sqlite = self.sqlite();
+			let explicit = match kind {
+				"read" => sqlite.compaction_read_bytes_per_second,
+				"write" => sqlite.compaction_write_bytes_per_second,
+				_ => None,
+			};
+			if let Some(bytes_per_second) = explicit {
+				return Some(bytes_per_second);
+			}
+
+			return Some(
+				self.runtime
+					.udb_throttle_bytes_per_second(name, kind)
+					.unwrap_or(match kind {
+						"read" => sqlite.compaction_read_bytes_per_second(),
+						"write" => sqlite.compaction_write_bytes_per_second(),
+						_ => return None,
+					}),
+			);
+		}
+
+		if name == DEPOT_ACTOR_THROTTLE {
+			let sqlite = self.sqlite();
+			let explicit = match kind {
+				"read" => sqlite.actor_read_bytes_per_second,
+				"write" => sqlite.actor_write_bytes_per_second,
+				_ => None,
+			};
+			// No fallback default: unset leaves the actor path unthrottled, as it was before this
+			// throttle existed. Unlike compaction, this lane carries user-visible commits.
+			return explicit.or_else(|| self.runtime.udb_throttle_bytes_per_second(name, kind));
+		}
+
+		self.runtime.udb_throttle_bytes_per_second(name, kind)
+	}
+
 	pub fn cache(&self) -> &Cache {
 		static DEFAULT: LazyLock<Cache> = LazyLock::new(Cache::default);
 		self.cache.as_ref().unwrap_or(&DEFAULT)
@@ -219,6 +264,15 @@ impl Root {
 
 		self.pegboard().validate()?;
 		self.features().validate()?;
+		self.sqlite().validate()?;
+
+		// A zero budget stalls whatever charges the axis outright rather than meaning "unlimited".
+		// Remove the entry to leave an axis unthrottled.
+		for (name, kind, bytes_per_second) in self.runtime.udb_throttle_budgets() {
+			if bytes_per_second == 0 {
+				bail!("runtime.udb_throttle_bytes_per_second.{name}.{kind} must be greater than 0");
+			}
+		}
 
 		// Validate that all datacenters have valid_hosts configured when there's more than one datacenter
 		let topology = self.topology();

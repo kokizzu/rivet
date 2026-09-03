@@ -33,7 +33,7 @@ pub struct OperationCtx {
 }
 
 impl OperationCtx {
-	#[tracing::instrument(skip_all, fields(%ray_id, req_id, from_workflow, name))]
+	#[tracing::instrument(level = "debug", skip_all, fields(%ray_id, req_id, from_workflow, name))]
 	pub fn new(
 		db: DatabaseHandle,
 		config: &rivet_config::Config,

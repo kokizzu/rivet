@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use depot::{
-	inspect::{self, CatalogQuery, RawScanQuery, RowsQuery, SampleQuery},
+	inspect::{self, CatalogQuery, ColdReconcileQuery, RawScanQuery, RowsQuery, SampleQuery},
 	types::{BucketId, DatabaseBranchId},
 };
 use rivet_api_builder::ApiCtx;
@@ -40,9 +40,13 @@ pub struct RawKeyPath {
 	pub key: String,
 }
 
-pub async fn summary(ctx: ApiCtx, _path: (), _query: ()) -> Result<inspect::InspectResponse> {
+pub async fn summary(
+	ctx: ApiCtx,
+	_path: (),
+	query: SampleQuery,
+) -> Result<inspect::InspectResponse> {
 	let udb = ctx.pools().udb()?;
-	inspect::summary(&udb, ctx.pools().node_id()).await
+	inspect::summary(&udb, ctx.pools().node_id(), query).await
 }
 
 pub async fn catalog(
@@ -110,6 +114,16 @@ pub async fn branch_rows(
 	let family = inspect::RowFamily::parse(&path.family)?;
 	let udb = ctx.pools().udb()?;
 	inspect::branch_rows(&udb, ctx.pools().node_id(), branch_id, family, query).await
+}
+
+pub async fn cold_reconcile(
+	ctx: ApiCtx,
+	path: BranchPath,
+	query: ColdReconcileQuery,
+) -> Result<inspect::InspectResponse> {
+	let branch_id = parse_database_branch_id(&path.branch_id)?;
+	let udb = ctx.pools().udb()?;
+	inspect::branch_cold_reconcile(&udb, ctx.pools().node_id(), branch_id, query).await
 }
 
 pub async fn raw_key(

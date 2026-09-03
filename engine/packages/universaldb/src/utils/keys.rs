@@ -125,12 +125,12 @@ define_keys! {
 	(97, ACL, "acl"),
 	(98, TOKEN, "token"),
 	(99, SECRET, "secret"),
-	// 100 - RESERVED BY EE
-	// 101 - RESERVED BY EE
-	// 102 - RESERVED BY EE
-	// 103 - RESERVED BY EE
-	// 104 - RESERVED BY EE
-	// 105 - RESERVED BY EE
+	(100, DATA_BY_HASH, "data_by_hash"),
+	(101, RULE, "rule"),
+	(102, POLICY, "policy"),
+	(103, ROLE, "role"),
+	(104, AUDIT_ENTRY, "audit_entry"),
+	(105, BY_TOKEN_ID, "by_token_id"),
 	(106, PROTOCOL_VERSION, "protocol_version"),
 	(107, LAST_COMMAND_IDX, "last_command_idx"),
 	(108, COMMAND, "command"),
@@ -158,4 +158,10 @@ define_keys! {
 	(130, GENERATION, "generation"),
 	(131, ENVOY_HASH_IDX, "envoy_hash_idx"),
 	(132, VIRTUAL_NODES, "virtual_nodes"),
+	(133, DEAD_IDX, "dead_idx"),
+	(134, SQLITE_MIGRATION, "sqlite_migration"),
+	(135, THROTTLE, "throttle"),
+	(136, ENVOY_CONN_ID, "envoy_conn_id"),
+	(137, ENGINE, "engine"),
+	(138, PROTOCOL, "protocol"),
 }

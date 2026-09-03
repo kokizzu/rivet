@@ -120,12 +120,24 @@ function configureFontAwesomeRegistry() {
 	`;
 	fs.writeFileSync(join(PATHS.src, ".npmrc"), npmrcContent);
 
-	// Create temporary package.json
+	// Create temporary package.json.
+	//
+	// The pro packages declare an older `@fortawesome/fontawesome-common-types`
+	// (6.6.0) whose `IconPrefix` union lacks newer prefixes such as `fadr`,
+	// while the free packages resolve 6.7.2. Without an override npm nests the
+	// 6.6.0 copy under each pro package, so `@rivet-gg/icons` re-exports icons
+	// typed against two different `IconDefinition` identities and any consumer
+	// that mixes pro and free icons in one collection (e.g. an icon registry
+	// keyed to `Record<string, typeof someProIcon>`) fails to type-check. Force
+	// a single common-types version so every icon shares one identity.
 	const packageJson = {
 		name: "@rivet-gg/internal-icons",
 		private: true,
 		sideEffects: false,
 		dependencies: FA_PACKAGES_CONFIG,
+		overrides: {
+			"@fortawesome/fontawesome-common-types": "6.7.2",
+		},
 	};
 	fs.writeFileSync(
 		join(PATHS.src, "package.json"),

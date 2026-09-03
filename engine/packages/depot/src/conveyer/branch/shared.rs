@@ -8,10 +8,51 @@ use crate::conveyer::{
 	error::SqliteStorageError,
 	keys,
 	types::{
-		BucketBranchId, BucketBranchRecord, CommitRow, DatabaseBranchId, DatabaseBranchRecord,
-		decode_bucket_branch_record, decode_commit_row, decode_database_branch_record,
+		BucketBranchId, BucketBranchRecord, BucketId, CommitRow, DatabaseBranchId,
+		DatabaseBranchOwner, DatabaseBranchRecord, DatabasePointer, decode_bucket_branch_record,
+		decode_commit_row, decode_database_branch_record, encode_database_branch_owner,
+		encode_database_pointer,
 	},
 };
+
+/// Writes a `DBPTR` row together with its reverse owner index row. Every pointer write must go
+/// through here so the index cannot drift from the pointer it mirrors.
+pub(crate) fn write_database_pointer(
+	tx: &universaldb::Transaction,
+	bucket_id: BucketId,
+	bucket_branch_id: BucketBranchId,
+	database_id: &str,
+	pointer: DatabasePointer,
+) -> Result<()> {
+	let branch_id = pointer.current_branch;
+	let encoded_pointer =
+		encode_database_pointer(pointer).context("encode sqlite database pointer")?;
+	tx.informal().set(
+		&keys::database_pointer_cur_key(bucket_branch_id, database_id),
+		&encoded_pointer,
+	);
+
+	let encoded_owner = encode_database_branch_owner(DatabaseBranchOwner {
+		bucket_id,
+		bucket_branch_id,
+		database_id: database_id.to_string(),
+	})
+	.context("encode sqlite database branch owner")?;
+	tx.informal()
+		.set(&keys::database_branch_owner_key(branch_id), &encoded_owner);
+
+	Ok(())
+}
+
+/// Drops the owner index row for a branch a pointer swap just superseded. The branch is frozen and
+/// no longer named by any `DBPTR` row, so leaving the row would report a stale owner.
+pub(crate) fn clear_database_branch_owner(
+	tx: &universaldb::Transaction,
+	branch_id: DatabaseBranchId,
+) {
+	tx.informal()
+		.clear(&keys::database_branch_owner_key(branch_id));
+}
 
 pub(super) fn decode_versionstamp_value(bytes: &[u8]) -> Result<[u8; 16]> {
 	bytes

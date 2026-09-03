@@ -1,17 +1,23 @@
-import { faArrowUpRight, faInfoCircle, Icon } from "@rivet-gg/icons";
+import {
+	faArrowUpRight,
+	faBarcodeRead,
+	faDatabase,
+	faInfoCircle,
+	faPencil,
+	faRunning,
+	faServer,
+	faSignalStream,
+	Icon,
+	type IconProp,
+} from "@rivet-gg/icons";
 import { useQuery } from "@tanstack/react-query";
 import { useMatch } from "@tanstack/react-router";
 import { endOfMonth, startOfMonth } from "date-fns";
 import { Suspense, useState } from "react";
 import { BillingPlans } from "@/app/billing/billing-plans";
-import { ComputeUsageCard } from "@/app/billing/compute-card";
-import {
-	billedMetricsMap,
-	computeBudgetPercent,
-	useBilledComputeCost,
-} from "@/app/billing/hooks";
+import { useBilledComputeCost } from "@/app/billing/hooks";
 import { ManageBillingButton } from "@/app/billing/manage-billing-button";
-import { formatMetricValue } from "@/app/billing/usage-format";
+import { formatMetricValue } from "@/app/billing/usage-card";
 import {
 	USAGE_METRICS,
 	type UsageMetricConfig,
@@ -29,11 +35,18 @@ import {
 	WithTooltip,
 } from "@/components";
 import { useCloudProjectDataProvider } from "@/components/actors";
-import { TwinklingSparkles } from "@/components/twinkling-sparkles";
-import { PLAN_LABELS } from "@/content/billing";
 import { features } from "@/lib/features";
+import { TwinklingSparkles } from "@/components/twinkling-sparkles";
+import { COMPUTE_MONTHLY_CAP_USD } from "@/content/billing";
 import { ResourcePicker } from "./resource-picker";
 import { SettingsCard } from "./settings-card";
+
+const PLAN_LABEL: Record<string, string> = {
+	free: "Free",
+	pro: "Hobby",
+	team: "Team",
+	enterprise: "Enterprise",
+};
 
 const PLAN_PRICE: Record<string, string> = {
 	free: "$0/mo",
@@ -92,21 +105,34 @@ function BillingDrawerBody() {
 	const dataProvider = useCloudProjectDataProvider();
 	// Use `useQuery` (not `useSuspenseQuery`) so a slow billing fetch doesn't
 	// bubble a Suspense to the route's pendingComponent and dim the top bar /
-	// chrome while we wait.
+	// chrome while we wait. The backend returns the fully-computed breakdown.
 	const { data: usage, isLoading } = useQuery(
 		dataProvider.currentProjectBillingUsageQueryOptions(),
 	);
-	const [plansOpen, setPlansOpen] = useState(false);
-	// Compute spend is shown in its own card, separate from the bill total.
 	const compute = useBilledComputeCost();
+	const [plansOpen, setPlansOpen] = useState(false);
 
 	if (isLoading || !usage) {
 		return <BillingSkeleton />;
 	}
 
 	const plan = usage.plan;
-	const metricsByKey = billedMetricsMap(usage);
+	const metricsByKey = new Map(usage.metrics.map((m) => [m.metric, m]));
 	const totalOverageCents = usage.totalCents;
+
+	// Billing is always project-scoped, even when this drawer is opened from a
+	// namespace URL, so compute usage shows the same regardless of context.
+	// Hide the compute row entirely when the project isn't using compute (no
+	// compute pools 404s, or an empty usage result), rather than rendering a
+	// row of zeros / skeletons.
+	const showCompute = features.compute && !compute.isUnavailable;
+	const computeDollars = compute.isError ? 0 : compute.monthToDate;
+	const computeCapUsd = COMPUTE_MONTHLY_CAP_USD[plan] ?? null;
+	// Capped plans are billed for compute only up to the cap.
+	const billedCompute =
+		computeCapUsd != null
+			? Math.min(computeDollars, computeCapUsd)
+			: computeDollars;
 
 	const periodStart = usage.currentPeriodStart
 		? new Date(usage.currentPeriodStart)
@@ -123,7 +149,10 @@ function BillingDrawerBody() {
 					onUpgrade={() => setPlansOpen(true)}
 				/>
 				<CurrentBillCard
-					total={totalOverageCents / 100}
+					total={
+						Number(totalOverageCents) / 100 +
+						(showCompute ? billedCompute : 0)
+					}
 					periodStart={periodStart}
 					periodEnd={periodEnd}
 				/>
@@ -176,22 +205,24 @@ function BillingDrawerBody() {
 										? BigInt(m.included)
 										: undefined
 								}
-								cost={Number(m?.overageCents ?? 0) / 100}
-								last={idx === USAGE_METRICS.length - 1}
+								costCents={BigInt(m?.overageCents ?? 0)}
+								last={
+									!showCompute &&
+									idx === USAGE_METRICS.length - 1
+								}
 							/>
 						);
 					})}
+					{showCompute ? (
+						<ComputeUsageRow
+							cost={computeDollars}
+							capUsd={computeCapUsd}
+							loading={compute.isLoading}
+							last
+						/>
+					) : null}
 				</SettingsCard>
 			</div>
-
-			{features.compute && !compute.isUnavailable ? (
-				<ComputeUsageCard
-					monthToDate={compute.monthToDate}
-					isLoading={compute.isLoading}
-					isError={compute.isError}
-					budgetPercent={computeBudgetPercent(usage)}
-				/>
-			) : null}
 		</div>
 	);
 }
@@ -203,7 +234,7 @@ function CurrentPlanCard({
 	plan: string;
 	onUpgrade: () => void;
 }) {
-	const label = PLAN_LABELS[plan] ?? "Free";
+	const label = PLAN_LABEL[plan] ?? "Free";
 	const price = PLAN_PRICE[plan] ?? "$0/mo";
 	const blurb = PLAN_BLURB[plan] ?? PLAN_BLURB.free;
 	return (
@@ -297,20 +328,20 @@ function UsageRow({
 	metric,
 	current,
 	includedInPlan,
-	cost,
+	costCents,
 	last,
 }: {
 	metric: UsageMetricConfig;
 	current: bigint;
 	includedInPlan: bigint | undefined;
-	/** Overage cost in dollars. */
-	cost: number;
+	costCents: bigint;
 	last: boolean;
 }) {
 	const includedLabel = includedInPlan
 		? `of ${formatMetricValue(includedInPlan, metric.metricType)}`
 		: null;
 	const currentLabel = formatMetricValue(current, metric.metricType);
+	const cost = Number(costCents) / 100;
 
 	const pct = includedInPlan
 		? Math.min(100, Number((current * 100n) / includedInPlan))
@@ -355,6 +386,75 @@ function UsageRow({
 			<div className="text-right">
 				<div className="text-sm tabular-nums font-medium text-foreground">
 					{formatCurrency(cost)}
+				</div>
+				<div className="text-[11px] text-muted-foreground">
+					this period
+				</div>
+			</div>
+		</div>
+	);
+}
+
+// Compute is a dollar amount rather than a metered unit, so it has its own row.
+// Capped plans show progress toward the cap; uncapped plans show "No limit" with
+// no bar. The billed amount (right column + total) is clamped to the cap.
+function ComputeUsageRow({
+	cost,
+	capUsd,
+	loading,
+	last,
+}: {
+	cost: number;
+	capUsd: number | null;
+	loading?: boolean;
+	last: boolean;
+}) {
+	const pct = capUsd ? Math.min(100, (cost / capUsd) * 100) : 0;
+	const billed = capUsd != null ? Math.min(cost, capUsd) : cost;
+
+	return (
+		<div
+			className={cn(
+				"grid grid-cols-[2fr_1fr_1fr_auto] items-center gap-6 px-5 py-3.5",
+				!last && "border-b border-foreground/10",
+			)}
+		>
+			<div className="flex items-start gap-3 min-w-0">
+				<div className="flex size-7 items-center justify-center rounded-md border border-foreground/10 mt-0.5 shrink-0">
+					<Icon icon={faServer} className="size-3.5" />
+				</div>
+				<div className="min-w-0">
+					<div className="text-sm font-medium text-foreground">
+						Compute
+					</div>
+					<div className="text-xs text-muted-foreground truncate">
+						Billed per active second by CPU and memory.
+					</div>
+				</div>
+			</div>
+			<div className="text-sm tabular-nums text-foreground">
+				{loading ? <Skeleton className="h-4 w-12" /> : formatCurrency(cost)}
+			</div>
+			<div className="min-w-0">
+				<div className="text-xs text-muted-foreground">
+					{capUsd != null ? `of ${formatCurrency(capUsd)}` : "No limit"}
+				</div>
+				{capUsd != null ? (
+					<div className="relative h-1 rounded-full bg-foreground/10 mt-1">
+						<div
+							className="absolute h-1 rounded-full bg-primary"
+							style={{ width: `${pct}%` }}
+						/>
+					</div>
+				) : null}
+			</div>
+			<div className="text-right">
+				<div className="text-sm tabular-nums font-medium text-foreground">
+					{loading ? (
+						<Skeleton className="h-4 w-12 ml-auto" />
+					) : (
+						formatCurrency(billed)
+					)}
 				</div>
 				<div className="text-[11px] text-muted-foreground">
 					this period

@@ -67,6 +67,18 @@ rivet-engine udb -q 'ls 0/1/2/workflow/by_name_and_tag/pegboard_actor/str:actor_
 
 - If a full engine test sweep fails during workflow-worker startup with `ActiveWorkerIdxKey` and `bad code, found 2`, treat it as a sporadic harness issue and retry the affected test once.
 
+## Build metadata
+
+- `rivet-build-meta`'s build script re-stamps the git SHA and build timestamp on every commit, so everything downstream of it recompiles each commit. Only crates that nothing but the `rivet-engine` binary pulls in may depend on it.
+- The binary reads the constants once and passes them into `rivet_config::Config::load`. Everywhere else reads them through `rivet_config::Config::build_meta()`.
+
+## Runtime protocol version sync
+
+- Compiled runtime protocol versions are assembled in `rivet_build_meta::compiled_runtime_protocols()` rather than the config crate, so a protocol bump does not recompile everything that depends on `rivet-config`.
+- The fleet only advances a runtime protocol version once every process heartbeating an older version is gone. A newly deployed process holds back to the oldest live version, so it must scan the protocol subspace in ascending version order.
+- Heartbeat timestamps are written with `MutationType::Max`, which compares values as little-endian integers, so `ProtocolVersionKey`'s value codec must be little-endian too.
+- Once a protocol has a call site that can speak more than one version, read the version from `rivet_config::Config::protocols()`. The `*_protocol::PROTOCOL_VERSION` constant is the compiled ceiling, not what the fleet has agreed to speak.
+
 ## Metrics
 
 - RivetKit core exposes per-actor Prometheus metrics at `/gateway/<actor_id>/metrics`, gated by `_RIVET_METRICS_TOKEN`; prefer this endpoint for actor and VFS performance tuning metrics.
@@ -88,9 +100,17 @@ rivet-engine udb -q 'ls 0/1/2/workflow/by_name_and_tag/pegboard_actor/str:actor_
 - `depot` fast-path commits should update an already-cached PIDX in memory after the store write, but must not load PIDX from store just to mutate it or the one-RTT path is gone.
 - `depot` shrink writes must delete above-EOF PIDX rows and fully-above-EOF SHARD blobs inside the same commit/takeover transaction; compaction only cleans partial shards by filtering pages at or below `head.db_size_pages`.
 - `depot` compaction should choose shard passes from the live PIDX scan, then delete DELTA blobs by comparing all existing delta keys against the remaining global PIDX references so multi-shard and overwritten deltas only disappear when every page ref is gone.
-- `depot` metrics should record compaction pass duration and totals in `compactor/worker.rs`, while shard outcome metrics such as folded pages, deleted deltas, delta gauge updates, and lag stay in `compactor/shard.rs` to avoid double counting.
+- `depot` metrics all live in the single flat `depot::metrics` module. Compaction pass duration/totals and per-pass volume (shards installed, cold refs published, reclaimed keys/bytes, lag) are recorded from the workflow `#[activity]` bodies via `metrics::record_*` helpers, never inside `#[workflow]` fns.
 - `depot` quota accounting should treat only `/META/head`, SHARD, DELTA, and PIDX keys as billable; `/META/quota` tracks the sum with signed atomic-add deltas.
 - `depot` latency tests that depend on `UDB_SIMULATED_LATENCY_MS` should live in a dedicated integration test binary, because UniversalDB caches that env var once per process with `OnceLock`.
+
+## UniversalDB throttling
+
+- Bulk background transactions bound their load with `tx.charge_throttle(name, kind)` at the top of the transaction body; UniversalDB then charges what the transaction reads and writes automatically. Do not hand-derive a charge from the rows a pass selected.
+- Reads are charged per attempt (including attempts that never commit) and writes once on commit. Any new charging path must preserve that split; charging writes per attempt silently strangles the budget.
+- Automatic write bytes only cover what an operation submits, so a `clear_range` must report the removed volume with `tx.charge_throttle_bytes(...)`. `COMPARE_AND_CLEAR` carries its value and is already covered.
+- `tx.check_throttle(...)` answers from process-local state and reads nothing, so it can be called before opening a transaction. Charging without checking is valid and is how a pass that must not yield still keeps the estimate honest.
+- Budgets are per `(throttle name, read|write)` in `runtime.udb_throttle_bytes_per_second`; depot compaction keeps its own `sqlite.compaction_{read,write}_bytes_per_second` keys, which win over the map.
 
 ## Pegboard Envoy
 

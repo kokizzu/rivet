@@ -14,7 +14,7 @@ use crate::routing::{
 };
 
 /// Build cache key for path-based actor routing
-#[tracing::instrument(skip_all)]
+#[tracing::instrument(level = "debug", skip_all)]
 pub fn build_cache_key_path_based(
 	req_ctx: &RequestContext,
 	actor_path_info: &ActorPathInfo,
@@ -34,7 +34,7 @@ pub fn build_cache_key_path_based(
 }
 
 /// Build cache key for target-based actor routing (header or WebSocket protocol)
-#[tracing::instrument(skip_all)]
+#[tracing::instrument(level = "debug", skip_all)]
 pub fn build_cache_key_target_based(req_ctx: &RequestContext, target: &str) -> Result<u64> {
 	// Check target
 	ensure!(target == "actor", "wrong target");

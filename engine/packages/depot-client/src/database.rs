@@ -48,6 +48,30 @@ impl crate::vfs::SqliteTransport for GenerationFencedTransport {
 		request.expected_generation.get_or_insert(self.generation);
 		self.inner.commit(request).await
 	}
+
+	async fn commit_stage_begin(
+		&self,
+		mut request: protocol::SqliteCommitStageBeginRequest,
+	) -> Result<protocol::SqliteCommitStageBeginResponse> {
+		request.expected_generation.get_or_insert(self.generation);
+		self.inner.commit_stage_begin(request).await
+	}
+
+	async fn commit_stage_segment(
+		&self,
+		mut request: protocol::SqliteCommitStageSegmentRequest,
+	) -> Result<protocol::SqliteCommitStageSegmentResponse> {
+		request.expected_generation.get_or_insert(self.generation);
+		self.inner.commit_stage_segment(request).await
+	}
+
+	async fn commit_finalize(
+		&self,
+		mut request: protocol::SqliteCommitFinalizeRequest,
+	) -> Result<protocol::SqliteCommitFinalizeResponse> {
+		request.expected_generation.get_or_insert(self.generation);
+		self.inner.commit_finalize(request).await
+	}
 }
 
 pub async fn open_database_from_transport(
@@ -277,6 +301,16 @@ impl NativeDatabaseHandle {
 
 	pub fn snapshot_preload_hints(&self) -> VfsPreloadHintSnapshot {
 		self.vfs.snapshot_preload_hints()
+	}
+
+	/// Reads back a file the connection wrote through its own VFS, such as a `VACUUM INTO` output.
+	pub fn read_vfs_file(&self, path: &str) -> Option<Vec<u8>> {
+		self.vfs.read_aux_file(path)
+	}
+
+	/// Drops a file the connection wrote through its own VFS, releasing the memory holding it.
+	pub fn delete_vfs_file(&self, path: &str) {
+		self.vfs.delete_aux_file(path);
 	}
 
 	pub fn sqlite_vfs_metrics(&self) -> SqliteVfsMetricsSnapshot {

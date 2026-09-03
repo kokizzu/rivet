@@ -176,7 +176,7 @@ impl InMemoryDriver {
 				result.push(self.cache().get(&**key).await.map(|x| x.value.clone()));
 			}
 		}
-		.instrument(tracing::info_span!("get"))
+		.instrument(tracing::debug_span!("get"))
 		.await;
 
 		tracing::debug!(
@@ -206,7 +206,7 @@ impl InMemoryDriver {
 				self.cache().insert(key.into(), entry).await;
 			}
 		}
-		.instrument(tracing::info_span!("set"))
+		.instrument(tracing::debug_span!("set"))
 		.await;
 
 		tracing::trace!("successfully wrote to in-memory cache with per-key expiry");
@@ -225,7 +225,7 @@ impl InMemoryDriver {
 				self.cache().remove(&*key).await;
 			}
 		}
-		.instrument(tracing::info_span!("delete"))
+		.instrument(tracing::debug_span!("delete"))
 		.await;
 
 		tracing::trace!("successfully deleted keys from in-memory cache");

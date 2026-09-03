@@ -234,6 +234,9 @@ fn build_atom(ty: Option<&str>, value: &str) -> Result<SimpleTupleValue> {
 		Some("bytes") | Some("b") => hex::decode(value.as_bytes())
 			.map(SimpleTupleValue::Bytes)
 			.with_context(|| format!("could not parse `{value}` as hex encoded bytes")),
+		Some("raw") => hex::decode(value.as_bytes())
+			.map(SimpleTupleValue::Unknown)
+			.with_context(|| format!("could not parse `{value}` as hex encoded bytes")),
 		Some(t) => bail!("unknown type: `{t}`"),
 		None => Ok(auto_detect(value)),
 	}

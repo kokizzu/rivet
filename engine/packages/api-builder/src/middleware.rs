@@ -10,6 +10,7 @@ use axum::{
 };
 use hyper::header::HeaderName;
 use opentelemetry::trace::TraceContextExt;
+use rivet_metrics::GaugeGuardExt;
 use tower_http::trace::TraceLayer;
 use tracing::Instrument;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
@@ -109,15 +110,18 @@ pub async fn http_logging_middleware(
 	);
 
 	// Metrics
-	metrics::API_REQUEST_PENDING
+	let pending_guard = metrics::API_REQUEST_PENDING
 		.with_label_values(&[router_name, method.as_str(), path.as_str()])
-		.inc();
+		.inc_guard();
 	metrics::API_REQUEST_TOTAL
 		.with_label_values(&[router_name, method.as_str(), path.as_str()])
 		.inc();
 
 	// Process the request
 	let response = async move {
+		// Held for the lifetime of the request so a client disconnect cannot leak the gauge
+		let _pending_guard = pending_guard;
+
 		let mut response = next.run(req).await;
 
 		// Add ray_id to response headers
@@ -184,9 +188,6 @@ pub async fn http_logging_middleware(
 			error_internal = %error.as_ref().and_then(|x| x.internal.as_ref()).map_or("-", |x| x.as_ref()),
 			"http response"
 		);
-
-		// Update metrics
-		metrics::API_REQUEST_PENDING.with_label_values(&[router_name, method.as_str(), path.as_str()]).dec();
 
 		let error_str: String = if status.is_success() {
 			String::new()

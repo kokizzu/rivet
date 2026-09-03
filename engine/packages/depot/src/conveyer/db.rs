@@ -1,6 +1,9 @@
-use std::sync::{
-	Arc,
-	atomic::{AtomicU64, Ordering},
+use std::{
+	collections::BTreeSet,
+	sync::{
+		Arc,
+		atomic::{AtomicU64, Ordering},
+	},
 };
 
 use anyhow::{Context, Result};
@@ -27,6 +30,11 @@ use super::{
 /// a pure perf cache that never acts as a correctness fence.
 const LTX_BLOB_CACHE_MAX_BYTES: u64 = 32 * 1024 * 1024;
 
+/// Commits whose segment layout is remembered per connection. One entry is a handful of page numbers
+/// and keys, and the layouts worth holding are the recent commits a working set keeps re-reading, so
+/// this only has to outlive a read burst rather than track the blob cache's byte budget.
+const DELTA_SEGMENT_LAYOUT_CACHE_MAX_ENTRIES: u64 = 4096;
+
 /// Bounded cache of parsed LTX blobs keyed by their immutable source key. Holds
 /// the raw bytes plus the parsed page index so repeated reads of the same shard
 /// or delta within a connection avoid both the FDB re-fetch and the index
@@ -39,6 +47,22 @@ pub(super) fn new_ltx_blob_cache() -> LtxBlobCache {
 		.weigher(|key: &Vec<u8>, blob: &Arc<super::ltx::LtxBlob>| {
 			u32::try_from(key.len() + blob.bytes().len()).unwrap_or(u32::MAX)
 		})
+		.build()
+}
+
+/// Bounded cache of one commit's segment layout, keyed by its DELTA txid prefix.
+///
+/// A commit's blobs are immutable and their keys are only discoverable by scanning the txid's rows,
+/// so without this a read would have to scan FDB even when every blob it needs is already parsed in
+/// `LtxBlobCache`. Caching the layout is what keeps the blob cache's zero-read hit path intact for a
+/// segmented commit. Entries are small (a page number and a key per segment), so this is capped by
+/// entry count rather than weighed by bytes.
+pub(super) type DeltaSegmentLayoutCache =
+	moka::future::Cache<Vec<u8>, Arc<Vec<(Option<u32>, Vec<u8>)>>>;
+
+pub(super) fn new_delta_segment_layout_cache() -> DeltaSegmentLayoutCache {
+	moka::future::Cache::builder()
+		.max_capacity(DELTA_SEGMENT_LAYOUT_CACHE_MAX_ENTRIES)
 		.build()
 }
 
@@ -91,6 +115,7 @@ pub struct Db {
 	pub(super) cache_snapshot: RwLock<Option<CacheSnapshot>>,
 	/// Cached parsed LTX blobs keyed by immutable source key. Perf cache only.
 	pub(super) ltx_blob_cache: LtxBlobCache,
+	pub(super) delta_segment_layout_cache: DeltaSegmentLayoutCache,
 	/// Cached `/META/quota`. Loaded once on the first UDB tx.
 	pub(super) storage_used: RwLock<Option<i64>>,
 	/// Bytes written across commits since the last metering rollup.
@@ -104,7 +129,37 @@ pub struct Db {
 	pub(super) fault_controller: Option<DepotFaultController>,
 }
 
+/// Longest an actor path will wait for the throttle before proceeding anyway.
+///
+/// The wait is bounded because an actor cannot park: SQLite is blocked inside its commit callback, so
+/// an unbounded wait becomes a hung write rather than backpressure. Compaction can return `Throttled`
+/// and resume from a cursor later; this lane has no such option, so it slows down and then proceeds.
+const ACTOR_THROTTLE_MAX_WAIT_MS: u64 = 1_000;
+
+/// How long each backoff step waits before re-checking.
+const ACTOR_THROTTLE_BACKOFF_MS: u64 = 25;
+
 impl Db {
+	/// Applies throttle backpressure to an actor-facing path before it opens its transaction.
+	///
+	/// Slows the caller rather than refusing it. Checked before the transaction rather than inside it
+	/// so the wait does not hold one open, and charged separately once the work is known.
+	pub(super) async fn await_actor_throttle(&self, kind: universaldb::ThrottleKind) {
+		let deadline = std::time::Instant::now()
+			+ std::time::Duration::from_millis(ACTOR_THROTTLE_MAX_WAIT_MS);
+		loop {
+			let decision = self.udb.check_throttle(
+				rivet_config::config::DEPOT_ACTOR_THROTTLE,
+				kind,
+				universaldb::ThrottleClass::default(),
+			);
+			if decision.allowed || std::time::Instant::now() >= deadline {
+				return;
+			}
+			tokio::time::sleep(std::time::Duration::from_millis(ACTOR_THROTTLE_BACKOFF_MS)).await;
+		}
+	}
+
 	pub fn new(udb: Arc<Database>, bucket_id: Id, database_id: String, node_id: NodeId) -> Self {
 		Self::new_inner(udb, bucket_id, database_id, node_id, None)
 	}
@@ -175,6 +230,7 @@ impl Db {
 			node_id,
 			cache_snapshot: RwLock::new(None),
 			ltx_blob_cache: new_ltx_blob_cache(),
+			delta_segment_layout_cache: new_delta_segment_layout_cache(),
 			storage_used: RwLock::new(None),
 			commit_bytes_since_rollup: AtomicU64::new(0),
 			read_bytes_since_rollup: AtomicU64::new(0),
@@ -210,7 +266,7 @@ impl Db {
 			snapshot.branch_id,
 			snapshot.ancestors.root_branch_id,
 			snapshot.last_access_bucket,
-			snapshot.pidx.range(0, u32::MAX),
+			snapshot.pidx.known_owners(),
 		))
 	}
 }
@@ -223,6 +279,7 @@ pub(super) async fn touch_access_if_bucket_advanced(
 	tx: &universaldb::Transaction,
 	branch_id: DatabaseBranchId,
 	cached_bucket: Option<i64>,
+	_touched_shards: &BTreeSet<u32>,
 	now_ms: i64,
 ) -> Result<Option<i64>> {
 	let bucket = access_bucket(now_ms);
@@ -262,9 +319,10 @@ pub mod test_hooks {
 		tx: &universaldb::Transaction,
 		branch_id: DatabaseBranchId,
 		cached_bucket: Option<i64>,
+		touched_shards: &BTreeSet<u32>,
 		now_ms: i64,
 	) -> Result<Option<i64>> {
-		touch_access_if_bucket_advanced(tx, branch_id, cached_bucket, now_ms).await
+		touch_access_if_bucket_advanced(tx, branch_id, cached_bucket, touched_shards, now_ms).await
 	}
 }
 

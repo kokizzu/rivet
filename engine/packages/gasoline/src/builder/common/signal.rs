@@ -161,18 +161,38 @@ impl<T: Signal + Serialize> SignalBuilder<T> {
 				};
 
 				let db_write_started = Instant::now();
-				self.db
+				let res = self
+					.db
 					.publish_signal(self.ray_id, workflow_id, signal_id, T::NAME, &input_val)
-					.await?;
+					.await;
+				match res {
+					Ok(_) => {}
+					Err(WorkflowError::WorkflowNotFound) if self.graceful_not_found => {
+						tracing::debug!("signal target not found");
+
+						return Ok(None);
+					}
+					Err(err) => return Err(err.into()),
+				}
 				db_write_duration = db_write_started.elapsed();
 			}
 			(None, Some(workflow_id), true) => {
 				tracing::debug!(to_workflow_id=%workflow_id, "dispatching signal via workflow id");
 
 				let db_write_started = Instant::now();
-				self.db
+				let res = self
+					.db
 					.publish_signal(self.ray_id, workflow_id, signal_id, T::NAME, &input_val)
-					.await?;
+					.await;
+				match res {
+					Ok(_) => {}
+					Err(WorkflowError::WorkflowNotFound) if self.graceful_not_found => {
+						tracing::debug!("signal target not found");
+
+						return Ok(None);
+					}
+					Err(err) => return Err(err.into()),
+				}
 				db_write_duration = db_write_started.elapsed();
 			}
 			(None, None, false) => {

@@ -308,3 +308,19 @@ pub struct WebSocketTargetChanged {
 	pub from_target_kind: String,
 	pub to_target_kind: String,
 }
+
+#[derive(RivetError, Serialize, Deserialize)]
+#[error(
+	"guard",
+	"websocket_not_supported",
+	"The requested service does not support websockets."
+)]
+pub struct WebSocketNotSupported;
+
+#[derive(RivetError, Serialize, Deserialize)]
+#[error(
+	"guard",
+	"websocket_hibernation_not_supported",
+	"The requested service does not support websocket hibernation."
+)]
+pub struct WebSocketHibernationNotSupported;

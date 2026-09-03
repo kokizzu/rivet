@@ -24,7 +24,7 @@ const SINGLE_SHOT_MAX_PAGES = 320;
 // Pages one staged segment carries, so a commit's segment count is predictable.
 const PAGES_PER_SEGMENT = 320;
 // The engine's total commit cap.
-const MAX_COMMIT_PAGES = 65_536;
+const MAX_COMMIT_PAGES = 32_768;
 
 const ROW_BYTES = 4_000;
 
@@ -114,7 +114,8 @@ async function main(): Promise<void> {
 						? Math.ceil(written.pagesDirtied / PAGES_PER_SEGMENT)
 						: 0,
 				pageCount: verified.pageCount,
-				sizeMib: Math.round((verified.sizeBytes / (1024 * 1024)) * 10) / 10,
+				sizeMib:
+					Math.round((verified.sizeBytes / (1024 * 1024)) * 10) / 10,
 				commitMs: written.slowestBatchMs,
 				integrity: verified.integrity,
 				mismatchedRows: verified.mismatchedRows,
@@ -140,9 +141,17 @@ async function main(): Promise<void> {
 		const rows = envNum("SUITE_EQUIV_ROWS", 4_000);
 		const startedAt = Date.now();
 		try {
-			const staged = client.largeCommitDb.getOrCreate(`lc-${runId}-equiv-staged`);
-			const chunked = client.largeCommitDb.getOrCreate(`lc-${runId}-equiv-chunked`);
-			const stagedWrite = await staged.write({ rows, rowBytes: ROW_BYTES, batches: 1 });
+			const staged = client.largeCommitDb.getOrCreate(
+				`lc-${runId}-equiv-staged`,
+			);
+			const chunked = client.largeCommitDb.getOrCreate(
+				`lc-${runId}-equiv-chunked`,
+			);
+			const stagedWrite = await staged.write({
+				rows,
+				rowBytes: ROW_BYTES,
+				batches: 1,
+			});
 			// 250 rows per batch keeps every one of these under the 320-page
 			// single-shot cap, so this side never stages.
 			const chunkedWrite = await chunked.write({
@@ -203,7 +212,11 @@ async function main(): Promise<void> {
 		const startedAt = Date.now();
 		try {
 			const handle = client.largeCommitDb.getOrCreate(key);
-			await handle.write({ rows: 6_000, rowBytes: ROW_BYTES, batches: 20 });
+			await handle.write({
+				rows: 6_000,
+				rowBytes: ROW_BYTES,
+				batches: 20,
+			});
 			const before = await handle.fingerprint();
 			const rewritten = await handle.rewriteAll({ rowBytes: ROW_BYTES });
 			const verified = await handle.verify({ rowBytes: ROW_BYTES });
@@ -221,7 +234,8 @@ async function main(): Promise<void> {
 				commitMs: rewritten.slowestBatchMs,
 				integrity: verified.integrity,
 				mismatchedRows: verified.mismatchedRows,
-				contentUnchanged: JSON.stringify(before) === JSON.stringify(after),
+				contentUnchanged:
+					JSON.stringify(before) === JSON.stringify(after),
 				elapsedMs: Date.now() - startedAt,
 			});
 		} catch (err) {
@@ -231,6 +245,62 @@ async function main(): Promise<void> {
 				name: "rewrite",
 				error: err instanceof Error ? err.message : String(err),
 				elapsedMs: Date.now() - startedAt,
+			});
+		}
+	}
+
+	// Byte volume under the actor throttle. Random rows so a commit costs what
+	// its page count implies: the deterministic payload compresses by around
+	// forty times, which makes every byte-volume number meaningless.
+	if (only?.split(",").includes("throttle")) {
+		const rows = envNum("SUITE_THROTTLE_ROWS", 8_000);
+		const passes = envNum("SUITE_THROTTLE_PASSES", 6);
+		const key = `lc-${runId}-throttle`;
+		try {
+			const handle = client.largeCommitDb.getOrCreate(key);
+			for (let pass = 0; pass < passes; pass += 1) {
+				const startedAt = Date.now();
+				const written = await handle.write({
+					rows,
+					rowBytes: ROW_BYTES,
+					batches: 1,
+					random: true,
+				});
+				log({
+					event: "throttle_pass",
+					pass,
+					pagesDirtied: written.pagesDirtied,
+					mib: Math.round(
+						(written.pagesDirtied * 4096) / (1024 * 1024),
+					),
+					commitMs: written.slowestBatchMs,
+					elapsedMs: Date.now() - startedAt,
+				});
+			}
+			const verified = await handle.verify({
+				rowBytes: ROW_BYTES,
+				random: true,
+			});
+			if (!verified.ok) failures += 1;
+			log({
+				event: "case",
+				name: "throttle",
+				expect: "incompressible commits, so byte volume matches page count",
+				key,
+				ok: verified.ok,
+				pageCount: verified.pageCount,
+				sizeMib: Math.round(verified.sizeBytes / (1024 * 1024)),
+				integrity: verified.integrity,
+				mismatchedRows: verified.mismatchedRows,
+				idGaps: verified.idGaps,
+			});
+		} catch (err) {
+			failures += 1;
+			log({
+				event: "case_error",
+				name: "throttle",
+				key,
+				error: err instanceof Error ? err.message : String(err),
 			});
 		}
 	}
@@ -252,13 +322,16 @@ async function main(): Promise<void> {
 			log({
 				event: "case",
 				name: "at-cap",
-				expect: "a commit at or near the 65,536-page cap publishes intact",
+				expect: "a commit at or near the 32,768-page cap publishes intact",
 				key,
 				ok: verified.ok,
 				rows: written.rowsWritten,
 				pagesDirtied: written.pagesDirtied,
-				estimatedSegments: Math.ceil(written.pagesDirtied / PAGES_PER_SEGMENT),
-				sizeMib: Math.round((verified.sizeBytes / (1024 * 1024)) * 10) / 10,
+				estimatedSegments: Math.ceil(
+					written.pagesDirtied / PAGES_PER_SEGMENT,
+				),
+				sizeMib:
+					Math.round((verified.sizeBytes / (1024 * 1024)) * 10) / 10,
 				commitMs: written.slowestBatchMs,
 				integrity: verified.integrity,
 				mismatchedRows: verified.mismatchedRows,

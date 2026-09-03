@@ -585,7 +585,7 @@ fn hash_position_key(
 		ENVOY_HASH_IDX,
 		namespace_id,
 		pool_name,
-		-(version as i32),
+		keys::ns::encode_reverse_u32(version),
 		&hash_pos[..],
 	))
 }

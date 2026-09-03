@@ -125,6 +125,8 @@ lazy_static::lazy_static! {
 		*REGISTRY
 	).unwrap();
 
+	/// Hold an `inc_guard()` across `WebSocketHandle::send` so this captures the lock-wait plus
+	/// network write time.
 	pub static ref WS_RESPONSES_IN_FLIGHT: IntGauge = register_int_gauge_with_registry!(
 		"pegboard_envoy_ws_responses_in_flight",
 		"Pod-wide count of responses currently queued on or being written to envoy WebSockets via WebSocketHandle::send.",

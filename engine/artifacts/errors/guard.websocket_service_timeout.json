@@ -1,5 +1,0 @@
-{
-  "code": "websocket_service_timeout",
-  "group": "guard",
-  "message": "WebSocket service timed out."
-}

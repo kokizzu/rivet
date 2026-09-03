@@ -19,6 +19,7 @@ use crate::subject::{InboxSubject, Subject};
 const GC_INTERVAL: Duration = Duration::from_secs(60);
 
 pub struct PubSubInner {
+	config: rivet_config::Config,
 	driver: PubSubDriverHandle,
 	chunk_tracker: ChunkTracker,
 	// Local in-memory subscribers by subject (shared across all drivers)
@@ -39,15 +40,17 @@ impl Deref for PubSub {
 }
 
 impl PubSub {
-	pub fn new(driver: PubSubDriverHandle) -> Self {
-		Self::new_with_memory_optimization(driver, true)
+	pub fn new(config: rivet_config::Config, driver: PubSubDriverHandle) -> Self {
+		Self::new_with_memory_optimization(config, driver, true)
 	}
 
 	pub fn new_with_memory_optimization(
+		config: rivet_config::Config,
 		driver: PubSubDriverHandle,
 		memory_optimization: bool,
 	) -> Self {
 		let inner = Arc::new(PubSubInner {
+			config,
 			driver,
 			chunk_tracker: ChunkTracker::new(),
 			local_subscribers: HashMap::new(),
@@ -86,7 +89,7 @@ impl PubSub {
 		self.subscribe_inner(subject, None).await
 	}
 
-	#[tracing::instrument(skip_all, fields(%subject))]
+	#[tracing::instrument(level = "debug", skip_all, fields(%subject))]
 	async fn subscribe_inner<T: Subject>(
 		&self,
 		subject: T,
@@ -173,7 +176,7 @@ impl PubSub {
 			.await
 	}
 
-	#[tracing::instrument(skip_all, fields(%subject, ?opts, message_id = tracing::field::Empty))]
+	#[tracing::instrument(level = "debug", skip_all, fields(%subject, ?opts, message_id = tracing::field::Empty))]
 	async fn publish_inner<T: Subject>(
 		&self,
 		subject: T,
@@ -185,12 +188,17 @@ impl PubSub {
 		let message_id = Uuid::new_v4();
 		tracing::Span::current().record("message_id", message_id.to_string());
 
+		// Read the negotiated version once so that every chunk of this message is encoded at the
+		// same version, even if the fleet moves between chunks.
+		let protocol_version = self.config.protocols().ups.version();
+
 		let chunks = split_payload_into_chunks(
 			payload,
 			self.driver.max_message_size(),
 			message_id,
 			reply_subject.as_ref().map(|x| x.as_cow()).as_deref(),
 			request_deadline_at,
+			protocol_version,
 		)?;
 		let chunk_count = chunks.len() as u32;
 
@@ -211,6 +219,7 @@ impl PubSub {
 				message_id,
 				reply_subject.clone(),
 				request_deadline_at,
+				protocol_version,
 			)?;
 
 			if use_local {
@@ -275,7 +284,7 @@ impl PubSub {
 		Ok(message_id)
 	}
 
-	#[tracing::instrument(skip_all)]
+	#[tracing::instrument(level = "debug", skip_all)]
 	pub async fn flush(&self) -> Result<()> {
 		self.driver.flush().await
 	}
@@ -297,7 +306,7 @@ impl PubSub {
 			.await
 	}
 
-	#[tracing::instrument(skip_all, fields(%subject))]
+	#[tracing::instrument(level = "debug", skip_all, fields(%subject))]
 	pub async fn request_with_timeout_inner<T: Subject>(
 		&self,
 		subject: T,
@@ -352,7 +361,7 @@ impl PubSub {
 		}
 	}
 
-	#[tracing::instrument(skip_all, fields(%subject))]
+	#[tracing::instrument(level = "debug", skip_all, fields(%subject))]
 	async fn should_use_local_subscriber(
 		&self,
 		subject: &impl Subject,
@@ -418,7 +427,7 @@ impl Subscriber {
 		}
 	}
 
-	#[tracing::instrument(skip_all, fields(subject=%self.subject, message_id = tracing::field::Empty))]
+	#[tracing::instrument(level = "debug", skip_all, fields(subject=%self.subject, message_id = tracing::field::Empty))]
 	pub async fn next(&mut self) -> Result<NextOutput> {
 		loop {
 			match self.driver.next().await? {
@@ -545,7 +554,7 @@ pub struct Message {
 }
 
 impl Message {
-	#[tracing::instrument(skip_all, fields(message_id=?self.message_id, reply_subject=?self.reply, request_deadline_at=?self.request_deadline_at))]
+	#[tracing::instrument(level = "debug", skip_all, fields(message_id=?self.message_id, reply_subject=?self.reply, request_deadline_at=?self.request_deadline_at))]
 	pub async fn reply(&self, payload: &[u8]) -> Result<()> {
 		if let Some(ref reply_subject) = self.reply {
 			if self.is_request_expired() {
@@ -581,7 +590,7 @@ struct LocalOptimizedSubscriberDriver {
 
 #[async_trait::async_trait]
 impl crate::driver::SubscriberDriver for LocalOptimizedSubscriberDriver {
-	#[tracing::instrument(skip_all)]
+	#[tracing::instrument(level = "debug", skip_all)]
 	async fn next(&mut self) -> Result<DriverOutput> {
 		loop {
 			tokio::select! {

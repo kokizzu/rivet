@@ -1,6 +1,9 @@
 use anyhow::Result;
-use axum::response::{IntoResponse, Json, Response};
-use rivet_api_builder::{ApiError, extract::Extension};
+use axum::{
+	extract::Extension,
+	response::{IntoResponse, Json, Response},
+};
+use rivet_api_builder::ApiError;
 use rivet_api_types::{datacenters::list::*, pagination::Pagination};
 use rivet_types::datacenters::Datacenter;
 
@@ -23,6 +26,7 @@ pub async fn list(Extension(ctx): Extension<ApiCtx>) -> Response {
 	}
 }
 
+#[tracing::instrument(level = "debug", skip_all)]
 async fn list_inner(ctx: ApiCtx) -> Result<ListResponse> {
 	ctx.auth().await?;
 

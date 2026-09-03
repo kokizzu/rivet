@@ -768,3 +768,61 @@ impl<'de> TupleUnpack<'de> for GenerationKey {
 		Ok((input, v))
 	}
 }
+
+/// Marks that a sqlite v1 to v2 import is in progress for this actor. The value
+/// is the total page count of the v1 database being imported.
+///
+/// A v2 database head can only be trusted as a complete database while this key
+/// is absent. The import spans several depot commits, so it publishes partial
+/// heads along the way.
+#[derive(Debug)]
+pub struct SqliteMigrationKey {
+	actor_id: Id,
+}
+
+impl SqliteMigrationKey {
+	pub fn new(actor_id: Id) -> Self {
+		SqliteMigrationKey { actor_id }
+	}
+}
+
+impl FormalKey for SqliteMigrationKey {
+	// Total pages in the v1 database being imported.
+	type Value = u32;
+
+	fn deserialize(&self, raw: &[u8]) -> Result<Self::Value> {
+		Ok(u32::from_be_bytes(raw.try_into()?))
+	}
+
+	fn serialize(&self, value: Self::Value) -> Result<Vec<u8>> {
+		Ok(value.to_be_bytes().to_vec())
+	}
+}
+
+impl TuplePack for SqliteMigrationKey {
+	fn pack<W: std::io::Write>(
+		&self,
+		w: &mut W,
+		tuple_depth: TupleDepth,
+	) -> std::io::Result<VersionstampOffset> {
+		let t = (ACTOR, DATA, self.actor_id, SQLITE_MIGRATION);
+		t.pack(w, tuple_depth)
+	}
+}
+
+impl<'de> TupleUnpack<'de> for SqliteMigrationKey {
+	fn unpack(input: &[u8], tuple_depth: TupleDepth) -> PackResult<(&[u8], Self)> {
+		let (input, (_, _, actor_id, key_type)) =
+			<(usize, usize, Id, usize)>::unpack(input, tuple_depth)?;
+
+		if key_type != SQLITE_MIGRATION {
+			return Err(PackError::Message(
+				"expected SQLITE_MIGRATION key type".into(),
+			));
+		}
+
+		let v = SqliteMigrationKey { actor_id };
+
+		Ok((input, v))
+	}
+}

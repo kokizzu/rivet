@@ -11,7 +11,7 @@ struct CatchUpState {
 	applied_entries: usize,
 }
 
-#[tracing::instrument(skip_all)]
+#[tracing::instrument(level = "debug", skip_all)]
 pub async fn setup_replica(ctx: &mut WorkflowCtx, _input: &super::Input) -> Result<()> {
 	// Block until the coordinator sends BeginLearning. On fresh clusters with no
 	// data to catch up the signal still arrives so the replica transitions to active.
@@ -21,7 +21,7 @@ pub async fn setup_replica(ctx: &mut WorkflowCtx, _input: &super::Input) -> Resu
 	Ok(())
 }
 
-#[tracing::instrument(skip_all, fields(replica_id = %ctx.config().epoxy_replica_id()))]
+#[tracing::instrument(level = "debug", skip_all, fields(replica_id = %ctx.config().epoxy_replica_id()))]
 pub async fn begin_learning(ctx: &mut WorkflowCtx, signal: &super::BeginLearning) -> Result<()> {
 	ctx.activity(StoreConfigInput {
 		config: signal.config.clone(),
@@ -80,7 +80,7 @@ async fn store_config(ctx: &ActivityCtx, input: &StoreConfigInput) -> Result<()>
 			let update_req = update_req.clone();
 			async move { crate::replica::update_config::update_config(&*tx, replica_id, update_req) }
 		})
-		.custom_instrument(tracing::info_span!("store_replica_config_tx"))
+		.custom_instrument(tracing::debug_span!("store_replica_config_tx"))
 		.await?;
 
 	Ok(())

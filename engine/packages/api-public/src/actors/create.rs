@@ -34,7 +34,9 @@ use crate::ctx::ApiCtx;
 	responses(
 		(status = 200, body = CreateResponse),
 	),
+	security(("bearer_auth" = [])),
 )]
+#[tracing::instrument(skip_all)]
 pub async fn create(
 	Extension(ctx): Extension<ApiCtx>,
 	Query(query): Query<CreateQuery>,
@@ -46,13 +48,13 @@ pub async fn create(
 	}
 }
 
-#[tracing::instrument(skip_all)]
+#[tracing::instrument(level = "debug", skip_all)]
 async fn create_inner(
 	ctx: ApiCtx,
 	query: CreateQuery,
 	body: CreateRequest,
 ) -> Result<CreateResponse> {
-	ctx.skip_auth();
+	ctx.auth().await?;
 
 	let namespace = ctx
 		.op(namespace::ops::resolve_for_name_global::Input {

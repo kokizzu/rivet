@@ -115,7 +115,7 @@ fn route_dispatch_phase(router: &'static str) -> Phase {
 }
 
 /// Creates the main routing function that handles all incoming requests
-#[tracing::instrument(skip_all)]
+#[tracing::instrument(level = "debug", skip_all)]
 pub fn create_routing_function(ctx: &StandaloneCtx, shared_state: SharedState) -> RoutingFn {
 	let ctx = ctx.clone();
 	Arc::new(move |req_ctx| {
@@ -298,7 +298,7 @@ pub fn create_routing_function(ctx: &StandaloneCtx, shared_state: SharedState) -
 				}
 				.build())
 			}
-			.instrument(tracing::info_span!("routing_fn", %hostname, %path)),
+			.instrument(tracing::debug_span!("routing_fn", %hostname, %path)),
 		)
 	})
 }

@@ -70,7 +70,7 @@ pub trait Database: Send {
 		worker_id: Id,
 		worker_version: i64,
 		update_active_idx: bool,
-	) -> WorkflowResult<()>;
+	) -> WorkflowResult<i64>;
 
 	/// Removes the worker from consideration for `pull_workflows` delegation.
 	async fn mark_worker_inactive(&self, worker_id: Id) -> WorkflowResult<()>;
@@ -119,11 +119,16 @@ pub trait Database: Send {
 		worker_id: Id,
 		worker_version: i64,
 		filter: &[&str],
+		running_workflows_by_name: &HashMap<String, usize>,
 	) -> WorkflowResult<Vec<PulledWorkflowData>>;
 
 	/// Mark a workflow as completed.
+	///
+	/// Fenced by the workflow's lease: fails with `WorkflowError::LeaseFenceMismatch` and writes
+	/// nothing if `worker_id` no longer holds the lease.
 	async fn complete_workflow(
 		&self,
+		worker_id: Id,
 		workflow_id: Id,
 		workflow_name: &str,
 		output: &serde_json::value::RawValue,
@@ -131,8 +136,11 @@ pub trait Database: Send {
 	) -> WorkflowResult<()>;
 
 	/// Write a workflow sleep/failure to the database.
+	///
+	/// Fenced by the workflow's lease.
 	async fn commit_workflow(
 		&self,
+		worker_id: Id,
 		workflow_id: Id,
 		workflow_name: &str,
 		wake_immediate: bool,
@@ -143,8 +151,11 @@ pub trait Database: Send {
 	) -> WorkflowResult<()>;
 
 	/// Pulls signals in order from oldest to newest with the given filter.
+	///
+	/// Fenced by the workflow's lease because it writes the signals event to history.
 	async fn pull_next_signals(
 		&self,
+		worker_id: Id,
 		workflow_id: Id,
 		workflow_name: &str,
 		filter: &[&str],
@@ -175,8 +186,11 @@ pub trait Database: Send {
 	) -> WorkflowResult<()>;
 
 	/// Write a new signal to the database. Contains extra info used to populate the history.
+	///
+	/// Fenced by the sending workflow's lease.
 	async fn publish_signal_from_workflow(
 		&self,
+		worker_id: Id,
 		from_workflow_id: Id,
 		location: &Location,
 		version: usize,
@@ -189,8 +203,11 @@ pub trait Database: Send {
 	) -> WorkflowResult<()>;
 
 	/// Publish a new workflow from an existing workflow.
+	///
+	/// Fenced by the parent workflow's lease.
 	async fn dispatch_sub_workflow(
 		&self,
+		worker_id: Id,
 		ray_id: Id,
 		workflow_id: Id,
 		location: &Location,
@@ -204,17 +221,25 @@ pub trait Database: Send {
 	) -> WorkflowResult<Id>;
 
 	/// Updates workflow state.
+	///
+	/// Fenced by the workflow's lease.
 	async fn update_workflow_state(
 		&self,
+		worker_id: Id,
 		workflow_id: Id,
 		state: &serde_json::value::RawValue,
 	) -> WorkflowResult<()>;
 
 	// MARK: History
+	//
+	// Every history write is fenced by the workflow's lease: it fails with
+	// `WorkflowError::LeaseFenceMismatch` and writes nothing if `worker_id` no longer holds the lease
+	// for the workflow being written.
 
 	/// Write a workflow activity event to history.
 	async fn commit_workflow_activity_event(
 		&self,
+		worker_id: Id,
 		workflow_id: Id,
 		location: &Location,
 		version: usize,
@@ -228,6 +253,7 @@ pub trait Database: Send {
 	/// Writes a message send event to history.
 	async fn commit_workflow_message_send_event(
 		&self,
+		worker_id: Id,
 		from_workflow_id: Id,
 		location: &Location,
 		version: usize,
@@ -240,6 +266,7 @@ pub trait Database: Send {
 	/// Updates a loop event in history and forgets all history items in the previous iteration.
 	async fn upsert_workflow_loop_event(
 		&self,
+		worker_id: Id,
 		workflow_id: Id,
 		workflow_name: &str,
 		location: &Location,
@@ -253,6 +280,7 @@ pub trait Database: Send {
 	/// Writes a workflow sleep event to history.
 	async fn commit_workflow_sleep_event(
 		&self,
+		worker_id: Id,
 		from_workflow_id: Id,
 		location: &Location,
 		version: usize,
@@ -263,6 +291,7 @@ pub trait Database: Send {
 	/// Updates a workflow sleep event's state.
 	async fn update_workflow_sleep_event_state(
 		&self,
+		worker_id: Id,
 		from_workflow_id: Id,
 		location: &Location,
 		state: SleepState,
@@ -271,6 +300,7 @@ pub trait Database: Send {
 	/// Writes a workflow branch event to history.
 	async fn commit_workflow_branch_event(
 		&self,
+		worker_id: Id,
 		from_workflow_id: Id,
 		location: &Location,
 		version: usize,
@@ -280,6 +310,7 @@ pub trait Database: Send {
 	/// Writes a workflow branch event to history.
 	async fn commit_workflow_removed_event(
 		&self,
+		worker_id: Id,
 		from_workflow_id: Id,
 		location: &Location,
 		event_type: EventType,
@@ -290,6 +321,7 @@ pub trait Database: Send {
 	/// Writes a workflow version check event to history.
 	async fn commit_workflow_version_check_event(
 		&self,
+		worker_id: Id,
 		from_workflow_id: Id,
 		location: &Location,
 		version: usize,

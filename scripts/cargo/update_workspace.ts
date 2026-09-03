@@ -106,11 +106,21 @@ async function updateCargoToml() {
 		// await writeFile(packageTomlPath, updatedPackageTomlContent, 'utf-8');
 	}
 
+	// Add hardcoded external dependencies
+	const hardcodedDependencies: Record<string, any> = {
+		"raw-foundationdb": {
+			package: "foundationdb",
+			version: "0.9.2",
+			features: ["fdb-7_3", "embedded-fdb-include"],
+		},
+	};
+
 	// Update and write workspace
 	workspaceToml.workspace = workspaceToml.workspace || {};
 	workspaceToml.workspace.members = members;
 	workspaceToml.workspace.dependencies = {
 		...existingDependencies,
+		...hardcodedDependencies,
 		...newDependencies,
 	};
 

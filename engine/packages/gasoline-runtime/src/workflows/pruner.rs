@@ -51,6 +51,36 @@ pub async fn gasoline_pruner(ctx: &mut WorkflowCtx, input: &Input) -> Result<()>
 				})
 				.await?;
 
+				ctx.v(2)
+					.loope(PruneState::default(), |ctx, state| {
+						async move {
+							let res = ctx
+								.activity(PruneSignalChunkInput {
+									last_key: state.last_key.clone(),
+								})
+								.await?;
+
+							match res {
+								PruneChunkOutput::Continue {
+									new_last_key,
+									prune_count,
+								} => {
+									state.last_key = Some(new_last_key);
+									state.prune_count += prune_count;
+
+									Ok(Loop::Continue)
+								}
+								PruneChunkOutput::Complete { prune_count } => {
+									state.prune_count += prune_count;
+
+									Ok(Loop::Break(state.prune_count))
+								}
+							}
+						}
+						.boxed()
+					})
+					.await?;
+
 				ctx.sleep(ctx.config().runtime.gasoline_prune_interval_duration())
 					.await?;
 
@@ -98,6 +128,44 @@ async fn prune_chunk(ctx: &ActivityCtx, input: &PruneChunkInput) -> Result<Prune
 		.await?;
 
 	tracing::debug!(%prune_count, "pruned workflows");
+
+	if let Some(new_last_key) = new_last_key {
+		Ok(PruneChunkOutput::Continue {
+			new_last_key,
+			prune_count,
+		})
+	} else {
+		Ok(PruneChunkOutput::Complete { prune_count })
+	}
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Hash)]
+struct PruneSignalChunkInput {
+	last_key: Option<Vec<u8>>,
+}
+
+#[activity(PruneSignalChunk)]
+async fn prune_signal_chunk(
+	ctx: &ActivityCtx,
+	input: &PruneSignalChunkInput,
+) -> Result<PruneChunkOutput> {
+	// Create new db instance with debug trait
+	let db = db::DatabaseKv::new(ctx.config().clone(), ctx.pools().clone()).await?
+		as Arc<dyn DatabaseDebug + Send + Sync>;
+
+	// Check if pruning is enabled
+	let Some(prune_eligibility_duration) =
+		ctx.config().runtime.gasoline_prune_eligibility_duration()
+	else {
+		return Ok(PruneChunkOutput::Complete { prune_count: 0 });
+	};
+
+	let before_ts = util::timestamp::now() - prune_eligibility_duration.as_millis() as i64;
+	let (prune_count, new_last_key) = db
+		.prune_signals(before_ts, MAX_PRUNES, input.last_key.as_deref())
+		.await?;
+
+	tracing::debug!(%prune_count, "pruned signals");
 
 	if let Some(new_last_key) = new_last_key {
 		Ok(PruneChunkOutput::Continue {

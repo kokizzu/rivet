@@ -6,7 +6,7 @@ use super::{
 	resolve::{resolve_bucket_branch, resolve_database_branch_in_bucket},
 	shared::{
 		lookup_txid_at_versionstamp, now_ms, read_bucket_branch_record, read_commit_row,
-		read_database_branch_record, read_versionstamp_pin,
+		read_database_branch_record, read_versionstamp_pin, write_database_pointer,
 	},
 };
 use crate::conveyer::{
@@ -17,8 +17,7 @@ use crate::conveyer::{
 		BranchState, BucketBranchId, BucketBranchRecord, BucketId, BucketPointer, DBHead,
 		DatabaseBranchId, DatabaseBranchRecord, DatabasePointer, ResolvedRestoreTarget,
 		ResolvedVersionstamp, RestorePointRef, SnapshotSelector, encode_bucket_branch_record,
-		encode_bucket_pointer, encode_database_branch_record, encode_database_pointer,
-		encode_db_head,
+		encode_bucket_pointer, encode_database_branch_record, encode_db_head,
 	},
 	udb,
 };
@@ -112,16 +111,16 @@ where
 				)
 				.await?;
 
-				let pointer = DatabasePointer {
-					current_branch: new_database_branch_id,
-					last_swapped_at_ms: now_ms()?,
-				};
-				let encoded_pointer = encode_database_pointer(pointer)
-					.context("encode sqlite fork database pointer")?;
-				tx.informal().set(
-					&keys::database_pointer_cur_key(target_bucket_branch, &new_database_id),
-					&encoded_pointer,
-				);
+				write_database_pointer(
+					&tx,
+					target_bucket,
+					target_bucket_branch,
+					&new_database_id,
+					DatabasePointer {
+						current_branch: new_database_branch_id,
+						last_swapped_at_ms: now_ms()?,
+					},
+				)?;
 				write_bucket_catalog_marker(
 					&tx,
 					target_bucket_branch,

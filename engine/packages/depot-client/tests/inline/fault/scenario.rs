@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::ffi::{CStr, CString};
 use std::future::Future;
 use std::pin::Pin;
@@ -5,13 +6,16 @@ use std::ptr;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use depot::{
 	fault::{DepotFaultCheckpoint, DepotFaultController, DepotFaultReplayEvent},
 	keys,
-	types::{DatabaseBranchId, RestorePointId, SnapshotSelector},
+	types::{
+		DatabaseBranchId, GetPagesOptions, PageSourceKind, PageSourceProvenance, RestorePointId,
+		SnapshotSelector, decode_cold_shard_ref,
+	},
 	workflows::compaction::{
-		DbHotCompacterWorkflow, DbManagerWorkflow, DbReclaimerWorkflow, DepotCompactionTestDriver,
+		DbHotCompactorWorkflow, DbManagerWorkflow, DbReclaimerWorkflow, DepotCompactionTestDriver,
 		ForceCompactionResult, ForceCompactionWork,
 		test_hooks::{self, WorkflowFaultControllerGuard},
 	},
@@ -26,7 +30,6 @@ use libsqlite3_sys::{
 };
 use parking_lot::Mutex;
 use rivet_pools::__rivet_util::Id;
-use rivet_test_deps::TestDeps;
 use tokio::runtime::Builder;
 use universaldb::{RangeOption, options::StreamingMode, utils::IsolationLevel::Snapshot};
 
@@ -36,6 +39,7 @@ use super::super::{
 };
 use super::oracle::{
 	AmbiguousOracleOutcome, NativeSqliteOracle, OracleCommitSemantics, OracleVerification,
+	page_one_db_size_pages,
 };
 use super::verify::DepotInvariantScanner;
 use super::workload::LogicalOp;
@@ -68,7 +72,6 @@ pub(crate) struct FaultScenarioCtx {
 }
 
 struct FaultScenarioInner {
-	name: String,
 	seed: u64,
 	profile: FaultProfile,
 	actor_id: String,
@@ -90,7 +93,6 @@ struct FaultScenarioInner {
 
 #[derive(Clone, Debug)]
 pub(crate) struct FaultScenarioReplayRecord {
-	pub(crate) scenario: String,
 	pub(crate) seed: u64,
 	pub(crate) profile: FaultProfile,
 	pub(crate) checkpoints: Vec<String>,
@@ -112,6 +114,14 @@ pub(crate) enum FaultReplayPhase {
 pub(crate) struct FaultScenarioReplayEvent {
 	pub(crate) event: DepotFaultReplayEvent,
 	pub(crate) phase: FaultReplayPhase,
+}
+
+/// Which depot `Db` state a page-1 read went through. An engine pod reuses a `Db` across actor
+/// generations, so both are real production configurations.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PageOneReadMode {
+	WarmHandle,
+	EvictedHandle,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -192,6 +202,7 @@ impl FaultScenario {
 			.enable_all()
 			.build()
 			.context("fault scenario runtime should build")?;
+		let scenario_name = self.name.clone();
 		let ctx = runtime.block_on(FaultScenarioCtx::new(&self))?;
 		ctx.open_database()?;
 
@@ -238,15 +249,16 @@ impl FaultScenario {
 		}
 
 		let shutdown_result = runtime.block_on(ctx.shutdown());
-		result?;
-		shutdown_result?;
+		result.with_context(|| format!("fault scenario {scenario_name} failed"))?;
+		shutdown_result
+			.with_context(|| format!("fault scenario {scenario_name} failed to shut down"))?;
 		Ok(())
 	}
 }
 
 impl FaultScenarioCtx {
 	async fn new(scenario: &FaultScenario) -> Result<Self> {
-		let test_ctx = build_test_ctx().await?;
+		let test_ctx = TestCtx::new(build_registry()).await?;
 		let udb = test_ctx.pools().udb()?;
 		let handle = tokio::runtime::Handle::current();
 		let actor_id = super::super::next_test_name("sqlite-fault-actor");
@@ -258,7 +270,6 @@ impl FaultScenarioCtx {
 
 		Ok(Self {
 			inner: Arc::new(FaultScenarioInner {
-				name: scenario.name.clone(),
 				seed: scenario.seed,
 				profile: scenario.profile,
 				actor_id,
@@ -384,6 +395,7 @@ impl FaultScenarioCtx {
 	pub(crate) async fn force_hot_compaction(&self) -> Result<ForceCompactionResult> {
 		self.force_compaction(ForceCompactionWork {
 			hot: true,
+			cold: false,
 			reclaim: false,
 			final_settle: false,
 		})
@@ -394,6 +406,7 @@ impl FaultScenarioCtx {
 	pub(crate) async fn force_reclaim(&self) -> Result<ForceCompactionResult> {
 		self.force_compaction(ForceCompactionWork {
 			hot: false,
+			cold: false,
 			reclaim: true,
 			final_settle: false,
 		})
@@ -444,6 +457,244 @@ impl FaultScenarioCtx {
 		}
 
 		Ok(())
+	}
+
+	/// Asserts that the page 1 depot serves agrees with `/META/head` about how large the database
+	/// is.
+	///
+	/// The VFS seeds its database size from page 1 exactly once, at open, so depot returning a
+	/// stale page 1 alongside a current head latches a short size before the actor runs any user
+	/// code. The next commit publishes that short size and depot truncates the tail. The head fence
+	/// cannot catch it because it compares txids, never bytes. Both values below come from the same
+	/// read transaction, so this is an atomic comparison rather than two racing reads.
+	pub(crate) async fn verify_page_one_matches_head(&self) -> Result<()> {
+		// The warm handle first, and before anything evicts it. An engine pod keeps a `Db` per
+		// database across actor generations, so a reopening actor's first read usually lands on a
+		// handle whose lazy PIDX cache was populated at an older head. That is the configuration a
+		// production restart actually reads through, so checking it after an evict would test a
+		// state the engine rarely has.
+		self.verify_page_one_matches_head_in_mode(PageOneReadMode::WarmHandle)
+			.await?;
+
+		// Then again with the handle's caches dropped, which is what a cold engine pod does.
+		self.inner
+			.storage
+			.evict_actor_db(&self.inner.actor_id)
+			.await;
+		self.verify_page_one_matches_head_in_mode(PageOneReadMode::EvictedHandle)
+			.await?;
+
+		// The open database latched its size from whatever page 1 it saw at open, which may be
+		// older than the page depot serves now.
+		let (_, head_db_size_pages, head_txid, _) = self.read_page_one_and_head().await?;
+		if head_db_size_pages == 0 {
+			return Ok(());
+		}
+		let latched =
+			self.with_database_blocking(|db| Ok(db._vfs.ctx().state.read().db_size_pages))?;
+		ensure!(
+			latched == head_db_size_pages,
+			"open database latched a size that disagrees with head: latched_db_size_pages={latched}, \
+			 head_db_size_pages={head_db_size_pages}, head_txid={head_txid}",
+		);
+
+		Ok(())
+	}
+
+	async fn verify_page_one_matches_head_in_mode(&self, mode: PageOneReadMode) -> Result<()> {
+		let (page, head_db_size_pages, head_txid, provenance) =
+			self.read_page_one_and_head().await?;
+		if head_db_size_pages == 0 {
+			return Ok(());
+		}
+		let provenance = provenance.context("depot returned no provenance for page 1")?;
+
+		let page = page.context("depot returned page 1 with no bytes")?;
+		let header_db_size_pages = page_one_db_size_pages(&page)?;
+		ensure!(
+			header_db_size_pages == head_db_size_pages,
+			"page 1 header disagrees with head via a {mode:?} read: \
+			 header_db_size_pages={header_db_size_pages}, \
+			 head_db_size_pages={head_db_size_pages}, head_txid={head_txid}; \
+			 page 1 provenance: {provenance:?}",
+		);
+
+		ensure!(
+			// `OutOfRange` is deliberately absent. Page 1 is legitimately out of range on a
+			// database whose head records zero pages, which is what a rolled back first commit
+			// leaves behind.
+			!matches!(
+				provenance.winner_kind,
+				PageSourceKind::ZeroFill | PageSourceKind::MissingDelta
+			),
+			"page 1 was served from a {:?} source via a {mode:?} read at head_txid={head_txid}; \
+			 candidates: {:?}",
+			provenance.winner_kind,
+			provenance.candidates,
+		);
+
+		let Some(winner_txid) = provenance.winner_txid else {
+			return Ok(());
+		};
+		ensure!(
+			winner_txid <= head_txid,
+			"page 1 was served from a source above head via a {mode:?} read: \
+			 winner_txid={winner_txid}, head_txid={head_txid}, winner_kind={:?}, \
+			 winner_shard_id={:?}",
+			provenance.winner_kind,
+			provenance.winner_shard_id,
+		);
+
+		// The bytes agreeing is weaker than the read having chosen the right source: a page 1 that
+		// happens to carry the same size can still have come from a stale source, and the next
+		// database to grow in that state would truncate. Provenance is the read path's own account
+		// of which candidate won, so assert on it directly.
+		//
+		// This is the incident's exact shape: the hot tier held an older version of shard 0 than the
+		// newest cold ref, and the read preferred hot without comparing the two. Only checked when a
+		// shard source actually won; a page owned by a delta written after the last fold
+		// legitimately sits above every shard image, and enumerating the sources costs two prefix
+		// scans that are not worth paying on every read.
+		if !matches!(
+			provenance.winner_kind,
+			PageSourceKind::HotShard | PageSourceKind::Cold
+		) {
+			return Ok(());
+		}
+		let (hot_versions, cold_versions) = self.shard_source_txids(0, head_txid).await?;
+		let Some(newest_shard_source) = hot_versions
+			.iter()
+			.chain(cold_versions.iter())
+			.copied()
+			.max()
+		else {
+			return Ok(());
+		};
+		ensure!(
+			winner_txid >= newest_shard_source,
+			"page 1 was served from a source older than the newest shard 0 image via a {mode:?} \
+			 read: winner_txid={winner_txid}, \
+			 newest_shard_source_txid={newest_shard_source}, head_txid={head_txid}, \
+			 hot_versions={hot_versions:?}, cold_versions={cold_versions:?}, winner_kind={:?}",
+			provenance.winner_kind,
+		);
+
+		Ok(())
+	}
+
+	/// Reads page 1, the head that the same transaction saw, and the read path's own account of
+	/// which source won. One read, so the three cannot disagree because of a concurrent commit.
+	async fn read_page_one_and_head(
+		&self,
+	) -> Result<(Option<Vec<u8>>, u32, u64, Option<PageSourceProvenance>)> {
+		let result = self
+			.inner
+			.storage
+			.get_pages_with_options(
+				&self.inner.actor_id,
+				&[1],
+				GetPagesOptions {
+					collect_provenance: true,
+					..GetPagesOptions::default()
+				},
+			)
+			.await?;
+		let page = result
+			.pages
+			.iter()
+			.find(|page| page.pgno == 1)
+			.context("depot read did not return page 1")?
+			.bytes
+			.clone();
+		let provenance = result.provenance.into_iter().find(|entry| entry.pgno == 1);
+		Ok((page, result.db_size_pages, result.head_txid, provenance))
+	}
+
+	/// Every source that could serve `shard_id` at or below `head_txid`, as `(hot versions, cold ref
+	/// versions)`. A fold writes a new hot version without clearing the previous one, so several hot
+	/// versions of a shard normally coexist and only the reclaimer removes the old ones.
+	pub(crate) async fn shard_source_txids(
+		&self,
+		shard_id: u32,
+		head_txid: u64,
+	) -> Result<(Vec<u64>, Vec<u64>)> {
+		let branch_id = self.database_branch_id().await?;
+		let db = self.inner.storage.depot_database();
+		db.txn(
+			"test_depot_clientinline_fault_scenario",
+			move |tx| async move {
+				let mut hot = BTreeSet::new();
+				for key in scan_keys(&tx, keys::branch_shard_prefix(branch_id)).await? {
+					let (candidate_shard_id, as_of_txid, _chunk_idx) =
+						keys::decode_branch_shard_row_key(branch_id, &key)?;
+					if candidate_shard_id == shard_id && as_of_txid <= head_txid {
+						hot.insert(as_of_txid);
+					}
+				}
+
+				let mut cold = BTreeSet::new();
+				for key in
+					scan_keys(&tx, keys::branch_compaction_cold_shard_prefix(branch_id)).await?
+				{
+					let value = tx
+						.informal()
+						.get(&key, Snapshot)
+						.await?
+						.context("cold shard ref should exist for a key just scanned")?;
+					let reference = decode_cold_shard_ref(&value)?;
+					if reference.shard_id == shard_id && reference.as_of_txid <= head_txid {
+						cold.insert(reference.as_of_txid);
+					}
+				}
+
+				Ok((
+					hot.into_iter().collect::<Vec<_>>(),
+					cold.into_iter().collect::<Vec<_>>(),
+				))
+			},
+		)
+		.await
+	}
+
+	/// Deletes every row of one hot shard version, leaving other versions of the same shard in
+	/// place.
+	///
+	/// This is how a test constructs "the hot tier holds an older version of this shard than the
+	/// newest cold ref" without waiting for shard cache eviction to produce it. Distinct from
+	/// `clear_hot_shards_for_harness_regression`, which clears every version and so sends reads to
+	/// the cold tier instead of to a stale hot version.
+	pub(crate) async fn clear_hot_shard_version_for_harness_regression(
+		&self,
+		shard_id: u32,
+		as_of_txid: u64,
+	) -> Result<usize> {
+		let branch_id = self.database_branch_id().await?;
+		let db = self.inner.storage.depot_database();
+		db.txn(
+			"test_depot_clientinline_fault_scenario",
+			move |tx| async move {
+				let (begin, end) =
+					keys::branch_shard_version_range(branch_id, shard_id, as_of_txid);
+				let informal = tx.informal();
+				let mut stream = informal.get_ranges_keyvalues(
+					RangeOption {
+						mode: StreamingMode::WantAll,
+						..(begin.as_slice(), end.as_slice()).into()
+					},
+					Snapshot,
+				);
+				let mut keys_to_clear = Vec::new();
+				while let Some(entry) = stream.try_next().await? {
+					keys_to_clear.push(entry.key().to_vec());
+				}
+				let count = keys_to_clear.len();
+				for key in keys_to_clear {
+					tx.informal().clear(&key);
+				}
+				Ok(count)
+			},
+		)
+		.await
 	}
 
 	pub(crate) async fn verify_against_native_oracle(&self) -> Result<()> {
@@ -503,7 +754,6 @@ impl FaultScenarioCtx {
 			.collect();
 
 		FaultScenarioReplayRecord {
-			scenario: self.inner.name.clone(),
 			seed: self.inner.seed,
 			profile: self.inner.profile,
 			checkpoints: self
@@ -556,6 +806,13 @@ impl FaultScenarioCtx {
 		test_ctx.shutdown().await
 	}
 
+	pub(crate) async fn branch_head(&self) -> Result<(DatabaseBranchId, u64)> {
+		self.inner
+			.storage
+			.read_branch_head(&self.inner.actor_id)
+			.await
+	}
+
 	pub(crate) async fn database_branch_id(&self) -> Result<DatabaseBranchId> {
 		self.inner
 			.storage
@@ -585,18 +842,6 @@ impl FaultScenarioCtx {
 			.await
 			.delete_restore_point(restore_point)
 			.await
-	}
-
-	pub(crate) async fn read_page_from_depot(&self, pgno: u32) -> Result<()> {
-		self.inner
-			.storage
-			.evict_actor_db(&self.inner.actor_id)
-			.await;
-		self.inner
-			.storage
-			.get_pages(&self.inner.actor_id, &[pgno])
-			.await?;
-		Ok(())
 	}
 
 	pub(crate) async fn latest_delta_chunk_count(&self) -> Result<usize> {
@@ -683,15 +928,10 @@ fn build_registry() -> Registry {
 	let mut registry = Registry::new();
 	registry.register_workflow::<DbManagerWorkflow>().unwrap();
 	registry
-		.register_workflow::<DbHotCompacterWorkflow>()
+		.register_workflow::<DbHotCompactorWorkflow>()
 		.unwrap();
 	registry.register_workflow::<DbReclaimerWorkflow>().unwrap();
 	registry
-}
-
-async fn build_test_ctx() -> Result<TestCtx> {
-	let test_deps = TestDeps::new().await?;
-	TestCtx::new_with_deps(build_registry(), test_deps).await
 }
 
 fn open_fault_database(
@@ -807,4 +1047,23 @@ fn sqlite_error_message(db: *mut sqlite3) -> String {
 	unsafe { CStr::from_ptr(err) }
 		.to_string_lossy()
 		.into_owned()
+}
+
+/// Collects every key under a prefix. Test-side scan, so the whole range is materialized.
+async fn scan_keys(tx: &universaldb::Transaction, prefix: Vec<u8>) -> Result<Vec<Vec<u8>>> {
+	let prefix_subspace =
+		universaldb::Subspace::from(universaldb::tuple::Subspace::from_bytes(prefix));
+	let informal = tx.informal();
+	let mut stream = informal.get_ranges_keyvalues(
+		RangeOption {
+			mode: StreamingMode::WantAll,
+			..RangeOption::from(&prefix_subspace)
+		},
+		Snapshot,
+	);
+	let mut keys = Vec::new();
+	while let Some(entry) = stream.try_next().await? {
+		keys.push(entry.key().to_vec());
+	}
+	Ok(keys)
 }

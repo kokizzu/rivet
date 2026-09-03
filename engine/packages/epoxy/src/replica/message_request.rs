@@ -13,7 +13,7 @@ pub async fn message_request(
 	message_request_inner(ctx, request).await
 }
 
-#[tracing::instrument(skip_all)]
+#[tracing::instrument(level = "debug", skip_all)]
 async fn message_request_inner(
 	ctx: &ApiCtx,
 	request: protocol::Request,
@@ -33,7 +33,7 @@ async fn message_request_inner(
 					let req = req.clone();
 					async move { replica::update_config::update_config(&*tx, current_replica_id, req) }
 				})
-				.custom_instrument(tracing::info_span!("update_config_tx"))
+				.custom_instrument(tracing::debug_span!("update_config_tx"))
 				.await?;
 
 			protocol::ResponseKind::UpdateConfigResponse
@@ -45,7 +45,7 @@ async fn message_request_inner(
 					let req = req.clone();
 					async move { replica::messages::prepare(&*tx, current_replica_id, req).await }
 				})
-				.custom_instrument(tracing::info_span!("prepare_tx"))
+				.custom_instrument(tracing::debug_span!("prepare_tx"))
 				.await?;
 			protocol::ResponseKind::PrepareResponse(response)
 		}
@@ -59,7 +59,7 @@ async fn message_request_inner(
 					let req = req.clone();
 					async move { replica::messages::accept(&*tx, current_replica_id, req).await }
 				})
-				.custom_instrument(tracing::info_span!("accept_tx"))
+				.custom_instrument(tracing::debug_span!("accept_tx"))
 				.await?;
 			protocol::ResponseKind::AcceptResponse(response)
 		}
@@ -70,7 +70,7 @@ async fn message_request_inner(
 					let req = req.clone();
 					async move { replica::messages::commit(&*tx, current_replica_id, req).await }
 				})
-				.custom_instrument(tracing::info_span!("commit_tx"))
+				.custom_instrument(tracing::debug_span!("commit_tx"))
 				.await?;
 			protocol::ResponseKind::CommitResponse(response)
 		}
@@ -81,7 +81,7 @@ async fn message_request_inner(
 					let req = req.clone();
 					async move { replica::changelog::read(&*tx, current_replica_id, req).await }
 				})
-				.custom_instrument(tracing::info_span!("changelog_read_tx"))
+				.custom_instrument(tracing::debug_span!("changelog_read_tx"))
 				.await?;
 			protocol::ResponseKind::ChangelogReadResponse(response)
 		}

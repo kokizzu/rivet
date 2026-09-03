@@ -40,10 +40,17 @@ use crate::{
 const DB_ACTION_RETRY: Duration = Duration::from_millis(150);
 /// Most db action retries
 const MAX_DB_ACTION_RETRIES: usize = 5;
+/// How long before a sleep deadline to stop pulling signals. Pulling signals is not cancel safe, so the
+/// deadline can only be observed between pulls. A pull started within this window of the deadline is
+/// skipped entirely instead.
+const SIGNAL_PULL_DEADLINE_PADDING: Duration = Duration::from_millis(25);
 
 // NOTE: Cloneable because of inner arcs
 #[derive(Clone)]
 pub struct WorkflowCtx {
+	/// Id of the worker running this workflow. Used to fence all history and state writes against the
+	/// workflow's lease.
+	worker_id: Id,
 	workflow_id: Id,
 	/// Name of the workflow to run in the registry.
 	name: String,
@@ -82,6 +89,7 @@ pub struct WorkflowCtx {
 impl WorkflowCtx {
 	#[tracing::instrument(skip_all, fields(workflow_id=%data.workflow_id, workflow_name=%data.workflow_name, ray_id=%data.ray_id))]
 	pub fn new(
+		worker_id: Id,
 		registry: RegistryHandle,
 		db: DatabaseHandle,
 		config: rivet_config::Config,
@@ -94,6 +102,7 @@ impl WorkflowCtx {
 		let event_history = Arc::new(data.events);
 
 		Ok(WorkflowCtx {
+			worker_id,
 			workflow_id: data.workflow_id,
 			name: data.workflow_name,
 			create_ts: data.create_ts,
@@ -183,9 +192,21 @@ impl WorkflowCtx {
 					// Write output
 					if let Err(err) = self
 						.db
-						.complete_workflow(self.workflow_id, &self.name, &output, prune_variant)
+						.complete_workflow(
+							self.worker_id,
+							self.workflow_id,
+							&self.name,
+							&output,
+							prune_variant,
+						)
 						.await
 					{
+						// The lease is gone, nothing can be written for this workflow anymore
+						if err.is_lease_fence_mismatch() {
+							tracing::error!(?err, "workflow lost its lease");
+							return Err(err);
+						}
+
 						if retries > MAX_DB_ACTION_RETRIES {
 							return Err(err);
 						}
@@ -237,6 +258,7 @@ impl WorkflowCtx {
 					let res = self
 						.db
 						.commit_workflow(
+							self.worker_id,
 							self.workflow_id,
 							&self.name,
 							wake_immediate,
@@ -248,6 +270,12 @@ impl WorkflowCtx {
 						.await;
 
 					if let Err(err) = res {
+						// The lease is gone, the workflow error itself cannot be written either
+						if err.is_lease_fence_mismatch() {
+							tracing::error!(?err, "workflow lost its lease");
+							return Err(err);
+						}
+
 						if retries > MAX_DB_ACTION_RETRIES {
 							return Err(err);
 						}
@@ -309,6 +337,7 @@ impl WorkflowCtx {
 
 				tokio::try_join!(
 					self.db.commit_workflow_activity_event(
+						self.worker_id,
 						self.workflow_id,
 						location,
 						self.version,
@@ -326,7 +355,11 @@ impl WorkflowCtx {
 							})?;
 
 							self.db
-								.update_workflow_state(self.workflow_id, &new_workflow_state)
+								.update_workflow_state(
+									self.worker_id,
+									self.workflow_id,
+									&new_workflow_state,
+								)
 								.await?;
 
 							*guard = new_workflow_state;
@@ -352,6 +385,7 @@ impl WorkflowCtx {
 				// Write error (failed state)
 				self.db
 					.commit_workflow_activity_event(
+						self.worker_id,
 						self.workflow_id,
 						location,
 						self.version,
@@ -385,6 +419,7 @@ impl WorkflowCtx {
 
 				self.db
 					.commit_workflow_activity_event(
+						self.worker_id,
 						self.workflow_id,
 						location,
 						self.version,
@@ -410,7 +445,6 @@ impl WorkflowCtx {
 		}
 	}
 
-	#[tracing::instrument(skip_all)]
 	pub(crate) fn set_parallelized(&mut self) {
 		self.parallelized = true;
 	}
@@ -418,12 +452,12 @@ impl WorkflowCtx {
 	/// Creates a new workflow run with one more depth in the location.
 	/// - **Not to be used directly by workflow users. For implementation uses only.**
 	/// - **Remember to validate latent history after this branch is used.**
-	#[tracing::instrument(skip_all)]
+	#[tracing::instrument(level = "debug", skip_all)]
 	pub async fn branch(&mut self) -> WorkflowResult<Self> {
 		self.custom_branch(self.input.clone(), self.version).await
 	}
 
-	#[tracing::instrument(skip_all, fields(version))]
+	#[tracing::instrument(level = "debug", skip_all, fields(version))]
 	pub(crate) async fn custom_branch(
 		&mut self,
 		input: Arc<serde_json::value::RawValue>,
@@ -436,6 +470,7 @@ impl WorkflowCtx {
 		if !matches!(history_res, HistoryResult::Event(_)) {
 			self.db
 				.commit_workflow_branch_event(
+					self.worker_id,
 					self.workflow_id,
 					&location,
 					version,
@@ -455,6 +490,7 @@ impl WorkflowCtx {
 		location: Location,
 	) -> WorkflowCtx {
 		WorkflowCtx {
+			worker_id: self.worker_id,
 			workflow_id: self.workflow_id,
 			name: self.name.clone(),
 			create_ts: self.create_ts,
@@ -557,7 +593,7 @@ impl WorkflowCtx {
 					let duration = (u64::try_from(wake_deadline_ts)?)
 						.saturating_sub(u64::try_from(rivet_util::timestamp::now())?);
 					tokio::time::sleep(Duration::from_millis(duration))
-						.instrument(tracing::info_span!("backoff_sleep"))
+						.instrument(tracing::debug_span!("backoff_sleep"))
 						.await;
 				}
 
@@ -717,17 +753,9 @@ impl WorkflowCtx {
 			interval.tick().await;
 
 			let mut ctx = ListenCtx::new(self, &location);
-			let mut next_wakeup_at = None;
 
 			loop {
-				let wakeup_to_pull = next_wakeup_at.take().map(|wakeup_at: Instant| {
-					let duration = wakeup_at.elapsed();
-					metrics::SIGNAL_WAKEUP_TO_PULL_SECONDS
-						.with_label_values(&[self.name()])
-						.observe(duration.as_secs_f64());
-					duration
-				});
-				ctx.reset(retries == 0, wakeup_to_pull);
+				ctx.reset(retries == 0);
 
 				match T::listen(&mut ctx, limit).in_current_span().await {
 					Ok(res) => break res,
@@ -741,14 +769,11 @@ impl WorkflowCtx {
 				}
 
 				// Poll and wait for a wake at the same time
-				next_wakeup_at = tokio::select! {
-					_ = bump_sub.next() => Some(Instant::now()),
-					_ = interval.tick() => Some(Instant::now()),
-					res = self.wait_stop() => {
-						res?;
-						None
-					},
-				};
+				tokio::select! {
+					_ = bump_sub.next() => {},
+					_ = interval.tick() => {},
+					res = self.wait_stop() => res?,
+				}
 			}
 		};
 
@@ -815,6 +840,7 @@ impl WorkflowCtx {
 
 			self.db
 				.commit_workflow_sleep_event(
+					self.worker_id,
 					self.workflow_id,
 					&location,
 					self.version,
@@ -921,6 +947,7 @@ impl WorkflowCtx {
 
 			self.db
 				.commit_workflow_sleep_event(
+					self.worker_id,
 					self.workflow_id,
 					&sleep_location,
 					self.version,
@@ -990,65 +1017,55 @@ impl WorkflowCtx {
 		// Sleep in memory if duration is shorter than the worker tick
 		else if duration < self.db.worker_poll_interval().as_millis() as i64 + 1 {
 			tracing::debug!(%deadline_ts, "sleeping in memory");
+			tracing::debug!("listening for signals with timeout");
 
-			let res = tokio::time::timeout(
-				Duration::from_millis(duration.try_into()?),
-				(async {
-					tracing::debug!("listening for signals with timeout");
+			// IMPORTANT: Pulling signals must never be cancelled. `pull_next_signals` clears the pending
+			// signal keys, writes the signals history event, and marks the sleep interrupted in a single
+			// txn, so dropping the future once that txn has committed consumes the signal without
+			// recording it in memory. The deadline is therefore only observed between pulls, and a pull
+			// that starts too close to the deadline is skipped rather than raced against it.
+			let pull_deadline = tokio::time::Instant::now()
+				+ Duration::from_millis(duration.try_into()?)
+					.saturating_sub(SIGNAL_PULL_DEADLINE_PADDING);
 
-					let mut bump_sub = self
-						.db
-						.bump_sub(BumpSubSubject::SignalPublish {
-							to_workflow_id: self.workflow_id,
-						})
-						.await?;
-					let mut interval = tokio::time::interval(self.db.signal_poll_interval());
-					interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-					// Skip first tick, we wait after the db call instead of before
-					interval.tick().await;
-
-					let mut ctx =
-						ListenCtx::new_with_sleep(self, &signals_location, &sleep_location);
-					let mut next_wakeup_at = None;
-
-					loop {
-						let wakeup_to_pull = next_wakeup_at.take().map(|wakeup_at: Instant| {
-							let duration = wakeup_at.elapsed();
-							metrics::SIGNAL_WAKEUP_TO_PULL_SECONDS
-								.with_label_values(&[self.name()])
-								.observe(duration.as_secs_f64());
-							duration
-						});
-						ctx.reset(false, wakeup_to_pull);
-
-						match T::listen(&mut ctx, limit).in_current_span().await {
-							// Retry
-							Err(WorkflowError::NoSignalFound(_)) => {}
-							x => return x,
-						}
-
-						// Poll and wait for a wake at the same time
-						next_wakeup_at = tokio::select! {
-							_ = bump_sub.next() => Some(Instant::now()),
-							_ = interval.tick() => Some(Instant::now()),
-							res = self.wait_stop() => {
-								res?;
-								None
-							},
-						};
-					}
+			let mut bump_sub = self
+				.db
+				.bump_sub(BumpSubSubject::SignalPublish {
+					to_workflow_id: self.workflow_id,
 				})
-				.in_current_span(),
-			)
-			.await;
+				.await?;
+			let mut interval = tokio::time::interval(self.db.signal_poll_interval());
+			interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-			match res {
-				Ok(res) => res?,
-				Err(_) => {
+			// Skip first tick, we wait after the db call instead of before
+			interval.tick().await;
+
+			let mut ctx = ListenCtx::new_with_sleep(self, &signals_location, &sleep_location);
+
+			loop {
+				// Any signal left pending here is picked up by the next listen
+				if tokio::time::Instant::now() >= pull_deadline {
 					tracing::debug!("timed out listening for signals");
 
-					Vec::new()
+					break Vec::new();
+				}
+
+				ctx.reset(false);
+
+				match T::listen(&mut ctx, limit).in_current_span().await {
+					Ok(res) => break res,
+					// Retry
+					Err(WorkflowError::NoSignalFound(_)) => {}
+					Err(err) => return Err(err.into()),
+				}
+
+				// Poll and wait for a wake at the same time. The deadline only wakes the loop so that the
+				// check above is reached promptly, it does not stop the loop itself.
+				tokio::select! {
+					_ = bump_sub.next() => {},
+					_ = interval.tick() => {},
+					_ = tokio::time::sleep_until(pull_deadline) => {},
+					res = self.wait_stop() => res?,
 				}
 			}
 		}
@@ -1070,17 +1087,9 @@ impl WorkflowCtx {
 			interval.tick().await;
 
 			let mut ctx = ListenCtx::new_with_sleep(self, &signals_location, &sleep_location);
-			let mut next_wakeup_at = None;
 
 			loop {
-				let wakeup_to_pull = next_wakeup_at.take().map(|wakeup_at: Instant| {
-					let duration = wakeup_at.elapsed();
-					metrics::SIGNAL_WAKEUP_TO_PULL_SECONDS
-						.with_label_values(&[self.name()])
-						.observe(duration.as_secs_f64());
-					duration
-				});
-				ctx.reset(retries == 0, wakeup_to_pull);
+				ctx.reset(retries == 0);
 
 				match T::listen(&mut ctx, limit).in_current_span().await {
 					Ok(res) => break res,
@@ -1096,14 +1105,11 @@ impl WorkflowCtx {
 				}
 
 				// Poll and wait for a wake at the same time
-				next_wakeup_at = tokio::select! {
-					_ = bump_sub.next() => Some(Instant::now()),
-					_ = interval.tick() => Some(Instant::now()),
-					res = self.wait_stop() => {
-						res?;
-						None
-					},
-				};
+				tokio::select! {
+					_ = bump_sub.next() => {},
+					_ = interval.tick() => {},
+					res = self.wait_stop() => res?,
+				}
 			}
 		};
 
@@ -1114,6 +1120,7 @@ impl WorkflowCtx {
 		} else if matches!(state, SleepState::Normal) {
 			self.db
 				.update_workflow_sleep_event_state(
+					self.worker_id,
 					self.workflow_id,
 					&sleep_location,
 					SleepState::Uninterrupted,
@@ -1135,6 +1142,7 @@ impl WorkflowCtx {
 
 				self.db
 					.commit_workflow_removed_event(
+						self.worker_id,
 						self.workflow_id,
 						&self.cursor.current_location(),
 						T::event_type(),
@@ -1191,6 +1199,7 @@ impl WorkflowCtx {
 
 			self.db
 				.commit_workflow_version_check_event(
+					self.worker_id,
 					self.workflow_id,
 					&event_location,
 					event_version + self.version - 1,
@@ -1242,6 +1251,10 @@ impl WorkflowCtx {
 
 	pub fn workflow_id(&self) -> Id {
 		self.workflow_id
+	}
+
+	pub(crate) fn worker_id(&self) -> Id {
+		self.worker_id
 	}
 
 	pub fn ray_id(&self) -> Id {

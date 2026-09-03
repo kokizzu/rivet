@@ -68,7 +68,7 @@ pub async fn create(
 	}
 }
 
-#[tracing::instrument(skip_all)]
+#[tracing::instrument(level = "debug", skip_all)]
 async fn create_inner(ctx: ApiCtx, body: CreateRequest) -> Result<CreateResponse> {
 	ctx.auth().await?;
 
