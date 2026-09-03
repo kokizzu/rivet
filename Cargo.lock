@@ -5740,7 +5740,7 @@ dependencies = [
 
 [[package]]
 name = "rivet-outbound-guard"
-version = "2.3.7"
+version = "2.3.13"
 dependencies = [
  "anyhow",
  "ipnet",

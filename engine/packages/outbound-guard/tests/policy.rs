@@ -175,6 +175,70 @@ fn deny_cidrs_catch_the_ipv6_wrapped_form() {
 }
 
 #[test]
+fn allow_hosts_exempt_a_first_party_service() {
+	let policy = policy(Outbound {
+		allow_hosts: Some(vec!["cloud-api.rivet-cloud-api".to_string()]),
+		..Default::default()
+	});
+
+	// A Kubernetes service name resolves to a private ClusterIP, which the default policy blocks.
+	check(
+		&policy,
+		"http://cloud-api.rivet-cloud-api:3001/api/rivet/start",
+	)
+	.expect("allow-listed host should be allowed");
+	assert_eq!(
+		policy.filter_addrs("cloud-api.rivet-cloud-api", [addr("10.4.0.9")]),
+		Ok(vec![addr("10.4.0.9")]),
+	);
+
+	// A neighbouring service on the same private range stays blocked.
+	assert_eq!(
+		policy.filter_addrs("nats.rivet-engine", [addr("10.4.0.10")]),
+		Err(BlockReason::NoAllowedAddresses {
+			host: "nats.rivet-engine".to_string(),
+		}),
+	);
+}
+
+#[test]
+fn allow_hosts_match_exactly() {
+	let policy = policy(Outbound {
+		allow_hosts: Some(vec!["cloud-api.rivet-cloud-api".to_string()]),
+		..Default::default()
+	});
+
+	// Case and a trailing root label are the same name.
+	assert!(policy.is_allowed_host("Cloud-API.Rivet-Cloud-API"));
+	assert!(policy.is_allowed_host("cloud-api.rivet-cloud-api."));
+
+	// A host a user could register must not satisfy the entry.
+	assert!(!policy.is_allowed_host("cloud-api.rivet-cloud-api.evil.com"));
+	assert!(!policy.is_allowed_host("evil-cloud-api.rivet-cloud-api"));
+	assert!(!policy.is_allowed_host("rivet-cloud-api"));
+}
+
+#[test]
+fn allow_hosts_do_not_bypass_the_scheme_check() {
+	let policy = policy(Outbound {
+		allow_insecure_scheme: Some(false),
+		allow_hosts: Some(vec!["cloud-api.rivet-cloud-api".to_string()]),
+		..Default::default()
+	});
+
+	assert_eq!(
+		check(&policy, "http://cloud-api.rivet-cloud-api:3001/"),
+		Err(BlockReason::InsecureScheme),
+	);
+	assert_eq!(
+		check(&policy, "file://cloud-api.rivet-cloud-api/etc/passwd"),
+		Err(BlockReason::UnsupportedScheme {
+			scheme: "file".to_string(),
+		}),
+	);
+}
+
+#[test]
 fn rejects_non_http_schemes() {
 	let policy = default_policy();
 

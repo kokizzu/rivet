@@ -29,6 +29,13 @@ pub struct Outbound {
 	pub allow_cidrs: Option<Vec<String>>,
 	/// Additional CIDRs that are always denied. Takes precedence over every allow rule.
 	pub deny_cidrs: Option<Vec<String>>,
+	/// Hostnames that are always permitted, whatever they resolve to.
+	///
+	/// Matched exactly and case-insensitively, with no wildcards. Use this for a first-party
+	/// service whose address is not known ahead of time, such as a Kubernetes service name.
+	/// Anything served at a listed host becomes reachable by every runner config, so list
+	/// individual hosts rather than a shared entry point.
+	pub allow_hosts: Option<Vec<String>>,
 	/// Maximum number of redirects to follow. Every hop is re-checked against this policy.
 	pub max_redirects: Option<usize>,
 }
@@ -52,6 +59,10 @@ impl Outbound {
 
 	pub fn deny_cidrs(&self) -> &[String] {
 		self.deny_cidrs.as_deref().unwrap_or(&[])
+	}
+
+	pub fn allow_hosts(&self) -> &[String] {
+		self.allow_hosts.as_deref().unwrap_or(&[])
 	}
 
 	pub fn max_redirects(&self) -> usize {

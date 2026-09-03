@@ -215,6 +215,7 @@ pub struct Policy {
 	allow_insecure_scheme: bool,
 	allow_cidrs: Vec<IpNet>,
 	deny_cidrs: Vec<IpNet>,
+	allow_hosts: Vec<String>,
 	max_redirects: usize,
 }
 
@@ -228,12 +229,27 @@ impl Policy {
 			allow_insecure_scheme: outbound.allow_insecure_scheme(),
 			allow_cidrs: parse_cidrs(outbound.allow_cidrs(), "outbound.allow_cidrs")?,
 			deny_cidrs: parse_cidrs(outbound.deny_cidrs(), "outbound.deny_cidrs")?,
+			allow_hosts: outbound
+				.allow_hosts()
+				.iter()
+				.map(|host| host.trim().to_ascii_lowercase())
+				.collect(),
 			max_redirects: outbound.max_redirects(),
 		})
 	}
 
 	pub fn max_redirects(&self) -> usize {
 		self.max_redirects
+	}
+
+	/// Whether a host is allow-listed by name, which exempts it from every address rule.
+	///
+	/// Exact match only. A suffix or wildcard match would let a user-supplied URL satisfy the
+	/// entry with a host the user controls.
+	pub fn is_allowed_host(&self, host: &str) -> bool {
+		let host = host.trim_end_matches('.').to_ascii_lowercase();
+
+		self.allow_hosts.iter().any(|allowed| *allowed == host)
 	}
 
 	/// Check everything about a destination that can be known without resolving DNS.
@@ -263,6 +279,10 @@ impl Policy {
 		let Some(host) = url.host() else {
 			return Err(BlockReason::MissingHost);
 		};
+
+		if self.is_allowed_host(&host.to_string()) {
+			return Ok(());
+		}
 
 		// A hostname is checked once it resolves, at connect time. An address literal skips the
 		// resolver entirely, so it has to be checked here.
@@ -337,6 +357,12 @@ impl Policy {
 		host: &str,
 		addrs: impl IntoIterator<Item = IpAddr>,
 	) -> Result<Vec<IpAddr>, BlockReason> {
+		// An allow-listed host is trusted by name, so whatever it resolves to is reachable. This is
+		// how a first-party service on a private address stays usable under the default policy.
+		if self.is_allowed_host(host) {
+			return Ok(addrs.into_iter().collect());
+		}
+
 		let mut allowed = Vec::new();
 
 		for addr in addrs {
