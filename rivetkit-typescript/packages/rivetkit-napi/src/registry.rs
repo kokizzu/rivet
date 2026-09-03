@@ -8,13 +8,13 @@ use napi::{JsFunction, JsObject};
 use napi_derive::napi;
 use parking_lot::Mutex as ParkingMutex;
 use rivetkit_core::{
-	CoreRegistry as NativeCoreRegistry, CoreServerlessRuntime, EngineSpawnMode, ServeConfig,
-	ServerlessRequest, HTTP_BODY_STREAM_CHANNEL_CAPACITY,
+	CoreRegistry as NativeCoreRegistry, CoreServerlessRuntime, EngineSpawnMode,
+	HTTP_BODY_STREAM_CHANNEL_CAPACITY, ServeConfig, ServerlessRequest,
 	registry::CoreEnvoyHandle,
 	serverless::ServerlessStreamError,
 	serverless_http::{
-		self, ApplicationFetch, ApplicationRequest, ApplicationResponse,
-		ApplicationResponseBody, ListenerConfig,
+		self, ApplicationFetch, ApplicationRequest, ApplicationResponse, ApplicationResponseBody,
+		ListenerConfig,
 	},
 };
 use tokio::sync::{Mutex as TokioMutex, Notify, mpsc};
@@ -33,6 +33,8 @@ pub struct JsServeConfig {
 	pub namespace: String,
 	pub pool_name: String,
 	pub engine_binary_path: Option<String>,
+	pub start_services: Option<bool>,
+	pub services_binary_path: Option<String>,
 	pub engine_host: Option<String>,
 	pub engine_port: Option<u16>,
 	pub handle_inspector_http_in_runtime: Option<bool>,
@@ -731,12 +733,10 @@ fn application_fetch_from_tsfn(callback: ApplicationFetchTsfn) -> ApplicationFet
 		Box::pin(async move {
 			let (body_tx, body_rx) = mpsc::channel(HTTP_BODY_STREAM_CHANNEL_CAPACITY);
 			let promise = callback
-				.call_async::<Promise<JsApplicationResponse>>(Ok(
-					ApplicationFetchPayload {
-						request,
-						response_stream: HttpResponseBodyStream::new(body_tx),
-					},
-				))
+				.call_async::<Promise<JsApplicationResponse>>(Ok(ApplicationFetchPayload {
+					request,
+					response_stream: HttpResponseBodyStream::new(body_tx),
+				}))
 				.await
 				.map_err(|error| anyhow::anyhow!("application fetch callback failed: {error}"))?;
 			let response = promise
@@ -838,6 +838,8 @@ fn serve_config_from_js(
 		namespace: config.namespace,
 		pool_name: config.pool_name,
 		engine_binary_path: config.engine_binary_path.map(PathBuf::from),
+		start_services: config.start_services.unwrap_or(false),
+		services_binary_path: config.services_binary_path.map(PathBuf::from),
 		engine_host: config.engine_host,
 		engine_port: config.engine_port,
 		engine_spawn: EngineSpawnMode::Auto,

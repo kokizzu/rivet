@@ -7,6 +7,10 @@ vi.mock("@rivetkit/engine-cli", () => ({
 	getEnginePath: () => "/tmp/rivet-engine",
 }));
 
+vi.mock("@rivet-dev/services", () => ({
+	getServicesPath: () => "/tmp/rivet-services",
+}));
+
 const testActor = actor({
 	state: {},
 	actions: {},
@@ -20,6 +24,7 @@ describe("Registry constructor", () => {
 	afterEach(() => {
 		vi.useRealTimers();
 		vi.restoreAllMocks();
+		vi.unstubAllEnvs();
 	});
 
 	test("does not schedule prestart when it is not explicitly enabled", async () => {
@@ -92,6 +97,52 @@ describe("Registry constructor", () => {
 		expect(serveConfig.endpoint).toBe("http://127.0.0.1:7654");
 		expect(serveConfig.engineHost).toBe("127.0.0.1");
 		expect(serveConfig.enginePort).toBe(7654);
+		expect(serveConfig.startServices).toBe(true);
+		expect(serveConfig.servicesBinaryPath).toBe("/tmp/rivet-services");
+	});
+
+	test("allows Services to be disabled", async () => {
+		const config = RegistryConfigSchema.parse({
+			use: { test: testActor },
+			startEngine: true,
+			startServices: false,
+		});
+
+		const serveConfig = await buildServeConfig(config);
+
+		expect(serveConfig.startServices).toBe(false);
+		expect(serveConfig.servicesBinaryPath).toBeUndefined();
+	});
+
+	test("does not enable Services for a remote Engine by default", () => {
+		const config = RegistryConfigSchema.parse({
+			use: { test: testActor },
+			endpoint: "https://api.rivet.dev",
+		});
+
+		expect(config.startServices).toBe(false);
+	});
+
+	test("RIVET_RUN_SERVICES can disable services for a local engine", () => {
+		vi.stubEnv("RIVET_RUN_SERVICES", "0");
+		const config = RegistryConfigSchema.parse({
+			use: { test: testActor },
+			startEngine: true,
+		});
+
+		expect(config.startServices).toBe(false);
+	});
+
+	test("does not resolve Services for the wasm runtime", async () => {
+		const config = RegistryConfigSchema.parse({
+			use: { test: testActor },
+			endpoint: "https://api.rivet.dev",
+		});
+
+		const serveConfig = await buildServeConfig(config, false);
+
+		expect(serveConfig.startServices).toBe(false);
+		expect(serveConfig.servicesBinaryPath).toBeUndefined();
 	});
 
 	test("uses the configured local engine port without an explicit spawn flag", () => {

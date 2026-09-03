@@ -2,7 +2,7 @@ use crate::{
 	common::{EncodingKind, RawWebSocket, TransportKind, HEADER_CONN_PARAMS, HEADER_ENCODING},
 	connection::{start_connection, ActorConnection, ActorConnectionInner},
 	protocol::{codec, query::*},
-	remote_manager::RemoteManager,
+	remote_manager::{GatewayTarget, RemoteManager},
 };
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
@@ -38,6 +38,36 @@ pub struct ActorHandleStateless {
 	// remain `Send` — required to call `.action(...)` from within axum
 	// middleware that needs `Send` futures.
 	query: Mutex<ActorQuery>,
+}
+
+/// An actor handle whose query has already resolved to a concrete actor ID.
+/// Raw requests through this handle never repeat Engine actor lookup.
+#[derive(Clone)]
+pub struct ResolvedActorHandle {
+	remote_manager: RemoteManager,
+	actor_id: String,
+}
+
+impl ResolvedActorHandle {
+	pub fn actor_id(&self) -> &str {
+		&self.actor_id
+	}
+
+	pub async fn fetch(
+		&self,
+		path: &str,
+		method: Method,
+		headers: HeaderMap,
+		body: Option<Bytes>,
+	) -> Result<Response> {
+		let path = normalize_fetch_path(path);
+		let target = GatewayTarget::Direct {
+			actor_id: self.actor_id.clone(),
+		};
+		self.remote_manager
+			.send_request(&target, &path, method, headers, body)
+			.await
+	}
 }
 
 impl ActorHandleStateless {
@@ -168,6 +198,45 @@ impl ActorHandleStateless {
 		self.remote_manager
 			.send_request(&target, &path, method, headers, body)
 			.await
+	}
+
+	/// Resolves this query to a concrete actor, preserving get-or-create
+	/// behavior for creating handles.
+	pub async fn resolve_handle(&self) -> Result<ResolvedActorHandle> {
+		let query = self.query.lock().expect("query lock poisoned").clone();
+		let actor_id = self.remote_manager.resolve_actor_id(&query).await?;
+		Ok(ResolvedActorHandle {
+			remote_manager: self.remote_manager.clone(),
+			actor_id,
+		})
+	}
+
+	/// Resolves a non-creating actor query without collapsing absence into a
+	/// stringly error. Get-or-create and create queries are rejected because
+	/// their absence has different semantics.
+	pub async fn resolve_optional(&self) -> Result<Option<ResolvedActorHandle>> {
+		let query = self.query.lock().expect("query lock poisoned").clone();
+		let actor_id = match &query {
+			ActorQuery::GetForId { get_for_id } => {
+				self.remote_manager
+					.get_for_id(&get_for_id.name, &get_for_id.actor_id)
+					.await?
+			}
+			ActorQuery::GetForKey { get_for_key } => {
+				self.remote_manager
+					.get_with_key(&get_for_key.name, &get_for_key.key)
+					.await?
+			}
+			ActorQuery::GetOrCreateForKey { .. } | ActorQuery::Create { .. } => {
+				return Err(anyhow!(
+					"resolve_optional is only valid for non-creating actor queries"
+				));
+			}
+		};
+		Ok(actor_id.map(|actor_id| ResolvedActorHandle {
+			remote_manager: self.remote_manager.clone(),
+			actor_id,
+		}))
 	}
 
 	pub async fn web_socket(

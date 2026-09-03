@@ -5,6 +5,8 @@ compile_error!(
 
 pub mod actor;
 #[cfg(feature = "native-runtime")]
+mod development_process;
+#[cfg(feature = "native-runtime")]
 pub mod engine_process;
 pub mod error;
 pub mod inspector;
@@ -16,6 +18,8 @@ pub(crate) mod serde_metrics;
 pub mod serverless;
 #[cfg(feature = "native-runtime")]
 pub mod serverless_http;
+#[cfg(feature = "native-runtime")]
+mod services_process;
 #[cfg(any(test, feature = "test-support"))]
 pub mod testing;
 pub(crate) mod time {

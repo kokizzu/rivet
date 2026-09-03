@@ -752,6 +752,12 @@ async function loadEngineCli(): Promise<typeof import("@rivetkit/engine-cli")> {
 	return import(["@rivetkit", "engine-cli"].join("/"));
 }
 
+async function loadServices(): Promise<typeof import("@rivet-dev/services")> {
+	// Keep the native binary opaque to edge bundlers for the same reason as
+	// engine-cli above.
+	return import(["@rivet-dev", "services"].join("/"));
+}
+
 function decodeValue<T>(value?: RuntimeBytes | null): T {
 	if (!value || value.length === 0) {
 		return undefined as T;
@@ -5427,6 +5433,7 @@ export function buildNativeFactory(
 
 export async function buildServeConfig(
 	config: RegistryConfig,
+	resolveServicesBinary = true,
 ): Promise<RuntimeServeConfig> {
 	if (!config.endpoint) {
 		throw nativeEndpointNotConfiguredError();
@@ -5438,6 +5445,7 @@ export async function buildServeConfig(
 		token: config.token,
 		namespace: config.namespace,
 		poolName: config.envoy.poolName,
+		startServices: resolveServicesBinary && config.startServices,
 		handleInspectorHttpInRuntime: true,
 		serverlessBasePath: config.serverless.basePath,
 		serverlessPackageVersion: VERSION,
@@ -5468,6 +5476,17 @@ export async function buildServeConfig(
 			msg: "could not resolve a local engine binary; if a local engine must be spawned it will fail with engine.binary_unavailable — set RIVET_ENGINE_BINARY_PATH or install the @rivetkit/engine-cli platform package",
 			error: stringifyError(error),
 		});
+	}
+	if (resolveServicesBinary && config.startServices) {
+		try {
+			const { getServicesPath } = await loadServices();
+			serveConfig.servicesBinaryPath = getServicesPath();
+		} catch (error) {
+			logger().warn({
+				msg: "could not resolve the Services binary; a local engine will fail with services.binary_unavailable — set RIVET_RUN_SERVICES=0 to disable Services or RIVET_SERVICES_BINARY to a local rivet-services binary",
+				error: stringifyError(error),
+			});
+		}
 	}
 	serveConfig.engineHost = config.engineHost;
 	serveConfig.enginePort = config.enginePort;
@@ -5514,7 +5533,7 @@ export async function buildRegistryWithRuntime(
 	return {
 		runtime,
 		registry,
-		serveConfig: await buildServeConfig(config),
+		serveConfig: await buildServeConfig(config, runtime.kind === "napi"),
 	};
 }
 
