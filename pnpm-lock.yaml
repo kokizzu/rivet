@@ -11,7 +11,17 @@ catalogs:
       version: 0.45.2
 
 overrides:
+  rivetkit: workspace:*
+  '@rivetkit/react': workspace:*
+  '@rivetkit/next-js': workspace:*
+  '@rivetkit/cloudflare-workers': workspace:*
+  '@rivetkit/supabase': workspace:*
+  '@rivetkit/db': workspace:*
   '@rivetkit/engine-api-full': workspace:*
+  '@rivetkit/rivetkit-napi': workspace:*
+  '@rivetkit/rivetkit-wasm': workspace:*
+  '@rivetkit/engine-cli': workspace:*
+  '@rivetkit/effect': workspace:*
   '@types/react': ^19
   '@types/react-dom': ^19
   react: 19.1.0
@@ -19,7 +29,6 @@ overrides:
   '@rivet-gg/components': workspace:*
   '@rivet-gg/icons': workspace:*
   '@rivet-gg/cloud': https://pkg.pr.new/rivet-dev/engine-ee/@rivet-gg/cloud@87a84c0
-  rivetkit: workspace:*
   '@flue/sdk': 1.0.0-beta.9
   '@codemirror/state': 6.5.2
   '@codemirror/view': 6.38.2
@@ -186,8 +195,8 @@ importers:
   examples/actor-actions:
     dependencies:
       '@rivetkit/react':
-        specifier: ^2.3.13
-        version: 2.3.13(react-dom@19.1.0(react@19.1.0))(react@19.1.0)
+        specifier: workspace:*
+        version: link:../../rivetkit-typescript/packages/react
       react:
         specifier: 19.1.0
         version: 19.1.0
@@ -273,8 +282,8 @@ importers:
         specifier: ^0.0.66
         version: 0.0.66(zod@4.3.6)
       '@rivetkit/react':
-        specifier: ^2.3.13
-        version: 2.3.13(react-dom@19.1.0(react@19.1.0))(react@19.1.0)
+        specifier: workspace:*
+        version: link:../../rivetkit-typescript/packages/react
       ai:
         specifier: ^4.0.38
         version: 4.3.19(react@19.1.0)(zod@4.3.6)
@@ -579,8 +588,8 @@ importers:
         specifier: ^1.14.1
         version: 1.19.9(hono@4.11.9)
       '@rivetkit/react':
-        specifier: ^2.3.13
-        version: 2.3.13(react-dom@19.1.0(react@19.1.0))(react@19.1.0)
+        specifier: workspace:*
+        version: link:../../rivetkit-typescript/packages/react
       '@tailwindcss/postcss':
         specifier: ^4.2.2
         version: 4.2.2
@@ -634,8 +643,8 @@ importers:
   examples/collaborative-document:
     dependencies:
       '@rivetkit/react':
-        specifier: ^2.3.13
-        version: 2.3.13(react-dom@19.1.0(react@19.1.0))(react@19.1.0)
+        specifier: workspace:*
+        version: link:../../rivetkit-typescript/packages/react
       react:
         specifier: 19.1.0
         version: 19.1.0
@@ -683,8 +692,8 @@ importers:
   examples/cross-actor-actions:
     dependencies:
       '@rivetkit/react':
-        specifier: ^2.3.13
-        version: 2.3.13(react-dom@19.1.0(react@19.1.0))(react@19.1.0)
+        specifier: workspace:*
+        version: link:../../rivetkit-typescript/packages/react
       react:
         specifier: 19.1.0
         version: 19.1.0
@@ -726,8 +735,8 @@ importers:
   examples/cursors:
     dependencies:
       '@rivetkit/react':
-        specifier: ^2.3.13
-        version: 2.3.13(react-dom@19.1.0(react@19.1.0))(react@19.1.0)
+        specifier: workspace:*
+        version: link:../../rivetkit-typescript/packages/react
       react:
         specifier: 19.1.0
         version: 19.1.0
@@ -769,8 +778,8 @@ importers:
   examples/cursors-raw-websocket:
     dependencies:
       '@rivetkit/react':
-        specifier: ^2.3.13
-        version: 2.3.13(react-dom@19.1.0(react@19.1.0))(react@19.1.0)
+        specifier: workspace:*
+        version: link:../../rivetkit-typescript/packages/react
       react:
         specifier: 19.1.0
         version: 19.1.0
@@ -1002,8 +1011,8 @@ importers:
         specifier: https://pkg.pr.new/rivet-dev/durable-streams/@durable-streams/writer@0323b8b
         version: https://pkg.pr.new/rivet-dev/durable-streams/@durable-streams/writer@0323b8b
       '@rivetkit/react':
-        specifier: ^2.3.13
-        version: 2.3.13(react-dom@19.1.0(react@19.1.0))(react@19.1.0)
+        specifier: workspace:*
+        version: link:../../rivetkit-typescript/packages/react
       ai:
         specifier: ^4.0.38
         version: 4.3.19(react@19.1.0)(zod@4.1.13)
@@ -1094,8 +1103,8 @@ importers:
   examples/hello-world:
     dependencies:
       '@rivetkit/react':
-        specifier: ^2.3.13
-        version: 2.3.13(react-dom@19.1.0(react@19.1.0))(react@19.1.0)
+        specifier: workspace:*
+        version: link:../../rivetkit-typescript/packages/react
       react:
         specifier: 19.1.0
         version: 19.1.0
@@ -1137,8 +1146,8 @@ importers:
   examples/hello-world-cloudflare-workers:
     dependencies:
       '@rivetkit/cloudflare-workers':
-        specifier: '*'
-        version: 2.3.2
+        specifier: workspace:*
+        version: link:../../rivetkit-typescript/packages/cloudflare-workers
       rivetkit:
         specifier: workspace:*
         version: link:../../rivetkit-typescript/packages/rivetkit
@@ -1159,8 +1168,8 @@ importers:
   examples/hello-world-cloudflare-workers-hono:
     dependencies:
       '@rivetkit/cloudflare-workers':
-        specifier: '*'
-        version: 2.3.2
+        specifier: workspace:*
+        version: link:../../rivetkit-typescript/packages/cloudflare-workers
       hono:
         specifier: ^4.8.3
         version: 4.11.9
@@ -1184,8 +1193,8 @@ importers:
   examples/hello-world-cloudflare-workers-raw:
     dependencies:
       '@rivetkit/cloudflare-workers':
-        specifier: '*'
-        version: 2.3.2
+        specifier: workspace:*
+        version: link:../../rivetkit-typescript/packages/cloudflare-workers
       rivetkit:
         specifier: workspace:*
         version: link:../../rivetkit-typescript/packages/rivetkit
@@ -1243,8 +1252,8 @@ importers:
   examples/hello-world-render:
     dependencies:
       '@rivetkit/react':
-        specifier: ^2.3.13
-        version: 2.3.13(react-dom@19.1.0(react@19.1.0))(react@19.1.0)
+        specifier: workspace:*
+        version: link:../../rivetkit-typescript/packages/react
       '@tailwindcss/postcss':
         specifier: ^4.2.2
         version: 4.2.2
@@ -1295,8 +1304,8 @@ importers:
   examples/hello-world-supabase-functions:
     dependencies:
       '@rivetkit/supabase':
-        specifier: '*'
-        version: 2.3.2
+        specifier: workspace:*
+        version: link:../../rivetkit-typescript/packages/supabase
       rivetkit:
         specifier: workspace:*
         version: link:../../rivetkit-typescript/packages/rivetkit
@@ -1333,8 +1342,8 @@ importers:
   examples/hono-react:
     dependencies:
       '@rivetkit/react':
-        specifier: ^2.3.13
-        version: 2.3.13(react-dom@19.1.0(react@19.1.0))(react@19.1.0)
+        specifier: workspace:*
+        version: link:../../rivetkit-typescript/packages/react
       hono:
         specifier: ^4.7.0
         version: 4.11.9
@@ -1575,8 +1584,8 @@ importers:
   examples/native-websockets:
     dependencies:
       '@rivetkit/react':
-        specifier: ^2.3.13
-        version: 2.3.13(react-dom@19.1.0(react@19.1.0))(react@19.1.0)
+        specifier: workspace:*
+        version: link:../../rivetkit-typescript/packages/react
       react:
         specifier: 19.1.0
         version: 19.1.0
@@ -1664,8 +1673,8 @@ importers:
   examples/per-tenant-database:
     dependencies:
       '@rivetkit/react':
-        specifier: ^2.3.13
-        version: 2.3.13(react-dom@19.1.0(react@19.1.0))(react@19.1.0)
+        specifier: workspace:*
+        version: link:../../rivetkit-typescript/packages/react
       react:
         specifier: 19.1.0
         version: 19.1.0
@@ -1707,8 +1716,8 @@ importers:
   examples/raw-fetch-handler:
     dependencies:
       '@rivetkit/react':
-        specifier: ^2.3.13
-        version: 2.3.13(react-dom@19.1.0(react@19.1.0))(react@19.1.0)
+        specifier: workspace:*
+        version: link:../../rivetkit-typescript/packages/react
       hono:
         specifier: ^4.6.18
         version: 4.11.9
@@ -1753,8 +1762,8 @@ importers:
   examples/raw-websocket-handler:
     dependencies:
       '@rivetkit/react':
-        specifier: ^2.3.13
-        version: 2.3.13(react-dom@19.1.0(react@19.1.0))(react@19.1.0)
+        specifier: workspace:*
+        version: link:../../rivetkit-typescript/packages/react
       react:
         specifier: 19.1.0
         version: 19.1.0
@@ -1802,8 +1811,8 @@ importers:
         specifier: ^1.2.0
         version: 1.3.0(@hono/node-server@1.19.9(hono@4.11.9))(hono@4.11.9)
       '@rivetkit/react':
-        specifier: ^2.3.13
-        version: 2.3.13(react-dom@19.1.0(react@19.1.0))(react@19.1.0)
+        specifier: workspace:*
+        version: link:../../rivetkit-typescript/packages/react
       hono:
         specifier: ^4.7.0
         version: 4.11.9
@@ -1854,8 +1863,8 @@ importers:
   examples/react:
     dependencies:
       '@rivetkit/react':
-        specifier: ^2.3.13
-        version: 2.3.13(react-dom@19.1.0(react@19.1.0))(react@19.1.0)
+        specifier: workspace:*
+        version: link:../../rivetkit-typescript/packages/react
       react:
         specifier: 19.1.0
         version: 19.1.0
@@ -1900,8 +1909,8 @@ importers:
         specifier: ^1.14.1
         version: 1.19.9(hono@4.11.9)
       '@rivetkit/react':
-        specifier: ^2.3.13
-        version: 2.3.13(react-dom@19.1.0(react@19.1.0))(react@19.1.0)
+        specifier: workspace:*
+        version: link:../../rivetkit-typescript/packages/react
       '@tailwindcss/postcss':
         specifier: ^4.2.2
         version: 4.2.2
@@ -1964,7 +1973,7 @@ importers:
         specifier: ^1.3.0
         version: 1.3.0(@hono/node-server@1.19.13(hono@4.11.9))(hono@4.11.9)
       '@rivetkit/react':
-        specifier: workspace:^
+        specifier: workspace:*
         version: link:../../rivetkit-typescript/packages/react
       '@rivetkit/sqlite-wasm':
         specifier: '*'
@@ -2160,8 +2169,8 @@ importers:
   examples/state:
     dependencies:
       '@rivetkit/react':
-        specifier: ^2.3.13
-        version: 2.3.13(react-dom@19.1.0(react@19.1.0))(react@19.1.0)
+        specifier: workspace:*
+        version: link:../../rivetkit-typescript/packages/react
       react:
         specifier: 19.1.0
         version: 19.1.0
@@ -2206,8 +2215,8 @@ importers:
         specifier: ^1.14.1
         version: 1.19.9(hono@4.11.9)
       '@rivetkit/react':
-        specifier: ^2.3.13
-        version: 2.3.13(react-dom@19.1.0(react@19.1.0))(react@19.1.0)
+        specifier: workspace:*
+        version: link:../../rivetkit-typescript/packages/react
       '@tailwindcss/postcss':
         specifier: ^4.2.2
         version: 4.2.2
@@ -2261,8 +2270,8 @@ importers:
   examples/stream:
     dependencies:
       '@rivetkit/react':
-        specifier: ^2.3.13
-        version: 2.3.13(react-dom@19.1.0(react@19.1.0))(react@19.1.0)
+        specifier: workspace:*
+        version: link:../../rivetkit-typescript/packages/react
       react:
         specifier: 19.1.0
         version: 19.1.0
@@ -2307,8 +2316,8 @@ importers:
         specifier: ^1.14.1
         version: 1.19.9(hono@4.11.9)
       '@rivetkit/react':
-        specifier: ^2.3.13
-        version: 2.3.13(react-dom@19.1.0(react@19.1.0))(react@19.1.0)
+        specifier: workspace:*
+        version: link:../../rivetkit-typescript/packages/react
       '@tailwindcss/postcss':
         specifier: ^4.2.2
         version: 4.2.2
@@ -5206,11 +5215,11 @@ packages:
 
   '@esbuild-kit/core-utils@3.3.2':
     resolution: {integrity: sha512-sPRAnw9CdSsRmEtnsl2WXWdyquogVpB3yZ3dgwJfe8zrOzTsV7cJvmwrKVa+0ma5BoiGJ+BoqkMvawbayKUsqQ==}
-    deprecated: 'Merged into tsx: https://tsx.is'
+    deprecated: 'Merged into tsx: https://tsx.hirok.io'
 
   '@esbuild-kit/esm-loader@2.6.5':
     resolution: {integrity: sha512-FxEMIkJKnodyA1OaCUoEvbYRkoZlLZ4d/eXFu9Fh8CbBBgP5EmZxrfTRyN0qpXZ4vOvqnE5YdRdcrmUUXuU+dA==}
-    deprecated: 'Merged into tsx: https://tsx.is'
+    deprecated: 'Merged into tsx: https://tsx.hirok.io'
 
   '@esbuild/aix-ppc64@0.19.12':
     resolution: {integrity: sha512-bmoCYyWdEL3wDQIVbcyzRyeKLgk2WtWLTWz1ZIAZF/EGbNOwSA6ew3PftJ1PqMiOOGu0OyFMzG53L0zqIpPeNA==}
@@ -8566,36 +8575,21 @@ packages:
     resolution: {integrity: sha512-3qndQUQXLdwafMEqfhz24hUtDPcsf1Bu3q52Kb8MqeH8JUh3h6R4HYW3ZJXiQsLcyYyFM68PuIwlLRlg1xDEpg==}
     engines: {node: ^14.18.0 || >=16.0.0}
 
-  '@rivetkit/cloudflare-workers@2.3.2':
-    resolution: {integrity: sha512-YuAwkjM/TDa+Ifq6huFUgn2M2ggk4hAlIKkw9M2QZRZUrTIW07R7IJ3wZQrNO6Wke1a5616v4oJkaNNPCwdnRg==}
-
   '@rivetkit/engine-cli-linux-x64-musl@2.3.5':
     resolution: {integrity: sha512-/yJPsQbfe3lIsgPKq5BEvHXQRYurQ4gy3HNrkI4OIG7rQnTdOgbOkZyaKaY7yUqyqq4EyWijSsUAtrvjQvxx7Q==}
     engines: {node: '>= 20.0.0'}
     cpu: [x64]
     os: [linux]
 
-  '@rivetkit/framework-base@2.3.13':
-    resolution: {integrity: sha512-JVEzXHTwE/+jWH6mJRgPOgDrHb9g4b3EhBBjlO9Wz0y705pfSchJ7Qj+OYtDxIsXU3tI3isQQFgyg3kZ5aCMNg==}
-
   '@rivetkit/on-change@6.0.1':
     resolution: {integrity: sha512-QBN/KRBXLJdCgN4gBTL3XAc/zKm58atSnieXWMOyFSPmo6F1/yIVV/LTRdvAktfCttrGx7W6c32i/lwqCHWnsQ==}
     engines: {node: '>=20'}
-
-  '@rivetkit/react@2.3.13':
-    resolution: {integrity: sha512-uXW4CZ0Mq4PxlLwh++mDeo7Velt6wbzn5lFB9wAOXjTQcY62ncF8NlhKq328PU4e5JJ1MYzPJezHwxX04id4ew==}
-    peerDependencies:
-      react: 19.1.0
-      react-dom: 19.1.0
 
   '@rivetkit/rivetkit-napi-linux-x64-gnu@2.3.5':
     resolution: {integrity: sha512-KZxr4zTFEG5UokI7foz+X+lBvzyUh+D1LccPSjNS9By8RJgh+PdROfEimlwUIOr9SAf5RQHXuTccYLzUWgdCBQ==}
     engines: {node: '>= 20.0.0'}
     cpu: [x64]
     os: [linux]
-
-  '@rivetkit/rivetkit-wasm@2.3.2':
-    resolution: {integrity: sha512-HNBzh6uQFi4ZYL0tHAZ6nrYKoGCfa+kObLCwdS+/ZzGePV7WGUl20Do1bHjBtnVgp9UwzQu+lka8kFwKfqm6WA==}
 
   '@rivetkit/sql-loader@2.2.1':
     resolution: {integrity: sha512-qqykzDGak06VY58o8qh8TH7CL77vIp2FHUJB2ZT78LJ+muRrXiwj/QHeVn9ykWePqCYCD9XP0L6Qd2fmERdXqQ==}
@@ -8606,9 +8600,6 @@ packages:
 
   '@rivetkit/sqlite@0.1.1':
     resolution: {integrity: sha512-NE7ZBy/hQhOrWzMZFjkHX9SoXxf+ILcDvVV+mNbUYPgiy/fsDzlXdK0+JDTGnko5f4Xl6/KVCoCozz9gkwkq8A==}
-
-  '@rivetkit/supabase@2.3.2':
-    resolution: {integrity: sha512-91q75LRkMpe/UEvC9mtQJR0pYh1bkwfesB3gXdiV8uMdENNTloKEnZLC7lbepzm+R9u/EiaJWNBgDiVJ1rJa7Q==}
 
   '@rolldown/binding-android-arm64@1.2.1':
     resolution: {integrity: sha512-02hOeOSryYxVrOIphmLAsqnCJWxwlzFk+pEt/N/i6OgT3lShHO7xGCU5cpgchRDHboAEbSjzgGh+O/u1GswQmA==}
@@ -24928,32 +24919,11 @@ snapshots:
 
   '@rivetkit/bare-ts@0.6.2': {}
 
-  '@rivetkit/cloudflare-workers@2.3.2':
-    dependencies:
-      '@rivetkit/rivetkit-wasm': 2.3.2
-      rivetkit: link:rivetkit-typescript/packages/rivetkit
-
   '@rivetkit/engine-cli-linux-x64-musl@2.3.5': {}
-
-  '@rivetkit/framework-base@2.3.13':
-    dependencies:
-      '@tanstack/store': 0.7.5
-      fast-deep-equal: 3.1.3
-      rivetkit: link:rivetkit-typescript/packages/rivetkit
 
   '@rivetkit/on-change@6.0.1': {}
 
-  '@rivetkit/react@2.3.13(react-dom@19.1.0(react@19.1.0))(react@19.1.0)':
-    dependencies:
-      '@rivetkit/framework-base': 2.3.13
-      '@tanstack/react-store': 0.7.5(react-dom@19.1.0(react@19.1.0))(react@19.1.0)
-      react: 19.1.0
-      react-dom: 19.1.0(react@19.1.0)
-      rivetkit: link:rivetkit-typescript/packages/rivetkit
-
   '@rivetkit/rivetkit-napi-linux-x64-gnu@2.3.5': {}
-
-  '@rivetkit/rivetkit-wasm@2.3.2': {}
 
   '@rivetkit/sql-loader@2.2.1': {}
 
@@ -24964,11 +24934,6 @@ snapshots:
       vbare: 0.0.4
 
   '@rivetkit/sqlite@0.1.1': {}
-
-  '@rivetkit/supabase@2.3.2':
-    dependencies:
-      '@rivetkit/rivetkit-wasm': 2.3.2
-      rivetkit: link:rivetkit-typescript/packages/rivetkit
 
   '@rolldown/binding-android-arm64@1.2.1':
     optional: true
