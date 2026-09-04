@@ -91,7 +91,7 @@ members = [
 ]
 
   [workspace.package]
-  version = "2.4.0"
+  version = "2.3.14"
   edition = "2024"
   authors = [ "Rivet Gaming, LLC <developer@rivet.dev>" ]
   license = "Apache-2.0"
@@ -638,45 +638,45 @@ members = [
 
     [workspace.dependencies.rivetkit-client-protocol]
     path = "rivetkit-rust/packages/client-protocol"
-    version = "=2.4.0"
+    version = "=2.3.14"
 
     [workspace.dependencies.rivetkit-client]
     path = "rivetkit-rust/packages/client"
-    version = "=2.4.0"
+    version = "=2.3.14"
 
     [workspace.dependencies.rivetkit-actor-persist]
     path = "rivetkit-rust/packages/actor-persist"
-    version = "=2.4.0"
+    version = "=2.3.14"
 
     [workspace.dependencies.rivetkit-inspector-protocol]
     path = "rivetkit-rust/packages/inspector-protocol"
-    version = "=2.4.0"
+    version = "=2.3.14"
 
     [workspace.dependencies.rivetkit]
     path = "rivetkit-rust/packages/rivetkit"
-    version = "=2.4.0"
+    version = "=2.3.14"
 
     [workspace.dependencies.rivetkit-core]
     path = "rivetkit-rust/packages/rivetkit-core"
-    version = "=2.4.0"
+    version = "=2.3.14"
 
     [workspace.dependencies.rivetkit-shared-types]
     path = "rivetkit-rust/packages/shared-types"
-    version = "=2.4.0"
+    version = "=2.3.14"
 
     [workspace.dependencies.depot-client-types]
     package = "rivet-depot-client-types"
     path = "engine/packages/depot-client-types"
-    version = "=2.4.0"
+    version = "=2.3.14"
 
     [workspace.dependencies.rivetkit-engine-process]
     path = "rivetkit-rust/packages/engine-process"
-    version = "=2.4.0"
+    version = "=2.3.14"
 
     [workspace.dependencies.depot-client]
     package = "rivet-depot-client"
     path = "engine/packages/depot-client"
-    version = "=2.4.0"
+    version = "=2.3.14"
 
     [workspace.dependencies.epoxy-protocol]
     path = "engine/sdks/rust/epoxy-protocol"

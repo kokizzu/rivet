@@ -1,6 +1,6 @@
 {
 	"name": "@rivetkit/cli-linux-x64-musl",
-	"version": "2.4.0",
+	"version": "2.3.14",
 	"description": "Rivet CLI for Linux x64 musl (static)",
 	"license": "LicenseRef-RivetEnterprise",
 	"os": [
