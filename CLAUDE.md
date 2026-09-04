@@ -87,6 +87,12 @@ docker-compose up -d
 - **Never push to `main` unless explicitly specified by the user.**
 - **Safety:** Never run destructive jj or git commands (`jj git push`, `jj abandon`, `jj squash` into a non-current revision, `jj op restore`, `jj op undo` past your own work, `jj rebase -d main`, `git push --force`, `git reset --hard`) unless the user explicitly requests it.
 
+
+### Releases
+
+- **Cut every release as a patch.** The version number is only incidentally semver-compatible; it is not semver-driven. Major and minor bumps are marketing decisions the user makes deliberately, never inferred from what changed in the code.
+- Always pass `--version <x.y.z> --latest` explicitly to `pnpm --filter=publish release`. The repo still carries pre-2.x calendar tags (`v25.8.0`) that sort above the current line, so the `--major/--minor/--patch` flags bump from the wrong version and the `latest` dist-tag silently resolves to false.
+
 ## Assets
 
 - Large public dashboard and website media belongs in the `rivet-assets` R2 bucket, not Git.
