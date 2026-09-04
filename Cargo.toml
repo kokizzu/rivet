@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+  "container-runner",
   "engine/packages/api-builder",
   "engine/packages/api-peer",
   "engine/packages/api-public",
@@ -84,7 +85,9 @@ members = [
   "rivetkit-rust/packages/rivetkit-core",
   "rivetkit-rust/packages/shared-types",
   "rivetkit-typescript/packages/rivetkit-napi",
-  "rivetkit-typescript/packages/rivetkit-wasm"
+  "rivetkit-typescript/packages/rivetkit-wasm",
+  "examples/chat-room-rust",
+  "examples/hello-world-rust"
 ]
 
   [workspace.package]
