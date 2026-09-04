@@ -472,11 +472,16 @@ type MessageId struct {
 # HTTP
 type ToEnvoyRequestStart struct {
 	actorId: Id
+	# Exact actor generation selected by Gateway 3. Legacy Gateway 2 requests
+	# omit this and retain highest-live-generation routing.
+	actorGeneration: optional<u32>
 	method: str
 	path: str
 	headers: map<str><str>
 	body: optional<data>
 	stream: bool
+	# Whether the gateway can accept a streamed response body.
+	responseStream: bool
 }
 
 type ToEnvoyRequestChunk struct {
@@ -484,7 +489,38 @@ type ToEnvoyRequestChunk struct {
 	finish: bool
 }
 
-type ToEnvoyRequestAbort void
+# Cumulative request-body bytes consumed by the actor handler. This restores
+# sender credit without requiring one acknowledgement per chunk.
+type ToRivetRequestBodyWindowUpdate struct {
+	consumedBytes: u64
+}
+
+# The actor handler no longer wants request-body bytes. The HTTP response may
+# still continue normally.
+type ToRivetRequestBodyCancel void
+
+type HttpStreamAbortReasonKind enum {
+	UNKNOWN
+	CANCELLED
+	HANDLER_ERROR
+	INTERNAL_ERROR
+}
+
+type HttpStreamAbortReason struct {
+	kind: HttpStreamAbortReasonKind
+	detail: optional<str>
+}
+
+type ToEnvoyRequestAbort struct {
+	# Exact admission identity. Gateway 3 always sets both fields so Envoy can
+	# suppress a delayed RequestStart after an indeterminate handoff.
+	actorId: optional<Id>
+	actorGeneration: optional<u32>
+	reason: HttpStreamAbortReason
+}
+
+# Stop the actor-side request body without cancelling the HTTP response.
+type ToEnvoyRequestBodyCancel void
 
 type ToRivetResponseStart struct {
 	status: u16
@@ -498,11 +534,22 @@ type ToRivetResponseChunk struct {
 	finish: bool
 }
 
-type ToRivetResponseAbort void
+# Cumulative response-body bytes consumed by the gateway client. This restores
+# sender credit without requiring one acknowledgement per chunk.
+type ToEnvoyResponseBodyWindowUpdate struct {
+	consumedBytes: u64
+}
+
+type ToRivetResponseAbort struct {
+	reason: HttpStreamAbortReason
+}
 
 # WebSocket
 type ToEnvoyWebSocketOpen struct {
 	actorId: Id
+	# Exact actor generation selected by Gateway 3. Legacy Gateway 2 requests
+	# omit this and retain highest-live-generation routing.
+	actorGeneration: optional<u32>
 	path: str
 	headers: map<str><str>
 }
@@ -542,6 +589,8 @@ type ToRivetTunnelMessageKind union {
 	ToRivetResponseStart |
 	ToRivetResponseChunk |
 	ToRivetResponseAbort |
+	ToRivetRequestBodyWindowUpdate |
+	ToRivetRequestBodyCancel |
 
 	# WebSocket
 	ToRivetWebSocketOpen |
@@ -561,6 +610,8 @@ type ToEnvoyTunnelMessageKind union {
 	ToEnvoyRequestStart |
 	ToEnvoyRequestChunk |
 	ToEnvoyRequestAbort |
+	ToEnvoyRequestBodyCancel |
+	ToEnvoyResponseBodyWindowUpdate |
 
 	# WebSocket
 	ToEnvoyWebSocketOpen |

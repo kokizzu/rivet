@@ -104,9 +104,27 @@ type KvResponseData union {
 
 # MARK: SQLite
 
-type SqlitePgno u32
 type SqliteGeneration u64
+type SqliteTxid u64
+type SqlitePgno u32
+type SqliteStageId u64
+
 type SqlitePageBytes data
+
+type SqliteMeta struct {
+	generation: SqliteGeneration
+	headTxid: SqliteTxid
+	materializedTxid: SqliteTxid
+	dbSizePages: u32
+	pageSize: u32
+	creationTsMs: i64
+	maxDeltaBytes: u64
+}
+
+type SqliteFenceMismatch struct {
+	actualMeta: SqliteMeta
+	reason: str
+}
 
 type SqliteDirtyPage struct {
 	pgno: SqlitePgno
@@ -120,213 +138,112 @@ type SqliteFetchedPage struct {
 
 type SqliteGetPagesRequest struct {
 	actorId: Id
+	generation: SqliteGeneration
 	pgnos: list<SqlitePgno>
-	expectedGeneration: optional<u64>
-	expectedHeadTxid: optional<u64>
 }
 
 type SqliteGetPagesOk struct {
 	pages: list<SqliteFetchedPage>
-	headTxid: optional<u64>
+	meta: SqliteMeta
 }
 
 type SqliteErrorResponse struct {
-	group: str
-	code: str
 	message: str
 }
 
 type SqliteGetPagesResponse union {
 	SqliteGetPagesOk |
+	SqliteFenceMismatch |
 	SqliteErrorResponse
 }
 
 type SqliteCommitRequest struct {
 	actorId: Id
+	generation: SqliteGeneration
+	expectedHeadTxid: SqliteTxid
 	dirtyPages: list<SqliteDirtyPage>
-	dbSizePages: u32
-	nowMs: i64
-	expectedGeneration: optional<u64>
-	expectedHeadTxid: optional<u64>
+	newDbSizePages: u32
 }
 
 type SqliteCommitOk struct {
-	headTxid: optional<u64>
+	newHeadTxid: SqliteTxid
+	meta: SqliteMeta
+}
+
+type SqliteCommitTooLarge struct {
+	actualSizeBytes: u64
+	maxSizeBytes: u64
 }
 
 type SqliteCommitResponse union {
 	SqliteCommitOk |
+	SqliteFenceMismatch |
+	SqliteCommitTooLarge |
 	SqliteErrorResponse
 }
 
-# Staged commit. A commit too large for one transaction is written as a sequence of shard-aligned
-# segments and then made visible by a single finalize. Nothing staged is readable until finalize:
-# no PIDX row, no COMMIT row, no head advance, so an abandoned stage is indistinguishable from no
-# commit at all. The single-shot SqliteCommitRequest above stays the path for small commits.
 type SqliteCommitStageBeginRequest struct {
 	actorId: Id
-	expectedGeneration: optional<u64>
-	# Fences before any bytes are staged, so an actor that lost its generation does not pay for a
-	# full payload before finding out.
-	expectedHeadTxid: optional<u64>
+	generation: SqliteGeneration
 }
 
 type SqliteCommitStageBeginOk struct {
-	# The engine allocates the txid (head + 1). Actor exclusivity makes that safe without an
-	# allocator.
-	txid: u64
+	txid: SqliteTxid
 }
 
 type SqliteCommitStageBeginResponse union {
 	SqliteCommitStageBeginOk |
+	SqliteFenceMismatch |
 	SqliteErrorResponse
 }
 
-type SqliteCommitStageSegmentRequest struct {
+type SqliteCommitStageRequest struct {
 	actorId: Id
-	expectedGeneration: optional<u64>
-	txid: u64
-	# Shard-aligned and strictly ascending across a commit's segments. The engine rejects a
-	# misaligned or out-of-order value rather than trusting the client to have produced it
-	# correctly: a shard split across two segments could be folded from one of them and written as
-	# a shard image missing the other's newer pages.
-	firstPgno: u32
-	dirtyPages: list<SqliteDirtyPage>
+	generation: SqliteGeneration
+	txid: SqliteTxid
+	chunkIdx: u32
+	bytes: data
+	isLast: bool
 }
 
-type SqliteCommitStageSegmentOk struct {
-	stagedBytes: u64
+type SqliteCommitStageOk struct {
+	chunkIdxCommitted: u32
 }
 
-type SqliteCommitStageSegmentResponse union {
-	SqliteCommitStageSegmentOk |
+type SqliteCommitStageResponse union {
+	SqliteCommitStageOk |
+	SqliteFenceMismatch |
 	SqliteErrorResponse
 }
 
 type SqliteCommitFinalizeRequest struct {
 	actorId: Id
-	expectedGeneration: optional<u64>
-	# The txid begin allocated. It is the head fence as well as the identity: finalize requires it to
-	# still be `head + 1`, so a separate expectedHeadTxid would only ever restate `txid - 1`.
-	txid: u64
+	generation: SqliteGeneration
+	expectedHeadTxid: SqliteTxid
+	txid: SqliteTxid
 	newDbSizePages: u32
-	nowMs: i64
-	# Exactly what the client believes it staged. Finalize verifies each one exists, so a client
-	# that lost a stage reply and finalized anyway is rejected instead of publishing a commit with
-	# a hole in it. Dirty page numbers are not carried here: the engine derives them from the
-	# staged segments' own page indexes.
-	segmentFirstPgnos: list<u32>
 }
 
 type SqliteCommitFinalizeOk struct {
-	headTxid: optional<u64>
+	newHeadTxid: SqliteTxid
+	meta: SqliteMeta
+}
+
+type SqliteStageNotFound struct {
+	stageId: SqliteStageId
 }
 
 type SqliteCommitFinalizeResponse union {
 	SqliteCommitFinalizeOk |
+	SqliteFenceMismatch |
+	SqliteStageNotFound |
 	SqliteErrorResponse
 }
 
-# MARK: SQLite Remote Execution
-
-type SqliteValueNull void
-
-type SqliteValueInteger struct {
-	value: i64
-}
-
-type SqliteValueFloat struct {
-	value: data[8]
-}
-
-type SqliteValueText struct {
-	value: str
-}
-
-type SqliteValueBlob struct {
-	value: data
-}
-
-type SqliteBindParam union {
-	SqliteValueNull |
-	SqliteValueInteger |
-	SqliteValueFloat |
-	SqliteValueText |
-	SqliteValueBlob
-}
-
-type SqliteColumnValue union {
-	SqliteValueNull |
-	SqliteValueInteger |
-	SqliteValueFloat |
-	SqliteValueText |
-	SqliteValueBlob
-}
-
-type SqliteQueryResult struct {
-	columns: list<str>
-	rows: list<list<SqliteColumnValue>>
-}
-
-type SqliteExecuteResult struct {
-	columns: list<str>
-	rows: list<list<SqliteColumnValue>>
-	changes: i64
-	lastInsertRowId: optional<i64>
-}
-
-type SqliteExecRequest struct {
-	namespaceId: Id
-	actorId: Id
+type SqliteStartupData struct {
 	generation: SqliteGeneration
-	sql: str
-}
-
-type SqliteExecuteRequest struct {
-	namespaceId: Id
-	actorId: Id
-	generation: SqliteGeneration
-	sql: str
-	params: optional<list<SqliteBindParam>>
-}
-
-type SqliteBatchStatement struct {
-	sql: str
-	params: optional<list<SqliteBindParam>>
-}
-
-type SqliteExecuteBatchRequest struct {
-	namespaceId: Id
-	actorId: Id
-	generation: SqliteGeneration
-	statements: list<SqliteBatchStatement>
-}
-
-type SqliteExecOk struct {
-	result: SqliteQueryResult
-}
-
-type SqliteExecuteOk struct {
-	result: SqliteExecuteResult
-}
-
-type SqliteExecuteBatchOk struct {
-	results: list<SqliteExecuteResult>
-}
-
-type SqliteExecResponse union {
-	SqliteExecOk |
-	SqliteErrorResponse
-}
-
-type SqliteExecuteResponse union {
-	SqliteExecuteOk |
-	SqliteErrorResponse
-}
-
-type SqliteExecuteBatchResponse union {
-	SqliteExecuteBatchOk |
-	SqliteErrorResponse
+	meta: SqliteMeta
+	preloadedPages: list<SqliteFetchedPage>
 }
 
 # MARK: Actor
@@ -426,6 +343,7 @@ type CommandStartActor struct {
 	config: ActorConfig
 	hibernatingRequests: list<HibernatingRequest>
 	preloadedKv: optional<PreloadedKv>
+	sqliteStartupData: optional<SqliteStartupData>
 }
 
 type StopActorReason enum {
@@ -616,29 +534,14 @@ type ToRivetSqliteCommitStageBeginRequest struct {
 	data: SqliteCommitStageBeginRequest
 }
 
-type ToRivetSqliteCommitStageSegmentRequest struct {
+type ToRivetSqliteCommitStageRequest struct {
 	requestId: u32
-	data: SqliteCommitStageSegmentRequest
+	data: SqliteCommitStageRequest
 }
 
 type ToRivetSqliteCommitFinalizeRequest struct {
 	requestId: u32
 	data: SqliteCommitFinalizeRequest
-}
-
-type ToRivetSqliteExecRequest struct {
-	requestId: u32
-	data: SqliteExecRequest
-}
-
-type ToRivetSqliteExecuteRequest struct {
-	requestId: u32
-	data: SqliteExecuteRequest
-}
-
-type ToRivetSqliteExecuteBatchRequest struct {
-	requestId: u32
-	data: SqliteExecuteBatchRequest
 }
 
 type ToRivet union {
@@ -652,11 +555,8 @@ type ToRivet union {
 	ToRivetSqliteGetPagesRequest |
 	ToRivetSqliteCommitRequest |
 	ToRivetSqliteCommitStageBeginRequest |
-	ToRivetSqliteCommitStageSegmentRequest |
-	ToRivetSqliteCommitFinalizeRequest |
-	ToRivetSqliteExecRequest |
-	ToRivetSqliteExecuteRequest |
-	ToRivetSqliteExecuteBatchRequest
+	ToRivetSqliteCommitStageRequest |
+	ToRivetSqliteCommitFinalizeRequest
 }
 
 # MARK: To Envoy
@@ -696,29 +596,14 @@ type ToEnvoySqliteCommitStageBeginResponse struct {
 	data: SqliteCommitStageBeginResponse
 }
 
-type ToEnvoySqliteCommitStageSegmentResponse struct {
+type ToEnvoySqliteCommitStageResponse struct {
 	requestId: u32
-	data: SqliteCommitStageSegmentResponse
+	data: SqliteCommitStageResponse
 }
 
 type ToEnvoySqliteCommitFinalizeResponse struct {
 	requestId: u32
 	data: SqliteCommitFinalizeResponse
-}
-
-type ToEnvoySqliteExecResponse struct {
-	requestId: u32
-	data: SqliteExecResponse
-}
-
-type ToEnvoySqliteExecuteResponse struct {
-	requestId: u32
-	data: SqliteExecuteResponse
-}
-
-type ToEnvoySqliteExecuteBatchResponse struct {
-	requestId: u32
-	data: SqliteExecuteBatchResponse
 }
 
 type ToEnvoy union {
@@ -731,11 +616,8 @@ type ToEnvoy union {
 	ToEnvoySqliteGetPagesResponse |
 	ToEnvoySqliteCommitResponse |
 	ToEnvoySqliteCommitStageBeginResponse |
-	ToEnvoySqliteCommitStageSegmentResponse |
-	ToEnvoySqliteCommitFinalizeResponse |
-	ToEnvoySqliteExecResponse |
-	ToEnvoySqliteExecuteResponse |
-	ToEnvoySqliteExecuteBatchResponse
+	ToEnvoySqliteCommitStageResponse |
+	ToEnvoySqliteCommitFinalizeResponse
 }
 
 # MARK: To Envoy Conn

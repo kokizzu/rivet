@@ -159,74 +159,6 @@ type SqliteCommitResponse union {
 	SqliteErrorResponse
 }
 
-# Staged commit. A commit too large for one transaction is written as a sequence of shard-aligned
-# segments and then made visible by a single finalize. Nothing staged is readable until finalize:
-# no PIDX row, no COMMIT row, no head advance, so an abandoned stage is indistinguishable from no
-# commit at all. The single-shot SqliteCommitRequest above stays the path for small commits.
-type SqliteCommitStageBeginRequest struct {
-	actorId: Id
-	expectedGeneration: optional<u64>
-	# Fences before any bytes are staged, so an actor that lost its generation does not pay for a
-	# full payload before finding out.
-	expectedHeadTxid: optional<u64>
-}
-
-type SqliteCommitStageBeginOk struct {
-	# The engine allocates the txid (head + 1). Actor exclusivity makes that safe without an
-	# allocator.
-	txid: u64
-}
-
-type SqliteCommitStageBeginResponse union {
-	SqliteCommitStageBeginOk |
-	SqliteErrorResponse
-}
-
-type SqliteCommitStageSegmentRequest struct {
-	actorId: Id
-	expectedGeneration: optional<u64>
-	txid: u64
-	# Shard-aligned and strictly ascending across a commit's segments. The engine rejects a
-	# misaligned or out-of-order value rather than trusting the client to have produced it
-	# correctly: a shard split across two segments could be folded from one of them and written as
-	# a shard image missing the other's newer pages.
-	firstPgno: u32
-	dirtyPages: list<SqliteDirtyPage>
-}
-
-type SqliteCommitStageSegmentOk struct {
-	stagedBytes: u64
-}
-
-type SqliteCommitStageSegmentResponse union {
-	SqliteCommitStageSegmentOk |
-	SqliteErrorResponse
-}
-
-type SqliteCommitFinalizeRequest struct {
-	actorId: Id
-	expectedGeneration: optional<u64>
-	# The txid begin allocated. It is the head fence as well as the identity: finalize requires it to
-	# still be `head + 1`, so a separate expectedHeadTxid would only ever restate `txid - 1`.
-	txid: u64
-	newDbSizePages: u32
-	nowMs: i64
-	# Exactly what the client believes it staged. Finalize verifies each one exists, so a client
-	# that lost a stage reply and finalized anyway is rejected instead of publishing a commit with
-	# a hole in it. Dirty page numbers are not carried here: the engine derives them from the
-	# staged segments' own page indexes.
-	segmentFirstPgnos: list<u32>
-}
-
-type SqliteCommitFinalizeOk struct {
-	headTxid: optional<u64>
-}
-
-type SqliteCommitFinalizeResponse union {
-	SqliteCommitFinalizeOk |
-	SqliteErrorResponse
-}
-
 # MARK: SQLite Remote Execution
 
 type SqliteValueNull void
@@ -611,21 +543,6 @@ type ToRivetSqliteCommitRequest struct {
 	data: SqliteCommitRequest
 }
 
-type ToRivetSqliteCommitStageBeginRequest struct {
-	requestId: u32
-	data: SqliteCommitStageBeginRequest
-}
-
-type ToRivetSqliteCommitStageSegmentRequest struct {
-	requestId: u32
-	data: SqliteCommitStageSegmentRequest
-}
-
-type ToRivetSqliteCommitFinalizeRequest struct {
-	requestId: u32
-	data: SqliteCommitFinalizeRequest
-}
-
 type ToRivetSqliteExecRequest struct {
 	requestId: u32
 	data: SqliteExecRequest
@@ -651,9 +568,6 @@ type ToRivet union {
 	ToRivetTunnelMessage |
 	ToRivetSqliteGetPagesRequest |
 	ToRivetSqliteCommitRequest |
-	ToRivetSqliteCommitStageBeginRequest |
-	ToRivetSqliteCommitStageSegmentRequest |
-	ToRivetSqliteCommitFinalizeRequest |
 	ToRivetSqliteExecRequest |
 	ToRivetSqliteExecuteRequest |
 	ToRivetSqliteExecuteBatchRequest
@@ -691,21 +605,6 @@ type ToEnvoySqliteCommitResponse struct {
 	data: SqliteCommitResponse
 }
 
-type ToEnvoySqliteCommitStageBeginResponse struct {
-	requestId: u32
-	data: SqliteCommitStageBeginResponse
-}
-
-type ToEnvoySqliteCommitStageSegmentResponse struct {
-	requestId: u32
-	data: SqliteCommitStageSegmentResponse
-}
-
-type ToEnvoySqliteCommitFinalizeResponse struct {
-	requestId: u32
-	data: SqliteCommitFinalizeResponse
-}
-
 type ToEnvoySqliteExecResponse struct {
 	requestId: u32
 	data: SqliteExecResponse
@@ -730,9 +629,6 @@ type ToEnvoy union {
 	ToEnvoyPing |
 	ToEnvoySqliteGetPagesResponse |
 	ToEnvoySqliteCommitResponse |
-	ToEnvoySqliteCommitStageBeginResponse |
-	ToEnvoySqliteCommitStageSegmentResponse |
-	ToEnvoySqliteCommitFinalizeResponse |
 	ToEnvoySqliteExecResponse |
 	ToEnvoySqliteExecuteResponse |
 	ToEnvoySqliteExecuteBatchResponse
