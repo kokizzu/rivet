@@ -409,6 +409,7 @@ members = [
     [workspace.dependencies.serde_bare]
     git = "https://github.com/rivet-dev/serde_bare"
     rev = "f63f155db7e0ab989255ee0d6991ff8eb9ebee25"
+    version = "0.5.0"
 
     [workspace.dependencies.vbare]
     version = "0.0.4"
