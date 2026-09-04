@@ -1,12 +1,12 @@
-use ::pyroscope::backend::{pprof_backend, BackendConfig, PprofConfig};
-use ::pyroscope::pyroscope::{PyroscopeAgentBuilder, PyroscopeAgentRunning};
 use ::pyroscope::PyroscopeAgent;
+use ::pyroscope::backend::{BackendConfig, PprofConfig, pprof_backend};
+use ::pyroscope::pyroscope::{PyroscopeAgentBuilder, PyroscopeAgentRunning};
 use anyhow::Result;
 use gas::prelude::*;
 use universalpubsub::NextOutput;
 
 use crate::pubsub_subjects::{
-	ProfileConfigSubject, SetProfileConfigMessage, PROFILE_CONFIG_SUBJECT,
+	PROFILE_CONFIG_SUBJECT, ProfileConfigSubject, SetProfileConfigMessage,
 };
 
 /// Listens for runtime profiling toggles and owns the Pyroscope agent lifecycle.
